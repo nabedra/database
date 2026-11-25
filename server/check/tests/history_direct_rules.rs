@@ -1,5 +1,6 @@
-//! The opt-in direct-path rules (`nabedra_check::checker::direct::request_rules`) on captured,
-//! existing and written histories.
+//! The retry rule of the direct path (`nabedra_check::checker::direct::results`, always on) and the
+//! opt-in rule about refusals (`direct::request_rules`) on captured, existing and written
+//! histories.
 //!
 //! `tests/fixtures/unreviewed_dr1_dr2/` holds histories captured by PR #118 at `9b810d96`: one
 //! seed, one local run, a simulated fault model. They are **unreviewed findings**. DR-1 and DR-2
@@ -11,6 +12,10 @@
 //! as a control, but its own first retry went on the wire and became the delayed attempt, so it
 //! is neither a valid control nor a planned reproduction (`dr-repro` report).
 
+use nabedra_check::checker::direct::results::{
+    EXPIRED, INSERT_MANY_RECOMPUTED, OTHER_BODY, OTHER_BODY_COMMITTED, OTHER_BODY_UNCHANGED,
+    OTHER_BODY_UNKNOWN, UNCLASSIFIED_MAY_REPEAT,
+};
 use nabedra_check::checker::direct::{
     self, InsertConflict, Options, ROW_CONFLICT, insert_conflict,
 };
@@ -25,18 +30,7 @@ use std::path::{Path, PathBuf};
 const UNSTABLE: &str = "unstable-result";
 const EFFECT: &str = "not-applied-took-effect";
 
-const STABLE_RESULTS: Options = Options {
-    stable_results: true,
-    request_not_applied: false,
-    max_configs: DEFAULT_MAX_CONFIGS,
-};
 const NOT_APPLIED: Options = Options {
-    stable_results: false,
-    request_not_applied: true,
-    max_configs: DEFAULT_MAX_CONFIGS,
-};
-const BOTH: Options = Options {
-    stable_results: true,
     request_not_applied: true,
     max_configs: DEFAULT_MAX_CONFIGS,
 };
@@ -65,12 +59,15 @@ fn jsonl_files(dir: &Path) -> Vec<(String, PathBuf)> {
     files
 }
 
-/// What `rules` adds to the default verdict, which must stay a prefix of the new one.
+/// What the opt-in rule adds to the default verdict, which must stay a prefix of the new one.
 fn added(events: &[Event], rules: &Options) -> Vec<Anomaly> {
     let default = direct::check(events);
     let with = direct::check_with(events, rules);
     let (kept, new) = with.anomalies.split_at(default.anomalies.len());
-    assert_eq!(kept, default.anomalies, "a rule changed a default anomaly");
+    assert_eq!(
+        kept, default.anomalies,
+        "the rule changed a default anomaly"
+    );
     new.to_vec()
 }
 
@@ -78,34 +75,39 @@ fn kinds(anomalies: &[Anomaly]) -> Vec<&str> {
     anomalies.iter().map(|a| a.kind.as_str()).collect()
 }
 
+/// What a captured history is, with the kinds that it must raise.
 enum Captured {
-    /// The finding was reproduced. The two rules' kinds it must raise.
-    Reproduced(&'static [&'static str]),
+    /// The finding was reproduced: the default's kinds, and whether the opt-in rule hits.
+    Reproduced(&'static [&'static str], bool),
     /// A valid control, or a case whose answers stayed unknown.
     Clean,
 }
 
 use Captured::{Clean, Reproduced};
 
+const DR1: &[&str] = &[UNSTABLE];
+/// The default does not read `not_applied` as a statement about the request.
+const DR2: &[&str] = &[];
+
 const FINDINGS: &[(&str, Captured)] = &[
-    ("dr1_insert_refused-seed-1", Reproduced(&[UNSTABLE, EFFECT])),
+    ("dr1_insert_refused-seed-1", Reproduced(DR1, true)),
     ("dr1_insert_refused_control_lost-seed-1", Clean),
     ("dr1_insert_refused_control_not_sent-seed-1", Clean),
-    ("dr1_sequential_retry-seed-1", Reproduced(&[UNSTABLE])),
-    ("dr1_update-seed-1", Reproduced(&[UNSTABLE])),
+    ("dr1_sequential_retry-seed-1", Reproduced(DR1, false)),
+    ("dr1_update-seed-1", Reproduced(DR1, false)),
     ("dr1_update_control_lost-seed-1", Clean),
     ("dr1_update_control_not_sent-seed-1", Clean),
-    ("dr2_admission_full-seed-1", Reproduced(&[EFFECT])),
+    ("dr2_admission_full-seed-1", Reproduced(DR2, true)),
     ("dr2_admission_full_control_lost-seed-1", Clean),
     // DR-2 was not reproduced here: every retry was answered unknown, and the row applied.
     ("dr2_all_links-seed-1", Clean),
-    ("dr2_leader_and_first_link-seed-1", Reproduced(&[EFFECT])),
-    ("dr2_leader_and_second_link-seed-1", Reproduced(&[EFFECT])),
-    ("dr2_leader_link-seed-1", Reproduced(&[EFFECT])),
+    ("dr2_leader_and_first_link-seed-1", Reproduced(DR2, true)),
+    ("dr2_leader_and_second_link-seed-1", Reproduced(DR2, true)),
+    ("dr2_leader_link-seed-1", Reproduced(DR2, true)),
 ];
 
 #[test]
-fn unreviewed_findings_are_flagged_by_their_rule_and_controls_are_not() {
+fn unreviewed_findings_are_flagged_and_controls_are_not() {
     let files = jsonl_files(&tests_dir().join("fixtures/unreviewed_dr1_dr2"));
     assert_eq!(
         files.iter().map(|(name, _)| name).collect::<Vec<_>>(),
@@ -114,21 +116,36 @@ fn unreviewed_findings_are_flagged_by_their_rule_and_controls_are_not() {
     );
     for ((name, path), (_, captured)) in files.iter().zip(FINDINGS) {
         let events = read(path);
-        // The default verdict accepts all of them, and these tests must not change that.
-        let default = direct::check(&events);
-        assert!(default.valid, "{name}: {:#?}", default.anomalies);
-        let expected: &[&str] = match captured {
-            Reproduced(kinds) => kinds,
-            Clean => &[],
+        let (by_default, opt_in) = match captured {
+            Reproduced(kinds, opt_in) => (*kinds, *opt_in),
+            Clean => (DR2, false),
         };
-        for (rules, kind) in [(&STABLE_RESULTS, UNSTABLE), (&NOT_APPLIED, EFFECT)] {
-            let hits = added(&events, rules);
-            let expected = expected.iter().filter(|k| **k == kind).count();
-            println!("{name} [{kind}]: {} hit(s)", hits.len());
-            assert_eq!(hits.len(), expected, "{name}: {hits:#?}");
-            assert!(hits.iter().all(|a| a.kind == kind), "{name}: {hits:#?}");
-        }
-        assert_eq!(kinds(&added(&events, &BOTH)), expected, "{name}");
+        let default = direct::check(&events);
+        println!("{name}: {:?}, opt-in {opt_in}", default.kinds());
+        assert_eq!(default.kinds(), by_default, "{name}: {default:#?}");
+        assert_eq!(default.anomalies.len(), by_default.len(), "{name}");
+        assert_eq!(default.unclassified_conflicts, 0, "{name}");
+        let hits = added(&events, &NOT_APPLIED);
+        assert_eq!(kinds(&hits), [EFFECT][..usize::from(opt_in)], "{name}");
+    }
+}
+
+/// Each DR-1 history shows the finding without its last answer too: the effect of a request that had
+/// answered a no-op or a row conflict.
+#[test]
+fn dr1_is_flagged_without_a_second_answer() {
+    let dir = tests_dir().join("fixtures/unreviewed_dr1_dr2");
+    for name in ["dr1_insert_refused", "dr1_update"] {
+        let events = read(&dir.join(format!("{name}-seed-1.jsonl")));
+        let verdict = direct::check(&events);
+        let last = *verdict.anomalies[0].events.last().unwrap();
+        let lone: Vec<Event> = events.into_iter().filter(|e| e.index != last).collect();
+        let verdict = direct::check(&lone);
+        assert_eq!(
+            verdict.kinds(),
+            ["non-linearizable"],
+            "{name}: {verdict:#?}"
+        );
     }
 }
 
@@ -139,16 +156,15 @@ fn findings_name_the_answers_that_disagree() {
         let dir = tests_dir().join("fixtures/unreviewed_dr1_dr2");
         read(&dir.join(format!("{name}-seed-1.jsonl")))
     };
-    let update = added(&load("dr1_update"), &STABLE_RESULTS);
+    let update = direct::check(&load("dr1_update")).anomalies;
     assert_eq!(update[0].events, [9, 10, 18, 19]);
-    assert!(
-        update[0].detail.contains("Existed(false)") && update[0].detail.contains("Existed(true)")
-    );
-    let insert = added(&load("dr1_insert_refused"), &BOTH);
+    assert!(update[0].detail.contains("NoOp") && update[0].detail.contains("Commit"));
+    let insert = direct::check(&load("dr1_insert_refused")).anomalies;
     assert_eq!(insert[0].events, [11, 12, 20, 21]);
     assert!(insert[0].detail.contains("RowConflict"));
+    let refused = added(&load("dr1_insert_refused"), &NOT_APPLIED);
     for (events, about) in [
-        (insert[1].events.clone(), vec![11, 12, 9, 10, 18, 19]),
+        (refused[0].events.clone(), vec![11, 12, 9, 10, 18, 19]),
         (
             added(&load("dr2_leader_link"), &NOT_APPLIED)[0]
                 .events
@@ -162,31 +178,21 @@ fn findings_name_the_answers_that_disagree() {
     }
 }
 
-/// Every hit of the opt-in rules on the histories that were here before them, reported as it
-/// is. The existing expectations (`history_corpus`) use the default and are unchanged.
+/// The hits of the opt-in rule on the corpus and the older fixtures, whose default verdicts are in
+/// `history_corpus`.
 #[test]
-fn hits_on_the_existing_corpus_and_fixtures() {
+fn opt_in_hits_on_the_corpus_and_fixtures() {
     let mut hits = Vec::new();
     for dir in ["corpus", "fixtures"] {
         for (name, path) in jsonl_files(&tests_dir().join(dir)) {
-            let events = read(&path);
-            for anomaly in added(&events, &BOTH) {
-                println!("{dir}/{name}: {}: {}", anomaly.kind, anomaly.detail);
+            for anomaly in added(&read(&path), &NOT_APPLIED) {
                 hits.push((name.clone(), anomaly.kind));
             }
         }
     }
     let hits: Vec<(&str, &str)> = hits.iter().map(|(n, k)| (n.as_str(), k.as_str())).collect();
-    assert_eq!(
-        hits,
-        [
-            // Expected invalid already, by `dedup-miss`: `true` and then `false`.
-            ("direct_dedup_miss", UNSTABLE),
-            // Expected valid by the default, which follows the shipped executor. `update` r2
-            // answers `false`, another client inserts the row, and the retry of r2 answers `true`.
-            ("direct_valid_retries", UNSTABLE),
-        ]
-    );
+    // The row conflict says `not_applied`. The default flags the same history.
+    assert_eq!(hits, [("direct_row_conflict_took_effect", EFFECT)]);
 }
 
 /// With the message of a row conflict in place of every other `conflict`, the history must be
@@ -212,9 +218,9 @@ fn legal_conflicts_that_are_not_about_a_row_are_not_flagged() {
         let events = read(&path);
         let default = direct::check(&events);
         assert!(default.valid, "{name}: {:#?}", default.anomalies);
-        assert!(added(&events, &BOTH).is_empty(), "{name}");
+        assert!(added(&events, &NOT_APPLIED).is_empty(), "{name}");
         assert_eq!(
-            direct::check_with(&events, &BOTH).unclassified_conflicts,
+            default.unclassified_conflicts,
             usize::from(name.ends_with("no_message")),
             "{name}"
         );
@@ -224,8 +230,8 @@ fn legal_conflicts_that_are_not_about_a_row_are_not_flagged() {
 }
 
 /// Not legal, or not certainly: an effect of an earlier attempt appears after a refusal that says
-/// `not_applied`. The refusal is not a row conflict, so rule 2 leaves these out (its module doc
-/// says why). A stricter rule may flag them, and then they move out of here.
+/// `not_applied`. The refusal is not a row conflict, so the opt-in rule leaves these out (its module
+/// doc says why). A stricter rule may flag them, and then they move out of here.
 #[test]
 fn accepted_misses() {
     let files = jsonl_files(&tests_dir().join("fixtures/accepted_misses"));
@@ -233,41 +239,39 @@ fn accepted_misses() {
     for (name, path) in files {
         let events = read(&path);
         assert!(direct::check(&events).valid, "{name}");
-        assert!(added(&events, &BOTH).is_empty(), "{name}");
+        assert!(added(&events, &NOT_APPLIED).is_empty(), "{name}");
         let row = added(&over_a_row(&events), &NOT_APPLIED);
         assert_eq!(kinds(&row), [EFFECT], "{name}");
     }
 }
 
 /// The message is read wherever the code is. For each spelling: an "abandoned" refusal is no
-/// result (rule 1) and no row (rule 2), and a row conflict is both a result and a refusal.
+/// result and no row, and a row conflict is both a result and a refusal.
 #[test]
 fn every_spelling_of_a_conflict_is_classified() {
     let files = jsonl_files(&tests_dir().join("fixtures/conflict_spellings"));
     assert_eq!(files.len(), 15);
     for (name, path) in files {
         let events = read(&path);
-        assert!(direct::check(&events).valid, "{name}");
-        let expected: &[&str] = if name.starts_with("row_") {
-            &[UNSTABLE, EFFECT]
-        } else {
-            &[]
-        };
-        assert_eq!(kinds(&added(&events, &BOTH)), expected, "{name}");
-        let verdict = direct::check_with(&events, &BOTH);
+        let row = name.starts_with("row_");
+        let verdict = direct::check(&events);
+        assert_eq!(verdict.kinds(), [UNSTABLE][..usize::from(row)], "{name}");
         assert_eq!(verdict.unclassified_conflicts, 0, "{name}");
+        let hits = added(&events, &NOT_APPLIED);
+        assert_eq!(kinds(&hits), [EFFECT][..usize::from(row)], "{name}");
     }
 }
 
 /// If the product rewords the row conflict, or a writer drops it, the rules go quiet on it. The
-/// verdict must say how many answers they left out, once, with either rule on and never by
-/// default.
+/// verdict must say how many answers they left out, once, by default and with the opt-in rule.
 #[test]
 fn a_reworded_row_conflict_is_counted() {
     let dir = tests_dir().join("fixtures/unreviewed_dr1_dr2");
     let captured = read(&dir.join("dr1_insert_refused-seed-1.jsonl"));
-    let verdict = direct::check_with(&captured, &BOTH);
-    assert_eq!(verdict.unclassified_conflicts, 0);
+    let verdict = direct::check(&captured);
+    assert!(verdict.has(UNSTABLE));
+    let json = serde_json::to_value(&verdict).unwrap();
+    assert_eq!(json.get("unclassified_conflicts"), None, "zero is absent");
     for message in [json!("a row with this key already exists"), Value::Null] {
         let mut reworded = captured.clone();
         let refused = reworded
@@ -275,26 +279,17 @@ fn a_reworded_row_conflict_is_counted() {
             .find(|e| e.value["message"] == ROW_CONFLICT)
             .unwrap();
         refused.value["message"] = message;
-        for (rules, count) in [
-            (&STABLE_RESULTS, 1),
-            (&NOT_APPLIED, 1),
-            (&BOTH, 1),
-            (&Options::default(), 0),
-        ] {
+        for rules in [&NOT_APPLIED, &Options::default()] {
             let verdict = direct::check_with(&reworded, rules);
             assert!(verdict.valid, "{:#?}", verdict.anomalies);
-            assert_eq!(verdict.unclassified_conflicts, count);
+            assert_eq!(verdict.unclassified_conflicts, 1);
             let json = serde_json::to_value(&verdict).unwrap();
-            let shown = json.get("unclassified_conflicts").cloned();
-            assert_eq!(
-                shown,
-                (count > 0).then(|| json!(count)),
-                "the default is as before"
-            );
+            assert_eq!(json["unclassified_conflicts"], 1);
         }
+        assert_eq!(direct::check(&reworded).unclassified_conflicts, 1);
         // Also when the history is flagged for something else.
         reworded.extend(
-            read(&dir.join("dr2_leader_link-seed-1.jsonl"))
+            read(&dir.join("dr1_update-seed-1.jsonl"))
                 .into_iter()
                 .map(|mut e| {
                     if !e.is_nemesis() {
@@ -305,10 +300,10 @@ fn a_reworded_row_conflict_is_counted() {
                 }),
         );
         reindex(&mut reworded);
-        let verdict = direct::check_with(&reworded, &NOT_APPLIED);
+        let verdict = direct::check(&reworded);
         assert_eq!(
             (verdict.kinds(), verdict.unclassified_conflicts),
-            (vec![EFFECT.into()], 1)
+            (vec![UNSTABLE.into()], 1)
         );
         let merged = Verdict::merge([Verdict::new(0, Vec::new()), verdict]);
         assert_eq!(merged.unclassified_conflicts, 1);
@@ -397,7 +392,7 @@ fn request_not_applied_reports_its_search_limit() {
          1> get m
          1< ok 5"#;
     let mut histories = vec![history(written), history(hidden)];
-    histories.extend((0..100).map(|seed| generated(seed, 60, Reading::Plan, false)));
+    histories.extend((0..100).map(|seed| generated(seed, 60, Reading::Shipped, false)));
     let (mut flagged, mut limited) = (0, 0);
     for events in histories {
         if added(&events, &NOT_APPLIED).is_empty() {
@@ -428,7 +423,7 @@ fn request_not_applied_reports_its_search_limit() {
 /// - `0> update k 1 r1`: process 0 invokes `update` on `k` with value 1 and request ID `r1`;
 /// - `0< ok false`, `0< info`, `0< fail` (a bare `fail`);
 /// - `0< refused overloaded`: a `not_applied` refusal with that code;
-/// - `0< exists`: the `conflict` refusal of an existing row, with its message.
+/// - `0< exists`, `0< reused`: the `conflict` refusal of an existing row or of reuse, with its message.
 fn history(text: &str) -> Vec<Event> {
     let mut open = BTreeMap::new();
     let mut events = Vec::new();
@@ -460,6 +455,10 @@ fn history(text: &str) -> Vec<Event> {
                 EventType::Fail,
                 json!({"not_applied": true, "code": "conflict", "message": "primary key already exists"}),
             ),
+            "reused" => (
+                EventType::Fail,
+                json!({"not_applied": true, "code": "conflict", "message": "request_id was already used with a different request body"}),
+            ),
             other => panic!("unknown completion {other}"),
         };
         events.push(event);
@@ -485,11 +484,18 @@ fn verdict(text: &str, rules: &Options) -> Verdict {
     direct::check_with(&history(text), rules)
 }
 
-#[test]
-fn stable_results_cases() {
-    let flagged = |name, text| case(&STABLE_RESULTS, name, text, Some(UNSTABLE));
-    let legal = |name, text| case(&STABLE_RESULTS, name, text, None);
+/// Checks the default verdict of one case: exactly these kinds, or valid.
+fn by_default(name: &str, text: &str, expected: &[&str]) {
+    let verdict = direct::check(&history(text));
+    assert_eq!(verdict.kinds(), expected, "{name}: {verdict:#?}");
+    assert_eq!(verdict.valid, expected.is_empty(), "{name}");
+    assert_eq!(verdict.unclassified_conflicts, 0, "{name}");
+}
 
+/// A wrong later answer of a request.
+#[test]
+fn answers_of_one_request_that_disagree_are_flagged() {
+    let flagged = |name: &str, text: &str| by_default(name, text, &[UNSTABLE]);
     flagged(
         "a no-op delete that a retry applies",
         "0> delete k null r
@@ -511,29 +517,45 @@ fn stable_results_cases() {
          0< ok",
     );
     flagged(
-        "a batch refused over a row that a retry applies",
-        r#"1> insert b 1 other
-           1< ok
-           0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
-           0< exists
-           1> delete b null gone
-           1< ok true
-           0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
-           0< ok 2"#,
+        "an answer between two others",
+        "0> update k 2 r
+         0< ok false
+         0> update k 2 r
+         0< ok false
+         1> insert k 1 other
+         1< ok
+         0> update k 2 r
+         0< ok true
+         1> get k
+         1< ok 2",
     );
-    // The second retry disagrees with the first answer, although the first retry overlapped it.
     flagged(
-        "a later retry after an overlapping pair",
+        "overlapping attempts that disagree",
         "0> update k 2 r
          2> insert k 1 other
          1> update k 2 r
          0< ok false
          2< ok
-         1< ok true
-         1> update k 2 r
          1< ok true",
     );
-    // The first attempt sent overlaps all others, so the two retries are the ones to compare.
+    flagged(
+        "overlapping attempts, the commit answered first",
+        "0> update k 2 r
+         2> insert k 1 other
+         1> update k 2 r
+         2< ok
+         1< ok true
+         0< ok false",
+    );
+    flagged(
+        "a retry invoked before the first answer returned",
+        "0> update k 2 r
+         1> update k 2 r
+         0< ok false
+         2> insert k 1 other
+         2< ok
+         1< ok true",
+    );
     flagged(
         "two later answers under an attempt that is still open",
         "0> update k 2 r
@@ -545,7 +567,50 @@ fn stable_results_cases() {
          3< ok true
          0< ok true",
     );
-    // Two commits with different answers are also a default anomaly. The kind is still added.
+    flagged(
+        "an unknown attempt and refusals between the answers",
+        "0> delete k null r
+         0< ok false
+         1> insert k 1 other
+         1< ok
+         0> delete k null r
+         0< refused overloaded
+         0> delete k null r
+         0< info
+         2> delete k null r
+         2< ok true",
+    );
+    // The message says that the insert met a row, so the upsert does not explain the refusal. It may
+    // be open, or refused itself.
+    for other in ["", "2< refused overloaded"] {
+        flagged(
+            "a row conflict while another body is about",
+            &format!(
+                "1> insert k 1 other
+                 1< ok
+                 2> upsert k 9 r
+                 {other}
+                 0> insert k 2 r
+                 0< exists
+                 1> delete k null gone
+                 1< ok true
+                 0> insert k 2 r
+                 0< ok"
+            ),
+        );
+    }
+    flagged(
+        "a no-op of another body between the answers",
+        "0> update k 2 r
+         0< ok false
+         2> delete k null r
+         2< ok false
+         1> insert k 1 other
+         1< ok
+         0> update k 2 r
+         0< ok true",
+    );
+    // After an answered commit, the fresh answer is a dedup miss, reported once.
     let recommitted = "1> insert k 1 other
          1< ok
          0> update k 2 r
@@ -554,44 +619,195 @@ fn stable_results_cases() {
          1< ok true
          0> update k 2 r
          0< ok false";
-    let both = verdict(recommitted, &STABLE_RESULTS);
-    assert!(both.has("dedup-miss") && both.has(UNSTABLE), "{both:#?}");
+    by_default(
+        "a no-op after a commit",
+        recommitted,
+        &["dedup-miss", "non-linearizable"],
+    );
+    // With answers that disagree, each is judged alone.
+    by_default(
+        "a replay and then another answer",
+        "0> update k 2 r
+         0< ok false
+         1> insert k 1 other
+         1< ok
+         0> update k 2 r
+         0< ok false
+         0> update k 2 r
+         0< ok true",
+        &["non-linearizable", UNSTABLE],
+    );
+    // Several requests are reported each.
+    let two = "0> delete k null r
+         0< ok false
+         0> delete j null r
+         0< ok false
+         1> insert_many j [{\"id\":\"j\",\"value\":1},{\"id\":\"k\",\"value\":1}] other
+         1< ok 2
+         0> delete k null r
+         0< ok true
+         0> delete j null r
+         0< ok true";
+    let verdict = verdict(two, &Options::default());
+    assert_eq!(kinds(&verdict.anomalies), [UNSTABLE, UNSTABLE]);
 
+    // Only a recognised row conflict is a result.
+    let mut moved = history(
+        "1> insert k 1 other
+         1< ok
+         0> insert k 2 r
+         0< exists
+         1> delete k null gone
+         1< ok true
+         0> insert k 2 r
+         0< ok",
+    );
+    moved[3].value["message"] = json!("pinned Catalog route moved before queue admission");
+    let verdict = direct::check(&moved);
+    assert!(verdict.valid && verdict.unclassified_conflicts == 0);
+    moved[3].value.as_object_mut().unwrap().remove("message");
+    let verdict = direct::check(&moved);
+    assert!(verdict.valid && verdict.unclassified_conflicts == 1);
+    moved[3].value["message"] = json!(ROW_CONFLICT);
+    assert_eq!(direct::check(&moved).kinds(), [UNSTABLE]);
+
+    // The count and the flag of each answer are checked alone.
+    let batch = |count: &str| {
+        format!(
+            r#"0> insert_many a [{{"id":"a","value":2}}] r
+               0< ok 1
+               0> insert_many a [{{"id":"a","value":2}}] r
+               0< ok {count}"#
+        )
+    };
+    by_default("another count", &batch("2"), &["non-linearizable"]);
+    by_default("no count", &batch(""), &[]);
+    by_default("the same count", &batch("1"), &[]);
+    by_default(
+        "no flag",
+        "0> update k 2 r
+         0< ok false
+         0> update k 2 r
+         0< ok",
+        &["non-linearizable"],
+    );
+}
+
+/// A replayed first result is legal whatever the row is by then.
+#[test]
+fn replays_of_the_first_result_are_accepted() {
+    let legal = |name, text| by_default(name, text, &[]);
     legal(
-        "overlapping attempts that disagree",
+        "a no-op update after the row appeared",
+        "0> update k 2 r
+         0< ok false
+         1> insert k 1 other
+         1< ok
+         0> update k 2 r
+         0< ok false
+         1> get k
+         1< ok 1",
+    );
+    legal(
+        "a no-op delete after the row appeared, twice",
+        "0> delete k null r
+         0< ok false
+         1> insert k 1 other
+         1< ok
+         0> delete k null r
+         0< ok false
+         1> update k 3 another
+         1< ok true
+         0> delete k null r
+         0< ok {\"data\":false}
+         1> get k
+         1< ok 3",
+    );
+    legal(
+        "a row conflict after the row is gone",
+        "1> insert k 1 other
+         1< ok
+         0> insert k 2 r
+         0< exists
+         1> delete k null gone
+         1< ok true
+         0> insert k 2 r
+         0< exists
+         1> get k
+         1< ok null",
+    );
+    legal(
+        "the same refusal twice",
+        "1> insert k 1 other
+         1< ok
+         0> insert k 2 r
+         0< exists
+         0> insert k 2 r
+         0< exists",
+    );
+    legal(
+        "overlapping attempts that agree",
         "0> update k 2 r
          2> insert k 1 other
          1> update k 2 r
          0< ok false
          2< ok
-         1< ok true",
-    );
-    // The retry is invoked one event before the first answer returns.
-    legal(
-        "a retry invoked before the first answer returned",
-        "0> update k 2 r
-         1> update k 2 r
-         0< ok false
-         2> insert k 1 other
-         2< ok
-         1< ok true",
+         1< ok false
+         2> get k
+         2< ok 1",
     );
     legal(
-        "an unknown attempt and one definite answer",
+        "a lost answer had read the missing row",
         "0> update k 2 r
          0< info
+         1> insert k 1 other
+         1< ok
          3> update k 2 r
          3< ok false",
     );
     legal(
+        "a lost answer had met the row",
+        "1> insert k 1 other
+         1< ok
+         0> insert k 2 r
+         0< info
+         1> delete k null gone
+         1< ok true
+         3> insert k 2 r
+         3< exists",
+    );
+    legal(
+        "an attempt that never completed had read the missing row",
+        "0> delete k null r
+         1> insert k 1 other
+         1< ok
+         3> delete k null r
+         3< ok false
+         1> get k
+         1< ok 1",
+    );
+    legal(
+        "a commit, replayed after the row is gone",
+        "1> insert k 1 other
+         1< ok
+         0> update k 2 r
+         0< ok true
+         1> delete k null gone
+         1< ok true
+         0> update k 2 r
+         0< ok true",
+    );
+    legal(
         "refusals before execution, before and after the result",
-        "0> upsert k 1 r
+        "0> delete k null r
          0< refused overloaded
-         0> upsert k 1 r
-         0< ok
-         0> upsert k 1 r
+         0> delete k null r
+         0< ok false
+         0> delete k null r
          0< refused storage_unavailable
-         0> upsert k 1 r
+         0> delete k null r
+         0< refused validation_error
+         0> delete k null r
          0< fail",
     );
     legal(
@@ -607,67 +823,999 @@ fn stable_results_cases() {
          0> delete k null r
          0< ok true",
     );
-    // The first refusal may be reuse of r by the upsert, so it is not r's insert result.
     legal(
-        "a conflict that another body could explain",
+        "reads have no identity",
+        "0> get k null r
+         0< ok null
+         1> insert k 1 other
+         1< ok
+         0> get k null r
+         0< ok 1",
+    );
+    // Nor does an unknown read hold one.
+    by_default(
+        "a read explains no refusal of reuse",
+        "0> get k null r
+         0< info
+         2> upsert k 9 r
+         2< reused",
+        &["non-linearizable", "request-id-reuse-misdetected"],
+    );
+    legal(
+        "requests without an ID",
+        "0> delete k
+         0< ok false
+         1> insert k 1 other
+         1< ok
+         0> delete k
+         0< ok true",
+    );
+}
+
+/// The whole history has to agree with the result of a request.
+#[test]
+fn a_request_without_effect_has_none_and_reads_the_row_once() {
+    let flagged = |name, text| by_default(name, text, &["non-linearizable"]);
+    flagged(
+        "an unknown attempt applies before the no-op is answered",
         "1> insert k 1 other
          1< ok
+         0> delete k null r
+         0< info
+         1> get k
+         1< ok null
+         2> delete k null r
+         2< ok false",
+    );
+    flagged(
+        "an unknown attempt applies after the no-op was answered",
+        "0> update k 2 r
+         0< info
+         2> update k 2 r
+         2< ok false
+         1> insert k 1 other
+         1< ok
+         1> get k
+         1< ok 2",
+    );
+    flagged(
+        "an attempt sent after the no-op applies",
+        "0> update k 2 r
+         0< ok false
+         0> update k 2 r
+         0< info
+         1> insert k 1 other
+         1< ok
+         1> get k
+         1< ok 2",
+    );
+    flagged(
+        "an insert applies after its row conflict",
+        "1> insert k 1 other
+         1< ok
+         0> insert k 2 r
+         0< info
+         2> insert k 2 r
+         2< exists
+         1> delete k null gone
+         1< ok true
+         1> get k
+         1< ok 2",
+    );
+    flagged(
+        "an existence flag shows the effect of a no-op",
+        "1> insert k 1 other
+         1< ok
+         0> delete k null r
+         0< info
+         2> delete k null r
+         2< ok false
+         1> update k 3 another
+         1< ok true",
+    );
+    flagged(
+        "the row was there all the time",
+        "1> insert k 1 other
+         1< ok
+         0> delete k null r
+         0< ok false
+         0> delete k null r
+         0< ok false",
+    );
+    flagged(
+        "the row was never there",
+        "0> insert k 2 r
+         0< info
+         2> insert k 2 r
+         2< exists
+         1> get k
+         1< ok null",
+    );
+    // The first answer bounds the read, so a later state cannot explain it.
+    flagged(
+        "the row disappears only after the first no-op",
+        "1> insert k 1 other
+         1< ok
+         0> delete k null r
+         0< ok false
+         1> delete k null gone
+         1< ok true
+         0> delete k null r
+         0< ok false",
+    );
+    // Of two overlapping attempts, the one that was answered first bounds the read.
+    flagged(
+        "the row disappears after the no-op that was answered first, not the one asked first",
+        "1> insert k 1 a
+         1< ok
+         0> delete k null r
+         2> delete k null r
+         2< ok false
+         1> delete k null b
+         1< ok true
+         0< ok false",
+    );
+    // And the first invoke does, so an earlier state cannot explain it.
+    flagged(
+        "the row was missing only before the first invoke",
+        "1> get k
+         1< ok null
+         1> insert k 1 other
+         1< ok
+         0> delete k null r
+         0< ok false
+         0> delete k null r
+         0< ok false",
+    );
+}
+
+/// A no-op or a row conflict holds the identity, answered or not: it explains the refusal of another
+/// body.
+#[test]
+fn a_result_without_a_commit_explains_the_refusal_of_another_body() {
+    let legal = |name: &str, text: &str| by_default(name, text, &[]);
+    let no_op = "0> update k 2 r
+         0< ok false";
+    let refused = format!(
+        "{no_op}
          2> upsert k 9 r
+         2< reused"
+    );
+    legal("an upsert after a no-op", &refused);
+    legal(
+        "an insert after a no-op",
+        &format!(
+            "{no_op}
+             2> insert k 9 r
+             2< reused"
+        ),
+    );
+    legal(
+        "two other bodies, and the replay",
+        &format!(
+            "{refused}
+             3> insert k 8 r
+             3< reused
+             0> update k 2 r
+             0< ok false
+             1> get k
+             1< ok null"
+        ),
+    );
+    legal(
+        "an upsert after a row conflict",
+        "1> insert k 1 other
+         1< ok
+         0> insert k 2 r
+         0< exists
+         2> upsert k 9 r
+         2< reused
+         1> get k
+         1< ok 1",
+    );
+    legal(
+        "an upsert after the row conflict of a batch",
+        r#"1> insert b 1 other
+           1< ok
+           0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
+           0< exists
+           2> upsert a 9 r
+           2< reused"#,
+    );
+    legal(
+        "before the answer of the no-op",
+        "0> update k 2 r
+         2> upsert k 9 r
+         2< reused
+         0< ok false",
+    );
+    // The shape of seed 304 of the review of PR #140: the row conflict was never answered, and the
+    // delete that could have removed the row again had answered a no-op.
+    legal(
+        "an unanswered row conflict",
+        "0> delete k null d
+         0< ok false
+         1> insert k 1 a
+         1< ok
+         2> delete k null d
+         2< info
+         3> insert k 2 x
+         3< info
+         4> delete k null e
+         5> update k 3 x
+         5< reused
+         4< ok true
+         6> get k
+         6< ok null",
+    );
+    // Only the first unknown attempt met the row.
+    legal(
+        "the first of two unknown attempts",
+        "1> insert k 1 other
+         1< ok
+         0> insert k 2 r
+         0< info
+         2> upsert k 9 r
+         2< reused
+         1> delete k null gone
+         1< ok true
+         3> insert k 2 r
+         3< info
+         1> get k
+         1< ok null",
+    );
+    let held = format!(
+        "{refused}
+         1> insert k 1 other
+         1< ok"
+    );
+    by_default(
+        "the refused body commits afterwards",
+        &format!(
+            "{held}
+             2> upsert k 9 r
+             2< ok
+             1> get k
+             1< ok 9"
+        ),
+        &["non-linearizable"],
+    );
+    by_default(
+        "the holder applies after all",
+        &format!(
+            "{held}
+             0> update k 2 r
+             0< info
+             1> get k
+             1< ok 2"
+        ),
+        &["non-linearizable"],
+    );
+    by_default(
+        "an unanswered result applies after it explained a refusal",
+        "0> delete k null r
+         0< info
+         2> upsert k 9 r
+         2< reused
+         1> insert k 1 other
+         1< ok
+         1> get k
+         1< ok null",
+        &["non-linearizable"],
+    );
+    for later in ["0< info", "0< ok false"] {
+        by_default(
+            "nothing could hold the identity yet",
+            &format!(
+                "2> upsert k 9 r
+                 2< reused
+                 0> delete k null r
+                 {later}"
+            ),
+            &["non-linearizable", "request-id-reuse-misdetected"],
+        );
+    }
+    by_default(
+        "the read of the no-op lies after the refusal",
+        "1> insert k 1 other
+         1< ok
+         0> delete k null r
+         2> upsert k 9 r
+         2< reused
+         1> delete k null gone
+         1< ok true
+         0< ok false",
+        &["non-linearizable"],
+    );
+    by_default(
+        "an upsert has no result without a commit",
+        "1> insert k 1 other
+         1< ok
+         0> upsert k 2 r
+         0< refused overloaded
+         2> upsert k 9 r
+         2< reused",
+        &["non-linearizable", "request-id-reuse-misdetected"],
+    );
+    by_default(
+        "two bodies have a result, so none of them holds",
+        "0> update k 2 r
+         0< ok false
+         2> delete k null r
+         2< ok false
+         3> upsert k 9 r
+         3< reused",
+        &["non-linearizable"],
+    );
+    // A refusal that a commit can explain says nothing about the result of the first body.
+    legal(
+        "a refusal while a third body commits",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         3> insert k 8 r
+         3< reused
+         2< ok
+         1> get k
+         1< ok 9",
+    );
+    by_default(
+        "the only holder is refused itself",
+        "0> delete k null r
+         0< info
+         2> upsert k 9 r
+         2< reused
+         0> delete k null r
+         0< reused",
+        &["non-linearizable", "request-id-reuse-misdetected"],
+    );
+    by_default(
+        "the only other attempt has the same body",
+        "2> upsert k 9 r
+         2< info
+         2> upsert k 9 r
+         2< reused",
+        &["non-linearizable", "request-id-reuse-misdetected"],
+    );
+    // A conflict without a message may be a refusal of reuse, so it is no second holder either.
+    let mut doubtful = history(
+        "0> update k 2 r
+         0< ok false
+         1> insert k 1 other
+         1< ok
+         2> insert k 3 r
+         2< exists
+         3> upsert k 9 r
+         3< reused",
+    );
+    doubtful[5].value.as_object_mut().unwrap().remove("message");
+    let verdict = direct::check(&doubtful);
+    assert!(verdict.valid, "{verdict:#?}");
+    assert_eq!(verdict.unclassified_conflicts, 1);
+    // The row conflict of a batch may be recorded or not, so it is no second holder.
+    legal(
+        "a batch and a no-op",
+        r#"1> insert b 1 other
+           1< ok
+           0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
+           0< exists
+           3> delete a null r
+           3< ok false
+           2> upsert a 9 r
+           2< reused"#,
+    );
+    by_default(
+        "two unanswered bodies that refuse each other",
+        "0> delete k null r
+         0< info
+         1> update k 3 r
+         1< info
+         2> delete k null r
+         2< reused
+         3> update k 3 r
+         3< reused",
+        &["non-linearizable"],
+    );
+    // So the batch may be refused itself.
+    legal(
+        "a batch that is refused after a no-op of another body",
+        r#"1> insert b 1 other
+           1< ok
+           0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
+           0< exists
+           1> delete b null gone
+           1< ok true
+           3> delete a null r
+           3< ok false
+           0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
+           0< reused"#,
+    );
+    by_default(
+        "a row conflict of another body after a refusal showed the holder",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         2< reused
+         1> insert k 1 other
+         1< ok
+         3> insert k 8 r
+         3< exists",
+        &["non-linearizable"],
+    );
+    // What says that it is about a row needs one.
+    by_default(
+        "a row conflict with another body, over a missing row",
+        "0> update k 2 r
+         0< ok false
+         2> insert k 9 r
+         2< exists",
+        &["non-linearizable"],
+    );
+    by_default(
+        "the refused body commits at the same time",
+        "0> delete k null r
+         0< ok false
+         2> upsert k 9 r
+         3> upsert k 9 r
+         2< ok
+         3< reused",
+        &["non-linearizable"],
+    );
+}
+
+/// A no-op or a row conflict and a refusal of reuse for the same request: one of them is wrong.
+#[test]
+fn a_result_and_a_refusal_of_reuse_exclude_each_other() {
+    for (name, before, after) in [
+        ("the result first", "0< ok false", "0< reused"),
+        ("the refusal first", "0< reused", "0< ok false"),
+    ] {
+        let text = format!(
+            "0> update k 2 r
+             {before}
+             2> upsert k 9 r
+             2< ok
+             0> update k 2 r
+             {after}"
+        );
+        let verdict = verdict(&text, &Options::default());
+        assert!(verdict.has(UNSTABLE), "{name}: {verdict:#?}");
+    }
+    by_default(
+        "a result, a refusal and the result again",
+        "0> delete k null r
+         0< ok false
+         1> insert k 2 r
+         2> delete k null r
+         2< reused
+         3> delete k null r
+         3< ok false
+         1< ok",
+        &[UNSTABLE],
+    );
+    by_default(
+        "a row conflict",
+        "1> insert k 1 other
+         1< ok
+         0> insert k 2 r
+         0< exists
+         2> upsert k 9 r
+         2< ok
+         0> insert k 2 r
+         0< reused",
+        &[UNSTABLE],
+    );
+    // No refusal of reuse, or none of the same body, or no result.
+    let refusal = |message: Option<&str>| {
+        let mut events = history(
+            "1> insert k 1 other
+             1< ok
+             0> insert k 2 r
+             0< exists
+             0> insert k 2 r
+             0< exists",
+        );
+        events[5].value["message"] = message.map_or(Value::Null, |m| json!(m));
+        direct::check(&events).kinds()
+    };
+    assert!(refusal(Some("original request run was abandoned")).is_empty());
+    assert!(refusal(None).is_empty());
+    for text in [
+        "request_id was already used with a different request body",
+        "request identity has a different body",
+        "request UUID conflicts with its durable identity",
+    ] {
+        assert_eq!(refusal(Some(text)), [UNSTABLE], "{text}");
+    }
+    // Only reuse refuses an update with a conflict, unless its message says otherwise.
+    let update = |message: Value| {
+        let mut events = history(
+            "0> update k 2 r
+             0< ok false
+             2> upsert k 9 r
+             2< ok
+             0> update k 2 r
+             0< reused",
+        );
+        events[5].value["message"] = message;
+        direct::check(&events).kinds()
+    };
+    assert_eq!(update(Value::Null), [UNSTABLE]);
+    assert_eq!(update(json!("reworded")), [UNSTABLE]);
+    assert!(update(json!("captured schema or lifecycle changed")).is_empty());
+    by_default(
+        "a refusal of another body",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         2< reused
+         0> update k 2 r
+         0< ok false",
+        &[],
+    );
+    by_default(
+        "a commit of another body and no result",
+        "2> upsert k 9 r
+         2< ok
+         0> update k 2 r
+         0< reused
+         0> update k 2 r
+         0< reused",
+        &[],
+    );
+    // For a batch, the decision does not say that its row conflict is a result.
+    by_default(
+        "a batch",
+        r#"1> insert b 1 other
+           1< ok
+           0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
+           0< exists
+           2> upsert a 9 r
+           2< ok
+           0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
+           0< reused"#,
+        &[],
+    );
+}
+
+/// The replay of the row conflict of a batch is legal, and so is computing it again.
+#[test]
+fn the_row_conflict_of_a_batch_may_be_replayed() {
+    let batch = r#"0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
+           0< "#;
+    let refused = format!(
+        "1> insert b 1 other
+         1< ok
+         {batch}exists
+         1> delete b null gone
+         1< ok true"
+    );
+    by_default("replayed", &format!("{refused}\n{batch}exists"), &[]);
+    by_default("recomputed", &format!("{refused}\n{batch}ok 2"), &[]);
+    by_default(
+        "replayed after an unanswered one",
+        &format!(
+            "1> insert b 1 other
+             1< ok
+             {batch}info
+             1> delete b null gone
+             1< ok true
+             {batch}exists"
+        ),
+        &[],
+    );
+    by_default(
+        "no row was ever there",
+        &format!("{batch}info\n{batch}exists"),
+        &["non-linearizable"],
+    );
+    by_default(
+        "a row was there only before the first attempt",
+        &format!(
+            "1> insert b 1 other
+             1< ok
+             1> delete b null gone
+             1< ok true
+             {batch}info
+             {batch}exists"
+        ),
+        &["non-linearizable"],
+    );
+    by_default(
+        "after its own commit",
+        &format!("{batch}ok 2\n{batch}exists"),
+        &["dedup-miss", "non-linearizable"],
+    );
+    by_default(
+        "replayed after it was computed again",
+        &format!("{refused}\n{batch}ok 2\n{batch}exists"),
+        &["dedup-miss", "non-linearizable"],
+    );
+    by_default(
+        "an unanswered one, its replay, and computed again",
+        &format!(
+            "1> insert b 1 other
+             1< ok
+             {batch}info
+             1> delete b null gone
+             1< ok true
+             {batch}exists
+             {batch}ok 2"
+        ),
+        &[],
+    );
+    // Without a message it is not known to be about a row.
+    let mut unknown = history(&format!("{refused}\n{batch}exists"));
+    let last = unknown.last_mut().unwrap();
+    last.value.as_object_mut().unwrap().remove("message");
+    let verdict = direct::check(&unknown);
+    assert!(verdict.valid, "{verdict:#?}");
+    assert_eq!(verdict.unclassified_conflicts, 1);
+    assert_eq!(verdict.not_judged[UNCLASSIFIED_MAY_REPEAT], 1);
+    // It is replayed over a holder that a refusal showed.
+    by_default(
+        "replayed after it refused another body",
+        &format!(
+            "{refused}
+             2> upsert a 9 r
+             2< reused
+             {batch}exists"
+        ),
+        &[],
+    );
+}
+
+/// A conflict that cannot be placed may be a row conflict, and may repeat one.
+#[test]
+fn a_conflict_without_a_message_may_repeat() {
+    let without = |text: &str| {
+        let mut events = history(text);
+        for event in &mut events {
+            if event.value["message"] == ROW_CONFLICT {
+                event.value.as_object_mut().unwrap().remove("message");
+            }
+        }
+        direct::check(&events)
+    };
+    let refused = "1> insert k 1 other
+         1< ok
          0> insert k 2 r
          0< exists
          1> delete k null gone
          1< ok true
          0> insert k 2 r
-         0< ok",
-    );
-    legal(
-        "existence not recorded",
-        "0> update k 2 r
-         0< ok false
-         0> update k 2 r
-         0< refused overloaded",
-    );
-    legal(
-        "the same refusal twice",
-        "1> insert k 1 other
-         1< ok
-         0> insert k 2 r
+         0< exists";
+    let verdict = without(refused);
+    assert!(verdict.valid, "{verdict:#?}");
+    assert_eq!(verdict.unclassified_conflicts, 2);
+    assert_eq!(verdict.not_judged[UNCLASSIFIED_MAY_REPEAT], 1);
+    // It still needs a row once, and is no second holder.
+    let never = without(
+        "0> insert k 2 r
          0< exists
          0> insert k 2 r
          0< exists",
     );
-
-    // The queued path's other conflicts are not the row's, so their message rules them out.
-    let mut moved = history(
+    assert_eq!(never.kinds(), ["non-linearizable"]);
+    let beside = without(
         "1> insert k 1 other
          1< ok
          0> insert k 2 r
          0< exists
          1> delete k null gone
          1< ok true
-         0> insert k 2 r
-         0< ok",
+         2> update k 5 r
+         2< ok false
+         3> upsert k 9 r
+         3< reused",
     );
-    moved[3].value["message"] = json!("pinned Catalog route moved before queue admission");
-    assert!(added(&moved, &STABLE_RESULTS).is_empty());
-    // Without a message it may be any of them.
-    moved[3].value.as_object_mut().unwrap().remove("message");
-    assert!(added(&moved, &STABLE_RESULTS).is_empty());
-    moved[3].value["message"] = json!(ROW_CONFLICT);
-    assert_eq!(kinds(&added(&moved, &STABLE_RESULTS)), [UNSTABLE]);
+    assert!(beside.valid, "{beside:#?}");
+}
 
-    // Batch counts: a different count disagrees, a missing one does not.
-    let batch = |count: &str| {
-        format!(
-            r#"0> insert_many a [{{"id":"a","value":2}}] r
-               0< ok 1
-               0> insert_many a [{{"id":"a","value":2}}] r
-               0< ok {count}"#
-        )
+/// What no text decides is accepted and counted by name.
+#[test]
+fn what_is_not_judged_is_counted() {
+    let counted = |name: &str, text: &str, expected: &[(&str, usize)]| {
+        let verdict = direct::check(&history(text));
+        assert!(verdict.valid, "{name}: {verdict:#?}");
+        let found: Vec<_> = verdict.not_judged.iter().filter(|(_, c)| **c > 0).collect();
+        let found: Vec<(&str, usize)> = found.iter().map(|(n, c)| (n.as_str(), **c)).collect();
+        assert_eq!(found, expected, "{name}");
+        // The three names of the open question are always there.
+        let json = serde_json::to_value(&verdict).unwrap();
+        for open in OTHER_BODY {
+            assert!(json["not_judged"][open].is_number(), "{name}: {json}");
+        }
+        let merged = Verdict::merge([verdict.clone(), Verdict::new(0, Vec::new())]);
+        assert_eq!(merged.not_judged, verdict.not_judged, "{name}");
     };
-    assert!(verdict(&batch("2"), &STABLE_RESULTS).has(UNSTABLE));
-    assert!(verdict(&batch(""), &STABLE_RESULTS).valid);
-    assert!(verdict(&batch("1"), &STABLE_RESULTS).valid);
+    counted(
+        "another body commits after a no-op",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         2< ok
+         1> get k
+         1< ok 9",
+        &[(OTHER_BODY_COMMITTED, 1)],
+    );
+    counted(
+        "another body commits after a row conflict",
+        "1> insert k 1 other
+         1< ok
+         0> insert k 2 r
+         0< exists
+         2> upsert k 9 r
+         2< ok",
+        &[(OTHER_BODY_COMMITTED, 1)],
+    );
+    counted(
+        "a commit that overlaps the no-op",
+        "0> update k 2 r
+         2> upsert k 9 r
+         2< ok
+         0< ok false",
+        &[(OTHER_BODY_COMMITTED, 1)],
+    );
+    counted(
+        "two identities",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         2< ok
+         0> update j 2 r
+         0< ok false
+         2> upsert j 9 r
+         2< ok",
+        &[(OTHER_BODY_COMMITTED, 2)],
+    );
+    counted(
+        "another body answers a no-op",
+        "0> update k 2 r
+         0< ok false
+         2> delete k null r
+         2< ok false",
+        &[(OTHER_BODY_UNCHANGED, 1)],
+    );
+    counted(
+        "another body has an unknown attempt",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         2< info
+         3> delete k null r2
+         3< ok false",
+        &[(OTHER_BODY_UNKNOWN, 1)],
+    );
+    counted(
+        "another body has an unknown attempt and a commit",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         2< info
+         2> upsert k 9 r
+         2< ok",
+        &[(OTHER_BODY_COMMITTED, 1)],
+    );
+    counted(
+        "an unknown attempt of the same body",
+        "0> update k 2 r
+         0< ok false
+         2> update k 2 r
+         2< info",
+        &[],
+    );
+    counted(
+        "a batch is computed again",
+        r#"1> insert b 1 other
+           1< ok
+           0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
+           0< exists
+           1> delete b null gone
+           1< ok true
+           0> insert_many a [{"id":"a","value":2},{"id":"b","value":3}] r
+           0< ok 2"#,
+        &[(INSERT_MANY_RECOMPUTED, 1)],
+    );
+    counted(
+        "a refusal of another body, another key and another ID",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         2< reused
+         2> upsert j 9 r
+         2< ok
+         2> upsert k 9 r2
+         2< ok",
+        &[],
+    );
+    // A commit that was answered before the other body asked is judged.
+    let verdict = verdict(
+        "2> upsert k 9 r
+         2< ok
+         2> delete k null gone
+         2< ok true
+         0> update k 2 r
+         0< ok false",
+        &Options::default(),
+    );
+    assert!(verdict.has("request-id-reuse-undetected"));
+    assert!(verdict.not_judged.values().all(|c| *c == 0), "{verdict:#?}");
+}
+
+#[test]
+fn answers_that_are_not_results() {
+    by_default(
+        "a missing table, then a result",
+        "0> update k 2 r
+         0< refused not_found
+         1> insert k 1 other
+         1< ok
+         0> update k 2 r
+         0< ok true
+         0> update k 2 r
+         0< refused not_found",
+        &[],
+    );
+    by_default(
+        "the first body repeats its no-op after an answered commit of another",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         2< ok
+         0> update k 2 r
+         0< ok false",
+        &["request-id-reuse-undetected"],
+    );
+    // A conflict of the queued path has to be explained by a row or another body.
+    let mut lifecycle = history(
+        "0> insert k 2 r
+         0< exists",
+    );
+    lifecycle[1].value["message"] = json!("captured schema or lifecycle changed");
+    assert_eq!(direct::check(&lifecycle).kinds(), ["non-linearizable"]);
+}
+
+/// Records expire after 24 hours. An identity that spans as much is not judged, so nothing in it is
+/// flagged, and it is counted.
+#[test]
+fn an_identity_that_spans_the_retention_is_not_judged() {
+    let hours = 3_600_000_000_000u64;
+    // The time of each event in hours.
+    let at = |text: &str, times: &[u64]| {
+        let mut events = history(text);
+        assert_eq!(events.len(), times.len());
+        for (event, time) in events.iter_mut().zip(times) {
+            event.time_ns = Some(*time);
+        }
+        direct::check(&events)
+    };
+    let legal = |name: &str, text: &str, times: &[u64]| {
+        let times: Vec<u64> = times.iter().map(|t| t * hours).collect();
+        let verdict = at(text, &times);
+        assert!(verdict.valid, "{name}: {verdict:#?}");
+        assert_eq!(verdict.not_judged[EXPIRED], 1, "{name}");
+    };
+    let recomputed = "0> update k 2 r
+         0< ok false
+         1> insert k 1 other
+         1< ok
+         0> update k 2 r
+         0< ok true";
+    legal("recomputed", recomputed, &[0, 0, 0, 0, 25, 25]);
+    legal(
+        "replayed, read and replayed",
+        "0> update k 2 r
+         0< ok false
+         1> insert k 5 other
+         1< ok
+         0> update k 2 r
+         0< ok false
+         1> get k
+         1< ok 5
+         0> update k 2 r
+         0< ok false",
+        &[0, 0, 0, 0, 1, 1, 1, 1, 25, 25],
+    );
+    legal(
+        "another body was refused, and the first is asked again",
+        "0> update k 3 r
+         0< ok false
+         0> update k 1 r
+         0< reused
+         0> update k 1 r
+         0< ok false",
+        &[0, 0, 1, 1, 25, 25],
+    );
+    legal(
+        "the refused body commits",
+        "0> delete k null r
+         0< ok false
+         1> insert k 5 r
+         1< reused
+         1> upsert k 6 r
+         1< ok
+         1> get k
+         1< ok 6",
+        &[0, 0, 1, 1, 25, 25, 25, 25],
+    );
+    legal(
+        "refused as reuse of a commit",
+        "0> update k 2 r
+         0< ok false
+         2> upsert k 9 r
+         2< ok
+         0> update k 2 r
+         0< reused",
+        &[0, 0, 24, 24, 25, 25],
+    );
+    legal(
+        "a commit runs again",
+        "1> insert k 1 other
+         1< ok
+         0> update k 2 r
+         0< ok true
+         1> delete k null gone
+         1< ok true
+         0> update k 2 r
+         0< ok false",
+        &[0, 0, 0, 0, 1, 1, 30, 30],
+    );
+    legal(
+        "a commit is replayed and then runs again",
+        "0> upsert k 2 r
+         0< ok
+         1> upsert k 3 other
+         1< ok
+         0> upsert k 2 r
+         0< ok
+         1> get k
+         1< ok 3
+         0> upsert k 2 r
+         0< ok
+         1> get k
+         1< ok 2",
+        &[0, 0, 1, 1, 2, 2, 2, 2, 25, 25, 25, 25],
+    );
+    // One nanosecond less, or the same times for all, and it is judged.
+    let short = [0, 1, 2, 3, 24 * hours - 2, 24 * hours - 1];
+    assert_eq!(at(recomputed, &short).kinds(), [UNSTABLE]);
+    assert!(!at(recomputed, &short).not_judged.contains_key(EXPIRED));
+    let exact = [0, 1, 2, 3, 24 * hours - 1, 24 * hours];
+    assert!(at(recomputed, &exact).valid);
+    assert_eq!(at(recomputed, &[24 * hours; 6]).kinds(), [UNSTABLE]);
+    assert_eq!(direct::check(&history(recomputed)).kinds(), [UNSTABLE]);
+    // Only the answers of that identity are left out: another one, and the reads, are judged.
+    let beside = format!(
+        "{recomputed}
+         0> delete j null r
+         0< ok false
+         1> insert j 1 x
+         1< ok
+         0> delete j null r
+         0< ok true"
+    );
+    let mut times = [25 * hours; 12];
+    times[0] = 0;
+    let verdict = at(&beside, &times);
+    assert_eq!(verdict.kinds(), [UNSTABLE]);
+    assert_eq!(verdict.anomalies.len(), 1);
+    let invented = format!(
+        "{recomputed}
+         1> get k
+         1< ok 7"
+    );
+    let verdict = at(&invented, &[0, 0, 0, 0, 25, 25, 25, 25].map(|t| t * hours));
+    assert_eq!(verdict.kinds(), ["non-linearizable"]);
+    // A refused attempt has no effect.
+    let refused = "0> upsert k 2 r
+         0< refused overloaded
+         0> upsert k 2 r
+         0< refused overloaded
+         1> get k
+         1< ok 2";
+    let verdict = at(refused, &[0, 0, 25, 25, 25, 25].map(|t| t * hours));
+    assert!(!verdict.valid, "{verdict:#?}");
 }
 
 #[test]
@@ -951,7 +2099,7 @@ fn request_not_applied_cases() {
          1> insert k 1 other
          1< ok
          1> get k
-         1< ok 2",
+         1< ok 1",
     );
 
     // Where the default already finds the key not linearizable, the rule adds nothing to it.
@@ -979,31 +2127,33 @@ fn request_not_applied_cases() {
     assert_eq!(verdict(after, &NOT_APPLIED).kinds(), ["non-linearizable"]);
 }
 
-/// The default follows the shipped executor, also against the decided retry rule: the replay of a
-/// recorded no-op or row conflict is `non-linearizable` there once the row changed. The rules
-/// accept it and keep judging the rest of the key.
+/// The opt-in rule keeps judging a key on which a recorded result was replayed, and one on which the
+/// default found a wrong answer.
 #[test]
-fn the_default_rejects_the_replay_of_a_recorded_no_op() {
-    let replayed = "0> update k 2 r
-         0< ok false
-         1> insert k 1 other
-         1< ok
-         0> update k 2 r
-         0< ok false";
-    assert_eq!(verdict(replayed, &BOTH).kinds(), ["non-linearizable"]);
-    let delayed = format!(
-        "{replayed}
-         4> upsert k 3 late
-         4< info
-         5> upsert k 3 late
-         5< refused overloaded
-         1> get k
-         1< ok 3"
-    );
-    assert_eq!(
-        verdict(&delayed, &BOTH).kinds(),
-        ["non-linearizable", EFFECT]
-    );
+fn the_opt_in_rule_judges_keys_with_replays() {
+    let cases: [(&str, &[&str]); 2] = [("false", &[]), ("true", &[UNSTABLE])];
+    for (again, default) in cases {
+        let delayed = format!(
+            "0> update k 2 r
+             0< ok false
+             1> insert k 1 other
+             1< ok
+             0> update k 2 r
+             0< ok {again}
+             4> upsert k 3 late
+             4< info
+             5> upsert k 3 late
+             5< refused overloaded
+             1> get k
+             1< ok 3"
+        );
+        let expected: Vec<&str> = [EFFECT]
+            .into_iter()
+            .chain(default.iter().copied())
+            .collect();
+        assert_eq!(verdict(&delayed, &Options::default()).kinds(), default);
+        assert_eq!(verdict(&delayed, &NOT_APPLIED).kinds(), expected);
+    }
 }
 
 /// Both spellings of `not_applied` in the history writers count.
@@ -1027,13 +2177,12 @@ fn both_spellings_of_not_applied_count() {
     assert!(added(&events, &NOT_APPLIED).is_empty());
 }
 
-/// The rules are off unless asked for, and one does not turn on the other.
+/// The rule about refusals is off unless asked for.
 #[test]
-fn rules_are_off_by_default() {
+fn the_rule_about_refusals_is_off_by_default() {
     assert_eq!(
         Options::default(),
         Options {
-            stable_results: false,
             request_not_applied: false,
             max_configs: DEFAULT_MAX_CONFIGS,
         }
@@ -1042,22 +2191,23 @@ fn rules_are_off_by_default() {
         let events = read(&path);
         let default = direct::check(&events);
         assert_eq!(default, direct::check_with(&events, &Options::default()));
-        let off = direct::check_with(&events, &STABLE_RESULTS);
-        assert!(!off.has(EFFECT));
-        let off = direct::check_with(&events, &NOT_APPLIED);
-        assert!(!off.has(UNSTABLE));
+        assert!(!default.has(EFFECT));
     }
 }
 
-/// Which text the generated store follows.
+/// What the generated store does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reading {
-    /// Both rules hold: every result is recorded, also a no-op and a row conflict, and a refusal
-    /// stops the attempts of its request that are still on their way.
-    Identity,
+    /// It records every result under its identity, as the plan's dedup key and D03 say: the same
+    /// body gets it again, and another body is refused. A refusal before execution stops the
+    /// attempts of its request that are still on their way.
+    Holds,
+    /// The same, except where the checker accepts more: a no-op or a row conflict does not hold the
+    /// identity against another body, and `insert_many` over a present row is not recorded.
+    Promised,
     /// The shipped executor, and `plans/oltp-direct-path.md` before 2026-11-24: only commits are
     /// recorded, and a refusal speaks for its attempt alone.
-    Plan,
+    Shipped,
 }
 
 #[derive(Clone, Debug)]
@@ -1106,14 +2256,31 @@ fn refusal(code: &str, message: &str) -> Reply {
 #[derive(Default)]
 struct Store {
     rows: BTreeMap<String, Value>,
-    /// By anchor and request ID, the body and its result.
-    records: BTreeMap<(String, String), (String, Reply)>,
+    /// By anchor and request ID, the body that holds the identity and its result.
+    commits: BTreeMap<(String, String), (String, Reply)>,
+    /// By anchor, request ID and body, the results without a commit.
+    unchanged: BTreeMap<(String, String, String), Reply>,
 }
 
 impl Store {
-    fn record(&self, request: &Request) -> Option<&(String, Reply)> {
+    /// The recorded answer to a request.
+    fn record(&self, request: &Request) -> Option<Reply> {
         let id = (request.anchor.clone(), request.id.clone());
-        self.records.get(&id)
+        if let Some((body, reply)) = self.commits.get(&id) {
+            let own = (id.0.clone(), id.1.clone(), request.body());
+            return Some(if *body == request.body() {
+                reply.clone()
+            } else if self.unchanged.contains_key(&own) {
+                // It has a result, so it is not refused as reuse of the body that committed since.
+                refusal("overloaded", "direct in-flight budget is full")
+            } else {
+                refusal(
+                    "conflict",
+                    "request_id was already used with a different request body",
+                )
+            });
+        }
+        self.unchanged.get(&(id.0, id.1, request.body())).cloned()
     }
 
     fn run(&mut self, request: &Request, reading: Reading) -> Reply {
@@ -1121,15 +2288,8 @@ impl Store {
             let row = self.rows.get(&request.anchor).cloned();
             return (EventType::Ok, row.unwrap_or(Value::Null));
         }
-        if let Some((body, reply)) = self.record(request) {
-            return if *body == request.body() {
-                reply.clone()
-            } else {
-                refusal(
-                    "conflict",
-                    "request_id was already used with a different request body",
-                )
-            };
+        if let Some(reply) = self.record(request) {
+            return reply;
         }
         let rows = request.rows();
         let exists = rows.iter().any(|(key, _)| self.rows.contains_key(key));
@@ -1148,9 +2308,11 @@ impl Store {
                 self.rows.insert(key, value);
             }
         }
-        if commits || reading == Reading::Identity {
-            let id = (request.anchor.clone(), request.id.clone());
-            self.records.insert(id, (request.body(), reply.clone()));
+        let (anchor, id, body) = (request.anchor.clone(), request.id.clone(), request.body());
+        if commits || reading == Reading::Holds {
+            self.commits.insert((anchor, id), (body, reply.clone()));
+        } else if reading == Reading::Promised && request.f != "insert_many" {
+            self.unchanged.insert((anchor, id, body), reply.clone());
         }
         reply
     }
@@ -1189,7 +2351,8 @@ fn generated(seed: u64, operations: usize, reading: Reading, queued: bool) -> Ve
                     // Send one of the last requests again, whatever its answers so far.
                     let recent = below(sent.len().min(6) as u64) as usize;
                     let mut request = sent[sent.len() - 1 - recent].clone();
-                    if below(12) == 0 && request.f == "upsert" && store.record(&request).is_some() {
+                    let single = ["insert", "update", "upsert"].contains(&request.f);
+                    if below(12) == 0 && single && store.record(&request).is_some() {
                         values += 2;
                         request.value = json!(values);
                     }
@@ -1257,18 +2420,12 @@ fn generated(seed: u64, operations: usize, reading: Reading, queued: bool) -> Ve
             }
             Some(mut attempt) => {
                 let request = &attempt.request;
-                let may_refuse = reading == Reading::Plan
+                let may_refuse = reading == Reading::Shipped
                     || store.record(request).is_none()
                     || answered.contains(&(request.id.clone(), request.body()));
                 // A stopped attempt stops no others: a later attempt may have committed by now.
                 let refuse = request.f != "get" && !attempt.stopped && may_refuse && below(3) == 0;
-                attempt.reply = Some(if attempt.stopped || refuse {
-                    if reading == Reading::Identity && refuse {
-                        late.retain(|other| !other.same(request));
-                        for other in open.iter_mut().flatten() {
-                            other.stopped |= other.reply.is_none() && other.request.same(request);
-                        }
-                    }
+                let reply = if attempt.stopped || refuse {
                     refusal("overloaded", "direct in-flight budget is full")
                 } else if queued
                     && request.f.starts_with("insert")
@@ -1278,7 +2435,17 @@ fn generated(seed: u64, operations: usize, reading: Reading, queued: bool) -> Ve
                     refusal("conflict", "original request run was abandoned")
                 } else {
                     store.run(request, reading)
-                });
+                };
+                // No record of the batch stops its earlier attempts, so its refusal does.
+                let refused_batch =
+                    request.f == "insert_many" && reply.1["message"] == ROW_CONFLICT;
+                if reading != Reading::Shipped && (refuse || refused_batch) {
+                    late.retain(|other| !other.same(request));
+                    for other in open.iter_mut().flatten() {
+                        other.stopped |= other.reply.is_none() && other.request.same(request);
+                    }
+                }
+                attempt.reply = Some(reply);
                 open[client] = Some(attempt);
             }
         }
@@ -1302,27 +2469,80 @@ fn generated(seed: u64, operations: usize, reading: Reading, queued: bool) -> Ve
     events
 }
 
-/// A store that keeps both promises is never flagged. The same clients on a store that follows
-/// the shipped executor are, often, which shows that the first half is not empty.
+/// A store that keeps the retry rule is never flagged by default, and one that also keeps the reading
+/// of the opt-in rule never by that. The same clients on a store that recomputes are, often, which
+/// shows that the first half is not empty. `NABEDRA_CASES` sets the number of seeds.
 #[test]
-fn a_store_that_keeps_both_promises_is_never_flagged() {
-    let (mut unstable, mut effects) = (0, 0);
-    let (mut identity_accepted, mut plan_accepted) = (0, 0);
-    for seed in 0..200 {
-        for queued in [false, true] {
-            let events = generated(seed, 60, Reading::Identity, queued);
-            let hits = added(&events, &BOTH);
-            assert!(hits.is_empty(), "seed {seed}, queued {queued}: {hits:#?}");
-            identity_accepted += usize::from(direct::check(&events).valid && !queued);
+fn a_store_that_keeps_its_promises_is_never_flagged() {
+    let seeds = std::env::var("NABEDRA_CASES").map_or(200, |n| n.parse().unwrap());
+    let (mut replays, mut unstable, mut by_default, mut effects) = (0, 0, 0, 0);
+    let (mut refusals, mut not_judged) = (0, 0);
+    for seed in 0..seeds {
+        for reading in [Reading::Holds, Reading::Promised] {
+            let events = generated(seed, 60, reading, false);
+            let verdict = direct::check(&events);
+            assert!(verdict.valid, "seed {seed}, {reading:?}: {verdict:#?}");
+            assert_eq!(verdict.unclassified_conflicts, 0, "seed {seed}");
+            if reading == Reading::Holds {
+                // A store that decides everything leaves nothing open, but a refusal may be lost.
+                let mut counts = verdict.not_judged.iter();
+                let unknown = |(n, c): (&String, &usize)| *c == 0 || n == OTHER_BODY_UNKNOWN;
+                assert!(counts.all(unknown), "seed {seed}");
+                refusals += usize::from(refused_after_a_result(&events));
+            } else {
+                not_judged += usize::from(verdict.not_judged.values().any(|c| *c > 0));
+                replays += usize::from(has_replay(&events));
+            }
+            // The default does not accept every conflict of the queued path, so only the opt-in
+            // rule is judged with them.
+            for queued in [false, true] {
+                let events = generated(seed, 60, reading, queued);
+                let hits = added(&events, &NOT_APPLIED);
+                assert!(hits.is_empty(), "seed {seed}, queued {queued}: {hits:#?}");
+            }
         }
-        let events = generated(seed, 60, Reading::Plan, false);
-        unstable += usize::from(!added(&events, &STABLE_RESULTS).is_empty());
+        let events = generated(seed, 60, Reading::Shipped, false);
+        let verdict = direct::check(&events);
+        unstable += usize::from(verdict.has(UNSTABLE));
+        by_default += usize::from(!verdict.valid);
         effects += usize::from(!added(&events, &NOT_APPLIED).is_empty());
-        plan_accepted += usize::from(direct::check(&events).valid);
     }
     println!(
-        "200 seeds. Identity store: 0 flagged, {identity_accepted} accepted by the default. Plan store: {unstable} {UNSTABLE}, {effects} {EFFECT}, {plan_accepted} accepted by the default"
+        "{seeds} seeds. Two stores that keep the rule: 0 flagged, {replays} with a replay that the row contradicts, {refusals} with a refusal that only a result without a commit explains, {not_judged} with something not judged. The store that recomputes: {by_default} flagged by default, {unstable} with {UNSTABLE}, {effects} {EFFECT}"
     );
-    assert!(unstable >= 30 && effects >= 10);
-    assert_eq!(plan_accepted, 200);
+    assert!(replays * 10 >= seeds as usize && refusals * 20 >= seeds as usize);
+    assert!(unstable * 5 >= seeds as usize && effects * 20 >= seeds as usize);
+}
+
+/// Another body was refused under an identity in which no attempt was answered with a commit.
+fn refused_after_a_result(events: &[Event]) -> bool {
+    let ops = pair(events).unwrap().ops;
+    let reused = "request_id was already used with a different request body";
+    let mut refused = ops
+        .iter()
+        .filter(|op| op.complete_value["message"] == reused);
+    refused.any(|refused| {
+        let mut same = ops
+            .iter()
+            .filter(|op| op.key == refused.key && op.request_id == refused.request_id);
+        !same.any(|op| op.outcome == Outcome::Ok && op.complete_value != json!(false))
+    })
+}
+
+/// A no-op or a row conflict was answered again although the row had changed in between: the history
+/// is not linearizable if each attempt is judged alone.
+fn has_replay(events: &[Event]) -> bool {
+    let mut alone = events.to_vec();
+    let ops = pair(events).unwrap().ops;
+    // Give every attempt without a commit an identity of its own.
+    for (i, op) in ops.iter().enumerate() {
+        let no_op = op.outcome == Outcome::Ok && op.complete_value == json!(false);
+        let refused = op.outcome == Outcome::Fail && op.complete_value["message"] == ROW_CONFLICT;
+        if no_op || refused {
+            for position in std::iter::once(op.call).chain(op.done) {
+                alone[position].request_id = Some(format!("alone{i}"));
+            }
+        }
+    }
+    direct::check(&alone).has("non-linearizable")
 }
