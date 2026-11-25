@@ -1,0 +1,16 @@
+id = "oltp-sim-topology-rest"
+module = "oltp"
+kinds = ["S", "H"]
+# Scratch only, never merged. The default profiles without the replica move and with the split
+# before the load, to see what is left beside the known findings.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+exec cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib sweep::tests::sweep -- --exact --nocapture --test-threads=1
+''']
+cwd = "server"
+timeout_s = 5400
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SIM_WORKLOAD = "topology", NABEDRA_SIM_TOPOLOGY = "no-move,split-before-load", NABEDRA_SEEDS = "24", NABEDRA_SIM_JOBS = "2", NABEDRA_SIM_VERIFY_REPLAY = "0.25", NABEDRA_SEED = "1", NABEDRA_SIM_CHECK_ID = "oltp-sim-topology-rest", NABEDRA_SIM_ARTIFACTS = "../../target/testing-logs/oltp-sim-topology-rest" }
