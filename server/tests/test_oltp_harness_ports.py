@@ -760,7 +760,8 @@ class Workers(Case):
         self.assertIn('listener failed', str(error))
 
     def test_a_killed_test_leaves_no_worker(self):
-        source = ('import sys, time; sys.path.insert(0, sys.argv[1]); import test_oltp_harness_ports as t; '
+        source = ('import signal, sys, time; signal.signal(signal.SIGINT, signal.default_int_handler); '
+                  'sys.path.insert(0, sys.argv[1]); import test_oltp_harness_ports as t; '
                   'from pathlib import Path; root = Path(sys.argv[2]); binary = root / "fake-worker"; '
                   'binary.write_text(t.FAKE_WORKER); binary.chmod(0o700); server = t.Rf1Serve(binary, root / "rf1"); '
                   'server.start(); print(server.process.pid, flush=True); time.sleep(60)')
