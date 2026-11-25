@@ -6,14 +6,14 @@
 //!
 //! **Determinism.** Every kernel returns the same bits at every level. The float kernels define
 //! their rounding: blocks of [`BLOCK`] values, in [`LANES`] lanes of fused multiply-adds, halves of
-//! the lanes added until one is left, blocks added in f64 and rounded once. NaNs may differ in
-//! their payload.
+//! the lanes added until one is left, blocks added in f64 and rounded once. That includes the sign
+//! of a zero; NaNs may differ in their payload.
 //!
 //! **Accuracy.** For finite inputs of `n` values, [`Kernels::dot`] is off from the true sum by at
 //! most `relative_error(n) * sum|a_i * b_i| + n * 2^-149`, and [`Kernels::l2_sq`] and
-//! [`Kernels::norm_sq`] likewise against their own terms, which are all positive. That holds while
-//! the sum of the terms' magnitudes is below f32::MAX / 2. Past it a result may be infinite or NaN,
-//! but it is never a finite number where the true one does not fit f32: use [`wide`] then.
+//! [`Kernels::norm_sq`] likewise against their own terms, which are all positive. Every finite
+//! result meets this bound: no rounding to f32::MAX loses more than the bound allows, and once a
+//! lane overflows the result is infinite or NaN. Use [`wide`] for those.
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 use std::sync::OnceLock;

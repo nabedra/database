@@ -35,11 +35,13 @@ pub(crate) mod avx2 {
         }
     }
 
-    /// The first 8 values of `p`, zero past its end.
+    /// The first values of `p`, then `fill`. The first operand is filled with -0 and the second
+    /// with +0: their product -0 leaves every sum as it is, also the sign of a zero, as the lanes
+    /// that the scalar level never reaches.
     #[inline]
     #[target_feature(enable = "avx2")]
-    fn load_tail(p: &[f32]) -> __m256 {
-        let mut values = [0.0; 8];
+    fn load_tail(p: &[f32], fill: f32) -> __m256 {
+        let mut values = [fill; 8];
         for (value, &x) in values.iter_mut().zip(p) {
             *value = x;
         }
@@ -66,7 +68,7 @@ pub(crate) mod avx2 {
             }
         }
         for (acc, (a, b)) in acc.iter_mut().zip(a.chunks(8).zip(b.chunks(8))) {
-            *acc = step::<L2>(*acc, load_tail(a), load_tail(b));
+            *acc = step::<L2>(*acc, load_tail(a, -0.0), load_tail(b, 0.0));
         }
         for half in [4, 2, 1] {
             for i in 0..half {
@@ -182,14 +184,16 @@ pub(crate) mod avx512 {
         unsafe { _mm512_loadu_ps(p.as_ptr()) }
     }
 
-    /// The first 16 values of `p`, zero past its end.
+    /// The first values of `p`, then `fill`. The first operand is filled with -0 and the second
+    /// with +0: their product -0 leaves every sum as it is, also the sign of a zero, as the lanes
+    /// that the scalar level never reaches.
     #[inline]
     #[target_feature(enable = "avx512f")]
-    fn load_tail(p: &[f32]) -> __m512 {
+    fn load_tail(p: &[f32], fill: f32) -> __m512 {
         let mask = ((1u32 << p.len().min(16)) - 1) as u16;
         // SAFETY: the mask selects at most the first `p.len()` lanes, and a masked load neither
         // reads nor faults on the others.
-        unsafe { _mm512_maskz_loadu_ps(mask, p.as_ptr()) }
+        unsafe { _mm512_mask_loadu_ps(_mm512_set1_ps(fill), mask, p.as_ptr()) }
     }
 
     /// The first 8 words of `p`, zero past its end.
@@ -224,7 +228,7 @@ pub(crate) mod avx512 {
             }
         }
         for (acc, (a, b)) in acc.iter_mut().zip(a.chunks(16).zip(b.chunks(16))) {
-            *acc = step::<L2>(*acc, load_tail(a), load_tail(b));
+            *acc = step::<L2>(*acc, load_tail(a, -0.0), load_tail(b, 0.0));
         }
         let (even, odd) = (_mm512_add_ps(acc[0], acc[2]), _mm512_add_ps(acc[1], acc[3]));
         let v = _mm512_add_ps(even, odd);

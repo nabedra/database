@@ -178,9 +178,64 @@ fn relative_error_holds_where_every_rounding_goes_one_way() {
     }
 }
 
+/// The sign of a zero result, from products that underflow, at every length and offset in a lane.
+#[test]
+fn zero_results_have_the_same_sign_at_every_level() {
+    let scalar = Kernels::at(Level::Scalar).expect("the scalar level");
+    for n in 0..=300 {
+        for (x, y) in [
+            (-1e-30f32, 1e-30f32),
+            (1e-30, 1e-30),
+            (-0.0, 0.0),
+            (-0.0, -0.0),
+        ] {
+            for mixed in [false, true] {
+                let a: Vec<f32> = (0..n)
+                    .map(|i| if mixed && i % 3 == 0 { -x } else { x })
+                    .collect();
+                let b = vec![y; n];
+                let want = [scalar.dot(&a, &b), scalar.l2_sq(&a, &b)].map(f32::to_bits);
+                for k in levels() {
+                    let got = [k.dot(&a, &b), k.l2_sq(&a, &b)].map(f32::to_bits);
+                    assert_eq!(got, want, "{k:?} n={n} {x} {y} {mixed}");
+                }
+            }
+        }
+    }
+    let (a, b) = ([-1e-30f32; 65], [1e-30f32; 65]);
+    assert_eq!(scalar.dot(&a, &b).to_bits(), 0x8000_0000);
+}
+
+/// A lane at f32::MAX loses later terms below half its last place, as rounding does elsewhere:
+/// the result stays finite and meets the stated bound.
+#[test]
+fn a_finite_result_meets_the_bound_even_past_f32() {
+    for n in [16, 65, 1024, 1025] {
+        let mut a = vec![0.0f32; n];
+        a[0] = f32::MAX;
+        for i in (64..n).step_by(64).take(15) {
+            a[i] = 1e31;
+        }
+        let ones = vec![1.0f32; n];
+        for k in levels() {
+            let got = k.dot(&a, &ones);
+            assert!(got.is_finite(), "{k:?} n={n}");
+            near(
+                "dot",
+                k.level(),
+                n,
+                got,
+                wide::dot(&a, &ones),
+                wide::dot(&a, &ones),
+            )
+            .unwrap();
+        }
+    }
+}
+
 /// A sum past f32 is infinite or NaN at every level and correct in `wide`.
 #[test]
-fn overflow_is_never_a_finite_number() {
+fn products_past_f32_give_no_finite_result() {
     let mut rng = SplitMix64::new(3);
     for n in 1..=300 {
         let huge: Vec<f32> = (0..n)

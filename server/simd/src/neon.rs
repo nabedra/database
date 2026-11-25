@@ -32,11 +32,13 @@ fn step<const L2: bool>(acc: float32x4_t, x: float32x4_t, y: float32x4_t) -> flo
     }
 }
 
-/// The first 4 values of `p`, zero past its end.
+/// The first values of `p`, then `fill`. The first operand is filled with -0 and the second
+/// with +0: their product -0 leaves every sum as it is, also the sign of a zero, as the lanes
+/// that the scalar level never reaches.
 #[inline]
 #[target_feature(enable = "neon")]
-fn load_tail(p: &[f32]) -> float32x4_t {
-    let mut values = [0.0; 4];
+fn load_tail(p: &[f32], fill: f32) -> float32x4_t {
+    let mut values = [fill; 4];
     for (value, &x) in values.iter_mut().zip(p) {
         *value = x;
     }
@@ -54,7 +56,7 @@ pub(crate) fn sum<const L2: bool>(a: &[f32], b: &[f32]) -> f32 {
         }
     }
     for (acc, (a, b)) in acc.iter_mut().zip(a.chunks(4).zip(b.chunks(4))) {
-        *acc = step::<L2>(*acc, load_tail(a), load_tail(b));
+        *acc = step::<L2>(*acc, load_tail(a, -0.0), load_tail(b, 0.0));
     }
     for half in [8, 4, 2, 1] {
         for i in 0..half {
