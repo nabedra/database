@@ -19,7 +19,7 @@
 //! | Kind | Rule | Scenarios |
 //! | --- | --- | --- |
 //! | `dedup-miss` | an attempt invoked after an attempt of the same identity and body answered with a commit was answered from fresh state: an `update` or `delete` of a missing row, or a `conflict` refusal | D02, D04, O15 |
-//! | `unstable-result` | two attempts of the same identity and body were answered with different definite results, and no `dedup-miss` covers them | O08, D02 |
+//! | `unstable-result` | two attempts of the same identity and body were answered with different definite results, and no `dedup-miss` covers them, or one with a no-op or a row conflict and one with a refusal of reuse | O08, D02 |
 //! | `request-id-reuse-undetected` | two bodies under one identity both committed, or one was answered `ok` although it was invoked after the other committed | D03 |
 //! | `request-id-reuse-misdetected` | an `upsert`, `update` or `delete` was refused with `conflict`, which on the direct path only reuse causes, but no other body under its identity could have held a dedup record by then | D03 |
 //!
@@ -82,6 +82,7 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
     }
     Verdict {
         unclassified_conflicts: results::unclassified_conflicts(&paired.ops),
+        not_judged: results::not_judged(&Identities::new(&paired.ops), &paired.ops),
         ..Verdict::merge(verdicts)
     }
 }
@@ -132,6 +133,17 @@ fn identity_verdict(ops: &[Op]) -> Verdict {
                         name(other),
                     ),
                     [ops[first].indices(), ops[other].indices()].concat(),
+                ));
+            }
+            if let Some((result, refused)) = results::result_and_refusal(ops, attempts) {
+                anomalies.push(Anomaly::new(
+                    "unstable-result",
+                    format!(
+                        "request {rid:?} at anchor {anchor:?}: {} has a result, and {} with the same body was refused as reuse",
+                        name(result),
+                        name(refused),
+                    ),
+                    [ops[result].indices(), ops[refused].indices()].concat(),
                 ));
             }
             let Some(c) = committed[b] else { continue };
@@ -186,7 +198,10 @@ fn identity_verdict(ops: &[Op]) -> Verdict {
             if op.outcome == Outcome::Fail
                 && error_code(op) == Some("conflict")
                 && matches!(classify(&op.f), Some("write" | "update" | "delete"))
-                && !ids.reuse_explains(i)
+                && !members
+                    .iter()
+                    .map(|&j| &ops[j])
+                    .any(|w| results::may_hold(w) && w.call < op.ret_pos() && body(w) != body(op))
             {
                 anomalies.push(Anomaly::new(
                     "request-id-reuse-misdetected",

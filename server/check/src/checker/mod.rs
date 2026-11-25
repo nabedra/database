@@ -14,6 +14,7 @@
 //! `malformed-history`, so it can never pass silently.
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 pub mod direct;
 pub mod edn;
@@ -41,6 +42,10 @@ pub struct Verdict {
     /// to print the count. See [`direct::results`].
     #[serde(skip_serializing_if = "none")]
     pub unclassified_conflicts: usize,
+    /// What [`direct::check`] accepted because no text decides it, by name. Not anomalies, but a
+    /// caller has to print them. See [`direct::results`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub not_judged: BTreeMap<String, usize>,
 }
 
 fn none(count: &usize) -> bool {
@@ -54,6 +59,7 @@ impl Verdict {
             anomalies,
             checked_ops,
             unclassified_conflicts: 0,
+            not_judged: BTreeMap::new(),
         }
     }
 
@@ -85,13 +91,19 @@ impl Verdict {
         let mut anomalies = Vec::new();
         let mut checked = 0;
         let mut unclassified = 0;
+        let mut not_judged = BTreeMap::<String, usize>::new();
         for v in verdicts {
             checked = checked.max(v.checked_ops);
             unclassified = unclassified.max(v.unclassified_conflicts);
+            for (name, times) in v.not_judged {
+                let most = not_judged.entry(name).or_default();
+                *most = times.max(*most);
+            }
             anomalies.extend(v.anomalies);
         }
         Verdict {
             unclassified_conflicts: unclassified,
+            not_judged,
             ..Verdict::new(checked, anomalies)
         }
     }

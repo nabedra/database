@@ -597,14 +597,14 @@ fn direct_result_and_identity_review_cases() {
     );
 
     check(
-        "read-only update cannot explain a reuse refusal",
+        "a no-op explains a reuse refusal",
         r#"
 {"type":"invoke","process":0,"f":"update","key":"k","value":1,"request_id":"r"}
 {"type":"ok","process":0,"f":"update","value":false}
 {"type":"invoke","process":0,"f":"upsert","key":"k","value":2,"request_id":"r"}
 {"type":"fail","process":0,"f":"upsert","value":{"code":"conflict"}}
 "#,
-        Some("request-id-reuse-misdetected"),
+        None,
     );
 
     check(
