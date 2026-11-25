@@ -1,4 +1,4 @@
-{"schema":"nabedra.catalog/1","count":3344,"tests":[
+{"schema":"nabedra.catalog/1","count":3346,"tests":[
 {"file":"orm/python/tests/events/test_client.py","hash":"202d453fc9458842","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_ack_uses_exact_offset_and_rejects_foreign_delivery_before_request","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"1c426c67dd348a60","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_claim_reuses_uuid_after_missing_response","lang":"python"},
 {"file":"orm/python/tests/events/test_client.py","hash":"b8d2b5c0d984c70e","id":"orm/python/tests/events/test_client.py::ClientWireTests::test_error_metadata_and_duplicate_fields","lang":"python"},
@@ -1907,6 +1907,8 @@
 {"file":"server/rt/src/sim/suspend/tests.rs","hash":"68ad5ecebc1a8242","id":"server/rt/src/sim/suspend/tests.rs::a_crash_lands_between_a_clock_read_and_its_use","lang":"rust"},
 {"file":"server/rt/src/sim/suspend/tests.rs","hash":"7e23249d07d2d3d3","id":"server/rt/src/sim/suspend/tests.rs::a_freeze_lands_after_a_chosen_clock_read","lang":"rust"},
 {"file":"server/rt/src/sim/suspend/tests.rs","hash":"73fafafbdd7c7407","id":"server/rt/src/sim/suspend/tests.rs::a_freeze_lands_in_a_job_and_after_a_reported_read","lang":"rust"},
+{"file":"server/rt/src/sim/suspend/tests.rs","hash":"0111fbbe3ddf472e","id":"server/rt/src/sim/suspend/tests.rs::a_frozen_one_shot_ends_with_a_crash","lang":"rust"},
+{"file":"server/rt/src/sim/suspend/tests.rs","hash":"15e91295147f6e4d","id":"server/rt/src/sim/suspend/tests.rs::a_job_stopped_at_a_clock_read_stays_stopped_until_the_thaw","lang":"rust"},
 {"file":"server/rt/src/sim/suspend/tests.rs","hash":"40f421a929087b8a","id":"server/rt/src/sim/suspend/tests.rs::a_lock_held_across_a_pause_fails_the_run","lang":"rust"},
 {"file":"server/rt/src/sim/suspend/tests.rs","hash":"8548610d2448e9f0","id":"server/rt/src/sim/suspend/tests.rs::a_paused_job_goes_on_after_its_hold_or_when_resumed","lang":"rust"},
 {"file":"server/rt/src/sim/suspend/tests.rs","hash":"d75bfbbc94d41ddc","id":"server/rt/src/sim/suspend/tests.rs::a_poll_on_a_helper_thread_races_branches_by_the_seed","lang":"rust"},
