@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use nabedra_check::Gen;
-use nabedra_check::evidence::{Artifact, Record};
+use nabedra_check::evidence::{Artifact, MAX_RECORD_BYTES, NotRun, Record};
 use nabedra_rt::time;
 use nabedra_sim::shrink;
 use nabedra_sim::sweep::{self, PlantedSearch, SeedRun, SeedSummary, SweepConfig, SweepReport};
@@ -867,97 +867,27 @@ fn write_record(
     record.seeds = Some(seeds);
     record.sim_core_hours = input.total_cpu_s.map(|seconds| seconds / 3600.0);
     record.virtual_hours = Some(report.virtual_ms() as f64 / 3_600_000.0);
-    for passed in input.assertions.into_values() {
-        record.assertion(passed);
+    for passed in input.assertions.values() {
+        record.assertion(*passed);
     }
     for passed in input.scenarios.values() {
         record.assertion(*passed);
     }
-    if input.defects_skipped {
-        record.not_run("seeded defects", "the unmodified smoke sweep failed");
-    }
-    for (rule, why) in rules_not_run(&input.exercised) {
-        record.not_run(&rule, &why);
-    }
-    record.not_run("ConsistentCommittedData", "no probe reports it");
-    if input.overlay {
-        record.not_run("background Control lane slots", NO_LANE_RULE);
-        if input.stage_unjudged > 0 {
-            record.not_run(
-                "ResourceBaseline/overlay",
-                &format!(
-                    "not judged in {} of {} seeds",
-                    input.stage_unjudged, report.count
-                ),
-            );
-        }
-    }
-    for (rule, why) in crate::invariants::queued::NOT_RUN {
-        record.not_run(rule, why);
-    }
-    if input.workload == Workload::Topology.name() {
-        for (rule, why) in crate::invariants::topology::NOT_RUN {
-            record.not_run(rule, why);
-        }
-    }
-    for (rule, seeds) in &input.unjudged {
-        let why = format!(
-            "not judged in {} of {} seeds: {seeds:?}",
-            seeds.len(),
-            report.count
-        );
-        record.not_run(rule, &why);
-    }
-    if input.workload.split(',').any(|name| name == "membership") {
-        use crate::invariants::membership::{GUIDANCE_ONLY, NOT_RUN_FORMS};
-        for (form, why) in NOT_RUN_FORMS {
-            record.not_run(form, why);
-        }
-        for (kind, why) in GUIDANCE_ONLY {
-            record.not_run(&format!("{kind} as a counted rule"), why);
-        }
-    }
-    if input.smoke {
-        for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {
-            record.not_run(scenario, &format!("runs in the {workload} workload"));
-        }
-    } else {
-        for (scenario, required) in SCENARIOS {
-            let missing: Vec<_> = required
-                .iter()
-                .filter(|clause| !input.scenarios.contains_key(*clause))
-                .collect();
-            for clause in &missing {
-                let why = clauses::unreachable(clause)
-                    .unwrap_or("no seed in this range executed its assertions");
-                record.not_run(clause, why);
-            }
-            if !missing.is_empty() {
-                record.not_run(scenario, &format!("clauses that did not run: {missing:?}"));
-            }
-        }
-    }
-    if input.unreplayed > 0 {
-        record.not_run(
-            "clean verdict of passing seeds",
-            &format!(
-                "{} passing seeds were run once and not replayed",
-                input.unreplayed
-            ),
-        );
-    }
-    if report.replayed() == 0 {
-        record.not_run(
-            "replay sampling",
-            "NABEDRA_SIM_VERIFY_REPLAY selected zero seeds",
-        );
-    }
-    for path in input.paths.iter().take(50) {
-        record.artifacts.push(Artifact {
+    record.assertions.not_run = not_run(&input, report.count, report.replayed());
+    for path in &input.paths {
+        let artifact = Artifact {
             name: path.strip_prefix(&config.artifacts)?.display().to_string(),
             sha256: sha256_file(path)?,
-        });
+        };
+        if !list_artifact(&mut record, artifact) {
+            break;
+        }
     }
+    eprintln!(
+        "Fault-model evidence record lists {} of {} artifacts",
+        record.artifacts.len(),
+        input.paths.len()
+    );
     let outcome = record.conclude();
     let records = env("NABEDRA_SIM_RECORD_DIR")
         .map(PathBuf::from)
@@ -968,6 +898,131 @@ fn write_record(
     // richer native record in that log so the attestation also binds these fields.
     print!("{}", std::fs::read_to_string(path)?);
     Ok(outcome == nabedra_check::evidence::Outcome::Pass)
+}
+
+/// The most artifacts that a record may list.
+const ARTIFACTS: usize = 50;
+/// Bytes that `Record::write_to` and `Record::conclude` may still add.
+const RECORD_SLACK: usize = 16;
+
+/// Adds `artifact` to the index, whose first entry is the sweep report, if the record stays below
+/// its cap.
+fn list_artifact(record: &mut Record, artifact: Artifact) -> bool {
+    if record.artifacts.len() == ARTIFACTS {
+        return false;
+    }
+    record.artifacts.push(artifact);
+    let fits = record.to_json().len() + RECORD_SLACK <= MAX_RECORD_BYTES;
+    if !fits {
+        record.artifacts.pop();
+    }
+    fits
+}
+
+/// What a sweep of `seeds` seeds did not judge, with the reason.
+fn not_run(input: &RecordInput, seeds: u64, replayed: u64) -> Vec<NotRun> {
+    let mut rows = Vec::new();
+    let mut row = |id: &str, reason: &str| {
+        rows.push(NotRun {
+            id: id.into(),
+            reason: reason.into(),
+        });
+    };
+    if input.defects_skipped {
+        row("seeded defects", "the unmodified smoke sweep failed");
+    }
+    for (rule, why) in rules_not_run(&input.exercised) {
+        row(&rule, &why);
+    }
+    row("ConsistentCommittedData", "no probe reports it");
+    if input.overlay {
+        row("background Control lane slots", NO_LANE_RULE);
+        if input.stage_unjudged > 0 {
+            row(
+                "ResourceBaseline/overlay",
+                &format!("not judged in {} of {} seeds", input.stage_unjudged, seeds),
+            );
+        }
+    }
+    for (rule, why) in crate::invariants::queued::NOT_RUN {
+        row(rule, why);
+    }
+    if input.workload == Workload::Topology.name() {
+        for (rule, why) in crate::invariants::topology::NOT_RUN {
+            row(rule, why);
+        }
+    }
+    for (rule, unjudged) in &input.unjudged {
+        let why = format!(
+            "not judged in {} of {seeds} seeds: {unjudged:?}",
+            unjudged.len()
+        );
+        row(rule, &why);
+    }
+    if input.workload.split(',').any(|name| name == "membership") {
+        use crate::invariants::membership::{GUIDANCE_ONLY, NOT_RUN_FORMS};
+        for (form, why) in NOT_RUN_FORMS {
+            row(form, why);
+        }
+        for (kind, why) in GUIDANCE_ONLY {
+            row(&format!("{kind} as a counted rule"), why);
+        }
+    }
+    if input.smoke {
+        for (scenario, workload) in [("D04", "direct"), ("D05", "direct"), ("O15", "cold")] {
+            row(scenario, &format!("runs in the {workload} workload"));
+        }
+    } else {
+        for (scenario, required) in SCENARIOS {
+            let missing: Vec<_> = required
+                .iter()
+                .filter(|clause| !input.scenarios.contains_key(*clause))
+                .collect();
+            for clause in &missing {
+                let why = clauses::unreachable(clause)
+                    .unwrap_or("no seed in this range executed its assertions");
+                row(clause, why);
+            }
+            if !missing.is_empty() {
+                row(scenario, "clauses of it that did not run are in this list");
+            }
+        }
+    }
+    if input.unreplayed > 0 {
+        row(
+            "clean verdict of passing seeds",
+            &format!(
+                "{} passing seeds were run once and not replayed",
+                input.unreplayed
+            ),
+        );
+    }
+    if replayed == 0 {
+        row(
+            "replay sampling",
+            "NABEDRA_SIM_VERIFY_REPLAY selected zero seeds",
+        );
+    }
+    share_reasons(rows)
+}
+
+/// The longest ID of a `not_run` entry.
+const NOT_RUN_ID: usize = 200;
+
+/// Rows with the same reason share an entry, which names each of them. A record is capped at
+/// `MAX_RECORD_BYTES`, and every workload lists the clauses of all of them.
+fn share_reasons(rows: Vec<NotRun>) -> Vec<NotRun> {
+    let mut shared: Vec<NotRun> = Vec::new();
+    for row in rows {
+        let fits = |entry: &&mut NotRun| {
+            entry.reason == row.reason && entry.id.len() + 2 + row.id.len() <= NOT_RUN_ID
+        };
+        match shared.iter_mut().find(fits) {
+            Some(entry) => entry.id.push_str(&format!(", {}", row.id)),
+            None => shared.push(row),
+        }
+    }
+    shared
 }
 
 fn count_rules(total: &mut BTreeMap<&'static str, u64>, run: &BTreeMap<&'static str, u64>) {
@@ -1075,6 +1130,100 @@ mod tests {
             assert!(!report.passed(), "panic in run {panicking}");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn record_input(workload: &str, overlay: bool) -> RecordInput {
+        RecordInput {
+            workload: workload.into(),
+            smoke: false,
+            overlay,
+            stage_unjudged: 1,
+            scenarios: BTreeMap::new(),
+            exercised: BTreeMap::from([(RANGE_CLOCK_NOT_RUN, 1)]),
+            assertions: BTreeMap::new(),
+            unjudged: BTreeMap::new(),
+            unreplayed: 1,
+            defects_skipped: true,
+            duration_s: 0.0,
+            total_cpu_s: None,
+            config_hash: String::new(),
+            defect: Defect::None,
+            paths: Vec::new(),
+        }
+    }
+
+    /// The rows of one reason share an entry. No row and no reason is lost.
+    #[test]
+    fn rows_that_share_an_entry_keep_their_names_and_reasons() {
+        let row = |id: &str, reason: &str| NotRun {
+            id: id.into(),
+            reason: reason.into(),
+        };
+        let long = "x".repeat(NOT_RUN_ID - 5);
+        let shared = share_reasons(vec![
+            row("a", "one"),
+            row("b", "two"),
+            row("c", "one"),
+            row(&long, "one"),
+            row("d", "one"),
+        ]);
+        let entries: Vec<_> = shared
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.reason.as_str()))
+            .collect();
+        assert_eq!(entries, [("a, c, d", "one"), ("b", "two"), (&*long, "one")]);
+        let rows = not_run(&record_input("membership", false), 1, 0);
+        let names: BTreeSet<_> = rows.iter().flat_map(|row| row.id.split(", ")).collect();
+        let clauses = SCENARIOS.iter().flat_map(|(_, clauses)| *clauses);
+        for expected in clauses.chain(SCENARIOS.iter().map(|(scenario, _)| scenario)) {
+            assert!(names.contains(expected), "{expected}");
+        }
+        for (form, _) in crate::invariants::membership::NOT_RUN_FORMS {
+            assert!(names.contains(form), "{form}");
+        }
+    }
+
+    /// The largest record that a sweep of one workload writes: no clause ran, 100 failing seeds
+    /// and more artifacts than fit. At 0594e357 the records of the integrated workloads were over
+    /// the cap.
+    #[test]
+    fn a_record_of_any_workload_is_below_the_cap() {
+        for (workload, overlay) in [
+            ("mixed", false),
+            ("mixed,resources", true),
+            ("queued", false),
+            ("topology", false),
+            ("membership", false),
+        ] {
+            let mut input = record_input(workload, overlay);
+            if workload == Workload::Topology.name() {
+                let seeds: Vec<u64> = (1..=24).collect();
+                let rules = topology::not_judged(None).into_iter().enumerate();
+                let unjudged = |(skip, rule)| (rule, seeds.iter().copied().skip(skip).collect());
+                input.unjudged = rules.map(unjudged).collect();
+            }
+            let mut record = Record::new("oltp-sim-membership-wipe", "S H");
+            record.fill_from_env();
+            record.assertions.not_run = not_run(&input, 24, 0);
+            assert!(record.assertions.not_run.len() <= 200);
+            for row in &record.assertions.not_run {
+                assert!(row.id.len() <= 200 && row.reason.len() <= 300, "{row:?}");
+            }
+            record.seeds = Some(nabedra_check::evidence::Seeds {
+                range: Some([1, 10_000]),
+                count: 10_000,
+                failing: (9_000..9_100).collect(),
+            });
+            let artifact = |seed| Artifact {
+                name: format!("oltp-sim-membership-wipe-seed-{seed}/trace-tail.txt"),
+                sha256: "0".repeat(64),
+            };
+            let listed = (0..60).take_while(|seed| list_artifact(&mut record, artifact(*seed)));
+            let listed = listed.count();
+            let bytes = record.to_json().len();
+            assert!(bytes < MAX_RECORD_BYTES, "{workload}: {bytes}");
+            assert!((30..=ARTIFACTS).contains(&listed), "{workload}: {listed}");
+        }
     }
 
     /// A sub-rule that never ran, and the commits that a rule could not judge, are not hidden

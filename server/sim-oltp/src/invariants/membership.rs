@@ -44,20 +44,17 @@ pub(crate) const OPERATOR_GUIDANCE: &str = "OperatorGuidance";
 pub(crate) const NOT_RUN_FORMS: [(&str, &str); 7] = [
     (
         "WipedNeverVotes over VoteSaved",
-        "needs the VoteSaved and Appended probes of #116; the swept form judges acknowledged writes",
+        "this rule reads no probe; the swept form judges acknowledged writes, and MonotonicVote judges each saved vote",
     ),
     (
         "MonotonicVote across a stale disk",
-        "needs the VoteSaved probe of #116; the stale disk is an opt-in schedule",
+        "the stale disk is an opt-in schedule",
     ),
     (
         "CapabilityBeforeUse over public answers",
         "no worker serves its stats before every voter runs, so no answer can show an early use (counted per seed as \"early capability answers\")",
     ),
-    (
-        "CapabilityBeforeUse over Applied",
-        "needs an advert probe and the Applied probe of #116",
-    ),
+    ("CapabilityBeforeUse over Applied", "needs an advert probe"),
     (
         "CapabilityBeforeUse with a build that lacks a feature",
         "ControlMachine::known_features_for_test is cfg(test) product code",
