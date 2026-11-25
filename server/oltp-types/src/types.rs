@@ -380,6 +380,9 @@ impl Timestamp {
         self.0.get()
     }
 }
+/// A column incarnation of one table. Never reused: a column that is dropped
+/// and added again gets another one.
+pub type ColumnId = u16;
 pub type CommitTs = Timestamp;
 pub type ReadTs = Timestamp;
 
