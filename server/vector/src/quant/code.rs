@@ -1,12 +1,12 @@
 use nabedra_simd::{Kernels, SLICES};
 
-use super::{CODE_STEP, EPSILON, Estimate, MAX_DIM, ROUNDING};
+use super::{CODE_STEP, EPSILON, Estimate, MAX_DIM, ROUNDS, transform_size};
 
-/// Residuals with a smaller squared length are rounding noise of equal directions.
-const NO_RESIDUAL: f32 = 1e-24;
 /// Where the top level of the 5-bit code ends, in multiples of the residual's root mean square.
 /// 3 suits the Gaussian values a rotation gives; the others serve residuals with other tails.
-const CLIPS: [f32; 12] = [1.0, 1.5, 2.0, 2.3, 2.6, 2.8, 3.0, 3.2, 3.5, 4.0, 5.0, 8.0];
+const CLIPS: [f64; 13] = [
+    1.0, 1.4, 1.75, 2.0, 2.3, 2.6, 2.8, 3.0, 3.2, 3.5, 4.0, 5.0, 8.0,
+];
 /// The fraction of the golden ratio: its multiples modulo 1 are spread evenly.
 const GOLDEN: u32 = 0x9e37_79b9;
 
@@ -19,6 +19,9 @@ const GOLDEN: u32 = 0x9e37_79b9;
 /// in RaBitQ (arXiv 2405.12497) and its extension (2409.09913), `r . q` is estimated by
 /// `(|r|^2 / (x . r)) * (x . q)`, whose error over random rotations has mean 0 and a deviation of at
 /// most `|r| |q| sqrt(1 / a^2 - 1) / sqrt(d - 1)`, where `a` is the cosine between `x` and `r`.
+///
+/// Everything stored, and every estimate, is the same on every CPU: only integer kernels and scalar
+/// arithmetic.
 pub struct CodeBlock {
     padded: usize,
     /// `padded / 64` words per entry.
@@ -80,25 +83,23 @@ impl CodeBlock {
         assert_direction(centroid, self.padded);
         assert!(super::is_length(len), "vector length {len}");
         let residual: Vec<f32> = dir.iter().zip(centroid).map(|(o, c)| o - c).collect();
-        let r2 = nabedra_simd::norm_sq(&residual);
+        let r2 = sum(&residual, |r| r * r);
         let mut factors = Factors {
             len,
             scale5: 0.0,
             var5: 0.0,
         };
-        let mut scale = 0.0;
-        if r2 > NO_RESIDUAL {
-            let best = best_scale(&residual, r2);
-            scale = best.scale;
-            factors.scale5 = r2 / best.dot;
-            let length2 = factors.scale5 * factors.scale5 * best.norm2;
-            factors.var5 = (length2 - r2).max(0.0) / (self.padded as f32 - 1.0);
-            self.r2.push(r2);
-            self.scale1.push(r2 / sum(&residual, f32::abs));
-        } else {
-            self.r2.push(0.0);
-            self.scale1.push(0.0);
+        let (mut scale, mut scale1) = (0.0, 0.0);
+        if r2 > 0.0 {
+            scale = best_scale(&residual, r2);
+            let code = Fit::new(&residual, scale);
+            let length2 = r2 / code.cosine2(r2);
+            factors.scale5 = (r2 / code.dot) as f32;
+            factors.var5 = ((length2 - r2).max(0.0) / (self.padded as f64 - 1.0)) as f32;
+            scale1 = (r2 / sum(&residual, f64::abs)) as f32;
         }
+        self.r2.push(r2 as f32);
+        self.scale1.push(scale1);
         self.factors.push(factors);
         self.bits.extend(residual.chunks_exact(64).map(|values| {
             let ones = values.iter().map(|&r| u64::from(r >= 0.0));
@@ -145,44 +146,52 @@ fn level(magnitude: f32, scale: f32) -> i32 {
     (magnitude * scale).min(15.0) as i32
 }
 
-struct Scale {
-    scale: f32,
+/// How well the 5-bit code of one scale fits a residual `r`.
+pub(super) struct Fit {
     /// `y . r`.
-    dot: f32,
+    dot: f64,
     /// `|y|^2`.
-    norm2: f32,
+    norm2: f64,
 }
 
-impl Scale {
-    fn new(residual: &[f32], scale: f32) -> Self {
-        let y = |r: f32| level(r.abs(), scale) as f32 + 0.5;
+impl Fit {
+    pub(super) fn new(residual: &[f32], scale: f32) -> Self {
+        let y = |r: f64| f64::from(level(r.abs() as f32, scale)) + 0.5;
         Self {
-            scale,
             dot: sum(residual, |r| y(r) * r.abs()),
             norm2: sum(residual, |r| y(r) * y(r)),
         }
     }
+
+    /// The squared cosine between `y` and `r`.
+    pub(super) fn cosine2(&self, r2: f64) -> f64 {
+        self.dot * self.dot / (self.norm2 * r2)
+    }
 }
 
-/// The scale whose code points closest to `residual`. Scale 0 gives the direction of the 1-bit
-/// code, so the 5-bit one is never worse.
-fn best_scale(residual: &[f32], r2: f32) -> Scale {
-    let rms = (r2 / residual.len() as f32).sqrt();
-    let cosine = |s: &Scale| s.dot * s.dot / s.norm2;
-    let scales = CLIPS.map(|clip| 16.0 / (clip * rms));
-    let scales = scales.into_iter().map(|scale| Scale::new(residual, scale));
-    scales.fold(Scale::new(residual, 0.0), |a, b| {
-        if cosine(&b) > cosine(&a) { b } else { a }
-    })
+/// The scale whose code points closest to `residual`, of squared length `r2`. Scale 0 gives the
+/// direction of the 1-bit code, so the 5-bit one is never worse.
+pub(super) fn best_scale(residual: &[f32], r2: f64) -> f32 {
+    let rms = (r2 / residual.len() as f64).sqrt();
+    let mut best = (0.0, Fit::new(residual, 0.0).cosine2(r2));
+    for clip in CLIPS {
+        let scale = (16.0 / (clip * rms)) as f32;
+        let cosine2 = Fit::new(residual, scale).cosine2(r2);
+        if cosine2 > best.1 {
+            best = (scale, cosine2);
+        }
+    }
+    best.0
 }
 
-/// The sum of `f` over `values`, in lanes that the compiler vectorizes.
+/// The sum of `f` over `values`, in lanes that the compiler vectorizes. In f64, so its rounding
+/// does not count.
 #[inline]
-fn sum(values: &[f32], f: impl Fn(f32) -> f32) -> f32 {
+fn sum(values: &[f32], f: impl Fn(f64) -> f64) -> f64 {
     let mut lanes = [0.0; 8];
     for values in values.as_chunks::<8>().0 {
         for (lane, &value) in lanes.iter_mut().zip(values) {
-            *lane += f(value);
+            *lane += f(f64::from(value));
         }
     }
     lanes.iter().sum()
@@ -209,7 +218,9 @@ pub struct QueryCode {
     step8: f32,
     error8: f32,
     /// `15.5 * sum levels`: the 5-bit code value is `16 * bit + ext - 15.5`.
-    center8: f32,
+    center8: f64,
+    /// The rounding error that an estimate may have besides its random one.
+    rounding: f32,
 }
 
 impl QueryCode {
@@ -247,7 +258,7 @@ impl QueryCode {
                 });
             }
         }
-        let error4 = nabedra_simd::l2_sq(&rounded, &q);
+        let error4 = squared_distance(&rounded, &q);
 
         // To the nearest: the conversion drops the fraction of a positive number.
         let nearest = |q: &f32| ((q * scale8 + 127.5).clamp(0.0, 254.0) as i32 - 127) as i8;
@@ -258,15 +269,22 @@ impl QueryCode {
         let total: i32 = levels.iter().map(|&level| i32::from(level)).sum();
         Self {
             padded,
-            q2: nabedra_simd::norm_sq(&q),
+            q2: sum(&q, |q| q * q) as f32,
             slices,
             step4,
             error4,
-            error8: nabedra_simd::l2_sq(&rounded, &q),
+            error8: squared_distance(&rounded, &q),
             levels,
             step8,
-            center8: 15.5 * total as f32,
+            center8: 15.5 * f64::from(total),
+            rounding: rounding(padded),
         }
+    }
+
+    /// Mean squared rounding error of the levels, in squared steps.
+    #[cfg(test)]
+    pub(super) fn error8_in_steps(&self) -> f64 {
+        f64::from(self.error8) / f64::from(self.step8).powi(2) / self.padded as f64
     }
 
     /// Replaces `out` with the 1-bit estimate of every entry of `block`, in order. Panics when the
@@ -305,7 +323,7 @@ impl QueryCode {
         assert_eq!(self.padded, block.padded, "padded dimensions");
         let (f, r2, d) = (block.factors[i], block.r2[i], self.padded as f32);
         let dot = Kernels::detect().code_dot(block.bits(i), block.ext(i), &self.levels);
-        let dot = f.scale5 * self.step8 * (dot as f32 - self.center8);
+        let dot = f.scale5 * self.step8 * (f64::from(dot) - self.center8) as f32;
         let var = self.q2 * f.var5 + (r2 + f.var5 * (d - 1.0)) * self.error8 / d;
         self.estimate(r2, dot, var)
     }
@@ -315,7 +333,7 @@ impl QueryCode {
     fn estimate(&self, r2: f32, dot: f32, var: f32) -> Estimate {
         Estimate {
             cos: 1.0 - 0.5 * (r2 + self.q2) + dot,
-            err: EPSILON * var.max(0.0).sqrt() + ROUNDING,
+            err: EPSILON * var.max(0.0).sqrt() + self.rounding,
         }
     }
 }
@@ -323,6 +341,23 @@ impl QueryCode {
 /// The lowest bit of each byte, the first byte's in bit 0.
 fn low_bits(bytes: u64) -> u64 {
     (bytes & 0x0101_0101_0101_0101).wrapping_mul(0x0102_0408_1020_4080) >> 56
+}
+
+/// A bound of the rounding of an estimated cosine, from `u = 2^-24`:
+///
+/// - A direction is off by `u` in length from its own rounding, and each round of the rotation adds
+///   one `u` per transform level, one for the factor and one for the product with it. For the two
+///   directions, whose distance is at most 2, that moves the cosine by at most twice both errors.
+/// - The residuals (8 u), the squared lengths (4 u), the sums (7 u) and the factors of a dot product
+///   of at most 6 (7 u each).
+fn rounding(padded: usize) -> f32 {
+    let direction = 1 + ROUNDS * (transform_size(padded).ilog2() as usize + 2);
+    (4 * direction + 64) as f32 / (1u32 << 24) as f32
+}
+
+fn squared_distance(a: &[f32], b: &[f32]) -> f32 {
+    let difference: Vec<f32> = a.iter().zip(b).map(|(a, b)| a - b).collect();
+    sum(&difference, |d| d * d) as f32
 }
 
 fn assert_padded(padded: usize) {
@@ -334,7 +369,7 @@ fn assert_padded(padded: usize) {
 
 fn assert_direction(v: &[f32], padded: usize) {
     assert_eq!(v.len(), padded, "padded dimensions");
-    let norm2 = nabedra_simd::norm_sq(v);
+    let norm2 = sum(v, |x| x * x);
     assert!(
         (norm2 - 1.0).abs() <= 2e-3,
         "not a direction: squared length {norm2}"

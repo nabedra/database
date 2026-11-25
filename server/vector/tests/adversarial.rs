@@ -56,11 +56,11 @@ fn zero_vectors_have_plain_dot_and_l2() {
     for dim in [1, 5, 64, 300] {
         let zero = vec![0.0f32; dim];
         let v: Vec<f32> = (0..dim).map(|i| i as f32 - 2.5).collect();
-        assert_eq!(exact(Op::Dot, &zero, &v), 0.0);
-        let l2 = f64::from(exact(Op::L2, &zero, &v));
+        assert_eq!(exact(Op::Dot, &zero, &v), Some(0.0));
+        let l2 = f64::from(exact(Op::L2, &zero, &v).unwrap());
         let want = wide::norm_sq(&v).sqrt();
         assert!((l2 - want).abs() <= 1e-6 * want, "{l2} {want}");
-        assert_eq!(exact(Op::L2, &zero, &zero), 0.0);
+        assert_eq!(exact(Op::L2, &zero, &zero), Some(0.0));
     }
 }
 
@@ -111,7 +111,7 @@ fn exact_is_finite_for_every_finite_input() {
                 if op == Op::Cosine && (zero(&a) || zero(&b)) {
                     continue; // L2 above
                 }
-                let score = exact(op, &a, &b);
+                let score = exact(op, &a, &b).unwrap();
                 assert!(score.is_finite(), "{op:?} dim {dim} gave {score}");
                 if op == Op::Cosine {
                     assert!((-1.0..=1.0).contains(&score), "cosine {score}");
@@ -142,13 +142,13 @@ fn exact_matches_f64_on_mixed_magnitudes() {
                 continue;
             }
             let (na, nb) = (wide::norm_sq(&a).sqrt(), wide::norm_sq(&b).sqrt());
-            let cos = exact(Op::Cosine, &a, &b);
+            let cos = exact(Op::Cosine, &a, &b).unwrap();
             assert!(
                 (f64::from(cos) - true_cosine(&a, &b)).abs() <= 1e-5,
                 "cos dim {dim}: {cos} {} a {a:?} b {b:?}",
                 true_cosine(&a, &b)
             );
-            let dot = f64::from(exact(Op::Dot, &a, &b));
+            let dot = f64::from(exact(Op::Dot, &a, &b).unwrap());
             let want = wide::dot(&a, &b);
             let fit = want.abs() < f64::from(f32::MAX);
             if fit {
@@ -157,7 +157,7 @@ fn exact_matches_f64_on_mixed_magnitudes() {
                     "dot dim {dim}: {dot} {want}"
                 );
             }
-            let l2 = f64::from(exact(Op::L2, &a, &b));
+            let l2 = f64::from(exact(Op::L2, &a, &b).unwrap());
             let want = wide::l2_sq(&a, &b).sqrt();
             if want < f64::from(f32::MAX) {
                 assert!(
@@ -190,7 +190,7 @@ fn assert_exact_inside_bounds(a: &[f32], b: &[f32], what: &str) {
     let est = Estimate { cos, err: 0.0 };
     for op in OPS {
         let (low, high) = bounds(op, est, la, lb);
-        let score = exact(op, a, b);
+        let score = exact(op, a, b).unwrap();
         assert!(
             low <= score && score <= high,
             "{what}: {op:?} exact {score} outside bounds ({low}, {high}) for the true cosine {cos}"

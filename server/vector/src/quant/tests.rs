@@ -64,9 +64,11 @@ fn rotation_preserves_lengths_and_inner_products() {
             let b = near(&a, 0.5 * length, &mut rng);
             let (ra, rb) = (rotated(&rotation, &a), rotated(&rotation, &b));
             let (norm_a, norm_b) = (wide::norm_sq(&a), wide::norm_sq(&b));
-            let tolerance = 2e-6 * (norm_a * norm_b).sqrt();
+            let levels = rotation.padded().trailing_zeros() as usize;
+            let relative = 2.0 * (ROUNDS * (levels + 2)) as f64 * UNIT;
+            let tolerance = 1.01 * relative * (norm_a * norm_b).sqrt();
             assert!(
-                (wide::norm_sq(&ra) - norm_a).abs() <= 2e-6 * norm_a,
+                (wide::norm_sq(&ra) - norm_a).abs() <= 1.01 * relative * norm_a,
                 "{dim}"
             );
             assert!(
@@ -97,11 +99,11 @@ fn rotation_gives_the_same_bits_forever() {
         hash(768, 8),
     ];
     let want = [
-        0xa26c06193b71e1c6,
-        0xae7ff4186b9d4b32,
-        0x530fb16fc53a15f7,
-        0x2f6c88643460bebc,
-        0x26162d4d6d81b41f,
+        0x721b7738ec1c3138,
+        0x212698a3fb04669e,
+        0x1b7c7bf12994c3f4,
+        0x9d2ed9d15efe1aa0,
+        0x1cebb2ac34155704,
     ];
     assert_eq!(golden, want, "{golden:#x?}");
 }
@@ -141,6 +143,68 @@ fn rotation_checks_its_sizes() {
 }
 
 // Codes and estimates.
+
+/// Replicas on different CPUs hold the same codes and give the same estimates.
+#[test]
+fn estimates_are_the_same_bits_on_every_cpu() {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for dim in [1, 64, 100, 768, 1088, 4096] {
+        let mut rng = SplitMix64::new(dim as u64);
+        let rotation = Rotation::new(dim, 5);
+        // Plain arithmetic: `ln` and `cos` are not the same on every platform.
+        let mut draw = || -> Vec<f32> {
+            let v: Vec<f32> = (0..dim).map(|_| uniform(&mut rng) as f32 - 0.5).collect();
+            rotated(&rotation, &unit(&v))
+        };
+        let (centroid, query) = (draw(), draw());
+        let mut block = CodeBlock::new(rotation.padded());
+        (0..5).for_each(|_| block.push(&draw(), &centroid, 1.0));
+        let code = QueryCode::new(&query, &centroid);
+        let mut scanned = Vec::new();
+        code.scan(&block, &mut scanned);
+        for (i, est) in scanned.into_iter().enumerate() {
+            let refined = code.refine(&block, i);
+            for x in [est.cos, est.err, refined.cos, refined.err] {
+                hash = (hash ^ u64::from(x.to_bits())).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+    assert_eq!(hash, 0x8b53_6273_c5a8_0191, "{hash:#x}");
+}
+
+/// Residuals as a rotation gives them, and with the shortest and with long tails: the chosen scale
+/// is close to the best of a fine search.
+#[test]
+fn extension_scale_is_close_to_the_best_one() {
+    let mut rng = SplitMix64::new(8);
+    type Draw = fn(&mut SplitMix64) -> f64;
+    let tails: [(&str, Draw); 3] = [
+        ("gaussian", gaussian),
+        ("uniform", |rng| 2.0 * uniform(rng) - 1.0),
+        ("long", |rng| gaussian(rng).powi(3)),
+    ];
+    for (name, draw) in tails {
+        let residual: Vec<f32> = (0..768).map(|_| draw(&mut rng) as f32).collect();
+        let r2 = wide::norm_sq(&residual);
+        let rms = (r2 / 768.0).sqrt();
+        let loss = |scale: f32| 1.0 - code::Fit::new(&residual, scale).cosine2(r2);
+        let fine = (1..2000).map(|i| loss((16.0 / (0.01 * f64::from(i) * rms)) as f32));
+        let best = fine.fold(1.0, f64::min);
+        let got = loss(code::best_scale(&residual, r2));
+        assert!(got <= 1.15 * best, "{name}: {got}, best {best}");
+    }
+}
+
+/// Rounded to the nearest, a value is off by a uniform part of a step, so its square by 1/12.
+#[test]
+fn query_levels_are_the_nearest() {
+    let mut rng = SplitMix64::new(9);
+    for dim in [768, 4096] {
+        let (q, c) = (random_unit(dim, &mut rng), random_unit(dim, &mut rng));
+        let ratio = QueryCode::new(&q, &c).error8_in_steps();
+        assert!((ratio * 12.0 - 1.0).abs() < 0.1, "{dim}: {ratio}");
+    }
+}
 
 /// Estimates of many pairs over many rotations, against the true cosine.
 #[derive(Default)]
@@ -282,8 +346,10 @@ fn true_cosine_lies_inside_the_stated_bound() {
 /// always too high.
 #[test]
 fn code_of_the_query_itself_is_inside_the_bound() {
+    const SEEDS: u64 = 40;
     for dim in [64, 768, 4096, 10_240] {
-        for seed in 0..20 {
+        let mut mean = [0.0f32; 2];
+        for seed in 0..SEEDS {
             let mut rng = SplitMix64::new(seed);
             let rotation = Rotation::new(dim, seed);
             let centroid = rotated(&rotation, &random_unit(dim, &mut rng));
@@ -293,18 +359,21 @@ fn code_of_the_query_itself_is_inside_the_bound() {
             let code = QueryCode::new(&dir, &centroid);
             let mut scanned = Vec::new();
             code.scan(&block, &mut scanned);
-            for est in [scanned[0], code.refine(&block, 0)] {
+            for (mean, est) in mean.iter_mut().zip([scanned[0], code.refine(&block, 0)]) {
                 // The code itself is exact here, so only the rounding of the query is left.
-                assert!((est.cos - 1.0).abs() <= 0.5 * est.err, "dim {dim}: {est:?}");
+                let error = (est.cos - 1.0) / est.err;
+                assert!(error.abs() <= 0.75, "dim {dim}: {est:?}");
+                *mean += error / SEEDS as f32;
             }
         }
+        assert!(mean.iter().all(|m| m.abs() < 0.1), "dim {dim}: {mean:?}");
     }
 }
 
 /// Where nothing is estimated, only rounding is left.
 #[test]
 fn equal_directions_leave_only_rounding() {
-    for dim in [1, 3, 64, 100, 768, 4096, 10_240] {
+    for dim in [1, 3, 64, 100, 768, 4096, 10_240, MAX_DIM] {
         let mut rng = SplitMix64::new(dim as u64);
         let rotation = Rotation::new(dim, 11);
         let (a, b) = (random_unit(dim, &mut rng), random_unit(dim, &mut rng));
@@ -325,7 +394,7 @@ fn equal_directions_leave_only_rounding() {
                     (f64::from(est.cos) - truth).abs() <= f64::from(est.err),
                     "{dim} {est:?}"
                 );
-                assert!(est.err < 1e-5, "{dim} {est:?}");
+                assert!(est.err < 4e-5, "{dim} {est:?}");
             }
         }
     }
@@ -407,14 +476,15 @@ fn preconditions_are_checked() {
     assert!(refuses(|| code.refine(&CodeBlock::new(64), 0)));
     assert!(refuses(|| CodeBlock::new(64).swap_remove(0)));
     for (x, y) in [(&zero, &a), (&a, &zero), (&zero, &zero)] {
-        assert!(refuses(|| exact(Op::Cosine, x, y)));
+        assert_eq!(exact(Op::Cosine, x, y), None);
+        assert_eq!(score(Op::Cosine, x, y), None);
     }
 }
 
 // Scores.
 
 /// The exact score in f64 of two vectors with these lengths and this cosine.
-fn score(op: Op, cos: f64, o: f64, q: f64) -> f64 {
+fn score_of(op: Op, cos: f64, o: f64, q: f64) -> f64 {
     match op {
         Op::Cosine => cos,
         Op::Dot => o * q * cos,
@@ -458,11 +528,11 @@ fn vs07_bounds_contain_the_exact_score() {
         if (f64::from(est.cos) - cos).abs() > f64::from(err) {
             return Ok(());
         }
-        let (fo, fq, slack) = (f64::from(o), f64::from(q), f64::from(ROUNDING));
+        let (fo, fq, slack) = (f64::from(o), f64::from(q), slack(MAX_DIM));
         for op in OPS {
             let (low, high) = bounds(op, est, o, q);
             let (flow, fhigh) = (f64::from(low), f64::from(high));
-            let want = score(op, cos, fo, fq);
+            let want = score_of(op, cos, fo, fq);
             if !(flow <= want && want <= fhigh) {
                 return Err(format!(
                     "{op:?} {o} {q} {cos} {est:?}: {want} not in {low}..{high}"
@@ -471,7 +541,7 @@ fn vs07_bounds_contain_the_exact_score() {
             // And nothing wider than the interval of the cosine explains.
             let ends = [-1.0, 1.0].map(|side| {
                 let end = f64::from(est.cos) + side * (f64::from(err) + 2.0 * slack);
-                score(op, end, fo, fq)
+                score_of(op, end, fo, fq)
             });
             let width = (ends[1] - ends[0]).abs();
             let rounding = match op {
@@ -517,7 +587,7 @@ fn vs07_bounds_contain_the_score_of_raw_vectors() {
             err: 1e-7,
         };
         for op in OPS {
-            let ((low, high), got) = (bounds(op, est, len_o, len_q), exact(op, &o, &q));
+            let ((low, high), got) = (bounds(op, est, len_o, len_q), exact(op, &o, &q).unwrap());
             if !(low <= got && got <= high) {
                 return Err(format!("{op:?}: {got} not in {low}..{high}"));
             }
@@ -563,6 +633,18 @@ fn vs07_exact_scores_at_every_magnitude() {
         }
         let (len_a, len_b) = (wide::norm_sq(&a).sqrt(), wide::norm_sq(&b).sqrt());
         let limit = f64::from(f32::MAX);
+        let mut scratch = vec![0.0; dim];
+        if let (Some(a_len), Some(b_len)) =
+            (direction(&a, &mut scratch), direction(&b, &mut scratch))
+        {
+            for op in OPS {
+                let (got, want) = (exact(op, &a, &b).unwrap(), score(op, &a, &b).unwrap());
+                let (low, high) = exact_bounds(op, got, dim, a_len, b_len);
+                if !(low <= want && want <= high) {
+                    return Err(format!("{op:?}: {want} not in {low}..{high} of {got}"));
+                }
+            }
+        }
         for (op, want, scale) in [
             (Op::Cosine, cosine(&a, &b), 1.0),
             (
@@ -572,21 +654,64 @@ fn vs07_exact_scores_at_every_magnitude() {
             ),
             (Op::L2, wide::l2_sq(&a, &b).sqrt().min(limit), len_a + len_b),
         ] {
-            let got = f64::from(exact(op, &a, &b));
+            let got = f64::from(exact(op, &a, &b).unwrap());
             if (got - want).abs() > 2e-5 * scale + 1e-41 {
                 return Err(format!("{op:?} {ma} {mb} dim {dim}: {got}, want {want}"));
             }
         }
-        if exact(Op::L2, &a, &a) != 0.0 || (exact(Op::Cosine, &a, &a) - 1.0).abs() > 1e-6 {
+        if exact(Op::L2, &a, &a) != Some(0.0) || exact(Op::Cosine, &a, &a).unwrap() < 1.0 - 1e-6 {
             return Err("a vector differs from itself".into());
         }
         Ok(())
     });
     // Zero vectors rank under dot and L2 (they live in a list that is always scanned).
-    assert_eq!(exact(Op::Dot, &[0.0, 0.0], &[3.0, 4.0]), 0.0);
-    assert_eq!(exact(Op::L2, &[0.0, 0.0], &[3.0, 4.0]), 5.0);
-    assert_eq!(exact(Op::Cosine, &[2.0, 0.0], &[0.0, 5.0]), 0.0);
-    assert_eq!(exact(Op::Cosine, &[2.0, 0.0], &[-3.0, 0.0]), -1.0);
+    assert_eq!(exact(Op::Dot, &[0.0, 0.0], &[3.0, 4.0]), Some(0.0));
+    assert_eq!(exact(Op::L2, &[0.0, 0.0], &[3.0, 4.0]), Some(5.0));
+    assert_eq!(exact(Op::Cosine, &[2.0, 0.0], &[0.0, 5.0]), Some(0.0));
+    assert_eq!(exact(Op::Cosine, &[2.0, 0.0], &[-3.0, 0.0]), Some(-1.0));
+}
+
+/// Vectors that lose as many terms to rounding as the kernels can: the intervals of L1 still hold
+/// the final score, up to the largest dimension, and are no wider than the stated slack.
+#[test]
+fn vs07_exact_bounds_contain_the_final_score_at_the_worst_rounding() {
+    for dim in [64, 1000, 1024, 1025, 4096, 10_240, MAX_DIM] {
+        for (lanes, e_a, e_b) in [
+            (1, 6, 24),
+            (16, 12, 12),
+            (64, 12, 25),
+            (64, 13, 13),
+            (64, 8, 20),
+        ] {
+            let fill = |e: i32| -> Vec<f32> {
+                let small = 2f32.powi(-e);
+                (0..dim)
+                    .map(|i| if i % 1024 < lanes { 1.0 } else { small })
+                    .collect()
+            };
+            let (a, b) = (fill(e_a), fill(e_b));
+            let len = |v: &[f32]| wide::norm_sq(v).sqrt() as f32;
+            for op in OPS {
+                let (got, want) = (exact(op, &a, &b).unwrap(), score(op, &a, &b).unwrap());
+                let (low, high) = exact_bounds(op, got, dim, len(&a), len(&b));
+                assert!(
+                    low <= want && want <= high,
+                    "{op:?} {dim}: {want} in {low}..{high}"
+                );
+                let unit = match op {
+                    Op::Cosine => 1.0,
+                    Op::Dot => len(&a) * len(&b),
+                    Op::L2 => got,
+                };
+                let widest = 2.1 * slack(dim) * f64::from(unit) + 1e-40;
+                assert!(
+                    f64::from(high - low) <= widest,
+                    "{op:?} {dim}: {low}..{high}"
+                );
+                assert!(slack(dim) < 4e-6);
+            }
+        }
+    }
 }
 
 #[test]
@@ -662,6 +787,54 @@ fn measure_kernels() {
     }
 }
 
+/// The worst fixed pair over rotations: pairs on few axes are what a fast rotation hides worst.
+#[test]
+#[ignore = "measurement"]
+fn measure_fixed_pairs() {
+    const SEEDS: u64 = 1000;
+    for dim in [64, 128, 192, 256, 320, 576, 1024, 1088, 4032] {
+        let (mut worst, mut bias) = ([0.0f64; 2], [0.0f64; 2]);
+        for case in 0..if dim < 600 { 40 } else { 8 } {
+            let mut rng = SplitMix64::new(case);
+            // Few axes whose numbers may cancel as bit patterns.
+            let axes: Vec<usize> = match case % 4 {
+                0 => vec![0, 1, 2],
+                1 => vec![0, 1, 2, 3],
+                2 => vec![0, 1, dim / 2, dim / 2 + 1],
+                _ => (0..4).map(|_| rng.next_u64() as usize % dim).collect(),
+            };
+            let mut draw = || {
+                let mut v = vec![0.0f32; dim];
+                axes.iter().for_each(|&i| v[i] = gaussian(&mut rng) as f32);
+                v[axes[rng.next_u64() as usize % axes.len()]] *= 100.0;
+                unit(&v)
+            };
+            let (c, q, e) = (draw(), draw(), draw());
+            let truth = cosine(&e, &q);
+            let (mut miss, mut sum) = ([0.0; 2], [0.0; 2]);
+            for seed in 0..SEEDS {
+                let rotation = Rotation::new(dim, seed * 7919 + 1);
+                let centroid = rotated(&rotation, &c);
+                let mut block = CodeBlock::new(rotation.padded());
+                block.push(&rotated(&rotation, &e), &centroid, 1.0);
+                let code = QueryCode::new(&rotated(&rotation, &q), &centroid);
+                let mut scanned = Vec::new();
+                code.scan(&block, &mut scanned);
+                for (stage, est) in [scanned[0], code.refine(&block, 0)].into_iter().enumerate() {
+                    let error = f64::from(est.cos) - truth;
+                    miss[stage] += f64::from(u8::from(error.abs() > f64::from(est.err)));
+                    sum[stage] += error / f64::from(est.err) * f64::from(EPSILON);
+                }
+            }
+            for stage in 0..2 {
+                worst[stage] = worst[stage].max(miss[stage] / SEEDS as f64);
+                bias[stage] = bias[stage].max((sum[stage] / SEEDS as f64).abs());
+            }
+        }
+        println!("{dim}: worst misses {worst:.3?}, largest mean {bias:.3?}");
+    }
+}
+
 #[test]
 #[ignore = "measurement"]
 fn measure_recall() {
@@ -731,7 +904,7 @@ fn measure_recall() {
         let all = rows_of.flat_map(|(p, (_, _, rows))| {
             rows.iter()
                 .enumerate()
-                .map(move |(i, row)| (exact(Op::Cosine, row, query), p, i))
+                .map(move |(i, row)| (score(Op::Cosine, row, query).unwrap(), p, i))
         });
         let truth = top(all.collect());
         let hits = |list: &[(f32, usize, usize)]| {
@@ -772,7 +945,7 @@ fn measure_recall() {
         let threshold = floor(&kept);
         let kept = kept.iter().filter(|e| e.0.cos + e.0.err >= threshold);
         let rerank: Vec<_> = kept
-            .map(|&(_, p, i)| (exact(Op::Cosine, &parts[p].2[i], query), p, i))
+            .map(|&(_, p, i)| (score(Op::Cosine, &parts[p].2[i], query).unwrap(), p, i))
             .collect();
         reranked += rerank.len();
         hits_staged += hits(&top(rerank));

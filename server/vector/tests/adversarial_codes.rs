@@ -341,7 +341,7 @@ fn pipeline(dim: usize, seed: u64, centroid_src: &[f32], stored: &[f32], query: 
         }
     }
     for op in [Op::Dot, Op::L2] {
-        let s = exact(op, stored, query);
+        let s = exact(op, stored, query).unwrap();
         assert!(s.is_finite(), "{op:?} {s}");
     }
 }

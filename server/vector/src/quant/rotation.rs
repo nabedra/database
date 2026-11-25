@@ -2,14 +2,19 @@ use nabedra_simd::Kernels;
 
 use super::{CODE_STEP, MAX_DIM};
 
-const ROUNDS: usize = 4;
+/// Enough that a fixed pair looks random over seeds. The transform of one value is a pattern, and
+/// the patterns of two values are related until several more rounds scramble them. With 4 rounds
+/// and blocks of 64 the 5-bit estimate of pairs that lie on a few axes missed its bound three times
+/// as often as stated.
+pub(super) const ROUNDS: usize = 8;
 
 /// A seeded random rotation of `dim` values into [`Rotation::padded`] ones.
 ///
 /// Each round flips signs, applies a Walsh-Hadamard transform to every block of the largest power
 /// of two that divides the padded length, and, when there are several blocks, deals the values of
-/// each block over all of them. Every step is orthogonal, so lengths and inner products keep within
-/// a relative 2e-6 of rounding. Only additions, subtractions and products in a fixed order, so a
+/// each block over all of them. Every step is orthogonal, so only rounding changes lengths and
+/// inner products: by at most `ROUNDS * (log2(block) + 2) * 2^-24` per vector, relative to its
+/// length. Only additions, subtractions and products in a fixed order, so a
 /// seed gives the same bits on every CPU. Stored codes depend on that: never change the result for
 /// a seed.
 pub struct Rotation {
@@ -26,7 +31,7 @@ impl Rotation {
     pub fn new(dim: usize, seed: u64) -> Self {
         assert!((1..=MAX_DIM).contains(&dim), "dimension {dim}");
         let padded = dim.next_multiple_of(CODE_STEP);
-        let block = 1 << padded.trailing_zeros();
+        let block = transform_size(padded);
         let scale = (block as f32).sqrt().recip();
         let mut state = seed;
         let mut signs = || {
@@ -80,6 +85,11 @@ impl Rotation {
             }
         }
     }
+}
+
+/// Values per transform of a rotation with this padded length.
+pub(super) fn transform_size(padded: usize) -> usize {
+    1 << padded.trailing_zeros()
 }
 
 /// SplitMix64 (Steele, Lea and Flood, 2014).
