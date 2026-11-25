@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
 use std::io;
+use std::sync::Mutex;
 
+use bytes::Bytes;
 use nabedra_rt::sim;
 
 use super::clock_bound::SimClockBound;
@@ -20,11 +23,19 @@ use super::super::{
     controller::StagedPromotion,
     protocol::{Lease, Topology, WorkerId},
 };
+use crate::cache::store::{Effect, Effects};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::cache::cluster) struct Knobs {
     pub lease_ignores_error_bound: bool,
-    pub replica_keeps_deleted_keys: bool,
+    // The replica discards every DEL effect. It does not order a SET after a
+    // DEL, so it stands in for P2 only in its result.
+    pub replica_drops_deletes: bool,
+    // A fault, not a defect: the replica receives the SET of an expired key a
+    // second time, right after the DEL that the primary synthesized for it.
+    pub redeliver_set_after_expiry: bool,
+    // P2: with the redelivery, the replica applies the SET after the DEL.
+    pub replica_accepts_stale_delta: bool,
     pub owner_change_keeps_epoch: bool,
     pub cold_reset_ignores_live_lease: bool,
     pub staged_ignores_fence: bool,
@@ -59,6 +70,14 @@ pub(in crate::cache::cluster) enum Observed {
         epoch: u64,
         sequence: u64,
         digest: [u8; 20],
+    },
+    Redelivered {
+        worker: WorkerId,
+        slot: u16,
+        epoch: u64,
+        sequence: u64,
+        current: u64,
+        applied: bool,
     },
     Promoted {
         slot: u16,
@@ -95,7 +114,12 @@ pub(super) struct Hooks {
     pub watched: std::collections::BTreeSet<u16>,
     pub observe: Box<Observe>,
     pub committed: Box<Commit>,
+    pub expiry_readings: ExpiryReadings,
 }
+
+/// The upper clock reading at each publication of a watched slot, by slot,
+/// epoch and sequence. Kept only for redelivery.
+pub(super) type ExpiryReadings = Mutex<BTreeMap<(u16, u64, u64), u64>>;
 
 pub(in crate::cache::cluster) fn knobs() -> Knobs {
     sim::world()
@@ -111,6 +135,23 @@ pub(in crate::cache::cluster) fn watched(slot: u16) -> bool {
 
 pub(in crate::cache::cluster) fn observe(event: Observed) {
     if let (Some(world), Some(node)) = (sim::world(), sim::current_node()) {
+        if let Observed::Published {
+            slot,
+            epoch,
+            sequence,
+            ..
+        } = event
+            && knobs().redeliver_set_after_expiry
+            && let Some(Ok((_, upper_ns))) = clock_bound()
+        {
+            world.with_ext::<Hooks, _>(|hooks| {
+                hooks
+                    .expiry_readings
+                    .lock()
+                    .unwrap()
+                    .insert((slot, epoch, sequence), upper_ns.div_ceil(1_000_000));
+            });
+        }
         world.with_ext::<Hooks, _>(|hooks| (hooks.observe)(node, event));
     }
 }
@@ -135,4 +176,75 @@ pub(in crate::cache::cluster) fn watched_slots() -> Vec<u16> {
             world.with_ext::<Hooks, _>(|hooks| hooks.watched.iter().copied().collect())
         })
         .unwrap_or_default()
+}
+
+/// One replicated delta, kept for a second delivery.
+pub(in crate::cache::cluster) struct Stale {
+    pub epoch: u64,
+    pub sequence: u64,
+    pub effects: Effects,
+    pub digest: [u8; 32],
+    // The key's latest deadline, which is not always this SET's.
+    deadline_ms: Option<u64>,
+}
+
+/// The first SET of each live key of a watched slot, as the replica got it.
+#[derive(Default)]
+pub(in crate::cache::cluster) struct Redelivery(BTreeMap<(u16, Bytes), Stale>);
+
+impl Redelivery {
+    pub fn forget(&mut self, slot: u16) {
+        self.0.retain(|(id, _), _| *id != slot);
+    }
+
+    /// Records an applied delta. Returns the SETs of the expired keys whose
+    /// DEL the primary synthesized in it, to deliver again now. An Effect does
+    /// not say why its key was deleted. But a primary whose upper reading is
+    /// at the deadline treats the key as absent, so any DEL it emits then is
+    /// a synthesized one.
+    pub fn applied(
+        &mut self,
+        slot: u16,
+        epoch: u64,
+        sequence: u64,
+        effects: &Effects,
+        digest: [u8; 32],
+    ) -> Vec<Stale> {
+        let mut again = Vec::new();
+        if !watched(slot) || !knobs().redeliver_set_after_expiry {
+            return again;
+        }
+        for effect in effects {
+            let key = (slot, effect.key().clone());
+            match effect {
+                Effect::Upsert { deadline_ms, .. } => {
+                    self.0
+                        .entry(key)
+                        .or_insert_with(|| Stale {
+                            epoch,
+                            sequence,
+                            effects: effects.clone(),
+                            digest,
+                            deadline_ms: None,
+                        })
+                        .deadline_ms = *deadline_ms;
+                }
+                Effect::Delete(_) => {
+                    let Some(stale) = self.0.remove(&key) else {
+                        continue;
+                    };
+                    let reading = sim::world().and_then(|world| {
+                        world.with_ext::<Hooks, _>(|hooks| {
+                            let readings = hooks.expiry_readings.lock().unwrap();
+                            readings.get(&(slot, epoch, sequence)).copied()
+                        })?
+                    });
+                    if stale.deadline_ms.is_some() && reading >= stale.deadline_ms {
+                        again.push(stale);
+                    }
+                }
+            }
+        }
+        again
+    }
 }
