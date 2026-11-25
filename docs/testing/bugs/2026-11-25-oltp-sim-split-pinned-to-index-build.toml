@@ -9,7 +9,7 @@ found_date = "2026-11-25"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
 seed = 1
 why_not_caught = "No runner requests a split while an index of the same table is building."
-invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=topology NABEDRA_SIM_PROFILE=none NABEDRA_SIM_TOPOLOGY=no-move,split-under-load, seeds 1, 2, 4, 8, 10 and 12: a requested split publishes within 60 s of the heal. Read in the code and not instrumented: the planner checks the index phase at the snapshot that the split ID pinned when it opened."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=topology NABEDRA_SIM_PROFILE=none NABEDRA_SIM_TOPOLOGY=no-move,split-under-load, seeds 1, 2, 4, 8, 10 and 12: a requested split publishes within 60 s of the heal. In each the build was ready before that. Read in the code and not instrumented: the planner checks the index phase at the snapshot that the split ID pinned when it opened."
 fix_commits = []
 revert_patch_ok = false
 status = "open"

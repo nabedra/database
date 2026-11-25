@@ -1354,7 +1354,7 @@ async fn drop_table(t: Topo, at: Duration, gateway: usize) -> Option<String> {
     let dropped = t.next();
     t.log(|log| log.dropped = Some(dropped));
     t.note("dropped", json!({"table": t.victim.table}));
-    for gateway in 0..GATEWAYS.len() {
+    for (gateway, through) in GATEWAYS.into_iter().enumerate() {
         let id = fresh_id(node).await;
         let invoked = t.next();
         let payload = json!({"name": "sim_victim"});
@@ -1364,7 +1364,7 @@ async fn drop_table(t: Topo, at: Duration, gateway: usize) -> Option<String> {
         let success = matches!(answer, Completion::Ok(_));
         t.log(|log| {
             log.calls.push(TableCall {
-                what: format!("table.describe through n{}", GATEWAYS[gateway]),
+                what: format!("table.describe through n{through}"),
                 invoked,
                 success,
             });
