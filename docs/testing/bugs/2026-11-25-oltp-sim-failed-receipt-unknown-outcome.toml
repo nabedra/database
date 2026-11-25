@@ -9,7 +9,7 @@ found_date = "2026-11-25"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
 seed = 6
 why_not_caught = "The queued workload read any failed receipt as settled until AcceptedSettlesInRun judged it. Other runners not checked."
-invariant_added = "Fault model, local and unattested, NABEDRA_SIM_WORKLOAD=queued, profile mixed,process,network,pause. Seed 6 (625d1236edd4d068 at 6b20e211, repeated by an independent reviewer): four accepted requests (81cc1997, 14233eaf, 17ec56e2, 43697d02) read failed, 'no registered group leader completed the strong service call', outcome unknown, through both gateways. Mutations also in seeds 2, 7, 11, 12 and 16 there, where no rule reported it. AcceptedSettlesInRun reports it at 1dfb7406 in seeds 2 (a78401b20ddb8b1a) and 7 (b3f460ea7bce4ebc), and at 5e704eee in seed 3 (cd6a5ec0d3678e73) and not in seeds 1, 2, 4, 5, 6, 7 and 15, whose schedules differ. Suspected product fault. The product path that makes the record terminal was not traced."
+invariant_added = "Fault model, unattested, NABEDRA_SIM_WORKLOAD=queued, profile mixed,process,network,pause. Seed 6 (625d1236edd4d068 at 6b20e211, repeated by an independent reviewer): four accepted requests (81cc1997, 14233eaf, 17ec56e2, 43697d02) read failed, 'no registered group leader completed the strong service call', outcome unknown, through both gateways. Mutations also in seeds 2, 7, 11, 12 and 16 there, where no rule reported it. AcceptedSettlesInRun reports it at 30ed3e75 in seeds 2 (d8307861f3dd1fea), 3, 4, 5, 10, 11 and 12 of 1 to 16, and not in seed 6, whose schedule differs there. Suspected product fault. The product path that makes the record terminal was not traced."
 fix_commits = []
 revert_patch_ok = false
 status = "open"

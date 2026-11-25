@@ -9,7 +9,7 @@ found_date = "2026-11-25"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
 seed = 1
 why_not_caught = "Not checked whether the scoped acceptance runner reads after a split."
-invariant_added = "Fault model, local and unattested, NABEDRA_SIM_WORKLOAD=queued NABEDRA_SIM_QUEUED_MODE=scoped-off NABEDRA_SIM_PROFILE=none, seed 1 (c433ffa09c2296ec at 6b20e211, where an independent reviewer confirmed the cause; 1056c825f47a29f7 at 5e704eee): 26 final reads refused with 'RPC decode reservation is too small'. ParticipantEndpoint::timestamps decodes a 3,091 B page that needs 74,278 B against 65,536 B. Not every scoped get: the group is cached after one success, and gets succeeded in all 10 scoped sweep seeds at 6b20e211. The scoped queue is off by default."
+invariant_added = "Fault model, unattested, NABEDRA_SIM_WORKLOAD=queued NABEDRA_SIM_QUEUED_MODE=scoped-off NABEDRA_SIM_PROFILE=none, seed 1 (c433ffa09c2296ec at 6b20e211, where an independent reviewer confirmed the cause; 350615067ee6df36 at 30ed3e75): 26 final reads refused with 'RPC decode reservation is too small'. ParticipantEndpoint::timestamps decodes a 3,091 B page that needs 74,278 B against 65,536 B. Not every scoped get: the group is cached after one success, and gets succeeded in all 10 scoped sweep seeds at 6b20e211. The scoped queue is off by default."
 fix_commits = []
 revert_patch_ok = false
 status = "open"

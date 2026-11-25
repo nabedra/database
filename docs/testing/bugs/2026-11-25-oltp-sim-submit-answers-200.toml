@@ -9,7 +9,7 @@ found_date = "2026-11-25"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
 seed = 2
 why_not_caught = "Not checked which runner, if any, sends POST /v1/requests for an ID that /v1/operations already committed directly."
-invariant_added = "Fault model, local and unattested, NABEDRA_SIM_WORKLOAD=queued, profile mixed,process,network,pause: SubmitAnswer in seed 2 (f07deb72cf06fd35 at 6b20e211, repeated by an independent reviewer; 32e5305d1468e205 at 5e704eee). plans/resource-aware-scheduling.md gives 202. plans/oltp-direct-path.md says the settle step returns Replayed and gives no HTTP form. Undecided which is right."
+invariant_added = "Fault model, unattested, NABEDRA_SIM_WORKLOAD=queued, profile mixed,process,network,pause: SubmitAnswer in seed 2 (f07deb72cf06fd35 at 6b20e211, repeated by an independent reviewer; d8307861f3dd1fea at 30ed3e75, where seeds 1, 2, 8, 11 and 15 of 1 to 16 report it). plans/resource-aware-scheduling.md gives 202. plans/oltp-direct-path.md says the settle step returns Replayed and gives no HTTP form. Undecided which is right."
 fix_commits = []
 revert_patch_ok = false
 status = "open"
