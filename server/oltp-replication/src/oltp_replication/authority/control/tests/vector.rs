@@ -327,3 +327,14 @@ async fn adv_vec_g14_vector_adverts_apply_identically_on_a_cap1_control_replica(
         .expect("the last advert enables");
     assert_eq!(enabled.activated_at.index, fixture.next - 1);
 }
+
+/// Pin the feature advert name and its durable Control key across upgrades.
+#[test]
+fn adv_vec_g14_the_feature_name_and_its_storage_key_are_the_contracts() {
+    use crate::oltp_replication::authority::control::CLUSTER_FEATURES;
+
+    assert_eq!(VECTOR_FEATURE, "data.vector.v1");
+    let vector = &CLUSTER_FEATURES[3];
+    assert_eq!(vector.name, "data.vector.v1");
+    assert_eq!(vector.enabled_key, b"ct/feature/data.vector.v1");
+}
