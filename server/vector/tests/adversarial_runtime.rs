@@ -368,6 +368,10 @@ fn nr07_state_stays_on_its_core_and_messages_run_on_the_receiver() {
         (Rc::new(Cell::new(0)), id, c)
     })
     .unwrap();
+    // `start` returns once every thread is up; a state is made right after, and a call waits for it.
+    for c in 0..4 {
+        cores.call(c, Class::Apply, 0, |_, _| ()).unwrap();
+    }
     let ids: Vec<ThreadId> = lock(&made).values().copied().collect();
     assert_eq!(ids.len(), 4);
     assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), 4, "two cores share a thread");
@@ -733,24 +737,23 @@ const DIM: usize = 6;
 
 struct World {
     ix: Index<ExactCodec>,
-    reads: Option<Arc<Counting>>,
     _files: Option<Files>,
 }
 
 fn world(kind: &str, dim: usize, rows: &[(u64, Option<Vec<f32>>)]) -> World {
-    let (vectors, reads, f): (Option<Arc<dyn Vectors>>, Option<Arc<Counting>>, Option<Files>) = match kind {
-        "rows" => (None, None, None),
-        "ram" => (Some(Arc::new(RamVectors::new())), None, None),
+    let (vectors, f): (Option<Arc<dyn Vectors>>, Option<Files>) = match kind {
+        "rows" => (None, None),
+        "ram" => (Some(Arc::new(RamVectors::new())), None),
         other => {
             let b = if other == "uring" { Backend::Uring } else { Backend::Pread };
             let f = files("world", b, 3);
             let c = Counting::new(Arc::new(NvmeVectors::on(f.disks.clone(), dim).unwrap()));
-            (Some(c.clone()), Some(c), Some(f))
+            (Some(c as Arc<dyn Vectors>), Some(f))
         }
     };
     let mut ix = serving(ix_config(dim, vectors));
     feed(&mut ix, rows, 0).unwrap();
-    World { ix, reads, _files: f }
+    World { ix, _files: f }
 }
 
 fn rows_of(g: &mut Gen, dim: usize, n: u64) -> Vec<(u64, Option<Vec<f32>>)> {
