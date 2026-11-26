@@ -3,6 +3,7 @@
 
 pub mod impact;
 pub mod index;
+pub mod multi;
 pub mod quant;
 pub mod text;
 pub mod runtime;
