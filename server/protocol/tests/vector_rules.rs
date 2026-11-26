@@ -494,7 +494,7 @@ fn rule_eight_search_columns_count_every_kind_and_only_those() {
         json!({"table_id": ID, "name": "x", "type": {"type": "vector", "dim": 2}}).to_string();
     let result =
         parse("table.add_column", &add).and_then(|r| r.operation.validate_for_table(&nine));
-    assert_eq!(code(result), ErrorCode::ValidationError);
+    assert_eq!(code(result), ErrorCode::LimitExceeded);
     let seven = descriptor(
         json!({"id": ID, "name": "t", "key": "id", "format": "parquet",
         "schema": serde_json::from_str::<Value>(&schema_with(7, 0, 0, 0)).unwrap()}),
