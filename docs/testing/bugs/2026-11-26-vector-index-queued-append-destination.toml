@@ -1,0 +1,14 @@
+id = "VECTOR-index-queued-append-destination"
+title = "Maintenance retires the first append's destination before its core consumes it"
+class = "resource-release-order"
+module = "vector"
+guarantees = ["VEC-G05", "VEC-G11"]
+scenarios = ["VS07", "VS17"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/index/tests/adversary.rs::adv07_queued_appends_keep_their_empty_destinations"
+seed = "unknown"
+why_not_caught = "Feed tests either processed appends immediately or did not run maintenance between the first pump and step."
+invariant_added = "A queued append keeps its destination alive until the core appends it, discards it, or sends it back for reassignment."
+fix_commits = ["038e7a14cb269d2e8214fcd97db09f31c84d0a1a"]
+revert_patch_ok = true
