@@ -225,7 +225,8 @@ ReleaseDelete(g) ==
     /\ removed[g]
     /\ g \in qmem
     /\ relPh[g] = "none"
-    /\ NextSeq <= MaxSeq
+    \* no sequence bound: MaxSeq bounds client writes; a release writes at
+    \* most once per group and open
     /\ jrn' = Append(jrn, E(NextSeq, g, "del"))
     /\ mem' = mem \cup {E(NextSeq, g, "del")}
     /\ relPh' = [relPh EXCEPT ![g] = "deleted"]
@@ -393,8 +394,8 @@ LiveSpec == Spec /\ Fairness
 (* Properties.                                                             *)
 
 TypeOK ==
-    /\ Len(jrn) <= MaxSeq
-    /\ fl \in 0..MaxSeq
+    /\ Len(jrn) <= MaxSeq + (MaxCrashes + 1) * Cardinality(Groups)
+    /\ fl \in 0..(MaxSeq + (MaxCrashes + 1) * Cardinality(Groups))
     /\ qdur \subseteq Groups /\ qmem \subseteq Groups /\ pend \subseteq Groups
     /\ status \in {"open", "down", "refused"}
     /\ running \in [Groups -> BOOLEAN]
