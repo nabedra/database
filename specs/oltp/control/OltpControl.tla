@@ -143,9 +143,12 @@ DropFence ==
 LoseAny == \E w \in Worker : LoseWorker(w)
 BeginFenceAny == \E w \in Worker : BeginOwnerFence(w)
 
-\* Nothing left to do: the owner is live and no step is in flight.
+\* Nothing left to do: the owner is live and no step is in flight. Or the
+\* run waits for an owner that nobody can establish: the liveness
+\* properties decide whether such a wait ends.
 Terminal ==
-    /\ up[owner] /\ fencing = None /\ move = None /\ remove = None
+    /\ \/ up[owner] /\ fencing = None /\ move = None /\ remove = None
+       \/ ~up[owner]
     /\ UNCHANGED vars
 
 Next ==
