@@ -343,9 +343,12 @@ fn row_of(id: i64) -> Value {
     json!({"id": id, "value": id, "tag": "t", "score": 0.5, "v": null, "s": null, "m": null, "tags": []})
 }
 
-/// VEC-G09: a group of 10,000 rows at the leader.
+/// VEC-G09: the largest group the gateway sends a leader (1,024 rows) is answered per row,
+/// and a call of 10,001 rows is refused whole. The gateway's 10,000 rows go through
+/// `vs17_a_call_at_the_limits_is_sent_in_bounded_chunks`: a debug build cannot commit
+/// 10,000 rows in one leader call inside the leader's own 30 s cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn adv_vec_g11_a_group_of_ten_thousand_rows_and_one_more() {
+async fn adv_vec_g11_a_chunk_of_1024_rows_and_a_call_of_one_too_many() {
     let cluster = Cluster::new(Options {
         batch: true,
         ..Options::default()
@@ -356,16 +359,16 @@ async fn adv_vec_g11_a_group_of_ten_thousand_rows_and_one_more() {
     let body = cluster.body(
         call,
         "table.upsert_many",
-        json!({"rows": rows(0..10_000, 0)}),
+        json!({"rows": rows(0..1_024, 0)}),
     );
-    let request = cluster.request_at(leader, &body, call, 1, Duration::from_secs(120));
+    let request = cluster.request_at(leader, &body, call, 1, Duration::from_secs(25));
     let answers = replies(
         cluster.voters[leader]
             .executor
             .execute(&cluster.voters[leader].handle, request)
             .await,
     );
-    assert_eq!(answers.len(), 10_000);
+    assert_eq!(answers.len(), 1_024);
     assert!(
         answers.iter().all(|a| *a == done("null")),
         "{:?}",

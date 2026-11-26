@@ -1138,3 +1138,153 @@ fn rule_every_prefix_of_a_valid_request_is_refused_cleanly() {
         }
     }
 }
+
+// ---- the gate and the reply ----
+
+/// VEC-G14: a table that needs the feature data.vector.v1 is not created while the
+/// feature is off, whichever way it needs it; a plain one is. Operations this
+/// build decodes but does not serve are refused whether the feature is on or
+/// not, and a group of rows is never queued whole.
+#[test]
+fn rule_the_gate_decides_create_and_the_unserved_operations() {
+    let _g = lock();
+    let creates = [
+        create(r#"{"id":"utf8","v":{"type":"vector","dim":2}}"#, ""),
+        create(r#"{"id":"utf8","s":{"type":"vector","sparse":true}}"#, ""),
+        create(
+            r#"{"id":"utf8","m":{"type":"list","item":{"type":"vector","dim":2}}}"#,
+            "",
+        ),
+        create(r#"{"id":"utf8","t":{"type":"list","item":"utf8"}}"#, ""),
+        create(
+            r#"{"id":"utf8","b":"utf8"}"#,
+            r#","full_text":{"b":"english"}"#,
+        ),
+        create(r#"{"id":"utf8","b":"utf8"}"#, r#","partition_by":"b""#),
+    ];
+    for payload in &creates {
+        let operation = parse("table.create", payload).unwrap().operation;
+        for check in [Operation::check_served, Operation::check_queued] {
+            let off = check(&operation, false).expect_err(payload);
+            assert_eq!(
+                (off.code, off.outcome),
+                (ErrorCode::UnsupportedOperation, Outcome::NotApplied)
+            );
+            assert!(off.message.contains("data.vector.v1"), "{off:?}");
+            assert!(check(&operation, true).is_ok(), "{payload}");
+        }
+    }
+    let plain = parse("table.create", &create(r#"{"id":"utf8","n":"int64"}"#, ""))
+        .unwrap()
+        .operation;
+    for check in [Operation::check_served, Operation::check_queued] {
+        assert!(check(&plain, false).is_ok() && check(&plain, true).is_ok());
+    }
+    let t = format!(r#""table_id":"{ID}""#);
+    let rank = format!(
+        r#"{{{t},"query":{{"select":null,"filter":null,"limit":1}},"rank":{{"rankings":[{{"column":"b","op":"match","value":"x"}}]}}}}"#
+    );
+    let many = format!(
+        r#"{{{t},"query":{{"select":null,"filter":null,"limit":1}},"rank":{{"rankings":[]}},"batch":[{{"column":"b","op":"match","value":"x"}}]}}"#
+    );
+    let unserved = [
+        (
+            "table.add_column",
+            format!(r#"{{{t},"name":"w","type":{{"type":"vector","dim":2}}}}"#),
+        ),
+        ("table.drop_column", format!(r#"{{{t},"name":"w"}}"#)),
+        (
+            "table.add_full_text",
+            format!(r#"{{{t},"column":"b","language":"english"}}"#),
+        ),
+        ("table.drop_full_text", format!(r#"{{{t},"column":"b"}}"#)),
+        ("table.search_status", format!("{{{t}}}")),
+        ("query.rank", rank),
+        ("query.rank_many", many),
+    ];
+    for (op, payload) in unserved {
+        let operation = parse(op, &payload).unwrap().operation;
+        for vector in [false, true] {
+            for check in [Operation::check_served, Operation::check_queued] {
+                let error = check(&operation, vector).expect_err(op);
+                assert_eq!(
+                    (error.code, error.outcome),
+                    (ErrorCode::UnsupportedOperation, Outcome::NotApplied),
+                    "{op}"
+                );
+            }
+        }
+    }
+    let upsert = parse(
+        "table.upsert_many",
+        &json!({"table_id": ID, "rows": []}).to_string(),
+    )
+    .unwrap()
+    .operation;
+    let delete = parse(
+        "table.delete_many",
+        &json!({"table_id": ID, "keys": []}).to_string(),
+    )
+    .unwrap()
+    .operation;
+    for operation in [&upsert, &delete] {
+        assert!(
+            operation.check_served(true).is_ok(),
+            "the direct path serves it"
+        );
+        for vector in [false, true] {
+            let error = operation.check_queued(vector).expect_err("queued whole");
+            assert_eq!(error.code, ErrorCode::UnsupportedOperation);
+        }
+    }
+}
+
+/// The reply of a group: an outcome names its class and its error agrees.
+#[test]
+fn rule_row_outcomes_agree_with_their_errors() {
+    let _g = lock();
+    let error = |outcome: Outcome| {
+        serde_json::to_value(ProtocolError::new(ErrorCode::ValidationError, "m", outcome)).unwrap()
+    };
+    let applied: RowOutcome = serde_json::from_value(json!({"o": "applied"})).unwrap();
+    assert_eq!(applied, RowOutcome::Applied);
+    for (o, outcome, ok) in [
+        ("not_applied", Outcome::NotApplied, true),
+        ("not_applied", Outcome::Unknown, false),
+        ("outcome_unknown", Outcome::Unknown, true),
+        ("outcome_unknown", Outcome::NotApplied, false),
+    ] {
+        let parsed = serde_json::from_value::<RowOutcome>(json!({"o": o, "error": error(outcome)}));
+        assert_eq!(parsed.is_ok(), ok, "{o} with {outcome:?}");
+    }
+    for bad in [
+        json!({"o": "applied", "error": error(Outcome::NotApplied)}),
+        json!({"o": "not_applied"}),
+        json!({"o": "outcome_unknown"}),
+        json!({"o": "done"}),
+        json!({}),
+    ] {
+        assert!(
+            serde_json::from_value::<RowOutcome>(bad.clone()).is_err(),
+            "{bad}"
+        );
+    }
+    // The class follows the error on every conversion and on the wire.
+    for outcome in [Outcome::NotApplied, Outcome::Unknown] {
+        let converted =
+            RowOutcome::from(ProtocolError::new(ErrorCode::OutcomeUnknown, "m", outcome));
+        let wire = serde_json::to_value(&converted).unwrap();
+        assert_eq!(
+            wire["o"],
+            if outcome == Outcome::Unknown {
+                "outcome_unknown"
+            } else {
+                "not_applied"
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<RowOutcome>(wire).unwrap(),
+            converted
+        );
+    }
+}
