@@ -229,9 +229,15 @@ add("search rows of 1 MiB fill requests", "lean",
                                                       "emb": None}]}]},
     [applied(7), applied(2)], type="ok", items=[7, 2])
 
+# Float64 counts as one byte in the row limit, while the request keeps its wire token.
+for extra in (0, 1):
+    row = docs_row(f=F(1.2345678901234567), tags=[{"$text": ["x", MiB - 125 + extra]}])
+    add(f"search row with float64 at 1 MiB plus {extra}", "docs", upsert([row]), [applied()],
+        **({"type": "LimitExceededError", "requests": 0} if extra else {"type": "ok", "items": [1]}))
+
 # Base64 padding does not count against the 1 MiB row limit.
 def padded_row(pad):
-    wire = {"id": "a", "n": 1, "f": 1.0, "b": True, "vec": {"f32": base64.b64encode(struct.pack("<2f", 1, 2)).decode()},
+    wire = {"id": "a", "n": 1, "f": 0, "b": True, "vec": {"f32": base64.b64encode(struct.pack("<2f", 1, 2)).decode()},
             "sp": {"sparse": {"i": base64.b64encode(struct.pack("<I", 3)).decode(),
                               "f32": base64.b64encode(struct.pack("<f", 1)).decode()}},
             "mu": {"f32s": base64.b64encode(struct.pack("<2f", 1, 2)).decode(), "n": 1}, "tags": [pad]}
@@ -414,9 +420,17 @@ add("delete_many of a key twice", "docs", delete(["a", "b", "a"]), [applied(3)],
     requests=0)
 add("upsert_many of a key twice", "docs", upsert([docs_row(), docs_row()]), [applied(2)],
     type="ValidationError", requests=0)
-add("the same key in two chunks", "docs",
-    {"method": "upsert_many", "args": [{"$concat": [{"$seq": [10000, seq_row]}, [docs_row(id="k0")]]}]},
-    [applied(10000), applied(1)], type="ok", items=[10000, 1], result_count=10001)
+add("a duplicate where an upsert chunk would split", "docs",
+    upsert({"$concat": [{"$seq": [10000, seq_row]}, [docs_row(id="k0")]]}),
+    type="ValidationError", requests=0)
+add("a duplicate after an upsert chunk was applied", "docs",
+    upsert({"$concat": [{"$seq": [10001, seq_row]}, [docs_row(id="k0")]]}),
+    [applied(10000)], type="BatchError", applied=10000, outcomes=[], outcome="partial", requests=1)
+add("a duplicate where a delete chunk would split", "docs",
+    delete({"$concat": [{"$seq": [10000, "k{i}"]}, ["k0"]]}), type="ValidationError", requests=0)
+add("a duplicate after a delete chunk was applied", "docs",
+    delete({"$concat": [{"$seq": [10001, "k{i}"]}, ["k0"]]}),
+    [applied(10000)], type="BatchError", applied=10000, outcomes=[], outcome="partial", requests=1)
 add("an invalid row in the second chunk", "docs",
     {"method": "upsert_many", "args": [{"$concat": [{"$seq": [10001, seq_row]}, [docs_row(id="bad", vec=V(1))]]}]},
     [applied(10000)], type="BatchError", applied=10000, outcomes=[], outcome="partial", requests=1)
@@ -720,6 +734,10 @@ for label, option, expect in (
         ("rank_many exact", {"exact": True}, {"type": "ok"})):
     add(f"misuse {label}", "chunks", {"method": "query", "options": {**many, "rank_options": option}},
         [{"data": "[[],[]]"}], **expect)
+for count, expected in ((256, {"type": "ok", "requests": 1}), (257, {"type": "LimitExceededError", "requests": 0})):
+    add(f"rank with {count} rankings", "chunks", {"method": "query", "options": {
+        "terminal": "collect", "limit": 1, "rank": [["emb", "cosine", V(1, 0, 0)]] * count}},
+        [{"data": "[]"}], **expected)
 add("misuse rank_many of 256", "chunks", {"method": "query", "options": {
     "terminal": "rank_many", "limit_many": 2, "rankings": {"$repeat": [["emb", "cosine", V(1, 0, 0)], 256]}}},
     [{"data": json.dumps([[]] * 256)}], type="ok")
@@ -788,8 +806,17 @@ create("with embed extra keys", {"id": "utf8", "t": "utf8", "v": DENSE},
        {"embed": {"v": {"source": "t", "model": "m", "x": 1}}}, type="ValidationError", requests=0)
 create("with embed and full text on one column", {"id": "utf8", "t": "utf8", "v": DENSE},
        {"embed": {"v": {"source": "t", "model": "m"}}, "full_text": {"t": "english"}}, type="ok", requests=1)
-create("with a language as given", {"id": "utf8", "t": "utf8"}, {"full_text": {"t": "klingon"}},
-       type="ok", requests=1)
+for language in ("English", "en-US", "klingon"):
+    create(f"with unsupported language {language}", {"id": "utf8", "t": "utf8"}, {"full_text": {"t": language}},
+           type="ValidationError", requests=0)
+    add(f"add full text with unsupported language {language}", "chunks",
+        {"method": "add_full_text", "args": ["note", language]}, type="ValidationError", requests=0)
+for model in ("docs v1", "-m", "m" * 65, "m\n"):
+    create(f"with malformed model {model!r}", {"id": "utf8", "t": "utf8", "v": DENSE},
+           {"embed": {"v": {"source": "t", "model": model}}}, type="ValidationError", requests=0)
+    add(f"add a column with malformed model {model!r}", "chunks",
+        {"method": "add_column", "args": ["new_emb", {"$type": DENSE}],
+         "options": {"embed": {"source": "body", "model": model}}}, type="ValidationError", requests=0)
 create("with full text on a vector", {"id": "utf8", "v": DENSE}, {"full_text": {"v": "english"}},
        type="ValidationError", requests=0)
 create("with an empty language", {"id": "utf8", "t": "utf8"}, {"full_text": {"t": ""}}, type="ValidationError",

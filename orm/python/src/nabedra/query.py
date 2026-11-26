@@ -149,6 +149,8 @@ class Query:
         """Order the matching rows by one operation, or by several fused operations."""
         if not rankings:
             raise ValidationError("Rank requires at least one ranking")
+        if len(rankings) > _MAX_BATCH:
+            raise LimitExceededError(f"rank exceeds {_MAX_BATCH} rankings")
         options = _rank_options(fusion, candidates, recall, exact, consistency, count=len(rankings))
         wire = [self._ranking(ranking) for ranking in rankings]
         self._check_rankable()

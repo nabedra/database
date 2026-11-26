@@ -135,8 +135,11 @@ class Table:
                 if column in row:
                     raise ValidationError(f'Column {column!r} is embedded and cannot be written')
         wire = layout.row_to_wire(validate_row(row, layout.written, key=self.key, partial=partial))
-        if layout.has_search and len(_encode(wire)) - sum(map(base64_overhead, wire.values())) > _MAX_ROW:
-            raise LimitExceededError('Row exceeds 1 MiB')
+        if layout.has_search:
+            # The server counts a float64 as one byte regardless of its JSON spelling.
+            measured = {name: 0 if layout.schema[name] is float else value for name, value in wire.items()}
+            if len(_encode(measured)) - sum(map(base64_overhead, wire.values())) > _MAX_ROW:
+                raise LimitExceededError('Row exceeds 1 MiB')
         return wire
 
     def insert(self, row: Row) -> None:
@@ -245,17 +248,19 @@ class Table:
         except TypeError:
             raise ValidationError('Rows must be iterable' if field == 'rows' else 'Keys must be iterable') from None
         chunk: dict[Key, object] = {}
+        seen: set[Key] = set()
         size = base
         for item in iterator:
             key, checked = check(item)
+            if key in seen:
+                raise ValidationError('A key appears more than once')
+            seen.add(key)
             encoded = len(_encode(checked))
             if base + encoded > _MAX_BODY:
                 raise LimitExceededError('Encoded request exceeds 8 MiB')
             if len(chunk) == _MAX_ROWS or size + encoded + bool(chunk) > _MAX_BODY:
                 yield chunk
                 chunk, size = {}, base
-            if key in chunk:
-                raise ValidationError('A key appears more than once')
             size += encoded + bool(chunk)
             chunk[key] = checked
         if chunk:

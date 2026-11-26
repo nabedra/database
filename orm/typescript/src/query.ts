@@ -201,6 +201,7 @@ export class Query<S extends Schema = Schema, C extends Column<S> = Column<S>, X
     const options = given ? last as RankOptions : {}
     const rankings = given ? values.slice(0, -1) : values
     if (rankings.length === 0) throw new ValidationError("Rank requires at least one ranking")
+    if (rankings.length > maxRankings) throw new LimitExceededError(`rank exceeds ${maxRankings} rankings`)
     const checked = rankOptions(options, rankings.length)
     const wire = rankings.map((ranking) => checkRanking(ranking, state.layout))
     checkRankable(state)

@@ -78,7 +78,11 @@ function checkedRow(table: { key: string }, row: unknown, partial = false): Json
   const wire = rowToWire(validateRow(row, writtenSchema(layout), table.key, partial), layout)
   if (hasSearch(layout)) {
     const overhead = Object.values(wire).reduce<number>((total, value) => total + base64Overhead(value), 0)
-    if (encode(wire).byteLength - overhead > maxRow) throw new LimitExceededError("Row exceeds 1 MiB")
+    // The server counts a float64 as one byte regardless of its JSON spelling.
+    const measured = Object.fromEntries(Object.entries(wire).map(([name, value]) => [
+      name, layout.schema[name] === Number ? 0 : value,
+    ]))
+    if (encode(measured).byteLength - overhead > maxRow) throw new LimitExceededError("Row exceeds 1 MiB")
   }
   return wire
 }
@@ -135,9 +139,12 @@ async function* chunksOf(
     throw new ValidationError(field === "rows" ? "Rows must be iterable" : "Keys must be iterable")
   }
   let chunk: Chunk = new Map()
+  const seen = new Set<Key>()
   let size = base
   for await (const item of iterable) {
     const [key, checked] = check(item)
+    if (seen.has(key)) throw new ValidationError("A key appears more than once")
+    seen.add(key)
     const encoded = encode(checked).byteLength
     if (base + encoded > maxBody) throw new LimitExceededError("Encoded request exceeds 8 MiB")
     if (chunk.size === maxRows || size + encoded + Number(chunk.size > 0) > maxBody) {
@@ -145,7 +152,6 @@ async function* chunksOf(
       chunk = new Map()
       size = base
     }
-    if (chunk.has(key)) throw new ValidationError("A key appears more than once")
     size += encoded + Number(chunk.size > 0)
     chunk.set(key, checked)
   }
