@@ -16,7 +16,10 @@ BUDGET = 30
 # Distinct states and completed depth, including the initial state.
 # The additional states in the replacement case are the late-report branch.
 CASES = {
-    "CacheRecoveryPolicy.cfg": (55, 55),
+    "CacheRecoveryPolicy.cfg": (57, 57),
+    "CacheRecoveryPolicy.skewed-failover.cfg": (14, 14),
+    "CacheRecoveryPolicy.frozen-move.cfg": (17, 17),
+    "CacheRecoveryPolicy.retired-replication.cfg": (11, 11),
     "CacheRecoveryPolicy.failover-after-window.cfg": (13, 13),
     "CacheRecoveryPolicy.replace-after-window.cfg": (15, 12),
     "CacheRecoveryPolicy.staged-reset.cfg": (15, 15),
@@ -65,7 +68,7 @@ def main() -> int:
         check.run_mutant(report, SPEC, MODEL, cfg, out, BUDGET, workers, model, baselines, controls)
         for cfg in mutants
     ]
-    report.check(len(caught) == 5, "policy mutants", f"{len(caught)} of 5 configured")
+    report.check(len(caught) == 10, "policy mutants", f"{len(caught)} of 10 configured")
     facts = {
         "mode": "exhaustive",
         "spec": "specs/cache/recovery-policy/CacheRecoveryPolicy",

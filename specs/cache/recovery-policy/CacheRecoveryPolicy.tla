@@ -11,9 +11,14 @@ PolicyVars == <<vars, step>>
 
 ASSUME Scenario \in {"last-copy", "transfer-at-limit", "transfer-over-limit",
                      "replace-after-window", "failover-after-window",
-                     "staged-reset", "operator-reset"}
+                     "staged-reset", "operator-reset", "skewed-failover", "frozen-move", "retired-replication"}
 
-PolicyInit == Init /\ step = 0
+PolicyInit ==
+    /\ Init
+    /\ step = 0
+    /\ (Scenario \in {"skewed-failover", "frozen-move"}) =>
+        (coff = MaxDrift /\ off[w1] = -MaxDrift /\ off[w2] = MaxDrift
+                         /\ off[w3] = MaxDrift)
 Advance == step' = step + 1
 TryStageStart == IF ENABLED StageStart(Slot) THEN StageStart(Slot) ELSE UNCHANGED vars
 TryStagedPromote == IF ENABLED StagedPromote(Slot) THEN StagedPromote(Slot) ELSE UNCHANGED vars
@@ -64,11 +69,17 @@ LastCopyCheck ==
        /\ Replace(w1) /\ Advance
     \/ /\ step = endSetup + 1
        /\ TryStagedPromote /\ Advance
-    \/ /\ step \in (endSetup + 2)..(endSetup + 7)
+    \/ /\ step = endSetup + 2
+       /\ IF cs[Slot].ep = 2 THEN Heartbeat(w3, TRUE) ELSE UNCHANGED vars
+       /\ Advance
+    \/ /\ step = endSetup + 3
+       /\ IF cs[Slot].ep = 2 THEN Write(c1, w1, Slot, Key, "set") ELSE UNCHANGED vars
+       /\ Advance
+    \/ /\ step \in (endSetup + 4)..(endSetup + 9)
        /\ Tick /\ Advance
-    \/ /\ step = endSetup + 8
+    \/ /\ step = endSetup + 10
        /\ (StagedPromote(Slot) \/ StagedReset(Slot)) /\ Advance
-    \/ EndAt(endSetup + 9)
+    \/ EndAt(endSetup + 11)
 
 \* A replica is disconnected as a term starts, then reports late after heal.
 \* The controller must wait during the window and keep the observed replica
@@ -134,6 +145,66 @@ OperatorResetCheck ==
             [] OTHER -> FALSE
     \/ EndAt(8)
 
+\* A fast controller fences the old grant by its lower bound. The slow
+\* predecessor and fast successor can both serve if authority ignores
+\* uncertainty. The correct successor serves and the predecessor refuses.
+SkewedFailoverCheck ==
+    \/ /\ Advance
+       /\ CASE step = 0 -> Heartbeat(w1, TRUE)
+            [] step = 1 -> Replicate(w2, Slot)
+            [] step = 2 -> Heartbeat(w2, TRUE)
+            [] step = 3 -> Heartbeat(w3, TRUE)
+            [] step = 4 -> CutCtrl(w1)
+            [] step = 5 -> ReportAges(w1)
+            [] step \in 6..8 -> Tick
+            [] step = 9 -> Failover(Slot)
+            [] step = 10 -> Heartbeat(w2, TRUE)
+            [] step = 11 -> Write(c1, w2, Slot, Key, "set")
+            [] step = 12 -> IF ENABLED Write(c2, w1, Slot, Key, "set")
+                            THEN Write(c2, w1, Slot, Key, "set")
+                            ELSE UNCHANGED vars
+            [] OTHER -> FALSE
+    \/ EndAt(13)
+
+\* A planned move takes the old primary's frozen prefix while its grant
+\* remains live in real time. The frozen actor must stop authorizing as
+\* soon as it installs the freeze and stay frozen after target activation.
+FrozenMoveCheck ==
+    \/ /\ Advance
+       /\ CASE step = 0 -> Heartbeat(w1, TRUE)
+            [] step = 1 -> Heartbeat(w2, TRUE)
+            [] step = 2 -> Heartbeat(w3, TRUE)
+            [] step = 3 -> MoveStart(Slot) /\ cs'[Slot].mtgt = Me(w3)
+            [] step = 4 -> Heartbeat(w1, TRUE)
+            [] step = 5 -> Heartbeat(w3, TRUE)
+            [] step = 6 -> Replicate(w3, Slot)
+            [] step = 7 -> Heartbeat(w3, TRUE)
+            [] step \in 8..9 -> Tick
+            [] step = 10 -> MoveFreeze(Slot)
+            [] step \in 11..12 -> Heartbeat(w1, TRUE)
+            [] step = 13 -> MoveFrozen(Slot)
+            [] step = 14 -> MoveCutover(Slot)
+            [] step = 15 -> Heartbeat(w3, TRUE)
+            [] OTHER -> FALSE
+    \/ EndAt(16)
+
+\* An assigned replica installs the retirement report, then pulls a write
+\* acknowledged by the source under its still-active committed grant.
+RetiredReplicationCheck ==
+    \/ /\ Advance
+       /\ CASE step = 0 -> Heartbeat(w1, TRUE)
+            [] step = 1 -> Heartbeat(w2, TRUE)
+            [] step = 2 -> Heartbeat(w3, TRUE)
+            [] step = 3 -> Replicate(w2, Slot)
+            [] step = 4 -> Tick
+            [] step = 5 -> Heartbeat(w1, TRUE)
+            [] step = 6 -> Replace(w1)
+            [] step = 7 -> Heartbeat(w2, TRUE)
+            [] step = 8 -> Write(c1, w1, Slot, Key, "set")
+            [] step = 9 -> Replicate(w2, Slot)
+            [] OTHER -> FALSE
+    \/ EndAt(10)
+
 PolicyNext ==
     CASE Scenario = "last-copy" -> LastCopyCheck
       [] Scenario \in {"transfer-at-limit", "transfer-over-limit"} -> TransferCheck
@@ -141,5 +212,8 @@ PolicyNext ==
       [] Scenario = "failover-after-window" -> FailoverCheck
       [] Scenario = "staged-reset" -> StagedResetCheck
       [] Scenario = "operator-reset" -> OperatorResetCheck
+      [] Scenario = "skewed-failover" -> SkewedFailoverCheck
+      [] Scenario = "frozen-move" -> FrozenMoveCheck
+      [] Scenario = "retired-replication" -> RetiredReplicationCheck
 
 =============================================================================

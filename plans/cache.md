@@ -214,7 +214,10 @@ The directed schedules restrict the interleavings independently of the broad `ca
 
 | Schedule | What the control checks | Local distinct states |
 | --- | --- | ---: |
-| Last copy | No promotion while the last committed grant remains live. Promote the verified staged copy at lag 33 when the fallback reset would otherwise become eligible. | 55 |
+| Last copy | No promotion while the last committed grant remains live. A premature successor installation would expose a stale acknowledgement. Promote the verified staged copy at lag 33 when the fallback reset would otherwise become eligible. | 57 |
+| Skewed failover | After a fast controller promotes a fast replica, a slow predecessor cannot still authorize or acknowledge a write. | 14 |
+| Frozen move | Keep the predecessor frozen while the successor serves the transferred prefix, even while the old grant is still live. | 17 |
+| Retired-source replication | After the replica learns the source was retired, the replica still pulls a new mutation acknowledged under the old grant. | 11 |
 | Failover after a term change | Keep the primary while its current-term report is pending, then renew it once the report arrives. | 13 |
 | Replica replacement | Wait through a partition and heal. A late report keeps the replica in place. If the report still has not arrived at the deadline, start replacement. | 15 |
 | Staged automatic reset | Wait past the old grant and through the grace period, then reset when the staged target has no baseline. | 15 |
@@ -222,11 +225,14 @@ The directed schedules restrict the interleavings independently of the broad `ca
 | Ordinary replica transfer at 32 | Complete the transfer. | 46 |
 | Ordinary replica transfer at 33 | Leave the copy staged. | 47 |
 
-The local clean twins finished with an empty queue. Mutants stopped at the named properties:
-`prefix_early_staged_commit` (`G05_NoEarlyStagedCommit`, 48 states), `prefix_failover_lacks_report_window`
-(`G05_ObservationWindow`, 11 states), `prefix_repair_lacks_report_window` (`G05_ObservationWindow`, 6 states),
-`prefix_last_copy_lag_gate` (`D6_LastVerifiedCopyPreserved`, 55 states), and `ordinary_transfer_ignores_lag`
-(`D6_OrdinaryTransferLag`, 47 states). Actions evidence for these schedules is pending.
+The initial recovery-policy run passed on [Actions 45846984253](https://github.com/zPy52/nabedra-database/actions/runs/45846984253).
+The extended local run completed each clean schedule with an empty queue. The clock-bound mutant exposed overlap in
+12 states (`G06_LeaseExclusive`) and a stale acknowledgement in 14 (`G06_ServedEpochOrder`). The freeze mutant exposed
+overlap in 17 states. The early-commit mutant exposed an unsafe transition in 48 states (`G05_NoEarlyStagedCommit`)
+and a stale acknowledgement in 50 (`G05_NoAckAfterHandover`). The retirement replication mutant exposed lost tail
+replication in 10 states (`G05_LossOnlyFromLag`). Observation-window mutants failed in 11 and 6 states. The last-copy reset and
+ordinary transfer lag mutants failed in 57 and 47 states. The broad baselines retain their original properties and
+bounds. These schedules provide evidence for the listed cases only.
 
 The model batches planning and commitment into one action. K03 must exercise reports and an outstanding recovery
 proposal crossing a controller term change, as well as the measured age of a late first report and the time needed
