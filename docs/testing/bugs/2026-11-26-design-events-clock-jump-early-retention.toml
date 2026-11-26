@@ -1,0 +1,25 @@
+# Design review rv-events, finding EVENTS-2 (wave-rv/findings/events.md). The plan states no clock bound ("monitor
+# clock skew"). The retention cutoff is the leader's wall clock minus the retention (control/operate.rs:474), and
+# events::retain and publish keep the maximum of every cutoff and publish time (partition/events.rs:56-58, 240), so a
+# leader clock that jumps ahead removes retained events early and the jump stays in replicated time.
+# TLC (local, unattested): specs/events-delivery/EventsDelivery.strict.cfg breaks G08_RetentionByPublishTime in 8
+# states: publish e1 at true time 0, the leader's clock jumps one tick ahead, two ticks pass, the retention loop
+# proposes cutoff 1 and removes e1 at true age 2 with a retention of 2. The fix needs a user decision (a stated
+# bound and EVT-G08's wording); EventsDelivery.cfg checks the proposed bound (Variant drift_bound_stated).
+id = "EVENTS-CLOCK-JUMP-EARLY-RETENTION"
+title = "A leader clock that jumps ahead removes retained events before their retention period, and the jump persists"
+class = "other"
+module = "events"
+guarantees = ["EVT-G08", "EVT-G05"]
+scenarios = ["EV03"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/events-delivery/EventsDelivery.strict.cfg"
+seed = "unknown"
+why_not_caught = "The plan names no clock bound, EVT-G08 names no tolerance, and the simulator has clock jumps but no retention loop and no G08 checker."
+invariant_added = "Intended, not met: an event is removed no earlier than its publish time plus the retention minus a stated clock bound, in true time, and one fast broker clock cannot advance the replicated retention cutoff or lease clock past that bound."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-26"
