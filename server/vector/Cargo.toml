@@ -9,8 +9,11 @@ repository = "https://github.com/zPy52/nabedra-database"
 publish = ["crates-io"]
 
 [dependencies]
-nabedra-rt = { path = "../rt", version = "0.1.0" }
+nabedra-rt = { path = "../rt", version = "0.1.0", features = ["uring"] }
 nabedra-simd = { path = "../simd", version = "0.1.0" }
+# CRC32C of the vector store's pages. Already in the graph through aws-smithy-checksums, with the
+# same default features.
+crc-fast = "=1.10.0"
 
 [dev-dependencies]
 nabedra-check = { path = "../check" }

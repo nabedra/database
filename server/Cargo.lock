@@ -2118,6 +2118,7 @@ dependencies = [
 name = "nabedra-vector"
 version = "0.1.0"
 dependencies = [
+ "crc-fast",
  "nabedra-check",
  "nabedra-rt",
  "nabedra-simd",

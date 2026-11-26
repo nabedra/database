@@ -142,6 +142,12 @@ pub enum Error {
     Io(String),
     /// An invariant broke. The call fails instead of answering in part.
     Internal(&'static str),
+    /// A query used up its `cpu`, `io` or `memory` budget. Nothing of it is returned.
+    OverBudget(&'static str),
+    /// The worker refused the work before it started (`429`).
+    Overloaded,
+    /// The vector store could not write or read a vector, or found it damaged.
+    Store(String),
 }
 
 impl fmt::Display for Error {
@@ -163,6 +169,9 @@ impl fmt::Display for Error {
             Error::InvalidQuery(why) => write!(f, "invalid query: {why}"),
             Error::Io(why) => write!(f, "checkpoint: {why}"),
             Error::Internal(why) => write!(f, "internal: {why}"),
+            Error::OverBudget(what) => write!(f, "the query used up its {what} budget"),
+            Error::Overloaded => f.write_str("the search worker is overloaded"),
+            Error::Store(why) => write!(f, "vector store: {why}"),
         }
     }
 }

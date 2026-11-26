@@ -1,12 +1,16 @@
 //! The row map: slot → key, generation and versions. A version knows when it was applied, and its
 //! successor says when it was superseded. A version counts the entries, copies in flight and queued
 //! appends that name it, and a slot is reused only when nothing does.
+//!
+//! With a vector store, a version's vector moves there when the version is added, and is released
+//! when the version goes, so the store reuses its place under the same rule as the slot.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::mutant::mutant;
-use crate::types::{CommitTs, Key, Pos, Row};
+use crate::store::{VecKey, Vectors};
+use crate::types::{CommitTs, Key, Pos, Result, Row};
 
 pub type Slot = u32;
 /// A generation of one range's index. A resync makes the older one, and every copy of it, void.
@@ -49,9 +53,83 @@ struct SlotData {
 pub struct Rows {
     slots: Vec<Option<SlotData>>,
     free: Vec<Slot>,
+    /// Where vectors live when not in the rows. A row there has `vec: None`.
+    vectors: Option<Arc<dyn Vectors>>,
+    /// Generations with a vector the store could not read.
+    damage: Arc<Mutex<BTreeSet<Gen>>>,
 }
 
 impl Rows {
+    pub fn new(vectors: Option<Arc<dyn Vectors>>) -> Rows {
+        Rows {
+            vectors,
+            ..Rows::default()
+        }
+    }
+
+    /// Moves the vector of a version into the store, if there is one. An error leaves it here.
+    pub fn store_vector(&mut self, slot: Slot, at: Pos) -> Result<()> {
+        let Some(store) = self.vectors.clone() else {
+            return Ok(());
+        };
+        let Some(v) = self.version_mut(slot, at) else {
+            return Ok(());
+        };
+        let Some((row, vec)) = v.row.as_ref().and_then(|r| Some((r, r.vec.clone()?))) else {
+            return Ok(());
+        };
+        store.put(VecKey { slot, at }, &vec)?;
+        let (cols, image) = (row.cols.clone(), row.image.clone());
+        v.row = Some(Arc::new(Row {
+            vec: None,
+            cols,
+            image,
+        }));
+        Ok(())
+    }
+
+    /// The vector of a version with a row. A store that cannot read it logs the damage.
+    pub fn vector(&self, slot: Slot, at: Pos) -> Result<Option<Arc<[f32]>>> {
+        let Some(row) = self.version(slot, at).and_then(|v| v.row.as_ref()) else {
+            return Ok(None);
+        };
+        let (Some(store), None) = (&self.vectors, &row.vec) else {
+            return Ok(row.vec.clone());
+        };
+        let got = store.get(VecKey { slot, at });
+        if got.is_err()
+            && let Some(generation) = self.generation(slot)
+        {
+            let mut damage = self.damage.lock().unwrap_or_else(PoisonError::into_inner);
+            damage.insert(generation);
+        }
+        got.map(Some)
+    }
+
+    /// The row of a version with its vector, as a hit returns it.
+    pub fn full_row(&self, slot: Slot, at: Pos) -> Result<Option<Arc<Row>>> {
+        let Some(row) = self.version(slot, at).and_then(|v| v.row.clone()) else {
+            return Ok(None);
+        };
+        if row.vec.is_some() || self.vectors.is_none() {
+            return Ok(Some(row));
+        }
+        let vec = self.vector(slot, at)?;
+        let (cols, image) = (row.cols.clone(), row.image.clone());
+        Ok(Some(Arc::new(Row { vec, cols, image })))
+    }
+
+    /// Whether reading a vector costs I/O.
+    pub fn on_disk(&self) -> bool {
+        self.vectors.as_ref().is_some_and(|v| v.on_disk())
+    }
+
+    /// The generations logged as damaged since the last call.
+    pub fn take_damage(&self) -> Vec<Gen> {
+        let mut damage = self.damage.lock().unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut *damage).into_iter().collect()
+    }
+
     fn data(&self, slot: Slot) -> Option<&SlotData> {
         self.slots.get(slot as usize)?.as_ref()
     }
@@ -210,8 +288,11 @@ impl Rows {
         let Some(data) = self.data_mut(slot) else {
             return;
         };
-        if data.dead {
-            data.versions.retain(|v| v.refs > 0);
+        let dropped: Vec<Version> = if data.dead {
+            let all = std::mem::take(&mut data.versions);
+            let (keep, dropped) = all.into_iter().partition(|v| v.refs > 0);
+            data.versions = keep;
+            dropped
         } else {
             let versions = &data.versions;
             let gone = |i: usize| {
@@ -221,12 +302,18 @@ impl Rows {
                     && (superseded || (v.row.is_none() && i + 1 == versions.len() && v.at <= low))
             };
             let n = (0..versions.len()).take_while(|&i| gone(i)).count();
-            data.versions.drain(..n);
+            data.versions.drain(..n).collect()
+        };
+        let empty = data.versions.is_empty();
+        if empty && let (Some(keys), false) = (keys, data.dead) {
+            keys.remove(&data.key);
         }
-        if data.versions.is_empty() {
-            if let (Some(keys), false) = (keys, data.dead) {
-                keys.remove(&data.key);
+        if let Some(store) = &self.vectors {
+            for v in dropped.iter().filter(|v| v.row.is_some()) {
+                store.release(VecKey { slot, at: v.at });
             }
+        }
+        if empty {
             self.slots[slot as usize] = None;
             self.free.push(slot);
         }

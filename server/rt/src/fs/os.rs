@@ -689,7 +689,7 @@ pub fn sync_dir(path: impl AsRef<Path>) -> io::Result<()> {
 pub const O_DIRECT: i32 = libc::O_DIRECT;
 
 /// The descriptor, for `fs::uring`. A simulated file has none and never reaches a ring.
-#[cfg(not(feature = "sim"))]
+#[cfg(all(feature = "uring", target_os = "linux", not(feature = "sim")))]
 impl File {
     #[inline]
     pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
