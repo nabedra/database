@@ -13,6 +13,5 @@ why_not_caught = "The unit test of shutdown submits before it stops, one thread,
 invariant_added = "A call that races stop always answers, run or refused: the test runs 400 iterations of three callers against stop and fails on a hang."
 fix_commits = ["8c074ad387f4bd94151129a45f9b5f691e157dfc"]
 revert_patch_ok = true
-status = "fixed"
 owner = "oltp-vector lead"
 expires = "2026-12-22"
