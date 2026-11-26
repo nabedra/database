@@ -356,3 +356,60 @@ join stalls admission and every stream commit for the whole copy (OLAPS-3). Neit
 
 Simulation coverage of the same design stays partial: the in-process workload has one worker registry, so it cannot
 reproduce F1 or any transfer loss.
+
+### Fenced join implementation and rollout
+
+The join lock covers both stream replicas and accepted queue records. Copy them at an exact
+control-root base identified by cluster, revision and change ID. The controller submits readiness
+with the captured backend Match token. Worker timeout, transport timeout and a controller crash
+cannot invalidate the token. The coordinator keeps the join seal until a fresh storage observation
+shows a strictly newer root from the same cluster. If publication is ambiguous and the root is
+still the base, the controller races it with a metadata-only conditional renewal on that base
+using a new change ID. Either conditional can win. Both outcomes invalidate the old Match.
+Subsequent controller acquisition also advances the root. If a read or competing write remains
+ambiguous, preserve the seal and retry observation. An elapsed time alone releases only the
+separate drain seal.
+
+The coordinator refreshes the ready members from the successor and confirms its own authority
+before reopening work. If the coordinator changed, the previous one can retire its seal after it
+observes the successor. The new coordinator uses the existing recovery procedure before admitting
+operations. Commands that waited behind a seal must re-read authority before mutating the queue or
+stream state. A published join must use the exact candidate corresponding to the copied worker
+incarnation and session. A failed join retries the copy with a new observation.
+
+The following sequence supports rolling workers and APIs that share the existing root format:
+
+1. Roll workers through the existing handoff while the old API is still active. Before activating
+   the new protocol, ensure the coordinator and workers eligible to take over can handle the
+   fenced join command. A new API uses a distinct signed join command and accepts a fenced reply
+   only. An old worker rejects the distinct command, so joins pause if it is coordinator.
+2. Quiesce admissions and legacy joins before transferring controller ownership. Stop every legacy
+   controller incarnation eligible to reacquire control. The new controller's acquisition must
+   advance the control root by Match before it enables fenced joins. It must observe the root that
+   won, because a pending legacy readiness write can race acquisition. Verify the current ready
+   copy set and repair its queue and stream state from surviving current holders before resuming
+   admitted work. If that state cannot be recovered, leave admission closed and use the existing
+   recovery procedure.
+3. Resume under the new API. Keep the old join command for workers talking to an old API before
+   activation. Return to a legacy controller only from a stopped, fenced deployment through an
+   explicit recovery procedure. Running old controllers may not compete for ownership after
+   activation.
+
+This adds an internal command discriminant and binds the reply to the captured base. It needs no
+extra round trip for a successful join or on ordinary client traffic. Resolution of an ambiguous
+join can add a control read and conditional metadata write. ST04 and R03 cover stream and queue
+continuity. The runtime regression must delay readiness at the object store, roll the seal clock
+past its deadline, and hold admissions until either readiness or a competing CAS resolves. Resume
+the old write after the competing CAS and assert a conditional conflict. Also test the case where
+readiness wins and the controller loses the reply. The joiner must have the accepted request and
+stream copies before the coordinator reopens either path.
+
+The rollout refinement is `specs/olap-stream/join/rollout/OlapJoinRollout.tla`. It covers one
+coordinator, a ready peer, a joiner, mixed-version coordination, the controller activation fence
+and an ambiguous readiness write. Its initial committed prefix is recoverable. Worker crash and
+controller takeover after activation are covered by `OlapJoinFence`. Eventual coordinator upgrade
+follows the operator's rollout, and the controller drives conditional resolution and retry.
+Local TLC completed both safety and liveness over 570 distinct states at depth 16, with 14 covered
+actions and minimum coverage 12. Mutant traces have 8 states for legacy fallback, 7 for a reused
+activation base, 4 for a legacy controller returning, and a 7-state lasso for missing coordinator
+upgrade. The `olap-join-rollout` check is pending attestation on this revision.
