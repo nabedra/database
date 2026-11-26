@@ -497,8 +497,8 @@ impl<C: Codec> Index<C> {
     fn score_entry(&self, scan: &mut Scan, e: &Entry) -> Result<bool> {
         // Keep the winning vectors for the response. A replacement occupies the same
         // space, but the incoming vector needs room while we score it.
-        let bytes = self.read_cost();
-        scan.charge(0, bytes, bytes)?;
+        let bytes = (self.cfg.schema.dim * size_of::<f32>()) as u64;
+        scan.charge(0, self.read_cost(), bytes)?;
         scan.charge_score()?;
         let (key, vec) = self.live(e)?;
         let before = scan.top.len();
