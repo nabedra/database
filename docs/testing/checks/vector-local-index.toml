@@ -1,0 +1,11 @@
+id = "vector-local-index"
+module = "vector"
+kinds = ["U", "D"]
+guarantees = ["VEC-G05"]
+scenarios = ["VS07", "VS10"]
+tiers = ["T1"]
+command = ["cargo", "test", "--locked", "--jobs", "4", "-p", "nabedra-vector", "--lib"]
+cwd = "server"
+timeout_s = 1200
+needs = []
+result_parser = "cargo-test"
