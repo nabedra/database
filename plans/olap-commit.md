@@ -125,15 +125,47 @@ stops after three attempts (finding F2 of the earlier review, mutant `prefix_ret
 
 ### Results
 
+TLC v1.8.0, pinned image, Actions run 45800777105 at 0f075ab3 (check `olap-olap-commit`, T1, 900 s per run).
+
 | Run | Result | Distinct states | Depth |
 | --- | --- | --- | --- |
-| pending | | | |
+| `OlapCommit.cfg` (L2 safety) | pass, exhaustive | 2,100,196 | 61 |
+| `OlapCommit.window.cfg` | pass, exhaustive | 2,765,474 | 64 |
+| `OlapCommit.gc.cfg` | not-run: stopped at 900 s, 1,611,449 states left on the queue | | |
+| `OlapCommit.live.cfg` | not-run: stopped at 900 s, 776,145 states left on the queue | | |
+| reader control (`unpinned_read` control: one reader, no collection) | pass, exhaustive | 18,335,430 | |
+
+The T1 check fails on coverage because `GcDelete` and the reader steps run only in the unfinished collection baseline,
+and a stale-receipt step that only the mutant enabled (fixed in 333795de). The T2 check `olap-olap-commit-long` runs
+the same baselines with a 5-hour budget: pending. The collection and liveness baselines need an abstraction to fit
+T1; their bounds are not cut.
 
 ### Mutants
 
+Counterexample lengths in states, from the same run.
+
 | Property | Mutant | Counterexample (states) |
 | --- | --- | --- |
-| pending | | |
+| `G01_NoTornCommit` | `root_before_uploads` | 7 |
+| `G01_ReaderSnapshot` | `unpinned_read` | 11 |
+| `G02_NoLostUpdate` | `loser_keeps_files` | 17 |
+| `G02_LinearHistory` | `no_cas` | 11 |
+| `G02_LinearHistory` | `loser_reput_stale` | 14 |
+| `G03_NoFalseNotApplied` | `timeout_not_applied` | 8 |
+| `G03_NoFalseNotApplied` | `prefix_unfenced_receipt` (finding OLAP-2) | 9 |
+| `G03_NoFalseNotApplied` | `prefix_stale_receipt` (SCHED-11) | 12 |
+| `G03_TerminalIsCommitted` | `ok_on_conflict` | 12 |
+| `G04_FenceMonotonic` | `fence_put_unconditional` | 7 |
+| `G04_NoStaleCommit` | `fence_outside_root` | 10 |
+| `G04_NoStaleCommit` | `rebase_adopts_term` | 10 |
+| `G04_CommitStaysVisible` | `cold_start_blind_overwrite` | 11 |
+| `G04_CommitStaysVisible` | `no_cas_rollback` | 13 |
+| `G05_OncePerRequest` | `skip_lookup` | 15 |
+| `G05_SameResult` | `skip_lookup_result` | 17 |
+| `G05_SameResult` | `prefix_local_unknown` (SCHED-12) | 12 |
+| `G05_Progress` | `prefix_retry_limit` (SCHED-3) | 14 (lasso) |
+| `G05_Progress` | `prefix_history_budget` (OLAP-1) | not counted: its control is the unfinished liveness baseline |
+| `GC_NeverDeletesReferenced` | `gc_ignores_pins`, `gc_ignores_inflight` | not counted: their control is the unfinished collection baseline |
 
 ### Counterexamples
 
