@@ -1381,6 +1381,10 @@ pub(super) fn schema(
     if config.authority != command.authority {
         return reject(tx, Fault::StaleAuthority);
     }
+    // The DDL coordinator advances search and direct epochs together.
+    if config.search.is_some() && matches!(command.change, DirectSchemaChange::Fence { .. }) {
+        return reject(tx, Fault::InvalidBinding);
+    }
     let next = match (config.direct_schema, command.change) {
         (Some(current), DirectSchemaChange::Activate { .. }) => current,
         (None, DirectSchemaChange::Activate { lifecycle }) => DirectSchema {

@@ -762,3 +762,22 @@ async fn vs16_concurrent_value_damage_reports_survive_restart() {
         assert!(reopened.is_group_quarantined(group), "lost quarantine for {group}");
     }
 }
+
+#[tokio::test]
+async fn vs14_a_search_range_refuses_a_plain_schema_fence() {
+    let mut s = S::new().await;
+    let before = s.f.dump().await;
+    let command = ParticipantCommand::DirectSchema(DirectSchemaFence {
+        authority: s.f.authority,
+        table_id: s.f.table,
+        change: DirectSchemaChange::Fence {
+            lifecycle: Some(nabedra_rt::ids::uuid_v4()),
+        },
+    });
+    assert_eq!(
+        s.f.submit(command).await,
+        ParticipantReply::Rejected(Fault::InvalidBinding)
+    );
+    assert_eq!(s.f.dump().await, before);
+    assert!(matches!(s.fence(columns()).await, SearchReply::Fenced { .. }));
+}
