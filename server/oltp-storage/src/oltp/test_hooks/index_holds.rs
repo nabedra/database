@@ -41,6 +41,7 @@ pub enum Checkpoint {
     ReadPin,
     Reclaim,
     QueuedPrepare,
+    StorageReserved,
 }
 
 #[derive(Debug)]
