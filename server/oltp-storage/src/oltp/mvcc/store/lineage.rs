@@ -811,7 +811,9 @@ pub(super) fn apply(
             || image.commit_ts > page.binding.read_ts
             || !owns_image(&page.binding.source, &page.binding.source_span, &image.key)
             || !image.complete()
-            || (image.search.is_some() && page.search.is_none())
+            || image.search.as_ref().is_some_and(|search| {
+                !page.search.as_ref().is_some_and(|split| search.fits(&split.schema))
+            })
         {
             return reject(tx, Fault::InvalidBinding);
         }

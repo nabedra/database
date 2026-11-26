@@ -367,7 +367,7 @@ impl ParticipantMachine {
                                 .and_then(|n| n.checked_add(IMAGE_METADATA_BYTES))
                                 .ok_or_else(invalid)?;
                             let image =
-                                row::image(view, logical, &value, search.is_some(), &owner)?;
+                                row::image(view, &config, logical, &value, search.is_some(), &owner)?;
                             let value = value
                                 .value
                                 .map(|value| {

@@ -6,6 +6,7 @@
 //! (`blobs`) and the source version of each embedded column (`source`). Both
 //! maps are absent when empty, so every other table keeps its bytes.
 use super::{embed::EmbedRecord, search::SearchSchema, *};
+use crate::protocol::ErrorCode;
 use crate::oltp::{
     mvcc::vector::{ColumnId, FRAME_BYTES, MAX_SEARCH_COLUMNS, RowSearch, VectorValue, open_frame},
     pool::{GroupRead, ScratchLease},
@@ -17,6 +18,8 @@ pub(super) const VECTOR: u8 = b'x';
 /// ordinal`, then the column. Nothing but Resolve removes them.
 pub(super) const STAGED: u8 = b'y';
 const DAMAGED_VALUE: &str = "storage corrupt: a stored vector value is missing or damaged";
+const BELOW_FLOOR: &str = "storage corrupt: a transaction resolved at or below the closed floor";
+const COLUMNS_UNKNOWN: &str = "the search columns of this restored range are not known yet";
 
 /// A timestamp per search column.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,9 +470,12 @@ pub(super) fn image_cost(
     Ok(Some(bytes))
 }
 /// The vectors (and, for a split, the records) of one stored row version, or
-/// `None` for one without any. The caller precharged `image_cost`.
+/// `None` for one without any. The caller precharged `image_cost`. Only the
+/// columns of `config`'s schema are served: a dropped column's vector is not,
+/// and a vector that does not have its column's type is damage (VEC-G10).
 pub(super) fn image(
     view: &mut GroupRead<'_>,
+    config: &Config,
     logical: &[u8],
     version: &Version<'_>,
     records: bool,
@@ -478,19 +484,32 @@ pub(super) fn image(
     if !version.searched() {
         return Ok(None);
     }
+    // A restored range learns its columns from its first search fence.
+    let schema = search::ready(config).ok_or_else(|| {
+        failure(ErrorCode::StorageUnavailable, COLUMNS_UNKNOWN)
+    })?;
+    let mut blobs = Columns::default();
     let mut vectors = Vec::with_capacity(version.blobs.0.len());
     for (column, at) in &version.blobs.0 {
+        let Some(definition) = schema.column(*column) else {
+            continue;
+        };
         let key = column_key(VECTOR, logical, *column, Some(*at))?;
         let raw = view.pinned(&key)?.ok_or_else(damaged_value)?;
-        let (kind, bytes) = open_frame(&raw).ok_or_else(damaged_value)?;
+        let (kind, bytes) = open_frame(&raw)
+            .filter(|(kind, bytes)| definition.fits(*kind, bytes.len()))
+            .ok_or_else(damaged_value)?;
+        blobs.0.insert(*column, *at);
         vectors.push(VectorImage {
             column: *column,
             value: VectorValue::from_stored(kind, bytes, owner.clone())?,
         });
     }
+    let mut source = version.source.clone();
+    source.0.retain(|column, _| schema.column(*column).is_some());
     let mut found = Vec::new();
     if records {
-        for column in version.source.0.keys() {
+        for column in source.0.keys() {
             if let Some(record) = embed::read(view, logical, *column)? {
                 found.push(RecordImage {
                     column: *column,
@@ -500,11 +519,70 @@ pub(super) fn image(
         }
     }
     Ok(Some(Box::new(RowImage {
-        blobs: version.blobs.clone(),
+        blobs,
         vectors,
-        source: version.source.clone(),
+        source,
         records: found,
     })))
+}
+
+/// A copy from another replica that installs its records as they are checks
+/// every vector against the columns of the copy's own config, which sorts
+/// before every vector (VEC-G10).
+#[derive(Default)]
+pub(crate) struct InstallCheck {
+    schema: Option<SearchSchema>,
+}
+impl InstallCheck {
+    pub(crate) fn record(&mut self, key: &[u8], value: &[u8]) -> Result<(), ProtocolError> {
+        if key == CONFIG {
+            let config: Config = serde_json::from_slice(value).map_err(|_| damaged_value())?;
+            self.schema = config.search;
+            return Ok(());
+        }
+        if key.first() != Some(&VECTOR) {
+            return Ok(());
+        }
+        let column = key
+            .len()
+            .checked_sub(10)
+            .and_then(|at| key.get(at..at + 2))
+            .map(|column| u16::from_be_bytes([column[0], column[1]]))
+            .ok_or_else(damaged_value)?;
+        let (kind, bytes) = open_frame(value).ok_or_else(damaged_value)?;
+        // A dropped column's vector stays until collection, and is never served.
+        let definition = self
+            .schema
+            .as_ref()
+            .filter(|schema| schema.epoch != 0)
+            .and_then(|schema| schema.column(column));
+        if definition.is_some_and(|definition| !definition.fits(kind, bytes.len())) {
+            return Err(damaged_value());
+        }
+        Ok(())
+    }
+}
+impl RowImage {
+    /// Every vector names a column of `schema` and has its type.
+    pub(super) fn fits(&self, schema: &SearchSchema) -> bool {
+        self.vectors.iter().all(|image| {
+            schema.column(image.column).is_some_and(|column| {
+                image
+                    .value
+                    .checked_len()
+                    .is_some_and(|len| column.fits(image.value.kind, len))
+            })
+        })
+    }
+}
+/// A Resolve whose commit timestamp is at or below the closed floor. It cannot be
+/// refused, which would break the transaction's atomicity, and must not land, as
+/// a search read at the floor was served without it. The coordinator takes the
+/// timestamp after every participant prepared, and `Closed` waits for open
+/// intents, so this is a broken protocol: the apply fails and the group is
+/// quarantined (defense in depth).
+pub(super) fn resolved_below_floor() -> ProtocolError {
+    failure(ErrorCode::StorageUnavailable, BELOW_FLOOR)
 }
 /// Writes an image's vectors. The caller checked `complete`.
 pub(super) fn install_vectors(
@@ -558,7 +636,7 @@ impl ParticipantMachine {
     ) -> Result<T, ProtocolError> {
         if result
             .as_ref()
-            .is_err_and(|error| error.message == DAMAGED_VALUE)
+            .is_err_and(|error| [DAMAGED_VALUE, BELOW_FLOOR].contains(&error.message.as_str()))
         {
             self.store
                 .pool()
@@ -786,6 +864,7 @@ fn read_row(
         .ok_or_else(damaged_value)?
         .checked_add(version.value.map_or(0, |value| value.get().len() + 256))
         .ok_or_else(invalid)?;
+    let search = image(view, &config, &logical, &version, true, owner)?;
     if bytes > max_bytes {
         return Err(failure(
             ErrorCode::LimitExceeded,
@@ -794,7 +873,7 @@ fn read_row(
     }
     Ok(SearchRow::Row {
         version: Some(CommitTs::new(at).map_err(|_| recovery_unknown())?),
-        search: image(view, &logical, &version, true, owner)?,
+        search,
         value: version
             .value
             .map(|value| {

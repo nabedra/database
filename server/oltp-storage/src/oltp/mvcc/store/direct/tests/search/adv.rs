@@ -9,7 +9,6 @@ use crate::oltp::mvcc::store::{
     lineage::{self, SplitBinding, SplitPage},
     restore,
     row::{STAGED, VECTOR},
-    search::SplitSearch,
 };
 
 use crate::oltp::mvcc::vector::MAX_VECTOR_BYTES;
@@ -135,12 +134,25 @@ async fn adv_g02_a_resolve_below_the_floor_is_not_a_silent_landing() {
     let plan = s.f.queued_plan(20, &writes);
     s.f.prepare(&plan, writes).await;
     seal(&mut s, &plan).await;
-    let reply = resolve(&mut s, &plan, commit_at(40), 128).await;
-    let landed = s.at(1, u64::MAX).await.version;
-    assert!(
-        landed.is_none_or(|at| at > 50),
-        "a version landed at {landed:?} at or below the closed floor 50 ({reply:?})"
-    );
+    // It cannot be refused (atomicity) and must not land: the apply fails and the
+    // group is quarantined, so this replica never serves or acknowledges again.
+    let proof = SealedStatusDecision::seal(DecisionStatement {
+        txn: plan.txn,
+        request: plan.request,
+        manifest: plan.manifest,
+        decided_at: position(1),
+        decision: commit_at(40),
+    })
+    .unwrap();
+    let command = ParticipantCommand::Resolve { authority: s.f.authority, proof, max_items: 128 };
+    let index = s.f.replica.index;
+    let reply = apply_entry(s.f.machine(), s.f.shared(), index, &command).await;
+    let error = reply.err().expect("a Resolve below the floor applied");
+    assert!(error.message.starts_with("storage corrupt"), "{}", error.message);
+    assert!(s.f.pool.is_group_quarantined(s.f.group.group_id));
+    // Nothing of it was written: the intent waits, and no version exists.
+    let versions: Vec<_> = s.records(VALUE).await;
+    assert!(versions.is_empty(), "a version landed below the closed floor 50: {versions:?}");
 }
 
 /// Closed twice, below the floor, redelivered, and after a leader change.
@@ -890,11 +902,14 @@ async fn adv_vec_g10_a_restored_range_takes_nothing_before_its_first_search_fenc
         .await;
     assert_eq!(prepared, ParticipantReply::Rejected(Fault::Incomplete));
     assert_eq!(restored.dump().await, before, "nothing was written");
-    // Reads and the feed work: the rows and vectors are there.
-    assert_eq!(got(&restored.machine, s.f.key(1), 20).await.unwrap().vectors[&PLAIN], (10, vec![1; 8]));
-    // The first fence names the columns; now writes, closes and embeddings apply.
+    // No vector is served before the range knows its columns, since it cannot be
+    // checked against them; the rows and vectors are there once it does.
+    let unknown = got(&restored.machine, s.f.key(1), 20).await.err().unwrap();
+    assert!(unknown.message.contains("not known yet"), "{}", unknown.message);
+    // The first fence names the columns; now reads, writes, closes and embeddings apply.
     let fence = fence_for(&s, 1, columns());
     assert!(matches!(search_reply(restored.submit(fence).await), SearchReply::Fenced { epoch: 1, .. }));
+    assert_eq!(got(&restored.machine, s.f.key(1), 20).await.unwrap().vectors[&PLAIN], (10, vec![1; 8]));
     let direct = match search_reply(restored.submit(fence_for(&s, 2, columns())).await) {
         SearchReply::Fenced { epoch: 2, direct: Some(direct) } => direct,
         other => panic!("{other:?}"),
@@ -1463,8 +1478,10 @@ async fn adv_vec_g14_a_dropped_embedded_column_leaves_no_record_and_takes_no_rep
     let got = s.get(2).await;
     assert!(got.source.is_empty() && !got.vectors.contains_key(&EMBEDDED), "{got:?}");
     assert_eq!(s.get(1).await.vectors[&PLAIN], (10, vec![1; 8]), "a kept column keeps its vector");
-    // The old version still has the dropped column's vector, until a collector says.
-    assert_eq!(s.at(2, 12).await.vectors[&EMBEDDED], (12, vec![12; 8]));
+    // The old version keeps the dropped column's vector until a collector takes
+    // it, and no reader is served it: a dropped column is never served (VEC-G08).
+    assert!(!s.at(2, 12).await.vectors.contains_key(&EMBEDDED));
+    assert_eq!(s.count(VECTOR).await, 2);
     // The id never comes back, with the same definition or another.
     for definition in [embedded(EMBEDDED), column(EMBEDDED, VectorKind::Dense, 2)] {
         let columns = vec![column(PLAIN, VectorKind::Dense, 2), definition];

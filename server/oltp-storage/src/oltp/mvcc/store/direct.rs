@@ -477,7 +477,7 @@ fn well_formed(
         key_length(key)?;
         if let Some(value) = value {
             serde_json::from_str::<&RawValue>(value.as_str()).map_err(|_| invalid())?;
-        } else if search.is_some() {
+        } else if search.is_some_and(|search| !search.vectors.is_empty() || !search.backfill.is_empty()) {
             return malformed;
         }
     }
@@ -780,11 +780,15 @@ fn check<'a>(
     {
         return done(Fault::InvalidBinding);
     }
-    // A row names only the group's search columns that no embedder fills.
-    if command.changes().any(|(.., search)| {
-        search.is_some_and(|search| {
+    // A row of a search range always carries `search`, even with no vector, so
+    // no write of it is the bytes of an older build's commit. It names only the
+    // group's search columns that no embedder fills.
+    let searched = config.search.is_some();
+    if command.changes().any(|(key, _, _, search)| match search {
+        Some(search) => {
             !search::ready(config).is_some_and(|schema| search.valid(&schema.columns))
-        })
+        }
+        None => searched && matches!(key, MvccKey::Row { .. }),
     }) {
         return done(Fault::InvalidBinding);
     }

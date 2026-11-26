@@ -185,9 +185,15 @@ impl SearchColumn {
     }
     /// Whether `value` has this column's kind and dimensions.
     pub(crate) fn accepts(&self, value: &VectorValue) -> bool {
-        let Some(len) = value.checked_len().filter(|_| value.kind == self.kind) else {
+        value
+            .checked_len()
+            .is_some_and(|len| self.fits(value.kind, len))
+    }
+    /// Whether a vector of `kind` and `len` bytes has this column's type.
+    pub(crate) fn fits(&self, kind: VectorKind, len: usize) -> bool {
+        if kind != self.kind {
             return false;
-        };
+        }
         let vector = self.dim as usize * 4;
         match self.kind {
             VectorKind::Dense => len == vector,

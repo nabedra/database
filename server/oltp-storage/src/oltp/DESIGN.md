@@ -50,7 +50,12 @@ whose table has search columns. Every other group keeps its bytes.
 
 Change records belong to one replica, like its log. The log's purge deletes
 them, no snapshot carries them, and each names the one before it, so a reader
-sees every gap. There is no MVCC version collection. A collector must use
+sees every gap. Readers serve only vectors of the range's search columns
+that have their column's type, and a split import or a snapshot install refuses
+one that does not. A Resolve at or below the closed floor fails its apply and
+quarantines the group: it cannot be refused without breaking atomicity, and the
+coordinator's timestamp order should make it impossible (defense in depth).
+There is no MVCC version collection. A collector must use
 `store::row::unreferenced` for vectors.
 
 Ambiguous writes

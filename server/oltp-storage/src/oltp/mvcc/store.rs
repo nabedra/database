@@ -1258,6 +1258,12 @@ fn resolve_writes(
     until: u64,
     decision: TxnDecision,
 ) -> Result<(), ProtocolError> {
+    if let TxnDecision::Commit { commit_ts } = decision
+        && until > state.resolved
+        && config.closed_floor.is_some_and(|floor| commit_ts <= floor)
+    {
+        return Err(row::resolved_below_floor());
+    }
     let schema = search::ready(config);
     let mut changes = feed::Changes::new(config);
     for ordinal in state.resolved..until {

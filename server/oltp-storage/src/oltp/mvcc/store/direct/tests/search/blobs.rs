@@ -550,3 +550,41 @@ async fn vs20_search_encodings_are_stable_and_an_older_decoder_refuses_them() {
     let version = [&[VALUE][..], &logical, &(!11u64).to_be_bytes()].concat();
     assert_eq!(dump[&version], br#"{"value":null}"#);
 }
+
+/// A replica snapshot whose vector does not have its column's type is refused,
+/// and the follower keeps what it had. A dropped column's vector installs, and
+/// is not served.
+#[tokio::test]
+async fn vs16_a_snapshot_install_refuses_a_vector_that_does_not_fit_its_column() {
+    for (fits, kind, bytes) in [
+        (true, VectorKind::Dense, vec![9u8; 8]),
+        (false, VectorKind::Sparse, vec![9u8; 8]),
+        (false, VectorKind::Dense, vec![9u8; 12]),
+    ] {
+        let mut s = S::new().await;
+        let write = s.write(1, None, Some(row(1, "a")), vec![s.set(PLAIN, s.dense(1))]);
+        s.direct(10, write).await;
+        let (key, _) = s.records(VECTOR).await.remove(0);
+        let value = s.value(kind, &bytes);
+        let mut frame = vec![0; 5 + bytes.len()];
+        value.frame(&mut frame).unwrap();
+        s.tamper(move |tx| tx.put(&key, &frame)).await;
+        let snapshot = s.f.machine().store().export_snapshot(BUDGET).await.unwrap();
+        let mut follower = s.f.replica_of_inactive().await;
+        let before = follower.dump().await;
+        let store = follower.machine.store().clone();
+        let installed = store.install_snapshot(snapshot, BUDGET).await;
+        if fits {
+            installed.unwrap();
+            follower.index = s.f.replica.index;
+            assert_eq!(follower.dump().await, s.f.dump().await);
+            continue;
+        }
+        let error = installed.err().unwrap();
+        assert!(error.message.starts_with("storage corrupt"), "{}", error.message);
+        assert_eq!(follower.dump().await, before);
+        // A reader of the source refuses it as damage, too.
+        let refused = got(s.f.machine(), s.f.key(1), 10).await.err().unwrap();
+        assert!(refused.message.starts_with("storage corrupt"), "{}", refused.message);
+    }
+}

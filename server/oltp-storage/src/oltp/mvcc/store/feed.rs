@@ -286,6 +286,7 @@ fn read_page(
         return Ok(ChangePage::Behind { applied });
     }
     let gone = || Ok(ChangePage::Gone { applied });
+    let config = &config;
     let mut entries: Vec<EntryChanges> = Vec::new();
     let mut budget = max_bytes;
     let mut reached = after;
@@ -301,7 +302,7 @@ fn read_page(
             return gone();
         }
         // A page ends before an entry that does not fit.
-        let Some(changes) = entry.read(view, &mut budget, owner)? else {
+        let Some(changes) = entry.read(view, config, &mut budget, owner)? else {
             return gone();
         };
         let Some(changes) = changes else {
@@ -360,6 +361,7 @@ impl<'a> Entry<'a> {
     fn read(
         &self,
         view: &mut GroupRead<'_>,
+        config: &Config,
         budget: &mut usize,
         owner: &Arc<ScratchLease>,
     ) -> Result<Option<Option<Vec<RowChange>>>, ProtocolError> {
@@ -410,7 +412,7 @@ impl<'a> Entry<'a> {
                             };
                             left = cost;
                             Some(ChangedRow {
-                                search: row::image(view, bytes, &version, false, owner)?,
+                                search: row::image(view, config, bytes, &version, false, owner)?,
                                 value: CanonicalJson::from_stored_json(
                                     value.get().as_bytes(),
                                     owner.clone(),

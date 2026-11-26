@@ -344,6 +344,18 @@ async fn vs16_a_backup_carries_rows_and_vectors_and_a_restore_derives_its_record
     }));
     for batch in [1, 3, 128] {
         let mut restored = restore(&s, &backup, 50, batch).await;
+        // No vector is served before the range knows its columns.
+        let unknown = got(&restored.machine, s.f.key(1), 50).await.err().unwrap();
+        assert!(unknown.message.contains("not known yet"), "{}", unknown.message);
+        // Writes wait for the columns, so nothing drops a vector.
+        let mut commit = s.commit(70, vec![s.write(1, Some(10), Some(serde_json::json!({"id": 1, "v": 1})), Vec::new())]);
+        commit.schema_epoch = 1;
+        let before = restored.dump().await;
+        let reply = restored.submit(ParticipantCommand::Direct(commit.clone())).await;
+        assert_eq!(reply, rejected(Fault::DirectInactive));
+        assert_eq!(restored.dump().await, before);
+        let fence = s.fence_command(7, columns());
+        assert!(matches!(search_reply(restored.submit(fence).await), SearchReply::Fenced { .. }));
         for key in 1..7 {
             let mut copied = got(&restored.machine, s.f.key(key), 50).await.unwrap();
             let mut original = s.at(key, 50).await;
@@ -358,15 +370,6 @@ async fn vs16_a_backup_carries_rows_and_vectors_and_a_restore_derives_its_record
             original.records.clear();
             assert_eq!(copied, original, "row {key}");
         }
-        // Writes wait for the columns, so nothing drops a vector.
-        let mut commit = s.commit(70, vec![s.write(1, Some(10), Some(serde_json::json!({"id": 1, "v": 1})), Vec::new())]);
-        commit.schema_epoch = 1;
-        let before = restored.dump().await;
-        let reply = restored.submit(ParticipantCommand::Direct(commit.clone())).await;
-        assert_eq!(reply, rejected(Fault::DirectInactive));
-        assert_eq!(restored.dump().await, before);
-        let fence = s.fence_command(7, columns());
-        assert!(matches!(search_reply(restored.submit(fence).await), SearchReply::Fenced { .. }));
         commit.schema_epoch = 2;
         assert_eq!(restored.submit(ParticipantCommand::Direct(commit)).await, applied(70));
         assert_eq!(got(&restored.machine, s.f.key(1), 70).await.unwrap().vectors[&PLAIN], (10, vec![1; 8]));
@@ -414,7 +417,9 @@ async fn vs16_a_restore_of_a_history_keeps_every_version_and_the_newest_records(
         if reversed {
             images.reverse();
         }
-        let restored = restore(&s, &images, 20, batch).await;
+        let mut restored = restore(&s, &images, 20, batch).await;
+        let fence = s.fence_command(7, columns());
+        assert!(matches!(search_reply(restored.submit(fence).await), SearchReply::Fenced { .. }));
         for at in [10, 11, 12, 13, 14] {
             for key in [1, 2] {
                 let mut original = s.at(key, at).await;

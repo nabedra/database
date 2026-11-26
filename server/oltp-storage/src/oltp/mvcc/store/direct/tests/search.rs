@@ -232,7 +232,7 @@ impl S {
         vectors: Vec<VectorChange>,
     ) -> DirectWrite {
         DirectWrite {
-            search: (!vectors.is_empty()).then(|| {
+            search: (self.search_epoch > 0 || !vectors.is_empty()).then(|| {
                 Box::new(RowSearch {
                     vectors,
                     backfill: Vec::new(),

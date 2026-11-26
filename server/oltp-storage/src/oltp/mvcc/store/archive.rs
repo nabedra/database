@@ -208,7 +208,7 @@ impl ParticipantMachine {
                             }
                             used += cost;
                             let key = decode_logical(&logical)?;
-                            let search = row::image(view, &logical, &version, false, &owner)?;
+                            let search = row::image(view, &config, &logical, &version, false, &owner)?;
                             let value = version
                                 .value
                                 .map(|value| {

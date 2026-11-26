@@ -21,7 +21,7 @@ use crate::oltp::{
 };
 use nabedra_oltp_types::types::{DecisionStatement, Text, Timestamp};
 use nabedra_resources::config::WorkerResources;
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 use std::fmt::Write as _;
 
 fn id(n: u128) -> Uuid {
