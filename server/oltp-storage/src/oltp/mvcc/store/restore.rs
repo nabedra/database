@@ -13,7 +13,7 @@ use crate::oltp::{
 pub(super) const RESTORE_GENESIS: &[u8] = b"mvcc/restore-genesis/v1";
 const RESTORE_INACTIVE: &[u8] = b"mvcc/restore-inactive/v1";
 /// The backup's search columns of the restored group (L7).
-const RESTORE_SEARCH: &[u8] = b"mvcc/restore-search/v1";
+pub(super) const RESTORE_SEARCH: &[u8] = b"mvcc/restore-search/v1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParticipantGenesis {
