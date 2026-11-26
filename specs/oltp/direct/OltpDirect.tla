@@ -134,7 +134,7 @@ ApplyDirect(s, m) ==
         q == [id |-> m.id, op |-> m.dg[1], key |-> m.key, val |-> m.dg[3]]
     IN
     IF Has(rec) THEN
-        IF rec.dg = m.dg THEN [s |-> s, o |-> "replayed", rec |-> rec]
+        IF rec.dg = m.dg \/ Mutant = "digest_ignored" THEN [s |-> s, o |-> "replayed", rec |-> rec]
         ELSE [s |-> s, o |-> "conflict", rec |-> NoRec]
     ELSE IF (head.ver # m.exp /\ ~(Mutant = "record_no_precondition" /\ ~m.wr))
             \/ (m.wr /\ m.ts <= head.ver)
@@ -287,7 +287,7 @@ GwDeadline(c) ==
         P == {x.ts : x \in {y \in X : y.ph = "prop"}}
         d == End(gw, answers, c, NotApplied(gw[c], 0), "deadline")
     IN
-    /\ gw[c].gs = "call"
+    /\ gw[c].gs = "call" /\ Mutant # "no_gateway_deadline"
     /\ gw' = d.g /\ answers' = d.a
     /\ exec' = exec \ X
     /\ pend' = IF Mutant = "prefix_settle_unknown"
@@ -346,8 +346,8 @@ Execute(x) ==
     /\ IF Has(rec) \/ (~cm.wr /\ unrecorded) THEN
           /\ exec' = exec \ {x}
           /\ IF Has(rec)
-             THEN Out(x, IF rec.dg # Dg(q) THEN "na" ELSE rec.rk,
-                      IF rec.dg # Dg(q) THEN "reused"
+             THEN Out(x, IF rec.dg # Dg(q) /\ Mutant # "digest_ignored" THEN "na" ELSE rec.rk,
+                      IF rec.dg # Dg(q) /\ Mutant # "digest_ignored" THEN "reused"
                       ELSE IF Mutant = "reexecute_on_retry" THEN cm.res ELSE rec.res)
              ELSE Out(x, cm.rk, cm.res)
           /\ UNCHANGED <<prop, pend, tso>>

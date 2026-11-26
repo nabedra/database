@@ -15,7 +15,7 @@ MCInitLeader == [r \in MCRanges |-> n1]
 Sym == Permutations({n2, n3})
 
 MCAllFaults == {"crash", "part", "move", "loss", "refuse", "gw"}
-MCSafetyFaults == {"crash", "part", "move", "refuse", "gw"}
+
 
 \* c1 is the client under test: two attempts per call, one new call after
 \* outcome_unknown. c2 is the concurrent writer: one attempt, no retry.
