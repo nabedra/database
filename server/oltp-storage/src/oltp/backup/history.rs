@@ -163,6 +163,9 @@ pub enum HistoryFrame {
     Scope(HistoryScope),
     StatusClosure(ArchiveClosureStatement),
     BeginGroup(GroupImageScope),
+    /// The search columns of the group that began, before its first image,
+    /// only for a table with search columns (L7).
+    GroupSearch(Box<crate::oltp::mvcc::store::search::SearchSchema>),
     Image(CommittedImage),
     CatalogIndexClosure(ArchivedIndexClosure),
     CatalogSplitPublication(ArchivedSplitPublication),
@@ -198,6 +201,11 @@ pub enum HistoryFrame {
         root: Digest,
     },
 }
+/// Metadata of a cloned image: 1 KiB, and 8 KiB with a vector list and column
+/// maps. The values themselves keep the owner of their frame.
+fn clone_bytes(search: bool) -> usize {
+    if search { 8 << 10 } else { 1024 }
+}
 pub struct OwnedImage {
     image: CommittedImage,
     _source: OwnedCommand<HistoryFrame>,
@@ -217,7 +225,7 @@ impl OwnedImage {
             image
                 .key
                 .heap_bytes()
-                .checked_add(1024)
+                .checked_add(clone_bytes(image.search.is_some()))
                 .ok_or_else(invalid)?,
         )?;
         let image = image.clone();
@@ -241,13 +249,14 @@ impl OwnedImage {
             effect
                 .key
                 .heap_bytes()
-                .checked_add(1024)
+                .checked_add(clone_bytes(effect.search.is_some()))
                 .ok_or_else(invalid)?,
         )?;
         let image = CommittedImage {
             key: effect.key.clone(),
             commit_ts: page.commit_ts,
             value: effect.value.clone(),
+            search: effect.search.clone(),
         };
         Ok(Self {
             image,
@@ -325,13 +334,11 @@ impl OwnedPayload for HistoryFrame {
             Self::BeginGroup(group) => {
                 group.group.database.capacity_bytes() + span_bytes(&group.span)
             }
-            Self::Image(image) | Self::SplitImage(image) => {
-                image.key.heap_bytes()
-                    + image
-                        .value
-                        .as_ref()
-                        .map_or(Ok(0), CanonicalJson::heap_bytes)?
-            }
+            Self::Image(image) | Self::SplitImage(image) => image
+                .key
+                .heap_bytes()
+                .checked_add(image.value_bytes()?)
+                .ok_or_else(invalid)?,
             Self::CatalogIndexClosure(closure) => closure.source.database.capacity_bytes(),
             Self::CatalogSplitPublication(publication) => {
                 publication.catalog.group.database.capacity_bytes()
@@ -346,29 +353,20 @@ impl OwnedPayload for HistoryFrame {
             Self::Identity { identity, .. } => serialized_size(identity)?,
             Self::BeginTransaction(decision) => serialized_size(decision)?,
             Self::ParticipantEffects(effects) => effects.heap_bytes()?,
+            Self::GroupSearch(schema) => serialized_size(schema)?,
             _ => 0,
         })
     }
     fn attach_fields(&self, owner: Arc<ScratchLease>) -> Result<(), ProtocolError> {
         match self {
-            Self::Image(CommittedImage {
-                value: Some(value), ..
-            })
-            | Self::SplitImage(CommittedImage {
-                value: Some(value), ..
-            }) => value.attach_charge(owner),
+            Self::Image(image) | Self::SplitImage(image) => image.attach_charge(owner),
             Self::ParticipantEffects(effects) => effects.attach_fields(owner),
             _ => Ok(()),
         }
     }
     fn fields_attached(&self) -> bool {
         match self {
-            Self::Image(CommittedImage {
-                value: Some(value), ..
-            })
-            | Self::SplitImage(CommittedImage {
-                value: Some(value), ..
-            }) => value.is_charged(),
+            Self::Image(image) | Self::SplitImage(image) => image.is_charged(),
             Self::ParticipantEffects(effects) => effects.fields_attached(),
             _ => true,
         }
@@ -405,6 +403,7 @@ struct GroupProgress {
     scope: GroupImageScope,
     count: u64,
     root: Digest,
+    searched: bool,
 }
 struct TxnProgress {
     decision: ArchivedDecision,
@@ -660,6 +659,7 @@ impl Chain {
                 group.group.validate().map_err(|_| invalid())?;
                 self.previous_group = Some(order);
                 self.group = Some(GroupProgress {
+                    searched: false,
                     scope: group.clone(),
                     count: 0,
                     root: serialized_digest(&(b"nabedra/history-group/v1", group))?,
@@ -763,6 +763,16 @@ impl Chain {
                 }) {
                     return Err(invalid());
                 }
+            }
+            HistoryFrame::GroupSearch(_) => {
+                let group = self.group.as_mut().ok_or_else(invalid)?;
+                if group.searched
+                    || group.count != 0
+                    || !matches!(group.scope.group.kind, GroupKind::Data { .. })
+                {
+                    return Err(invalid());
+                }
+                group.searched = true;
             }
             HistoryFrame::EndGroup {
                 group_id,

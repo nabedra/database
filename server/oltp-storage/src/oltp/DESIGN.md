@@ -34,6 +34,34 @@ Modules
 - `query`: working-memory charges and bounded serialization for the planner.
 - `native`: explicit thread and stack reservations (`NativeThreadBudget`).
 
+Tables with search columns
+--------------------------
+
+[Vector search](../../../../plans/oltp-vector.md) adds records only to groups
+whose table has search columns. Every other group keeps its bytes.
+
+| Record | Holds |
+| --- | --- |
+| `'x' ‖ row key ‖ column ‖ commit_ts` | One vector: kind, CRC32C and bytes |
+| `blobs` and `source` in a `'v'` record | The vector versions the row version references, and the source version of each embedded column |
+| `'e' ‖ row key ‖ column` | The pending or failure record of an embedding |
+| `'y' ‖ txn ‖ ordinal` | Vectors a prepared transaction staged, until Resolve |
+| `0x40 ‖ group ‖ 'c' ‖ log index` | What the entry changed, for the search feed |
+
+Change records belong to one replica, like its log. The log's purge deletes
+them, no snapshot carries them, and each names the one before it, so a reader
+sees every gap. Readers serve only vectors of the range's search columns
+that have their column's type, and a split import or a snapshot install refuses
+one that does not. A Resolve at or below the closed floor fails its apply and
+quarantines the group: it cannot be refused without breaking atomicity, and the
+coordinator's timestamp order should make it impossible (defense in depth). A
+damaged vector quarantines its group durably: a synced group marker and pool
+record survive a restart, so the replica never opens, votes or serves again
+until its release. A restore checks every vector against the backup's search
+columns (`HistoryFrame::GroupSearch`) and refuses a mismatch as a schema error.
+There is no MVCC version collection. A collector must use
+`store::row::unreferenced` for vectors.
+
 Ambiguous writes
 ----------------
 

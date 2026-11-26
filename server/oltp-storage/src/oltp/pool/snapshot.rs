@@ -860,6 +860,8 @@ impl GroupStore {
             let mut batch = WriteBatch::with_capacity_bytes(budget.batch_bytes);
             let mut used = 12usize;
             let mut last_tag = 0u8;
+            let data = matches!(self.identity().kind, nabedra_oltp_types::types::GroupKind::Data { .. });
+            let mut vectors = crate::oltp::mvcc::store::row::InstallCheck::default();
             let mut previous_key = Vec::<u8>::new();
             loop {
                 let mut tag = [0u8; 1];
@@ -903,6 +905,9 @@ impl GroupStore {
                 let (key, value) = record.as_slice().split_at(key_len);
                 if tag[0] == 4 && last_tag == 4 && previous_key.as_slice() >= key {
                     return Err(storage_error_message());
+                }
+                if data && tag[0] == 4 {
+                    vectors.record(key, value)?;
                 }
                 let mut disk_key = if tag[0] == 4 {
                     prefix.clone()

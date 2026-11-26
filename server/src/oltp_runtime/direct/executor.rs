@@ -1497,6 +1497,9 @@ impl DirectExecutor {
                 expected_version: version,
                 value,
                 index,
+                // C1: `Some` (also with no vector) for every row of a table with
+                // search columns; apply refuses `None` there.
+                search: None,
             });
         }
         Ok(Some(Computed { writes, result }))

@@ -52,6 +52,7 @@ async fn o08_o13_small_data_proposals_share_two_gib() {
                         serde_json::json!({"id": id, "value": id, "tag": tag, "score": 0}),
                     )),
                     index: Vec::new(),
+                    search: None,
                 }],
                 result: fixed(serde_json::Value::Null),
                 applied_unix_ms: 1,

@@ -350,12 +350,7 @@ pub(super) fn apply(
             buffer[0] = VALUE;
             buffer[end..].copy_from_slice(&(!version.get()).to_be_bytes());
             let row = tx.pinned(buffer)?.ok_or_else(recovery_unknown)?;
-            #[derive(Deserialize)]
-            struct Version<'a> {
-                #[serde(borrow)]
-                value: Option<&'a RawValue>,
-            }
-            let row: Version<'_> = serde_json::from_slice(&row).map_err(|_| recovery_unknown())?;
+            let row = row::Version::decode(&row)?;
             let Some(value) = row.value else {
                 return Ok(matches!(mode, GuardMode::MetadataCleanup));
             };
@@ -1154,6 +1149,8 @@ mod index_recovery_tests {
             split_child: None,
             direct_pause: None,
             direct_schema: None,
+            search: None,
+            closed_floor: None,
         };
         let recover = |binding: LifecycleBinding, authority: Authority| {
             let catalog = catalog.clone();

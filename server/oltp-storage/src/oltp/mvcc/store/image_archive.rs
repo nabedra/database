@@ -11,6 +11,38 @@ pub struct CommittedImage {
     pub key: MvccKey,
     pub commit_ts: CommitTs,
     pub value: Option<super::super::CanonicalJson>,
+    /// The row version's vectors, only for a table with search columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<Box<row::RowImage>>,
+}
+impl CommittedImage {
+    /// Uncharged heap of the value and the vectors, without the key.
+    pub(crate) fn value_bytes(&self) -> Result<usize, ProtocolError> {
+        let value = self.value.as_ref().map_or(Ok(0), |value| value.heap_bytes())?;
+        let search = self.search.as_ref().map_or(Ok(0), |search| search.heap_bytes())?;
+        value.checked_add(search).ok_or_else(invalid)
+    }
+    pub(crate) fn attach_charge(&self, owner: Arc<ScratchLease>) -> Result<(), ProtocolError> {
+        if let Some(value) = &self.value {
+            value.attach_charge(owner.clone())?;
+        }
+        self.search
+            .as_ref()
+            .map_or(Ok(()), |search| search.attach_charge(owner))
+    }
+    pub(crate) fn is_charged(&self) -> bool {
+        self.value.as_ref().is_none_or(|value| value.is_charged())
+            && self.search.as_ref().is_none_or(|search| search.is_charged())
+    }
+    /// A row image holds every vector its row references, and only a live row
+    /// has any.
+    pub(super) fn complete(&self) -> bool {
+        self.search.as_ref().is_none_or(|search| {
+            self.value.is_some()
+                && matches!(self.key, MvccKey::Row { .. })
+                && search.complete(self.commit_ts)
+        })
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +68,9 @@ pub enum ImagePage {
         images: Page<CommittedImage>,
         after: Option<MvccKey>,
         exhausted: bool,
+        /// On the pages of a frozen split source with search columns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search: Option<Box<search::SplitSearch>>,
     },
 }
 impl ImagePage {
@@ -92,14 +127,21 @@ impl OwnedPayload for ImagePage {
                 group,
                 images,
                 after,
+                search,
                 ..
             } => images.iter().try_fold(
                 group.database.capacity_bytes()
                     + after.as_ref().map_or(0, MvccKey::heap_bytes)
+                    + search.as_ref().map_or(0, |search| search.heap_bytes())
                     + images.capacity() * std::mem::size_of::<CommittedImage>(),
                 |n, image| {
+                    let search = match &image.search {
+                        Some(search) => search.heap_bytes()?,
+                        None => 0,
+                    };
                     n.checked_add(image.key.heap_bytes())
                         .and_then(|n| n.checked_add(IMAGE_METADATA_BYTES))
+                        .and_then(|n| n.checked_add(search))
                         .ok_or_else(invalid)
                 },
             ),
@@ -108,9 +150,7 @@ impl OwnedPayload for ImagePage {
     fn attach_fields(&self, owner: Arc<ScratchLease>) -> Result<(), ProtocolError> {
         if let Self::Images { images, .. } = self {
             for image in images.iter() {
-                if let Some(value) = &image.value {
-                    value.attach_charge(owner.clone())?;
-                }
+                image.attach_charge(owner.clone())?;
             }
         }
         Ok(())
@@ -118,9 +158,7 @@ impl OwnedPayload for ImagePage {
     fn fields_attached(&self) -> bool {
         match self {
             Self::Blocked { .. } => true,
-            Self::Images { images, .. } => images
-                .iter()
-                .all(|image| image.value.as_ref().is_none_or(|value| value.is_charged())),
+            Self::Images { images, .. } => images.iter().all(CommittedImage::is_charged),
         }
     }
 }
@@ -154,7 +192,8 @@ impl ParticipantMachine {
                 .await?,
         );
         let group = self.store.identity().clone();
-        self.store
+        let page = self
+            .store
             .read_owned(
                 TransactionBudget {
                     scratch_bytes: 32 << 20,
@@ -201,10 +240,13 @@ impl ParticipantMachine {
                         }
                         None => prefix.to_vec(),
                     };
+                    let search = search::SplitSearch::of(&config);
+                    let records = search::SplitSearch::frozen_at(&config, request.read_ts);
                     let mut images = Vec::with_capacity(request.max_items as usize);
                     let mut used = 4096
                         + images.capacity() * std::mem::size_of::<CommittedImage>()
                         + cursor.capacity()
+                        + search.as_ref().map_or(0, |search| search.heap_bytes())
                         + request.after.as_ref().map_or(0, MvccKey::heap_bytes);
                     let mut wire_used = 4096usize;
                     let mut next = request.after.clone();
@@ -301,16 +343,13 @@ impl ParticipantMachine {
                             if commit_ts > request.read_ts {
                                 return Err(recovery_unknown());
                             }
-                            #[derive(Deserialize)]
-                            #[serde(deny_unknown_fields)]
-                            struct Version<'a> {
-                                #[serde(borrow)]
-                                value: Option<&'a RawValue>,
-                            }
-                            let value: Version<'_> = serde_json::from_slice(version.value())
-                                .map_err(|_| recovery_unknown())?;
+                            let value = row::Version::decode(version.value())?;
+                            let vectors =
+                                row::image_cost(view, logical, &value, records)?
+                                    .ok_or_else(row::damaged_value)?;
                             let cost = encoded_length(&key, super::super::MAX_FIXED_COMMAND_BYTES)?
                                 .checked_add(value.value.map_or(0, |v| v.get().len()))
+                                .and_then(|n| n.checked_add(vectors))
                                 .and_then(|n| n.checked_add(2048))
                                 .ok_or_else(invalid)?;
                             if wire_used
@@ -325,8 +364,11 @@ impl ParticipantMachine {
                                 .and_then(|n| {
                                     n.checked_add(value.value.map_or(0, |v| v.get().len()))
                                 })
+                                .and_then(|n| n.checked_add(vectors))
                                 .and_then(|n| n.checked_add(IMAGE_METADATA_BYTES))
                                 .ok_or_else(invalid)?;
+                            let image =
+                                row::image(view, &config, logical, &value, records, &owner)?;
                             let value = value
                                 .value
                                 .map(|value| {
@@ -340,6 +382,7 @@ impl ParticipantMachine {
                                 key: key.clone(),
                                 commit_ts,
                                 value,
+                                search: image,
                             }))))
                         })?;
                         let emitted = match outcome {
@@ -417,12 +460,14 @@ impl ParticipantMachine {
                             images: Page::new(images).map_err(|_| invalid())?,
                             after: next,
                             exhausted,
+                            search,
                         },
                         owner,
                     )
                 },
             )
-            .await
+            .await;
+        self.note_damage(page).await
     }
 }
 impl ParticipantHandle {

@@ -1370,6 +1370,8 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                                     .unwrap_or_else(|| vec![prefix + 1]);
                                 tx.delete_range(&index_key(prefix, start), &end)?;
                             }
+                            // The entries' change records go with them (DB-5).
+                            tx.purge_changes(start, id.index)?;
                         }
                         let bytes = tx.encode_value(&id)?;
                         tx.put(PURGED, bytes.as_slice())?;

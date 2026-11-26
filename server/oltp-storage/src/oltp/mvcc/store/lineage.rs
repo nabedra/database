@@ -116,6 +116,9 @@ pub struct SplitPage {
     /// advancing past a scanned head without a version at this cut.
     pub after: Option<MvccKey>,
     pub exhausted: bool,
+    /// The source's search columns and closed floor, if it has any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<Box<search::SplitSearch>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -626,6 +629,8 @@ pub(super) fn stage_child(
         || tx
             .first_from(&[super::direct::EXPIRY], &[super::direct::EXPIRY])?
             .is_some()
+        || tx.first_from(&[row::VECTOR], &[row::VECTOR])?.is_some()
+        || tx.first_from(&[embed::EMBED], &[embed::EMBED])?.is_some()
     {
         return reject(tx, Fault::Conflict);
     }
@@ -670,6 +675,13 @@ pub(crate) fn initial_root(binding: &SplitBinding) -> Result<Digest, ProtocolErr
     )
 }
 pub(crate) fn page_root(page: &SplitPage) -> Result<Digest, ProtocolError> {
+    let root = image_page_root(page)?;
+    match &page.search {
+        Some(search) => hash(b"nabedra/split-page-search/v1\0", &(root, search)),
+        None => Ok(root),
+    }
+}
+fn image_page_root(page: &SplitPage) -> Result<Digest, ProtocolError> {
     hash(
         b"nabedra/split-page/v1\0",
         &(
@@ -798,6 +810,10 @@ pub(super) fn apply(
         if previous.is_some_and(|old| compare_keys(old, &image.key) != Ordering::Less)
             || image.commit_ts > page.binding.read_ts
             || !owns_image(&page.binding.source, &page.binding.source_span, &image.key)
+            || !image.complete()
+            || image.search.as_ref().is_some_and(|search| {
+                !page.search.as_ref().is_some_and(|split| search.fits(&split.schema))
+            })
         {
             return reject(tx, Fault::InvalidBinding);
         }
@@ -835,16 +851,21 @@ pub(super) fn apply(
             if tx.pinned(key)?.is_some() {
                 return Err(recovery_unknown());
             }
-            #[derive(Serialize)]
-            struct Version<'a> {
-                value: Option<&'a RawValue>,
-            }
             let value = image
                 .value
                 .as_ref()
                 .map(|value| serde_json::from_str(value.as_str()).map_err(|_| invalid()))
                 .transpose()?;
-            tx.put_serialized(key, &Version { value })?;
+            if let Some(search) = &image.search {
+                // The frozen source took no entry since its cut, so its records
+                // are copied as they are (DB-22).
+                let logical = &key[1..length + 1];
+                row::install_vectors(tx, logical, search)?;
+                for image in &search.records {
+                    embed::put(tx, logical, image.column, &image.record)?;
+                }
+            }
+            tx.put_serialized(key, &row::imaged(value, image.search.as_deref()))?;
             key[0] = HEAD;
             tx.put_serialized(
                 &key[..length + 1],
@@ -893,12 +914,23 @@ pub(super) fn apply(
     if encoded_length(&state, METADATA_BYTES).is_err() {
         return reject(tx, Fault::ResourceLimit);
     }
+    if let Some(search) = &page.search {
+        config.search = Some(search.schema.clone());
+        config.closed_floor = search.closed_floor;
+        // A search worker gets the imported rows from a range snapshot.
+        feed::start(tx, position)?;
+    }
     if page.exhausted {
         config
             .split_child
             .as_mut()
             .ok_or_else(recovery_unknown)?
             .complete = true;
+    }
+    if page.exhausted || page.search.is_some() {
+        if encoded_length(&config, METADATA_BYTES).is_err() {
+            return reject(tx, Fault::ResourceLimit);
+        }
         tx.put_serialized(CONFIG, &config)?;
     }
     tx.put_serialized(STATE, &state)?;
@@ -972,6 +1004,7 @@ impl SplitBinding {
                     images,
                     after,
                     exhausted,
+                    search,
                 } = image
                 else {
                     return Err(failure(
@@ -991,6 +1024,7 @@ impl SplitBinding {
                     images: Page::new(images.to_vec()).map_err(|_| invalid())?,
                     after: after.clone(),
                     exhausted: *exhausted,
+                    search: search.clone(),
                 };
                 let root = page_root(&page)?;
                 let command = ParticipantCommand::SplitImportPage {
@@ -1037,17 +1071,12 @@ impl SplitPage {
     pub(super) fn heap_bytes(&self) -> Result<usize, ProtocolError> {
         let base = self.binding.heap_bytes()?
             + self.images.capacity() * std::mem::size_of::<SplitImage>()
-            + self.after.as_ref().map_or(0, MvccKey::heap_bytes);
+            + self.after.as_ref().map_or(0, MvccKey::heap_bytes)
+            + self.search.as_ref().map_or(0, |search| search.heap_bytes());
         self.images.iter().try_fold(base, |bytes, image| {
-            let value = image
-                .value
-                .as_ref()
-                .map(|value| value.heap_bytes())
-                .transpose()?
-                .unwrap_or(0);
             bytes
                 .checked_add(image.key.heap_bytes())
-                .and_then(|bytes| bytes.checked_add(value))
+                .and_then(|bytes| bytes.checked_add(image.value_bytes().ok()?))
                 .ok_or_else(invalid)
         })
     }
@@ -1056,18 +1085,11 @@ impl SplitPage {
         owner: Arc<crate::oltp::pool::ScratchLease>,
     ) -> Result<(), ProtocolError> {
         for image in self.images.iter() {
-            if let Some(value) = &image.value {
-                value.attach_charge(owner.clone())?;
-            }
+            image.attach_charge(owner.clone())?;
         }
         Ok(())
     }
     pub(super) fn fields_attached(&self) -> bool {
-        self.images.iter().all(|image| {
-            image
-                .value
-                .as_ref()
-                .is_none_or(|value| value.ensure_charged().is_ok())
-        })
+        self.images.iter().all(SplitImage::is_charged)
     }
 }
