@@ -1,0 +1,14 @@
+# Design check of the nabedra-kv storage engine (plans/native-storage-engine.md, design review
+# section): every T1 baseline of specs/lsm/Lsm (crash model, journal values and early rolls, media
+# damage, disk loss, no faults, liveness), exhaustive with coverage, then every mutant.
+id = "lsm-lsm"
+module = "lsm"
+kinds = ["T"]
+guarantees = ["LSM-G01", "LSM-G02", "LSM-G03"]
+scenarios = ["LSM01", "NS03", "NS04", "NS05", "NS06", "NS07", "NS08", "NS13", "NS25"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/lsm", "Lsm", "--budget-s", "2400"]
+cwd = "."
+timeout_s = 20400
+needs = ["tlc"]
+result_parser = "tlc"
