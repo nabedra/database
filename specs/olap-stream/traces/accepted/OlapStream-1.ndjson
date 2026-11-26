@@ -1,6 +1,0 @@
-{"trace":"nabedra.trace/1","spec":"OlapStream","seed":1,"sha":"0000000000000000000000000000000000000000","workload":"handwritten","params":{"Nodes":["w1","w2"],"Clients":["c1"],"OpenOnly":[],"BatchRows":2,"RowCount":[2,3],"DropLast":false,"MaxCrashes":1,"MaxLoss":1,"MaxDup":1,"MaxDelay":1,"MaxPartitions":1,"MaxCommits":1}}
-{"seq":0,"t":1000,"node":"orm","action":"ClientStart","vars":{"ph":"opening","seq":0,"h":0},"msg":{"c":"c1"}}
-{"seq":1,"t":2000,"node":"w1","action":"DriverCommit","vars":{"entry":{"h":1,"ver":[1,1],"snap":1,"cp":{"seq":-1,"first":0,"next":0,"out":[-1,-1,-1]}},"ph":"streaming","seq":0,"h":1},"msg":{"k":"open","c":"c1","run":1,"h":0,"seq":0}}
-{"seq":2,"t":3000,"node":"w1","action":"DriverCommit","vars":{"entry":{"h":1,"ver":[1,2],"snap":1,"cp":{"seq":0,"first":0,"next":2,"out":[1,0,2]}},"ph":"streaming","seq":1,"h":1},"msg":{"k":"demand","c":"c1","run":1,"h":1,"seq":0}}
-{"seq":3,"t":4000,"node":"w1","action":"Crash","vars":{"term":2,"run":1,"sched":"w2","ready":["w2"]}}
-{"seq":4,"t":5000,"node":"w2","action":"DriverCommit","vars":{"entry":{"h":1,"ver":[2,1],"snap":1,"cp":{"seq":1,"first":2,"next":2,"out":[0,0,0]}},"ph":"done","seq":1,"h":1},"msg":{"k":"demand","c":"c1","run":1,"h":1,"seq":1}}
