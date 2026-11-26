@@ -510,3 +510,44 @@ fn vs17_adv_invisible_format_characters_do_not_make_a_different_word() {
         assert_eq!(names(&a, visible), names(&a, marked), "{marked:?}");
     }
 }
+
+#[test]
+fn vs17_adv_the_limit_counts_bytes_after_lowercase_and_is_exactly_sixty_four() {
+    let a = Analyzer::new("simple").unwrap();
+    for (n, kept) in [(63usize, true), (64, true), (65, false)] {
+        assert_eq!(
+            names(&a, &"q".repeat(n)).len(),
+            usize::from(kept),
+            "{n} bytes"
+        );
+    }
+    // `İ` is two bytes and lowercases to three: 32 of them are 64 bytes and 96 after lowercase.
+    assert!(names(&a, &"İ".repeat(32)).is_empty());
+    assert_eq!(names(&a, &"İ".repeat(21)).len(), 1);
+    assert_eq!(MAX_TERM_BYTES, 64);
+}
+
+#[test]
+fn vs17_adv_no_two_languages_are_the_same_analyzer() {
+    let words: Vec<&str> = SAMPLES
+        .iter()
+        .flat_map(|(_, t)| t.split(' '))
+        .chain([
+            "kutyák",
+            "köpekler",
+            "chanteurs",
+            "hundar",
+            "hunden",
+            "hundene",
+        ])
+        .collect();
+    let stems = |l: &str| {
+        let a = Analyzer::new(l).unwrap();
+        words.iter().map(|w| names(&a, w)).collect::<Vec<_>>()
+    };
+    for (i, a) in LANGUAGES.iter().enumerate() {
+        for b in &LANGUAGES[i + 1..] {
+            assert_ne!(stems(a), stems(b), "{a} and {b} stem alike");
+        }
+    }
+}

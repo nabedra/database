@@ -1184,3 +1184,45 @@ fn vs07_adv_counts_of_ranges_add_up() {
     assert_eq!((both.docs, both.words), (14, 9 * 2 + 5 * 4));
     assert!(ix.counts(&[RangeId(99)], "w1").is_err());
 }
+
+#[test]
+fn vs07_adv_local_counts_follow_updates_deletes_and_merges() {
+    let mut ix = serving(text_cfg_with("simple", 2, 2));
+    let mut m = Model::default();
+    let mut docs: BTreeMap<u64, String> = BTreeMap::new();
+    let steps: Vec<Vec<(u64, Option<&str>)>> = vec![
+        vec![
+            (1, Some("w1 w2 w2")),
+            (2, Some("w1")),
+            (3, Some("w3 w3 w3 w3")),
+        ],
+        vec![(2, Some("w2 w2 w2 w9")), (3, None)],
+        vec![(1, None), (4, Some("")), (5, Some("w1 w1 w2 w7 w7"))],
+        vec![(4, Some("w1")), (2, None), (3, Some("w2"))],
+    ];
+    for step in steps {
+        let changes = step
+            .iter()
+            .map(|(k, t)| (*k, t.map(|t| text(t, vec![tags(&[])], *k))))
+            .collect();
+        ix.apply(RANGE, &m.page(changes, false)).unwrap();
+        for (k, t) in step {
+            match t {
+                Some(t) => docs.insert(k, t.to_owned()),
+                None => docs.remove(&k),
+            };
+        }
+        let applied = ix.status(RANGE).unwrap().applied;
+        ix.advance_low(RANGE, applied).unwrap();
+        for _ in 0..3 {
+            ix.compact().unwrap();
+        }
+        for q in ["w1 w2 w3", "w9 w7", "absent"] {
+            assert_eq!(
+                ix.counts(&[RANGE], q).unwrap(),
+                Global::of(&docs).stats(q),
+                "{q} after {docs:?}"
+            );
+        }
+    }
+}

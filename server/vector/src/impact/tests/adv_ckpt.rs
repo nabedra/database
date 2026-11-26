@@ -685,3 +685,29 @@ fn vs10_adv_a_peer_copy_is_whole_or_detected_after_a_crash_at_every_step() {
         }
     }
 }
+
+#[test]
+fn vs10_adv_a_checkpoint_without_rows_is_still_of_its_columns_only() {
+    let fs = disk();
+    let cfg = Config::new(Kind::Text("english".into()), vec![ColumnType::Tags]);
+    let mut ix = ImpactIndex::new(cfg.clone(), RamStore::default(), Some(store(&fs))).unwrap();
+    bring_up(&mut ix, RANGE, 3);
+    ix.checkpoint().unwrap();
+    let (ok, damage) = ImpactIndex::recover(cfg, RamStore::default(), store(&fs)).unwrap();
+    assert_eq!((damage.len(), ok.status(RANGE).unwrap().applied), (0, 3));
+    for cols in [
+        vec![],
+        vec![ColumnType::Int],
+        vec![ColumnType::Tags, ColumnType::Tags],
+    ] {
+        let other = Config::new(Kind::Text("english".into()), cols.clone());
+        assert_eq!(
+            ImpactIndex::recover(other, RamStore::default(), store(&fs))
+                .unwrap()
+                .1
+                .len(),
+            1,
+            "{cols:?}"
+        );
+    }
+}
