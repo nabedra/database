@@ -1,0 +1,23 @@
+# Design review rv-cache, 2026-11-26. The spec form of CACHE-retired-live-source-lost-writes (found in the fault
+# model by the review of #111). specs/cache/CacheCluster.tla: with the candidate fix follow_retired (CacheCluster.fixed.cfg)
+# G05_NoAckAfterHandover and G05_LossOnlyFromLag hold; the shipped design is restored by the mutants
+# prefix_early_staged_commit (a Retired staged promotion commits before the grant ends, placement.rs:415 and :656-692)
+# and prefix_retired_gate (copies drop a retired source, worker/sync.rs:302 and worker/actor.rs:876).
+# Whether the loss is allowed instead is a contract question for the user (decision 5).
+id = "DESIGN-cache-retired-source-handover"
+title = "A retired cache primary keeps acknowledging writes on its grant after its successor took over or its copy stopped pulling"
+class = "membership-replacement-trust"
+module = "cache"
+guarantees = ["CACHE-G05"]
+scenarios = ["K03"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/cache/mutants/prefix_early_staged_commit.cfg"
+seed = "unknown"
+why_not_caught = "No property tied the replication lag window to the handover: the history checker has no lag window and every owner change is a failover marker, so any loss above the retained prefix passed."
+invariant_added = "G05_NoAckAfterHandover (no write is acknowledged in an epoch after a later epoch took over its prefix) and G05_LossOnlyFromLag (a promotable copy can pull from its source while the source is authorized)."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

@@ -1,0 +1,21 @@
+# Design review rv-cache, 2026-11-26. The spec form of CACHE-K03-DOCKER-PLACEMENT. specs/cache/CacheCluster.tla: with the
+# candidate fix observe_window (CacheCluster.fixed.cfg) G05_NoRepairOfSteady holds; prefix_no_observe_window restores the
+# shipped planner, which fails over (placement.rs:784) and starts replica-only transfers (:790-811) on a worker it has not
+# heard from in the current term, while only the cold reset waits for cold_reset_not_before_ms (:695).
+id = "DESIGN-cache-silent-worker-repair"
+title = "After a controller term change or at start, the cache planner fails over and replaces replicas of workers that are connected but not yet heard"
+class = "fence-lifecycle-order"
+module = "cache"
+guarantees = ["CACHE-G05"]
+scenarios = ["K03"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/cache/mutants/prefix_no_observe_window.cfg"
+seed = "unknown"
+why_not_caught = "The plan gives the 3 s report window only to the scoped cold reset, and no property separated a silent connected worker from a lost one."
+invariant_added = "G05_NoRepairOfSteady: no failover or replica replacement drops a worker connected since the current controller term started."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"
