@@ -23,6 +23,7 @@ const GOLDEN: u32 = 0x9e37_79b9;
 ///
 /// Everything stored, and every estimate, is the same on every CPU: only integer kernels and scalar
 /// arithmetic.
+#[derive(Clone)]
 pub struct CodeBlock {
     padded: usize,
     /// `padded / 64` words per entry.
@@ -296,9 +297,13 @@ impl QueryCode {
     /// Replaces `out` with the 1-bit estimate of every entry of `block`, in order. Panics when the
     /// block has other padded dimensions.
     pub fn scan(&self, block: &CodeBlock, out: &mut Vec<Estimate>) {
+        out.clear();
+        self.append_scan(block, out);
+    }
+
+    pub(crate) fn append_scan(&self, block: &CodeBlock, out: &mut Vec<Estimate>) {
         assert_eq!(self.padded, block.padded, "padded dimensions");
         const CHUNK: usize = 64;
-        out.clear();
         out.reserve(block.len());
         let kernels = Kernels::detect();
         let d = self.padded as f32;
