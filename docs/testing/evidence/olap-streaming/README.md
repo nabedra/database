@@ -43,7 +43,7 @@ The earlier OLAP process run completed ten assertion groups in 125.9 seconds. Be
 
 ## Verification after OLTP merged
 
-The streaming branch and published OLTP branch merged cleanly in both orders. The merged source is `70f14f6fc9545377b358af260d1e20ff300ff02f`. A Linux x86-64 Docker container with 2 CPUs, 5 GiB of RAM, and zero swap ran the checks below. [OLTP PR #13](https://github.com/zPy52/nabedra-database/pull/13)
+The streaming branch and published OLTP branch merged cleanly in both orders. The merged source is `70f14f6fc9545377b358af260d1e20ff300ff02f`. A Linux x86-64 Docker container with 2 CPUs, 5 GiB of RAM, and zero swap ran the checks below. [OLTP PR #13](https://github.com/nabedra/database/pull/13)
 
 - The locked OLAP build produced SHA-256 `786ceecfa691444548ba1deab24ea1fbfa19a8585660ee1ff408445e25a4627e`. All 13 modern process assertion groups passed in 156.2 seconds. All 190 Python tests passed with PyArrow 20.0.0, and all four O02 dependency graphs passed, including `oltp-backup-s3`.
 - The merged binary overflowed a Tokio thread's default stack in the provider drain test, both with a stream open and with the unchanged provider fixture. The larger-stack diagnostic passed the live-stream removal check. Source `0fd10e64d0932681dd23515353c3acdc170ebf3f` moved the drain future to the heap at both provider tick call sites. The new OLAP binary, SHA-256 `23e45fd3145102e973d53c89dfc702b41f0140ae57893b73e3938c32c9acd5ab`, passed at the default stack size. The local callback fixture exercised A01/A02, including explicit scale to zero and restart. After the earlier worker removal the original stream replayed batch zero byte for byte, yielded the exact next row, then returned EOF and closed (ST05/A02).

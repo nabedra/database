@@ -43,7 +43,7 @@ class PullRequestLintTests(unittest.TestCase):
         self.assertEqual(len(pr_lint.lint("~~~markdown\n" + VALID + "~~~\n")), 4)
 
 
-RUN = "https://github.com/zPy52/nabedra-database/actions/runs/123"
+RUN = "https://github.com/nabedra/database/actions/runs/123"
 
 
 class DesignLineTests(unittest.TestCase):
