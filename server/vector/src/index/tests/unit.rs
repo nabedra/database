@@ -718,3 +718,45 @@ fn vs07_the_direction_codec_is_used_and_exact_search_still_matches_raw() {
         }
     }
 }
+
+#[test]
+fn vs17_direction_query_preparation_counts_against_the_budget() {
+    use crate::runtime::Budget;
+
+    let mut cfg = Config::new(schema(4096, &[], None), 1);
+    cfg.flat = 0;
+    let mut indexed = serving(cfg, DirectionCodec::new(4096, 3).unwrap(), None);
+    let vector = vec![1.0; 4096];
+    feed(
+        &mut indexed,
+        RANGE,
+        &page(0, vec![(1, Some(row(&vector, Vec::new(), 1)))]),
+    );
+    let pin = latest(&mut indexed, None);
+    let limits = [
+        (
+            Budget {
+                cpu: 5000,
+                ..Budget::UNLIMITED
+            },
+            "cpu",
+        ),
+        (
+            Budget {
+                memory: 32 << 10,
+                ..Budget::UNLIMITED
+            },
+            "memory",
+        ),
+    ];
+    let mut q = query(Op::Dot, &vector, 1);
+    for (budget, resource) in limits {
+        assert!(indexed.search_within(&pin, &q, budget).is_ok());
+        q.exact = false;
+        assert_eq!(
+            indexed.search_within(&pin, &q, budget),
+            Err(Error::OverBudget(resource))
+        );
+        q.exact = true;
+    }
+}

@@ -52,6 +52,11 @@ impl Rotation {
         self.padded
     }
 
+    /// Work units for scaling, all butterflies, and moving the interleaved blocks.
+    pub(crate) fn work(&self) -> u64 {
+        (ROUNDS * self.padded * (self.block.ilog2() as usize + 3)) as u64
+    }
+
     /// Writes the rotation of `v`, followed by zeros up to the padded length, to `out`.
     ///
     /// `v` must be finite with a length of at most 1e30; directions are. Panics unless `v` has
