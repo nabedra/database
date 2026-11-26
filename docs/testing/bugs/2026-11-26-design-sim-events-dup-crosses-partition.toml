@@ -1,7 +1,3 @@
-# Found by reading the simulator code (server/events/src/sim/net.rs: the duplicate copy runs after delay_ms + 1 with no
-# is_blocked or is_up check; the reply leg checks the link once, before its delay) and confirmed as a counterexample of
-# specs/sim/net-rpc (mutant prefix_dup_crosses_block breaks NothingCrossesBlockedLink). Not reproduced in a running
-# simulator. First found by dr-sim on 2026-11-24; unchanged on main e6b4040b.
 id = "SIM-EVENTS-DUP-PARTITION"
 title = "An Events simulation duplicate is handled across a partition that opened after the original arrived"
 class = "other"
@@ -10,12 +6,9 @@ guarantees = ["EVT-G01", "EVT-G03"]
 scenarios = ["EV01", "EV02"]
 found_by = "review"
 found_date = "2026-11-24"
-lowest_regression = "specs/sim/net-rpc/mutants/prefix_dup_crosses_block.cfg"
-seed = "unknown"
+lowest_regression = "server/events/src/sim/cluster.rs::rpc_delivery_tests"
+seed = 1
 why_not_caught = "The duplicate copy reuses the original's link check, a partition inside its 1 ms gap is rare in seeds, and no test covers it."
 invariant_added = "NothingCrossesBlockedLink: no handler runs for a request copy that arrives while its link is blocked (specs/sim/net-rpc/SimNetRpc.tla)."
-fix_commits = []
+fix_commits = ["649e496eab2083efccc900bec06c146f3810641d"]
 revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-24"
