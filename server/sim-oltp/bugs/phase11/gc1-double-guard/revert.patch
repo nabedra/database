@@ -1,5 +1,5 @@
 diff --git a/server/oltp-replication/src/oltp_replication/typed_log.rs b/server/oltp-replication/src/oltp_replication/typed_log.rs
-index 26abe757..d613ded7 100644
+index 1dba9e96..605bf5a1 100644
 --- a/server/oltp-replication/src/oltp_replication/typed_log.rs
 +++ b/server/oltp-replication/src/oltp_replication/typed_log.rs
 @@ -192,6 +192,7 @@ struct AppendJob<C: TypedConfig> {
@@ -10,7 +10,7 @@ index 26abe757..d613ded7 100644
      #[cfg(test)]
      hook: Option<AppendHook>,
  }
-@@ -983,6 +984,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
+@@ -1083,6 +1084,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
              epoch: 0,
              batch,
              callback,
@@ -18,7 +18,7 @@ index 26abe757..d613ded7 100644
              #[cfg(test)]
              hook: append_hook,
          });
-@@ -995,13 +997,11 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
+@@ -1095,13 +1097,11 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
              ],
          )
          .since(submit);
@@ -37,7 +37,7 @@ index 26abe757..d613ded7 100644
              use crate::oltp_replication::by_kind;
              use nabedra_resources::perf_stage;
              let kind = store.identity().kind.clone();
-@@ -1187,10 +1187,12 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
+@@ -1308,10 +1308,12 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
              // before reporting, so a flushed entry is always read back stored.
              // Callbacks fire in log order.
              let mut committed = None;
@@ -50,7 +50,7 @@ index 26abe757..d613ded7 100644
                      ..
                  } = job;
                  let (first, last) = (job_batch[0].index(), job_batch[job_batch.len() - 1].index());
-@@ -1202,12 +1204,14 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
+@@ -1323,6 +1325,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                          io::Error::new(error.kind(), error.to_string())
                      }),
                  );
@@ -58,9 +58,10 @@ index 26abe757..d613ded7 100644
              }
              if let Some(id) = committed
                  && let Err(error) = save_commit_marker(&store, &retry, Some(id), true).await
-             {
-                 tracing::warn!(target: "nabedra_database_server::oltp_replication::typed_log", group=%store.identity().group_id,code=?error.code,"deferred Raft commit marker not saved");
-             }
+@@ -1334,6 +1337,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
+                 guard,
+                 abandoned: false,
+             });
 +            drop(pending);
          });
          Ok(())

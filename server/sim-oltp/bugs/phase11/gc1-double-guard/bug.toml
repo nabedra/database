@@ -14,6 +14,11 @@ port_notes = """
 b694f75b reversed in typed_log.rs (log targets changed around it): each AppendJob carries a second
 PendingGuard besides its task's guard. Not sensitive: the regression fails on the pending counter only. The defect
 changes only the count. Both guards are acquired and released once each, so there is no other behaviour to test.
+Refreshed on 1fb888a9 (close-out of broad run 45727968538): #151 added sim-only probe lines to the append task
+(`WorkStarted` and `WorkDone` for the task's guard). Context only, the changed lines are the same (digest
+unchanged). `drop(pending)` stays the task's last statement, now after the sim-only `WorkDone`, so a sim build
+still reports the work done before the job guards are released. In a sim build the probe now names the job's
+guard (moved into AppendJob) and the task's own guard has no WorkStarted or WorkDone.
 """
 # The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
 # not a detection. ../simulator.toml says which faults and trigger, and what is missing.
@@ -54,13 +59,8 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out
 # - the [regression] test, the counter: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456711262 (1bf1064d) 3 of 3 failed: `left: 2`, `right: 1`.
 # Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
 # the failure text it reports.
-[review]
-digest = "d8fba12562860bc339e6a3d29ac6852840db814ed4ef061dbb08a770648d3d00"
-verdict = "not-sensitive"
-assertion = "counter"
-reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
-source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
-notes = """\
-Patch read: exact inverse of b694f75b. Not sensitive by the rule: `left: 2 right: 1`, the pending counter, \
-nothing else.\
-"""
+# That [review] named digest d8fba12562860bc339e6a3d29ac6852840db814ed4ef061dbb08a770648d3d00 (the patch before the
+# 1fb888a9 refresh), verdict not-sensitive, assertion counter, reviewer "Claude Opus 5.5 (REVIEW-121, independent
+# reviewer of PR #121, wrote no patch)", source wave-p8/reports/review-121.md on 58fa013b. The refreshed patch
+# (review digest 729c0b8b57033af51d7402625d9b05cfad1815ed7344c9326900cec418079974) has not been reviewed again, so
+# there is no [review] until someone who did not refresh it reads it (README: a refreshed patch needs another review).
