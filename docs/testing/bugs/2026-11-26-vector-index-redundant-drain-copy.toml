@@ -1,0 +1,14 @@
+id = "VECTOR-index-redundant-drain-copy"
+title = "Draining a source into its reassignment destination duplicates an index entry"
+class = "resource-release-order"
+module = "vector"
+guarantees = ["VEC-G05", "VEC-G11"]
+scenarios = ["VS07"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/index/tests/adversary_rules.rs::adv25_an_entry_that_a_reassign_moved_is_not_copied_again_by_a_drain_of_its_source"
+seed = "unknown"
+why_not_caught = "Result-level deduplication hid the duplicate physical entry from the query oracle."
+invariant_added = "Once the old pin ends, draining a reassigned row into the same target leaves one physical copy of its version."
+fix_commits = ["139d08682867ff5230cfa4ea8018be0242f7b1a2"]
+revert_patch_ok = false

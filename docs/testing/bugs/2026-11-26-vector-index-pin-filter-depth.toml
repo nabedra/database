@@ -1,0 +1,14 @@
+id = "VECTOR-index-pin-filter-depth"
+title = "Pinning with a deeply nested filter aborts the search worker"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS17"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/index/tests/adversary_rules.rs::adv24_a_filter_nested_without_end_is_refused_and_does_not_overflow_the_stack"
+seed = "unknown"
+why_not_caught = "Scan validation tested filter limits after pinning, while tenant selection traversed the filter first."
+invariant_added = "Index pinning refuses a filter beyond the depth bound before selecting its trees."
+fix_commits = ["3f76c3e21a03e0d620118b5ef02dc94bfe30432c"]
+revert_patch_ok = false

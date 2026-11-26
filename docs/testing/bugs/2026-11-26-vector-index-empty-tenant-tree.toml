@@ -1,0 +1,14 @@
+id = "VECTOR-index-empty-tenant-tree"
+title = "Empty tenant trees and partitions accumulate after churn"
+class = "resource-release-order"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS07", "VS17"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/index/tests/adversary.rs::adv07_deleted_tenants_leave_no_partitions_behind"
+seed = "unknown"
+why_not_caught = "Churn tests checked row slots without measuring the remaining tenant trees."
+invariant_added = "Maintenance retires empty partitions and releases their trees once no copy or pin needs the partition."
+fix_commits = ["139d08682867ff5230cfa4ea8018be0242f7b1a2"]
+revert_patch_ok = false
