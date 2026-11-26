@@ -59,6 +59,11 @@ export class StorageError extends NabedraError {
   protected static override readonly defaultOutcome = "not_applied"
 }
 
+export class SearchUnavailableError extends NabedraError {
+  static override readonly code = "search_unavailable"
+  protected static override readonly defaultOutcome = "not_applied"
+}
+
 export class TransportError extends NabedraError {
   static override readonly code = "transport_error"
 }
@@ -70,6 +75,34 @@ export class ProtocolError extends NabedraError {
 export class UnknownOutcomeError extends NabedraError {
   static override readonly code = "outcome_unknown"
   protected static override readonly defaultOutcome = "unknown"
+}
+
+export interface RowOutcome {
+  key: string | bigint
+  outcome: "applied" | "not_applied" | "outcome_unknown"
+  error: NabedraError | null
+}
+
+/**
+ * A multi-row write stopped early. `applied` counts the rows known to be applied. `outcomes` lists
+ * every row of the chunk that failed, in order. Later rows were not sent.
+ */
+export class BatchError extends NabedraError {
+  static override readonly code = "batch_error"
+
+  readonly applied: number
+  readonly outcomes: RowOutcome[]
+
+  constructor(message: string, options: NabedraErrorOptions & {
+    applied: number
+    outcomes?: RowOutcome[]
+    cause?: unknown
+  }) {
+    super(message, options)
+    this.applied = options.applied
+    this.outcomes = options.outcomes ?? []
+    if (options.cause !== undefined) this.cause = options.cause
+  }
 }
 
 export class StreamUnsupportedError extends NabedraError {

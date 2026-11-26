@@ -11,11 +11,11 @@ import * as gateway from "nabedra/gateway"
 import * as cli from "nabedra/cli"
 import * as sink from "nabedra/events/sink"
 
-const root = ["AuthenticationError", "AwsCredentials", "BatchStream", "Cache", "Cluster", "ConflictError", "DB", "Database",
+const root = ["AuthenticationError", "AwsCredentials", "BatchError", "BatchStream", "Cache", "Cluster", "ConflictError", "DB", "Database",
   "Expr", "Gateway", "GatewayContext", "HTTPResponse", "KubernetesProvider", "LimitExceededError",
   "NabedraError", "NotFoundError", "OverloadedError", "ProtocolError", "ProviderError", "Query",
-  "RequestReceipt", "S3", "StorageError", "StreamAbandonedError", "StreamExpiredError", "StreamSnapshot",
-  "StreamUnsupportedError", "Table", "TransportError", "UnknownOutcomeError", "ValidationError", "col", "serve"]
+  "RequestReceipt", "S3", "SearchUnavailableError", "StorageError", "StreamAbandonedError", "StreamExpiredError", "StreamSnapshot",
+  "StreamUnsupportedError", "Table", "TransportError", "UnknownOutcomeError", "ValidationError", "col", "list", "serve", "vector"]
 
 const eventValues = ["Batch", "Event", "Events", "EventsError", "EventsProtocolError", "EventsTransportError",
   "EventsUnknownOutcomeError", "Lease", "PublishRecord", "Subscription"]
@@ -43,11 +43,14 @@ test("package has the Python ORM and Events exports with camelCase public member
   assert.deepEqual(classMembers(orm.Database.prototype),
     ["close", "createTable", "mode", "receipt", "submit", "table", "tables"])
   assert.deepEqual(classMembers(orm.Table.prototype),
-    ["delete", "drop", "get", "insert", "insertMany", "query", "schema", "update", "upsert", "where"])
+    ["addColumn", "addFullText", "delete", "deleteMany", "drop", "dropColumn", "dropFullText", "get", "insert",
+      "insertMany", "query", "schema", "searchStatus", "update", "upsert", "upsertMany", "where"])
   assert.deepEqual(classMembers(orm.Query.prototype),
-    ["collect", "count", "explain", "limit", "orderBy", "select", "stream", "streamSnapshot", "where"])
+    ["collect", "count", "explain", "limit", "orderBy", "rank", "rankMany", "rerank", "select", "stream",
+      "streamSnapshot", "where"])
   assert.deepEqual(classMembers(orm.Expr.prototype),
-    ["and", "eq", "ge", "gt", "le", "lt", "ne", "not", "or"])
+    ["and", "contains", "containsAny", "cosine", "dot", "eq", "ge", "gt", "l2", "le", "lt", "match", "ne", "not",
+      "or", "startsWith"])
   assert.deepEqual(classMembers(orm.Cluster.prototype), ["autoscale", "scale", "status"])
   assert.deepEqual(classMembers(orm.RequestReceipt.prototype), ["poll", "terminal", "wait"])
   assert.deepEqual(classMembers(orm.Gateway.prototype), ["aclose", "close", "handle", "handleAsync", "middleware"])
@@ -64,7 +67,10 @@ test("compares exports with the Python package", { skip: !process.env.NABEDRA_TE
   const [rootNames, eventNames, deploymentNames] = JSON.parse(execFileSync(process.env.NABEDRA_TEST_PYTHON,
     ["-c", script, source], { encoding: "utf8", timeout: 10_000 }))
   const aliases = new Set(["Key", "Row", "Scalar", "Schema"])
-  assert.deepEqual(rootNames.filter(name => !aliases.has(name)).sort(), Object.keys(orm).sort())
+  // Vector(...) and the built-in list[...] are the functions vector() and list() here.
+  const types = new Map([["vector", "Vector"], ["list", null]])
+  assert.deepEqual(rootNames.filter(name => !aliases.has(name)).sort(),
+    Object.keys(orm).map(name => types.has(name) ? types.get(name) : name).filter(name => name !== null).sort())
   assert.deepEqual(eventNames.sort(), Object.keys(events).sort())
   assert.deepEqual(deploymentNames.filter(name => name !== "StatefulGrowthAdapter").sort(), Object.keys(deployment).sort())
 })

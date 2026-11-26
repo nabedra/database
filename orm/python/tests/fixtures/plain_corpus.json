@@ -1,0 +1,958 @@
+{
+"collect": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":null,\"order_by\":null,\"limit\":null}}}"
+]
+},
+"collect and or not": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"or\",\"args\":[{\"op\":\"and\",\"args\":[{\"op\":\"gt\",\"column\":\"n\",\"value\":1},{\"op\":\"lt\",\"column\":\"f\",\"value\":2.5}]},{\"op\":\"not\",\"arg\":{\"op\":\"eq\",\"column\":\"b\",\"value\":true}}]},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"collect kwargs": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"and\",\"args\":[{\"op\":\"eq\",\"column\":\"n\",\"value\":3},{\"op\":\"eq\",\"column\":\"b\",\"value\":true}]},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"collect where": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"ge\",\"column\":\"n\",\"value\":3},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"count": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.count\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"n\",\"value\":1},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"count limit": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.count\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":null,\"order_by\":null,\"limit\":5}}}"
+]
+},
+"create all scalars": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.create\",\"payload\":{\"name\":\"t\",\"schema\":{\"id\":\"utf8\",\"n\":\"int64\",\"f\":\"float64\",\"b\":\"bool\"},\"key\":\"id\",\"format\":\"parquet\"}}"
+]
+},
+"create int key": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.create\",\"payload\":{\"name\":\"t\",\"schema\":{\"id\":\"int64\",\"name\":\"utf8\"},\"key\":\"id\",\"format\":\"parquet\"}}"
+]
+},
+"create parquet": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.create\",\"payload\":{\"name\":\"t\",\"schema\":{\"id\":\"utf8\"},\"key\":\"id\",\"format\":\"parquet\"}}"
+]
+},
+"create unicode column": {
+"failure": "ValidationError: Identifier must match [A-Za-z_][A-Za-z0-9_]{0,63}",
+"requests": []
+},
+"deep": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"and\",\"args\":[{\"op\":\"and\",\"args\":[{\"op\":\"gt\",\"column\":\"n\",\"value\":1},{\"op\":\"lt\",\"column\":\"n\",\"value\":9}]},{\"op\":\"and\",\"args\":[{\"op\":\"gt\",\"column\":\"f\",\"value\":0.5},{\"op\":\"eq\",\"column\":\"b\",\"value\":true}]}]},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"delete text 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.delete\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\"}}"
+]
+},
+"delete text 1": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.delete\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\"}}"
+]
+},
+"delete text 10": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.delete\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}"
+]
+},
+"delete text 2": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.delete\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\u00e9\"}}"
+]
+},
+"delete text 3": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.delete\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"e\u0301\"}}"
+]
+},
+"delete text 4": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.delete\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\ud83d\ude00\"}}"
+]
+},
+"delete text 5": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.delete\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\\u0000\"}}"
+]
+},
+"delete text 6": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.delete\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\\u001f\"}}"
+]
+},
+"delete text 7": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.delete\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\u007f\"}}"
+]
+},
+"delete text 8": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.delete\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\u2028\"}}"
+]
+},
+"delete text 9": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.delete\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\\\"\\\\/\\b\\f\\n\\r\\t\"}}"
+]
+},
+"drop": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.drop\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\"}}"
+]
+},
+"explain": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.explain\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"n\",\"value\":1},\"order_by\":{\"column\":\"n\",\"desc\":false},\"limit\":null}}}"
+]
+},
+"get text 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.get\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\"}}"
+]
+},
+"get text 1": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.get\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\"}}"
+]
+},
+"get text 10": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.get\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}"
+]
+},
+"get text 2": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.get\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\u00e9\"}}"
+]
+},
+"get text 3": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.get\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"e\u0301\"}}"
+]
+},
+"get text 4": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.get\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\ud83d\ude00\"}}"
+]
+},
+"get text 5": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.get\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\\u0000\"}}"
+]
+},
+"get text 6": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.get\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\\u001f\"}}"
+]
+},
+"get text 7": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.get\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\u007f\"}}"
+]
+},
+"get text 8": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.get\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\u2028\"}}"
+]
+},
+"get text 9": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.get\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\\\"\\\\/\\b\\f\\n\\r\\t\"}}"
+]
+},
+"insert float 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1.0,\"b\":false}}}"
+]
+},
+"insert float 1": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":-0.0,\"b\":false}}}"
+]
+},
+"insert float 10": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1e+21,\"b\":false}}}"
+]
+},
+"insert float 11": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1000000000000000.0,\"b\":false}}}"
+]
+},
+"insert float 2": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":0.1,\"b\":false}}}"
+]
+},
+"insert float 3": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1e+16,\"b\":false}}}"
+]
+},
+"insert float 4": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1e-07,\"b\":false}}}"
+]
+},
+"insert float 5": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":5e-324,\"b\":false}}}"
+]
+},
+"insert float 6": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1.7976931348623157e+308,\"b\":false}}}"
+]
+},
+"insert float 7": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":123456789.12345679,\"b\":false}}}"
+]
+},
+"insert float 8": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":2.5e-05,\"b\":false}}}"
+]
+},
+"insert float 9": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1e+22,\"b\":false}}}"
+]
+},
+"insert int 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":0,\"f\":1.0,\"b\":false}}}"
+]
+},
+"insert int 1": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":-1,\"f\":1.0,\"b\":false}}}"
+]
+},
+"insert int 2": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":9007199254740992,\"f\":1.0,\"b\":false}}}"
+]
+},
+"insert int 3": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":9007199254740993,\"f\":1.0,\"b\":false}}}"
+]
+},
+"insert int 4": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":9223372036854775807,\"f\":1.0,\"b\":false}}}"
+]
+},
+"insert int 5": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":-9223372036854775808,\"f\":1.0,\"b\":false}}}"
+]
+},
+"insert text 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"insert text 1": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"insert text 10": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"insert text 2": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\u00e9\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"insert text 3": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"e\u0301\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"insert text 4": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\ud83d\ude00\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"insert text 5": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\\u0000\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"insert text 6": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\\u001f\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"insert text 7": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\u007f\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"insert text 8": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\u2028\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"insert text 9": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\\\"\\\\/\\b\\f\\n\\r\\t\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"insert_many": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert_many\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"rows\":[{\"id\":\"k0\",\"n\":0,\"f\":0.0,\"b\":true},{\"id\":\"k1\",\"n\":1,\"f\":0.3333333333333333,\"b\":false},{\"id\":\"k2\",\"n\":2,\"f\":0.6666666666666666,\"b\":true},{\"id\":\"k3\",\"n\":3,\"f\":1.0,\"b\":false},{\"id\":\"k4\",\"n\":4,\"f\":1.3333333333333333,\"b\":true},{\"id\":\"k5\",\"n\":5,\"f\":1.6666666666666667,\"b\":false},{\"id\":\"k6\",\"n\":6,\"f\":2.0,\"b\":true},{\"id\":\"k7\",\"n\":7,\"f\":2.3333333333333335,\"b\":false},{\"id\":\"k8\",\"n\":8,\"f\":2.6666666666666665,\"b\":true},{\"id\":\"k9\",\"n\":9,\"f\":3.0,\"b\":false},{\"id\":\"k10\",\"n\":10,\"f\":3.3333333333333335,\"b\":true},{\"id\":\"k11\",\"n\":11,\"f\":3.6666666666666665,\"b\":false},{\"id\":\"k12\",\"n\":12,\"f\":4.0,\"b\":true},{\"id\":\"k13\",\"n\":13,\"f\":4.333333333333333,\"b\":false},{\"id\":\"k14\",\"n\":14,\"f\":4.666666666666667,\"b\":true},{\"id\":\"k15\",\"n\":15,\"f\":5.0,\"b\":false},{\"id\":\"k16\",\"n\":16,\"f\":5.333333333333333,\"b\":true},{\"id\":\"k17\",\"n\":17,\"f\":5.666666666666667,\"b\":false},{\"id\":\"k18\",\"n\":18,\"f\":6.0,\"b\":true},{\"id\":\"k19\",\"n\":19,\"f\":6.333333333333333,\"b\":false},{\"id\":\"k20\",\"n\":20,\"f\":6.666666666666667,\"b\":true},{\"id\":\"k21\",\"n\":21,\"f\":7.0,\"b\":false},{\"id\":\"k22\",\"n\":22,\"f\":7.333333333333333,\"b\":true},{\"id\":\"k23\",\"n\":23,\"f\":7.666666666666667,\"b\":false},{\"id\":\"k24\",\"n\":24,\"f\":8.0,\"b\":true},{\"id\":\"k25\",\"n\":25,\"f\":8.333333333333334,\"b\":false},{\"id\":\"k26\",\"n\":26,\"f\":8.666666666666666,\"b\":true},{\"id\":\"k27\",\"n\":27,\"f\":9.0,\"b\":false},{\"id\":\"k28\",\"n\":28,\"f\":9.333333333333334,\"b\":true},{\"id\":\"k29\",\"n\":29,\"f\":9.666666666666666,\"b\":false},{\"id\":\"k30\",\"n\":30,\"f\":10.0,\"b\":true},{\"id\":\"k31\",\"n\":31,\"f\":10.333333333333334,\"b\":false},{\"id\":\"k32\",\"n\":32,\"f\":10.666666666666666,\"b\":true},{\"id\":\"k33\",\"n\":33,\"f\":11.0,\"b\":false},{\"id\":\"k34\",\"n\":34,\"f\":11.333333333333334,\"b\":true},{\"id\":\"k35\",\"n\":35,\"f\":11.666666666666666,\"b\":false},{\"id\":\"k36\",\"n\":36,\"f\":12.0,\"b\":true},{\"id\":\"k37\",\"n\":37,\"f\":12.333333333333334,\"b\":false},{\"id\":\"k38\",\"n\":38,\"f\":12.666666666666666,\"b\":true},{\"id\":\"k39\",\"n\":39,\"f\":13.0,\"b\":false},{\"id\":\"k40\",\"n\":40,\"f\":13.333333333333334,\"b\":true},{\"id\":\"k41\",\"n\":41,\"f\":13.666666666666666,\"b\":false},{\"id\":\"k42\",\"n\":42,\"f\":14.0,\"b\":true},{\"id\":\"k43\",\"n\":43,\"f\":14.333333333333334,\"b\":false},{\"id\":\"k44\",\"n\":44,\"f\":14.666666666666666,\"b\":true},{\"id\":\"k45\",\"n\":45,\"f\":15.0,\"b\":false},{\"id\":\"k46\",\"n\":46,\"f\":15.333333333333334,\"b\":true},{\"id\":\"k47\",\"n\":47,\"f\":15.666666666666666,\"b\":false},{\"id\":\"k48\",\"n\":48,\"f\":16.0,\"b\":true},{\"id\":\"k49\",\"n\":49,\"f\":16.333333333333332,\"b\":false}]}}"
+]
+},
+"insert_many floats": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert_many\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"rows\":[{\"id\":\"f0\",\"n\":1,\"f\":1.0,\"b\":true},{\"id\":\"f1\",\"n\":1,\"f\":-0.0,\"b\":true},{\"id\":\"f2\",\"n\":1,\"f\":0.1,\"b\":true},{\"id\":\"f3\",\"n\":1,\"f\":1e+16,\"b\":true},{\"id\":\"f4\",\"n\":1,\"f\":1e-07,\"b\":true},{\"id\":\"f5\",\"n\":1,\"f\":5e-324,\"b\":true},{\"id\":\"f6\",\"n\":1,\"f\":1.7976931348623157e+308,\"b\":true},{\"id\":\"f7\",\"n\":1,\"f\":123456789.12345679,\"b\":true},{\"id\":\"f8\",\"n\":1,\"f\":2.5e-05,\"b\":true},{\"id\":\"f9\",\"n\":1,\"f\":1e+22,\"b\":true},{\"id\":\"f10\",\"n\":1,\"f\":1e+21,\"b\":true},{\"id\":\"f11\",\"n\":1,\"f\":1000000000000000.0,\"b\":true}]}}"
+]
+},
+"insert_many generator": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert_many\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"rows\":[{\"id\":\"k0\",\"n\":0,\"f\":0.0,\"b\":true},{\"id\":\"k1\",\"n\":1,\"f\":0.3333333333333333,\"b\":false},{\"id\":\"k2\",\"n\":2,\"f\":0.6666666666666666,\"b\":true},{\"id\":\"k3\",\"n\":3,\"f\":1.0,\"b\":false},{\"id\":\"k4\",\"n\":4,\"f\":1.3333333333333333,\"b\":true},{\"id\":\"k5\",\"n\":5,\"f\":1.6666666666666667,\"b\":false},{\"id\":\"k6\",\"n\":6,\"f\":2.0,\"b\":true},{\"id\":\"k7\",\"n\":7,\"f\":2.3333333333333335,\"b\":false},{\"id\":\"k8\",\"n\":8,\"f\":2.6666666666666665,\"b\":true},{\"id\":\"k9\",\"n\":9,\"f\":3.0,\"b\":false},{\"id\":\"k10\",\"n\":10,\"f\":3.3333333333333335,\"b\":true},{\"id\":\"k11\",\"n\":11,\"f\":3.6666666666666665,\"b\":false},{\"id\":\"k12\",\"n\":12,\"f\":4.0,\"b\":true},{\"id\":\"k13\",\"n\":13,\"f\":4.333333333333333,\"b\":false},{\"id\":\"k14\",\"n\":14,\"f\":4.666666666666667,\"b\":true},{\"id\":\"k15\",\"n\":15,\"f\":5.0,\"b\":false},{\"id\":\"k16\",\"n\":16,\"f\":5.333333333333333,\"b\":true},{\"id\":\"k17\",\"n\":17,\"f\":5.666666666666667,\"b\":false},{\"id\":\"k18\",\"n\":18,\"f\":6.0,\"b\":true},{\"id\":\"k19\",\"n\":19,\"f\":6.333333333333333,\"b\":false},{\"id\":\"k20\",\"n\":20,\"f\":6.666666666666667,\"b\":true},{\"id\":\"k21\",\"n\":21,\"f\":7.0,\"b\":false},{\"id\":\"k22\",\"n\":22,\"f\":7.333333333333333,\"b\":true},{\"id\":\"k23\",\"n\":23,\"f\":7.666666666666667,\"b\":false},{\"id\":\"k24\",\"n\":24,\"f\":8.0,\"b\":true},{\"id\":\"k25\",\"n\":25,\"f\":8.333333333333334,\"b\":false},{\"id\":\"k26\",\"n\":26,\"f\":8.666666666666666,\"b\":true},{\"id\":\"k27\",\"n\":27,\"f\":9.0,\"b\":false},{\"id\":\"k28\",\"n\":28,\"f\":9.333333333333334,\"b\":true},{\"id\":\"k29\",\"n\":29,\"f\":9.666666666666666,\"b\":false},{\"id\":\"k30\",\"n\":30,\"f\":10.0,\"b\":true},{\"id\":\"k31\",\"n\":31,\"f\":10.333333333333334,\"b\":false},{\"id\":\"k32\",\"n\":32,\"f\":10.666666666666666,\"b\":true},{\"id\":\"k33\",\"n\":33,\"f\":11.0,\"b\":false},{\"id\":\"k34\",\"n\":34,\"f\":11.333333333333334,\"b\":true},{\"id\":\"k35\",\"n\":35,\"f\":11.666666666666666,\"b\":false},{\"id\":\"k36\",\"n\":36,\"f\":12.0,\"b\":true},{\"id\":\"k37\",\"n\":37,\"f\":12.333333333333334,\"b\":false},{\"id\":\"k38\",\"n\":38,\"f\":12.666666666666666,\"b\":true},{\"id\":\"k39\",\"n\":39,\"f\":13.0,\"b\":false},{\"id\":\"k40\",\"n\":40,\"f\":13.333333333333334,\"b\":true},{\"id\":\"k41\",\"n\":41,\"f\":13.666666666666666,\"b\":false},{\"id\":\"k42\",\"n\":42,\"f\":14.0,\"b\":true},{\"id\":\"k43\",\"n\":43,\"f\":14.333333333333334,\"b\":false},{\"id\":\"k44\",\"n\":44,\"f\":14.666666666666666,\"b\":true},{\"id\":\"k45\",\"n\":45,\"f\":15.0,\"b\":false},{\"id\":\"k46\",\"n\":46,\"f\":15.333333333333334,\"b\":true},{\"id\":\"k47\",\"n\":47,\"f\":15.666666666666666,\"b\":false},{\"id\":\"k48\",\"n\":48,\"f\":16.0,\"b\":true},{\"id\":\"k49\",\"n\":49,\"f\":16.333333333333332,\"b\":false}]}}"
+]
+},
+"insert_many one": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert_many\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"rows\":[{\"id\":\"k0\",\"n\":0,\"f\":0.0,\"b\":true}]}}"
+]
+},
+"insert_many unicode": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.insert_many\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"rows\":[{\"id\":\"\",\"n\":1,\"f\":1.0,\"b\":true},{\"id\":\"a\",\"n\":1,\"f\":1.0,\"b\":true},{\"id\":\"\u00e9\",\"n\":1,\"f\":1.0,\"b\":true},{\"id\":\"e\u0301\",\"n\":1,\"f\":1.0,\"b\":true},{\"id\":\"\ud83d\ude00\",\"n\":1,\"f\":1.0,\"b\":true},{\"id\":\"\\u0000\",\"n\":1,\"f\":1.0,\"b\":true},{\"id\":\"\\u001f\",\"n\":1,\"f\":1.0,\"b\":true},{\"id\":\"\u007f\",\"n\":1,\"f\":1.0,\"b\":true},{\"id\":\"\u2028\",\"n\":1,\"f\":1.0,\"b\":true},{\"id\":\"\\\"\\\\/\\b\\f\\n\\r\\t\",\"n\":1,\"f\":1.0,\"b\":true},{\"id\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"n\":1,\"f\":1.0,\"b\":true}]}}"
+]
+},
+"limit 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":null,\"order_by\":null,\"limit\":0}}}"
+]
+},
+"order asc": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":null,\"order_by\":{\"column\":\"n\",\"desc\":false},\"limit\":null}}}"
+]
+},
+"order desc": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":null,\"order_by\":{\"column\":\"n\",\"desc\":true},\"limit\":7}}}"
+]
+},
+"select": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":[\"id\",\"f\"],\"filter\":null,\"order_by\":null,\"limit\":null}}}"
+]
+},
+"table": {
+"failure": null,
+"requests": []
+},
+"tables": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.list\",\"payload\":{}}"
+]
+},
+"update float 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"f\":1.0}}}"
+]
+},
+"update float 1": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"f\":-0.0}}}"
+]
+},
+"update float 10": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"f\":1e+21}}}"
+]
+},
+"update float 11": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"f\":1000000000000000.0}}}"
+]
+},
+"update float 2": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"f\":0.1}}}"
+]
+},
+"update float 3": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"f\":1e+16}}}"
+]
+},
+"update float 4": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"f\":1e-07}}}"
+]
+},
+"update float 5": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"f\":5e-324}}}"
+]
+},
+"update float 6": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"f\":1.7976931348623157e+308}}}"
+]
+},
+"update float 7": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"f\":123456789.12345679}}}"
+]
+},
+"update float 8": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"f\":2.5e-05}}}"
+]
+},
+"update float 9": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"f\":1e+22}}}"
+]
+},
+"update int 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"n\":0}}}"
+]
+},
+"update int 1": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"n\":-1}}}"
+]
+},
+"update int 2": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"n\":9007199254740992}}}"
+]
+},
+"update int 3": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"n\":9007199254740993}}}"
+]
+},
+"update int 4": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"n\":9223372036854775807}}}"
+]
+},
+"update int 5": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"n\":-9223372036854775808}}}"
+]
+},
+"update many fields": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"n\":2,\"f\":3.5,\"b\":false}}}"
+]
+},
+"update text 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\",\"values\":{\"n\":2}}}"
+]
+},
+"update text 1": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"a\",\"values\":{\"n\":2}}}"
+]
+},
+"update text 10": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"values\":{\"n\":2}}}"
+]
+},
+"update text 2": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\u00e9\",\"values\":{\"n\":2}}}"
+]
+},
+"update text 3": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"e\u0301\",\"values\":{\"n\":2}}}"
+]
+},
+"update text 4": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\ud83d\ude00\",\"values\":{\"n\":2}}}"
+]
+},
+"update text 5": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\\u0000\",\"values\":{\"n\":2}}}"
+]
+},
+"update text 6": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\\u001f\",\"values\":{\"n\":2}}}"
+]
+},
+"update text 7": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\u007f\",\"values\":{\"n\":2}}}"
+]
+},
+"update text 8": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\u2028\",\"values\":{\"n\":2}}}"
+]
+},
+"update text 9": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.update\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"key\":\"\\\"\\\\/\\b\\f\\n\\r\\t\",\"values\":{\"n\":2}}}"
+]
+},
+"upsert float 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1.0,\"b\":false}}}"
+]
+},
+"upsert float 1": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":-0.0,\"b\":false}}}"
+]
+},
+"upsert float 10": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1e+21,\"b\":false}}}"
+]
+},
+"upsert float 11": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1000000000000000.0,\"b\":false}}}"
+]
+},
+"upsert float 2": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":0.1,\"b\":false}}}"
+]
+},
+"upsert float 3": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1e+16,\"b\":false}}}"
+]
+},
+"upsert float 4": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1e-07,\"b\":false}}}"
+]
+},
+"upsert float 5": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":5e-324,\"b\":false}}}"
+]
+},
+"upsert float 6": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1.7976931348623157e+308,\"b\":false}}}"
+]
+},
+"upsert float 7": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":123456789.12345679,\"b\":false}}}"
+]
+},
+"upsert float 8": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":2.5e-05,\"b\":false}}}"
+]
+},
+"upsert float 9": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1e+22,\"b\":false}}}"
+]
+},
+"upsert int 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":0,\"f\":1.0,\"b\":false}}}"
+]
+},
+"upsert int 1": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":-1,\"f\":1.0,\"b\":false}}}"
+]
+},
+"upsert int 2": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":9007199254740992,\"f\":1.0,\"b\":false}}}"
+]
+},
+"upsert int 3": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":9007199254740993,\"f\":1.0,\"b\":false}}}"
+]
+},
+"upsert int 4": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":9223372036854775807,\"f\":1.0,\"b\":false}}}"
+]
+},
+"upsert int 5": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":-9223372036854775808,\"f\":1.0,\"b\":false}}}"
+]
+},
+"upsert text 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"upsert text 1": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"a\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"upsert text 10": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"upsert text 2": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\u00e9\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"upsert text 3": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"e\u0301\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"upsert text 4": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\ud83d\ude00\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"upsert text 5": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\\u0000\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"upsert text 6": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\\u001f\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"upsert text 7": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\u007f\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"upsert text 8": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\u2028\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"upsert text 9": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"table.upsert\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"row\":{\"id\":\"\\\"\\\\/\\b\\f\\n\\r\\t\",\"n\":1,\"f\":1.0,\"b\":true}}}"
+]
+},
+"where bool": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"ne\",\"column\":\"b\",\"value\":false},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where eq": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"eq\",\"column\":\"n\",\"value\":5},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where float 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"f\",\"value\":1.0},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where float 1": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"f\",\"value\":-0.0},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where float 10": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"f\",\"value\":1e+21},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where float 11": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"f\",\"value\":1000000000000000.0},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where float 2": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"f\",\"value\":0.1},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where float 3": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"f\",\"value\":1e+16},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where float 4": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"f\",\"value\":1e-07},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where float 5": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"f\",\"value\":5e-324},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where float 6": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"f\",\"value\":1.7976931348623157e+308},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where float 7": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"f\",\"value\":123456789.12345679},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where float 8": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"f\",\"value\":2.5e-05},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where float 9": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"f\",\"value\":1e+22},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where ge": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"ge\",\"column\":\"n\",\"value\":5},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where gt": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"gt\",\"column\":\"n\",\"value\":5},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where int 0": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"eq\",\"column\":\"n\",\"value\":0},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where int 1": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"eq\",\"column\":\"n\",\"value\":-1},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where int 2": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"eq\",\"column\":\"n\",\"value\":9007199254740992},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where int 3": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"eq\",\"column\":\"n\",\"value\":9007199254740993},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where int 4": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"eq\",\"column\":\"n\",\"value\":9223372036854775807},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where int 5": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"eq\",\"column\":\"n\",\"value\":-9223372036854775808},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where le": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"le\",\"column\":\"n\",\"value\":5},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where lt": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"lt\",\"column\":\"n\",\"value\":5},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where ne": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"ne\",\"column\":\"n\",\"value\":5},\"order_by\":null,\"limit\":null}}}"
+]
+},
+"where string": {
+"failure": null,
+"requests": [
+"{\"request_id\":\"ID\",\"operation\":\"query.collect\",\"payload\":{\"table_id\":\"00000000-0000-0000-0000-000000000022\",\"query\":{\"select\":null,\"filter\":{\"op\":\"eq\",\"column\":\"id\",\"value\":\"caf\u00e9\"},\"order_by\":null,\"limit\":null}}}"
+]
+}
+}

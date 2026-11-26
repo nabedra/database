@@ -1,1 +1,1 @@
-export { Table } from "../table.js"
+export { Table, type SearchStatus } from "../table.js"

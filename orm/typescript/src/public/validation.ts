@@ -1,17 +1,17 @@
 import {
-  validateRow as row, validateSchema as schema, validateValue as value, type ScalarType, type Schema,
+  validateRow as row, validateSchema as schema, validateValue as value, type ColumnType, type Schema,
 } from "../validation.js"
 
 export {
   validateIdentifier, validateFormat, schemaToWire, schemaFromWire, validateKey, int64Min, int64Max, maxColumns,
-  type Scalar, type Key, type Row, type Schema, type RowOf, type ScalarType,
+  type Scalar, type Key, type Row, type Schema, type RowOf, type ScalarType, type ColumnType, type VectorValue,
 } from "../validation.js"
 
 export function validateSchema(input: unknown, { key }: { key?: string | null } = {}): Schema {
   return schema(input, key ?? undefined)
 }
 
-export function validateValue(input: unknown, expectedType: ScalarType, { column }: { column?: string } = {}) {
+export function validateValue(input: unknown, expectedType: ColumnType, { column }: { column?: string } = {}) {
   return value(input, expectedType, column)
 }
 

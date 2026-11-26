@@ -53,6 +53,27 @@ response, you can't tell whether it was applied. Keep its request identity and
 follow the
 [guidance on uncertain writes](https://github.com/zPy52/nabedra-database/blob/main/orm/python/docs/reference.md#errors-and-uncertain-writes).
 
+## Vector search
+
+On an OLTP server with search, tables can hold vectors, sparse weights, several
+vectors per row and lists of strings. The column type says what the data is, and
+the query says how to rank it:
+
+```python
+from nabedra import Vector
+
+notes = db.create_table("notes", {"id": str, "acl": list[str], "body": str, "embedding": Vector(3)},
+                        key="id", full_text={"body": "english"})
+notes.upsert_many([{"id": "a", "acl": ["staff"], "body": "reset a password", "embedding": [0.1, 0.2, 0.3]}])
+hits = (notes.where(col("acl").contains("staff"))
+        .rank(col("embedding").cosine([0.1, 0.2, 0.3]), col("body").match("password"))
+        .limit(10).collect())  # rows with _score
+```
+
+`upsert_many` accepts any iterable and raises `BatchError` with per-row outcomes.
+The [reference](https://github.com/zPy52/nabedra-database/blob/main/orm/python/docs/reference.md#vector-search)
+lists the types, operations and limits.
+
 ## Cache
 
 `Cache` connects to a Nabedra Cache server. Use it as a context manager: it

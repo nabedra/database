@@ -8,7 +8,7 @@ import {
 } from './errors.js'
 import { StreamChannel, streamJson } from './streamTransport.js'
 import { hasFields, type JsonObject, type Transport } from './transport.js'
-import { decodeRow, type ScalarType, type Schema } from './validation.js'
+import { decodeRow, type ColumnType, type Schema } from './validation.js'
 
 const maxBatchRows = 10_000
 const maxBatchBytes = 8 * 1024 * 1024
@@ -30,7 +30,7 @@ export interface StreamOptions {
   shard?: number
 }
 
-function integer(value: unknown, min: number, max: number, name: string): number {
+export function integer(value: unknown, min: number, max: number, name: string): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
     throw new ValidationError(`${name} must be an integer between ${min} and ${max}`)
   }
@@ -316,7 +316,7 @@ function arrowDecoder(schema: Schema, batchRows: number): BatchDecoder<RecordBat
       validateArrowMessages(raw, arrow)
       const table = arrow.tableFromIPC(raw)
       const fields = table.schema.fields
-      const types = new Map<ScalarType, string>([
+      const types = new Map<ColumnType, string>([
         [String, new arrow.Utf8().toString()],
         [BigInt, new arrow.Int64().toString()],
         [Number, new arrow.Float64().toString()],

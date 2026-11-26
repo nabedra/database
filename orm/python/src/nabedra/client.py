@@ -1,7 +1,7 @@
 """Private synchronous HTTP transport and public Database creation/discovery."""
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from http.client import HTTPException, IncompleteRead
 import json
 import math
@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from ._http_pool import ConnectionPool
 from .errors import (
     AuthenticationError, ConflictError, LimitExceededError, NabedraError,
-    NotFoundError, OverloadedError, ProtocolError, StorageError, TransportError,
+    NotFoundError, OverloadedError, ProtocolError, SearchUnavailableError, StorageError, TransportError,
     UnknownOutcomeError, ValidationError,
 )
 from .validation import (
@@ -32,22 +32,24 @@ if TYPE_CHECKING:
 _MAX_BODY = 8 * 1024 * 1024
 _MUTATIONS = frozenset({
     'table.create', 'table.drop', 'table.insert', 'table.insert_many',
-    'table.update', 'table.upsert', 'table.delete',
+    'table.update', 'table.upsert', 'table.delete', 'table.upsert_many', 'table.delete_many',
+    'table.add_column', 'table.drop_column', 'table.add_full_text', 'table.drop_full_text',
 })
 _READS = frozenset({
     'table.describe', 'table.list', 'table.get',
     'query.collect', 'query.count', 'query.explain',
+    'table.search_status', 'query.rank', 'query.rank_many',
 })
 _ERROR_STATUS = {
     'validation_error': 400, 'unsupported_operation': 400, 'unauthorized': 401,
     'not_found': 404, 'conflict': 409, 'limit_exceeded': 413, 'overloaded': 429,
-    'storage_unavailable': 503, 'outcome_unknown': 503,
+    'storage_unavailable': 503, 'search_unavailable': 503, 'outcome_unknown': 503,
 }
 _ERROR_TYPES = {
     'validation_error': ValidationError, 'unauthorized': AuthenticationError,
     'not_found': NotFoundError, 'conflict': ConflictError,
     'limit_exceeded': LimitExceededError, 'overloaded': OverloadedError,
-    'storage_unavailable': StorageError,
+    'storage_unavailable': StorageError, 'search_unavailable': SearchUnavailableError,
 }
 _T = TypeVar('_T')
 
@@ -144,8 +146,8 @@ class _Transport:
             raise AuthenticationError('Set NABEDRA_TOKEN or pass token before making a request')
         return self._token
 
-    def request(self, operation: str, payload: dict, *,
-                decode: Callable[[object], _T] | None = None) -> _T | object:
+    def request(self, operation: str, payload: dict, *, decode: Callable[[object], _T] | None = None,
+                request_id: str | None = None) -> _T | object:
         """POST one v0 operation and return data, or the exact decode(data) result.
 
         Decoders must validate server data and raise ValidationError,
@@ -162,7 +164,8 @@ class _Transport:
             raise ValidationError('Operation payload must be a dictionary')
         if decode is not None and not callable(decode):
             raise ValidationError('Result decoder must be callable')
-        request_id = str(uuid.uuid4())
+        if request_id is None:
+            request_id = str(uuid.uuid4())
         try:
             body = json.dumps({'request_id': request_id, 'operation': operation, 'payload': payload},
                               ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode('utf-8')
@@ -441,19 +444,23 @@ class Database:
         """Reconnect to an accepted request using the same database credentials."""
         return self._transport.receipt(run_id, request_id)
 
-    def create_table(self, name: str, schema: Schema, key: str, *,
-                     format: Literal['parquet'] = 'parquet') -> Table:
+    def create_table(self, name: str, schema: Schema, key: str, *, format: Literal['parquet'] = 'parquet',
+                     partition_by: str | None = None, full_text: Mapping[str, str] | None = None,
+                     embed: Mapping[str, Mapping[str, str]] | None = None) -> Table:
+        from ._layout import Layout
         from .table import _table_from_descriptor
 
         name = validate_identifier(name)
         key = validate_identifier(key)
         schema = validate_schema(schema, key=key)
         format = validate_format(format)
-        payload = {'name': name, 'schema': schema_to_wire(schema), 'key': key, 'format': format}
+        layout = Layout.build(schema, partition_by, full_text, embed)
+        payload = {'name': name, 'schema': schema_to_wire(schema), 'key': key, 'format': format,
+                   **layout.wire_options()}
 
         def descriptor_result(data: object) -> Table:
             table = _table_from_descriptor(self._transport, data)
-            if (table.name != name or table.schema != schema
+            if (table.name != name or table._layout != layout
                     or table.key != key or table.format != format):
                 raise ProtocolError('Created descriptor does not match submitted metadata')
             return table

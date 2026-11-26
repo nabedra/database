@@ -1,27 +1,59 @@
 import { LimitExceededError, ProtocolError, ValidationError } from "./errors.js"
 import { floatToken, isJsonObject, type JsonObject } from "./transport.js"
+import {
+  checkValue, columnKind, typeFromWire, typeToWire, vectorFromWire,
+  type List, type SparseVector, type Vector, type VectorInput, type VectorValue,
+} from "./vector.js"
 
+export type { VectorValue } from "./vector.js"
 export type Scalar = string | bigint | number | boolean
 export type Key = string | bigint
-export type Row = Record<string, Scalar>
+export type Row = Record<string, Scalar | readonly string[] | VectorValue | null>
 export type ScalarType = StringConstructor | BigIntConstructor | NumberConstructor | BooleanConstructor
-export type Schema = Record<string, ScalarType>
+export type ColumnType = ScalarType | Vector | List
+export type Schema = Record<string, ColumnType>
 export type Column<S extends Schema> = keyof S & string
-export type RowOf<S extends Schema> = { -readonly [C in keyof S]: ReturnType<S[C]> }
+type ValueOf<T> =
+  T extends ScalarType ? ReturnType<T>
+    : T extends Vector<true> ? SparseVector | null
+      : T extends Vector<false> ? Float32Array | null
+        : T extends Vector ? SparseVector | Float32Array | null
+          : T extends List<StringConstructor> ? string[]
+            : T extends List<Vector<false>> ? Float32Array[] | null
+              : string[] | Float32Array[] | null
+type InputOf<T> =
+  T extends ScalarType ? ReturnType<T>
+    : T extends Vector<true> ? Readonly<SparseVector> | null
+      : T extends Vector<false> ? VectorInput | null
+        : T extends Vector ? Readonly<SparseVector> | VectorInput | null
+          : T extends List<StringConstructor> ? readonly string[]
+            : T extends List<Vector<false>> ? readonly VectorInput[] | null
+              : readonly string[] | readonly VectorInput[] | null
+export type RowOf<S extends Schema> = { -readonly [C in keyof S]: ValueOf<S[C]> }
+/** A full row to write. It omits the columns E that the database embeds. */
+export type RowInput<S extends Schema, E extends Column<S> = never> = {
+  -readonly [C in keyof S as C extends E ? never : C]: InputOf<S[C]>
+}
 export type KeyColumn<S extends Schema> = {
   [C in Column<S>]-?: Extract<S[C], StringConstructor | BigIntConstructor> extends never ? never : C
 }[Column<S>]
 export type KeyOf<S extends Schema, K extends Column<S>> = Extract<RowOf<S>[K], Key>
-export type Update<S extends Schema, K extends Column<S>> =
-  string extends K ? Partial<RowOf<S>> : Partial<Omit<RowOf<S>, K>> & { [C in K]?: never }
-export type Filters<S extends Schema> = Partial<RowOf<S>>
+export type Update<S extends Schema, K extends Column<S>, E extends Column<S> = never> =
+  string extends K ? Partial<RowInput<S, E>> : Partial<Omit<RowInput<S, E>, K>> & { [C in K]?: never }
+export type Filters<S extends Schema> = {
+  [C in keyof S as Extract<S[C], ScalarType> extends never ? never : C]?: ReturnType<Extract<S[C], ScalarType>>
+}
+/** The columns that a ranked query returns by default: every selected column, or every nonvector column. */
+export type RankedColumn<S extends Schema, C extends Column<S>> = [Column<S>] extends [C]
+  ? string extends C ? C : { [N in C]: S[N] extends ScalarType | List<StringConstructor> ? N : never }[C]
+  : C
 
-type WireType = "utf8" | "int64" | "float64" | "bool"
+type WireType = "utf8" | "int64" | "float64" | "bool" | JsonObject
 
-const wireTypes = new Map<ScalarType, WireType>([
+const wireTypes = new Map<ColumnType, WireType>([
   [String, "utf8"], [BigInt, "int64"], [Number, "float64"], [Boolean, "bool"],
 ])
-const scalarTypes = new Map<string, ScalarType>(Array.from(wireTypes, ([kind, wire]) => [wire, kind]))
+const scalarTypes = new Map<unknown, ColumnType>(Array.from(wireTypes, ([kind, wire]) => [wire, kind]))
 export const int64Min = -(2n ** 63n)
 export const int64Max = 2n ** 63n - 1n
 export const maxColumns = 128
@@ -55,7 +87,7 @@ export function validateSchema(schema: unknown, key?: string): Schema {
   if (columns.length > maxColumns) throw new LimitExceededError(`Schema exceeds ${maxColumns} columns`)
   for (const [column, kind] of columns) {
     validateIdentifier(column)
-    if (!wireTypes.has(kind as ScalarType)) {
+    if (columnKind(kind) === null && !wireTypes.has(kind as ScalarType)) {
       throw new ValidationError(`Unsupported type for column '${column}'`)
     }
   }
@@ -70,21 +102,29 @@ export function validateSchema(schema: unknown, key?: string): Schema {
 
 export function schemaToWire(schema: Schema): Record<string, WireType> {
   return Object.fromEntries(Object.entries(validateSchema(schema)).map(([column, kind]) => [
-    column, wireTypes.get(kind)!,
+    column, wireTypes.get(kind) ?? typeToWire(kind),
   ]))
 }
 
 export function schemaFromWire(schema: unknown): Schema {
-  const source = mappingCopy(schema, "Wire schema")
-  const result = Object.fromEntries(Object.entries(source).map(([column, wire]) => {
-    const kind = typeof wire === "string" ? scalarTypes.get(wire) : undefined
-    if (kind === undefined) throw new ValidationError("Unsupported wire schema type")
-    return [column, kind]
-  }))
-  return validateSchema(result)
+  return decodeSchema(schema, false)
 }
 
-export function validateValue(value: unknown, expectedType: ScalarType, column = "value"): Scalar {
+export function decodeSchema(schema: unknown, response: boolean): Schema {
+  const source = mappingCopy(schema, "Wire schema")
+  return validateSchema(Object.fromEntries(Object.entries(source).map(([column, wire]) => [
+    column, scalarTypes.get(wire) ?? typeFromWire(wire, response),
+  ])))
+}
+
+/** Validate one value for rows, keys and predicate builders, copying vectors and lists. */
+export function validateValue(value: unknown, expectedType: ColumnType, column = "value"): Row[string] {
+  return columnKind(expectedType) === null
+    ? validateScalar(value, expectedType as ScalarType, column)
+    : checkValue(value, expectedType, column) as Row[string]
+}
+
+export function validateScalar(value: unknown, expectedType: ScalarType, column = "value"): Scalar {
   if (!wireTypes.has(expectedType)) throw new ValidationError("Unsupported scalar type")
   if (expectedType === String && typeof value === "string") return value
   if (expectedType === Boolean && typeof value === "boolean") return value
@@ -120,16 +160,14 @@ export function validateRow(row: unknown, schema: Schema, key: string, partial =
   } else if (Object.keys(checked).length !== Object.keys(result).length) {
     throw new ValidationError("Full rows must include every schema column")
   }
-  for (const [column, value] of Object.entries(result)) validateValue(value, checked[column], column)
+  for (const [column, value] of Object.entries(result)) {
+    result[column] = validateValue(value, checked[column], column)
+  }
   return result as Row
 }
 
 export function scalarToWire(value: Scalar): unknown {
   return typeof value === "number" ? floatToken(value) : value
-}
-
-export function rowToWire(row: Row): JsonObject {
-  return Object.fromEntries(Object.entries(row).map(([column, value]) => [column, scalarToWire(value)]))
 }
 
 export function decodeRow(data: unknown, schema: Schema): Row {
@@ -139,6 +177,8 @@ export function decodeRow(data: unknown, schema: Schema): Row {
     throw new ProtocolError("Row must contain exactly the projected columns")
   }
   return Object.fromEntries(columns.map(([column, kind]) => [
-    column, validateValue(data[column], kind, column),
+    column, columnKind(kind) === null
+      ? validateValue(data[column], kind, column)
+      : vectorFromWire(data[column], kind, column) as Row[string],
   ]))
 }

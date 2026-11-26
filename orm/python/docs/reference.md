@@ -148,7 +148,8 @@ have completed their lifecycle.
 ## Tables and rows
 
 Table and column names must match `[A-Za-z_][A-Za-z0-9_]{0,63}`. A schema has
-1 to 128 columns and accepts exactly these Python types:
+1 to 128 columns and accepts exactly these Python types, plus the
+[vector and list types](#vector-search):
 
 | Python type | Stored type | Accepted values |
 | --- | --- | --- |
@@ -159,19 +160,20 @@ Table and column names must match `[A-Za-z_][A-Za-z0-9_]{0,63}`. A schema has
 
 Values must have the exact declared type. A boolean is not an integer here,
 an integer does not fill a float column, and subclasses are not accepted.
-Columns are nonnullable. Full rows must contain every schema column, with no
-unknown columns or `None` values. The primary key must name a `str` or `int`
+Columns are nonnullable, except vector columns. Full rows must contain every
+schema column, with no unknown columns or other `None` values. The primary key must name a `str` or `int`
 column and must be unique. Only `format="parquet"` is supported.
 
 Obtain `Table` handles through `Database`, rather than constructing them directly.
 Each handle has immutable `id`, `name`, `key` and `format` metadata and retains
-its original schema. Input mappings are copied, and each access to
+its schema. Only its own `add_column`, `drop_column`, `add_full_text` and
+`drop_full_text` calls change that schema. Input mappings are copied, and each access to
 `table.schema` returns a fresh dictionary. Changing that dictionary does not
 change the handle or server schema. Row and query operations use the table ID.
 
 | Method | Result and behavior |
 | --- | --- |
-| `db.create_table(name, schema, key, *, format="parquet")` | New `Table`; an existing name raises `ConflictError`. |
+| `db.create_table(name, schema, key, *, format="parquet", partition_by=None, full_text=None, embed=None)` | New `Table`; an existing name raises `ConflictError`. |
 | `db.table(name)` | One discovered `Table`; a missing name raises `NotFoundError`. |
 | `db.tables()` | `list[Table]` sorted by name; `[]` if none exist. |
 | `table.insert(row)` | `None`; an existing key raises `ConflictError`. |
@@ -180,6 +182,13 @@ change the handle or server schema. Row and query operations use the table ID.
 | `table.update(key, values)` | `bool` indicating whether the row exists; accepts partial values, including `{}`, but forbids the key field even if unchanged. |
 | `table.upsert(row)` | `None`; inserts a new row or replaces the entire existing row. |
 | `table.delete(key)` | `True` if deleted, `False` for a missing row. |
+| `table.upsert_many(rows, *, wait_for_embedding=False)` | Applied `int` count. See [batches](#batches). |
+| `table.delete_many(keys)` | Applied `int` count. A missing key counts as applied. |
+| `table.add_column(name, type, *, embed=None)` | `None`; adds a vector column online. |
+| `table.drop_column(name)` | `None`; drops a vector column. |
+| `table.add_full_text(column, language)` | `None`; indexes a `str` column for `match`. |
+| `table.drop_full_text(column)` | `None`; stops indexing it. |
+| `table.search_status()` | Dictionary per search column: `state` (`"building"`, `"ready"` or `"failed"`), `lag_ms`, `pending_embeddings`, `failed_embeddings` and `recall`. `lag_ms` and `recall` can be `None`. |
 | `table.query()` | New unfiltered `Query`, without network I/O. |
 | `table.where(expr=None, **filters)` | New filtered `Query`, without network I/O. |
 | `table.drop()` | `None`; removes the table from the server catalog. |
@@ -190,6 +199,40 @@ validates one bounded batch before sending anything, stopping if it exceeds
 validated prefix. The server applies the whole batch atomically; duplicate keys
 within the batch or against existing rows reject the batch. An empty iterable
 still sends one request to validate table existence, then returns `0`.
+
+### Batches
+
+`upsert_many` and `delete_many` accept any iterable and send it in requests of
+at most 10,000 rows and 8 MiB. Each row is atomic and durable. The call is not
+atomic across rows. A key that appears twice in one request is a
+`ValidationError`; in different requests the later row wins. An empty iterable
+sends nothing and returns `0`.
+
+The call stops at the first request that fails and raises `BatchError`:
+
+| Attribute | Value |
+| --- | --- |
+| `applied` | Rows known to be applied, in the whole call |
+| `outcomes` | One dictionary per row of the failed request, in order, with `key`, `outcome` and `error`. `outcome` is `"applied"`, `"not_applied"` or `"outcome_unknown"`. `error` is `None` for an applied row. |
+| `request_id` | ID of the failed request |
+| `outcome` | `"not_applied"`, `"partial"`, `"unknown"`, or `"applied"` when only the wait for embeddings failed |
+
+The class of a row's `error` follows its outcome, then its code: `"outcome_unknown"`
+gives `UnknownOutcomeError`. A `"not_applied"` row maps `validation_error`,
+`unauthorized`, `not_found`, `conflict`, `limit_exceeded`, `overloaded`,
+`storage_unavailable` and `search_unavailable` to their classes in the
+[error table](#errors-and-uncertain-writes), and any other code to `NabedraError`.
+
+A lost response makes every row of its request `"outcome_unknown"`. The client
+never sends a request again. Writing the same rows again is safe while no other
+writer changes them. Rows after the failed request were not sent. An invalid row
+raises `ValidationError` if nothing was sent yet. After that, it or an exception
+from the iterable raises `BatchError` with the applied count and no `outcomes`.
+
+`wait_for_embedding=True` polls `search_status()` after the last request until no
+embedding of the table is pending, for at most the client's `timeout`. Other
+writers' rows count too. If the wait fails, `BatchError` reports every row as
+applied. Failed embeddings end the wait; see `failed_embeddings`.
 
 Missing tables raise `NotFoundError`, including through old handles after a
 drop. Recreating the same name gives a new ID; existing handles and their queries
@@ -245,6 +288,72 @@ for an oversized result; use an explicit smaller limit or projection. `count()`
 returns a scalar and can count more than 10,000 matches. Pagination and streaming
 results are not available in v0.
 
+## Vector search
+
+Search needs an OLTP server that supports it. Other servers reject these types and
+operations with code `unsupported_operation` or `validation_error`. The application
+gateway does not forward them.
+
+```python
+from nabedra import Database, Vector, col
+
+db = Database(url="http://127.0.0.1:8000")
+chunks = db.create_table("chunks", {
+    "id": str, "tenant": str, "acl": list[str], "body": str,
+    "embedding": Vector(1024),
+    "sparse": Vector(sparse=True),
+    "tokens": list[Vector(128)],
+}, key="id", partition_by="tenant", full_text={"body": "english"},
+   embed={"embedding": {"source": "body", "model": "docs-v1"}})
+
+mine = chunks.where((col("tenant") == "acme") & col("acl").contains_any(["staff"]))
+hits = mine.rank(col("embedding").cosine("reset my password")).select("id", "body").limit(10).collect()
+# [{"id": "doc7#0", "body": "...", "_score": 0.88}]
+```
+
+| Column type | Values | Operations |
+| --- | --- | --- |
+| `Vector(n)` | `n` float32 values, as a list, a tuple or any contiguous float32 buffer such as `array("f")` or a float32 NumPy array. Read as `array("f")`. | `cosine`, `dot`, `l2` |
+| `Vector(sparse=True)` | `{index: weight}` with unsigned 32-bit indices. Read as a dictionary in index order. | `cosine`, `dot` |
+| `list[Vector(n)]` | A list or tuple of up to 1,024 vectors, for example `list(matrix)`. Read as a list of `array("f")`. | `cosine`, `dot`: for every query vector, its best row vector, summed |
+| `list[str]` | A list of strings | `contains`, `contains_any` filters |
+| `str` in `full_text` | Text | `match` (BM25) |
+
+Vector values are stored as float32 and must be finite. Vector columns accept
+`None`, and those rows never rank on that column. Scalar comparisons and
+`order_by` do not accept these types.
+
+| Table option | Meaning |
+| --- | --- |
+| `partition_by` | A `str` or `int` column. Each of its values gets its own index. |
+| `full_text` | `{column: language}` for `str` columns |
+| `embed` | `{column: {"source": column, "model": name}}`. The database fills this `Vector(n)` column from a `str` column. Rows omit it, and writing it is a `ValidationError`. |
+
+A table has at most 8 search columns, counting vector and full-text columns. With
+any, `_score` is a reserved column name and a row holds at most 1 MiB, counting
+vectors as raw float32 bytes.
+
+| Query method | Result and behavior |
+| --- | --- |
+| `col(name).cosine(query)`, `.dot(query)`, `.l2(query)` | A ranking. A string is embedded with the column's model. `cosine` rejects a zero query vector. |
+| `col(name).match(text)` | A ranking by BM25 |
+| `col(name).contains(value)`, `.contains_any(values)` | Filters on `list[str]` columns. `contains_any` of nothing matches nothing. It sends a `set` or `frozenset` sorted by UTF-8 bytes and any other iterable, `dict` keys included, in its order. |
+| `col(name).starts_with(prefix)` | Filter on `str` columns |
+| `rank(*rankings, fusion="rrf", candidates=100, recall=0.95, exact=False, consistency="latest")` | New query ordered by one ranking, or by several fused. `fusion` is `"rrf"` or one nonnegative weight per ranking. |
+| `rerank(ranking, *, candidates=200)` | New query that scores the best candidates of `rank` again |
+| `rank_many(rankings, *, limit, ...)` | One result list per ranking, up to 256, with the options of `rank` |
+
+A ranked query needs a `limit` of at most 1,000 and supports only `collect`. Its rows
+gain `_score` and omit vector columns unless selected. `l2` sorts ascending, the
+others descending, then by key. `order_by` cannot be combined with `rank`. `recall`
+is a target, not a guarantee; `exact=True` is exact. `"latest"` shows every write
+acknowledged before the query, and `"snapshot"` reads one cut across ranges.
+
+An operation that a column does not support is a `ValidationError` before any
+request. An unknown keyword argument is a `TypeError`, as for any Python call.
+`SearchUnavailableError` (503) means that search cannot answer now.
+The query can be sent again later. Streams support only scalar columns.
+
 ## Errors and uncertain writes
 
 All client errors below derive from `NabedraError`, exported by `nabedra`.
@@ -258,6 +367,8 @@ All client errors below derive from `NabedraError`, exported by `nabedra`.
 | `LimitExceededError` | Local input or a valid server error exceeds a limit. |
 | `OverloadedError` | Server cannot accept more work. |
 | `StorageError` | Server storage failed with outcome `not_applied`. |
+| `SearchUnavailableError` | Search cannot answer now. The query can be sent again later. |
+| `BatchError` | `upsert_many` or `delete_many` stopped early. See [batches](#batches). |
 | `TransportError` | Read-side network failure. |
 | `ProtocolError` | Malformed or invalid read response, including an oversized response. |
 | `UnknownOutcomeError` | Mutation may have committed despite an unknown server outcome or a lost/invalid response. |
@@ -319,7 +430,7 @@ copy and cannot survive losing that process.
 ## Limits and scope
 
 Requests and responses are capped at 8 MiB of encoded JSON, including envelopes.
-Batches and collected results are capped at 10,000 rows, schemas at 128 columns,
+Requests and collected results are capped at 10,000 rows, schemas at 128 columns,
 and OLAP tables at 100,000 rows and 64 MiB of decoded row payload. OLTP does
 not apply these logical-table limits. Byte limits can be reached before row
 limits for bounded requests and results. The server remains authoritative for

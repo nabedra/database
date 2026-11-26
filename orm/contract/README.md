@@ -8,7 +8,8 @@ Install the TypeScript package's locked dependencies with `npm ci --prefix orm/t
 | `python3.11 scripts/testing/api_manifest.py parity` | List one-sided symbols in both directions. Exit with status 1 for a new gap or a stale exception. |
 | `python3.11 -m unittest scripts.testing.test_api_manifest` | Reject a changed Python default, a new one-sided method and mismatched package versions. |
 | `PYTHONPATH=orm/python/src python3.11 -m unittest discover -s orm/python/tests -p test_contract_vectors.py` | Replay OLAP and Events exchanges from Python. |
-| `npm run build --prefix orm/typescript && node --test orm/typescript/tests/contract-vectors.test.mjs` | Replay the same exchanges from the TypeScript package. |
+| `PYTHONPATH=orm/python/src python3.11 -m unittest discover -s orm/python/tests -p test_vector_contract.py` | Replay the vector search cases from Python. |
+| `npm run build --prefix orm/typescript && node --test orm/typescript/tests/contract-vectors.test.mjs orm/typescript/tests/vectorContract.test.mjs` | Replay the same cases from the TypeScript package. |
 
 ## API manifest
 
@@ -25,3 +26,9 @@ For an approved API change, update both ORMs and run `python3.11 scripts/testing
 Each case selects an operation and can override its response or decoded result. The operations list the preceding exchanges, the expected request and a default response. Both clients send real HTTP requests to a local fixture. The tests compare method, path, authentication, database and lease headers, and the complete UTF-8 body. The fixture substitutes the generated OLAP request ID for `@request_id` when echoing it back. Response bodies are raw strings so malformed JSON, duplicate fields, and integer-versus-float tokens survive fixture loading.
 
 Expected results use decimal strings for wide integers after asserting the native integer type. Malformed cases pin whether reads report a protocol error and whether writes report an unknown outcome. The OLAP vectors cover the JSON and response-validation clauses of U02. The [Cache contract](../cache-contract/README.md) has its own runner and vectors.
+
+## Vector search
+
+`vector/vectors.json` holds one case per type, value, operation, filter, option and error of vector search and batch writes. `create` cases build a table, `describe` cases decode a descriptor, and `calls` cases run one table method or query. A case has the exact `operation` and `payload` of its only request, or neither when the client must reject it first. `response` is a raw `data` string, an error, `drop` for a lost reply or `raw` for a body that is not JSON. Where the languages word an existing message differently, `message` has one text for each.
+
+Values that JSON cannot express are tagged: `$int` is an exact integer, `$float` a float, `$list` a list of floats, `$float32` an `array("f")` or `Float32Array`, and `$sparse` a mapping from index to weight. The base64 values were computed from packed bytes, not by an SDK.
