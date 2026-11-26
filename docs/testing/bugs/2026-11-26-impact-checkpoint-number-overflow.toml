@@ -1,0 +1,17 @@
+id = "VECTOR-impact-checkpoint-number-overflow"
+title = "A file named doc-ffffffffffffffff in the checkpoint directory panics begin_checkpoint (wraps to file number 0 in release)"
+class = "other"
+module = "vector"
+guarantees = ["unknown"]
+scenarios = ["VS10"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/impact/tests/adv_ckpt.rs::vs10_adv_stray_files_are_ignored_and_never_break_the_next_checkpoint"
+seed = "unknown"
+why_not_caught = "Crash and damage tests damage the named files and never add a file with another name."
+invariant_added = "begin_checkpoint picks a free file number for any directory content, with checked arithmetic."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "task G"
+expires = "2026-12-03"

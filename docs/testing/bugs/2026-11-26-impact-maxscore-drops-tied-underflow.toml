@@ -1,0 +1,17 @@
+id = "VECTOR-impact-maxscore-drops-tied-underflow"
+title = "MaxScore prunes a row whose f64 score is below the worst f32 score but rounds to it, so a tie that wins by key is lost"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G05"]
+scenarios = ["VS07"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/impact/tests/adv_rank.rs::vs07_adv_scores_that_underflow_or_round_to_negative_zero_tie_as_zero"
+seed = "unknown"
+why_not_caught = "The slack of below() is relative to the magnitudes, which is 1e-300 near zero, while f32 rounds by up to 7e-46 there. The existing generators use weights of normal size."
+invariant_added = "A limited MaxScore result equals the brute-force order by rounded f32 score and then key, also for scores below the f32 normal range."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "task G"
+expires = "2026-12-03"

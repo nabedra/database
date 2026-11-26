@@ -3,6 +3,8 @@
 use nabedra_check::Gen;
 use nabedra_check::prop::{Config as Runs, check_with};
 
+mod adversary;
+
 use super::*;
 
 fn names(a: &Analyzer, text: &str) -> Vec<String> {

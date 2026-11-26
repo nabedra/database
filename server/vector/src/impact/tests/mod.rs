@@ -1,3 +1,7 @@
+mod adv_ckpt;
+mod adv_fuse;
+mod adv_rank;
+mod adv_state;
 mod crash;
 mod diff;
 mod fuse;
