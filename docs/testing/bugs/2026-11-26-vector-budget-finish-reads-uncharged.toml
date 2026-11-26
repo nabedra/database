@@ -13,6 +13,3 @@ why_not_caught = "The budget tests counted what the scan charged and never count
 invariant_added = "The vectors a query reads from the store, counted at the store, never exceed its I/O budget."
 fix_commits = ["8c074ad387f4bd94151129a45f9b5f691e157dfc"]
 revert_patch_ok = true
-status = "fixed"
-owner = "oltp-vector lead"
-expires = "2026-12-22"

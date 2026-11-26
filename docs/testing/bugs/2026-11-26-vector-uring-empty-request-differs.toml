@@ -13,6 +13,3 @@ why_not_caught = "The differential test of the backends used non-empty requests.
 invariant_added = "Both backends return the same result for every request, empty ones included."
 fix_commits = ["8c074ad387f4bd94151129a45f9b5f691e157dfc"]
 revert_patch_ok = true
-status = "fixed"
-owner = "oltp-vector lead"
-expires = "2026-12-22"

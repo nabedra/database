@@ -13,6 +13,3 @@ why_not_caught = "Every test of the store flushed before it read, and its dimens
 invariant_added = "Reads between flushes: a record that is whole in the file and in RAM reads exactly, for generated record sizes and with reuse of places."
 fix_commits = ["8c074ad387f4bd94151129a45f9b5f691e157dfc"]
 revert_patch_ok = true
-status = "fixed"
-owner = "oltp-vector lead"
-expires = "2026-12-22"
