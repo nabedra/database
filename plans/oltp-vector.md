@@ -125,7 +125,7 @@ chunks = db.create_table("chunks", {
    full_text={"body": "english"},       # optional: allows col("body").match()
    embed={"embedding": {"source": "body", "model": "docs-v1"}})   # optional
 
-chunks.upsert_many(rows)                # any size; each row atomic and durable, safe to retry
+chunks.upsert_many(rows)                # any size; each row atomic and durable; calling it again rewrites the rows
 chunks.delete_many(["doc7#3", "doc7#4"])
 
 mine = chunks.where((col("tenant") == "acme") & col("acl").contains_any(groups) & (col("year") >= 2024))
@@ -206,7 +206,7 @@ class Table:
 | Zero vectors | Stored. `dot` and `l2` rank them. `cosine` is undefined for them, so it skips a zero row and rejects a zero query. |
 | Tenants | `partition_by` gives each tenant its own tree. Prefix keys with the tenant and filter with `col("id").starts_with("acme/")` to also limit the query to that tenant's ranges. |
 | `recall` | A target the engine pursues per query, not a guarantee. `exact=True` is exact. For `dot` on a `list[Vector]` column it is pursued only when the vectors have unit length. |
-| `upsert_many`, `delete_many` | New. Stream any iterable in bounded chunks, grouped by range and sent to each leader in parallel. Each row is atomic, durable and applied once per request ID. The call is not atomic across rows, also when they share a range. On failure it stops sending and raises `BatchError` with the applied count and, for every row in flight, `applied`, `not_applied` or `outcome_unknown`. `insert_many` stays all or nothing. |
+| `upsert_many`, `delete_many` | New. Stream any iterable in bounded chunks, grouped by range and sent to each leader in parallel. Each row is atomic, durable and applied once per request ID. A new call is a new request ID: sending the same rows again writes them again, which an upsert or delete makes harmless but which creates new row versions and new embeddings. The call is not atomic across rows, also when they share a range. On failure it stops sending and raises `BatchError` with the applied count and, for every row in flight, `applied`, `not_applied` or `outcome_unknown`. `insert_many` stays all or nothing. |
 | Limits | 1 to 4,096 dimensions, 8 search columns, `limit` ≤ 1,000, 256 rankings per `rank_many`, 1,024 vectors per `list[Vector]` value, 1 MiB per row. Existing 10,000-row and 8 MiB request limits stay. |
 | Errors | Existing classes, plus `SearchUnavailableError` (503, retryable) and `BatchError`. |
 
