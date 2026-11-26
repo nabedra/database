@@ -388,13 +388,20 @@ Heartbeat(w, delivered) ==
 (* Reconcile turns (placement.rs plan, recover_staged, plan_slot, plan_move,  *)
 (* reconcile, valid_change, valid_staged).  Each commits one slot change.     *)
 
+\* Once an epoch advances, no old slot progress can pass Baseline again.
+\* Keep the incarnation report for liveness and the observation window.
+ClearOldProgress(scope) ==
+    [w \in Workers |-> [rep[w] EXCEPT !.sl =
+        [s \in Slots |-> IF s \in scope THEN NoRptSlot ELSE rep[w].sl[s]]]]
+
 Commit(s, next) ==
     /\ cs' = [cs EXCEPT ![s] = next]
     /\ owners' = [owners EXCEPT ![s][next.ep] = @ \cup {next.pri}]
+    /\ rep' = IF next.ep > cs[s].ep THEN ClearOldProgress({s}) ELSE rep
 
 ClearStg(s) == stg' = [stg EXCEPT ![s] = [on |-> FALSE, seq |-> -1]]
 
-ReconcileUnchangedButCur == UNCHANGED <<member, gen, coff, rep, obsStart, workerVars, envVars,
+ReconcileUnchangedButCur == UNCHANGED <<member, gen, coff, obsStart, workerVars, envVars,
                                   jr, base, served, srvMax, srvBad, gone, lateAck>>
 ReconcileUnchanged == ReconcileUnchangedButCur /\ UNCHANGED cur
 
@@ -652,7 +659,8 @@ AdminColdReset(scope, fleet) ==
     /\ lease' = [s \in Slots |-> IF s \in scope THEN [exp |-> 0, nb |-> 0] ELSE lease[s]]
     /\ stg' = [s \in Slots |-> IF s \in scope THEN [on |-> FALSE, seq |-> -1] ELSE stg[s]]
     /\ fb' = [fb EXCEPT !.reset = @ + 1]
-    /\ UNCHANGED <<member, cur, coff, rep, obsStart, workerVars, now, ccut, pcut, nWrites,
+    /\ rep' = ClearOldProgress(scope)
+    /\ UNCHANGED <<member, cur, coff, obsStart, workerVars, now, ccut, pcut, nWrites,
                    steady, jr, base, served, srvMax, srvBad, promo, gone, lateAck>>
 
 -----------------------------------------------------------------------------
