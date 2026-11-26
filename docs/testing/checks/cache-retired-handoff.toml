@@ -1,0 +1,11 @@
+id = "cache-retired-handoff"
+module = "cache"
+kinds = ["U"]
+guarantees = []
+scenarios = ["K03"]
+tiers = ["T0", "T1"]
+command = ["cargo", "test", "--locked", "-j", "4", "--no-default-features", "--features", "cache", "--lib", "cache::cluster::controller::tests::k03_staged_promotion_checks_fence_lag_and_copy_at_apply", "--", "--exact", "--test-threads=1"]
+cwd = "server"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"

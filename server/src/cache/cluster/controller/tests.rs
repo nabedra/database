@@ -15,7 +15,7 @@ use super::super::protocol::{
 };
 use super::super::transport::Endpoint;
 use super::state::{Command, State};
-use super::{RaftConfig, log::Log, machine::Machine, placement::Observations};
+use super::{RaftConfig, log::Log, machine::Machine, placement::{Change, Observations, SourceFence}};
 use uuid::Uuid;
 
 struct Directory(PathBuf);
@@ -884,8 +884,8 @@ fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
     assert!(reset.lease.is_none());
     assert!(reset.moving.is_none());
 
-    // A retirement can commit before expiry. It cannot give the target
-    // writable authority before the last grant's deadline.
+    // A new leader must defer staging promotion while the retired source
+    // can still acknowledge writes under its existing lease.
     let mut retired = state.clone();
     assert!(matches!(
         retired.apply(
@@ -900,7 +900,25 @@ fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
     let mut observations = Observations::default();
     report(&mut observations, &retired, target, 4_000, Some(copy));
     let changes = observations.plan(&retired, bounds(4_000));
-    assert!(retired.reconcile(4_000, changes));
+    assert!(!retired.reconcile(4_000, changes));
+    assert_eq!(retired.topology.slots[0], staged);
+
+    // Previously committed reconcile entries retain their apply semantics.
+    let mut legacy = retired.clone();
+    let mut legacy_promotion = promotion.clone();
+    let Change::Slot {
+        staged: Some(proof),
+        ..
+    } = &mut legacy_promotion
+    else {
+        panic!("expected staged promotion");
+    };
+    proof.fence = SourceFence::Retired;
+    assert!(legacy.reconcile(4_000, vec![legacy_promotion]));
+    assert_eq!(legacy.topology.slots[0].primary, Some(target));
+
+    let changes = observations.plan(&retired, bounds(5_000));
+    assert!(retired.reconcile(5_000, changes));
     let next = retired.topology.slots[0];
     assert_eq!(next.primary, Some(target));
     assert_eq!(next.epoch, 2);
