@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use nabedra_kv::fs::{FaultFs, Fs, OpenMode};
+use nabedra_kv::journal::format::{BLOCK, RECORD_HEADER_LEN};
 use nabedra_kv::{
     Background, Damage, DamageReason, Durability, Error, FileId, Options, Store, WriteBatch,
 };
@@ -937,4 +938,128 @@ fn ns06_ns25_torn_tails_recover_to_an_exact_prefix() {
         assert_eq!(again.store.visible_seq(), seq, "{case}");
         check_prefix(&again.store);
     }
+}
+
+/// NS07: the durable flush covers a lost journal header, while another record in the
+/// same block still holds a live value. Recovery must keep that segment and resume.
+#[test]
+fn ns07_flushed_header_damage_preserves_live_journal_value() {
+    let (fs, dir) = fault_fs();
+    let bg = Background::new(2).unwrap();
+    let store = open(&dir, options(&fs, &bg));
+    let plain = val("flushed-inline");
+    let retained = val("flushed-journal");
+    write_kv(&store, b"", b"s/plain", &plain, false, Durability::NoSync);
+    write_kv(&store, b"", b"s/journal", &retained, true, Durability::Sync);
+    store.flush().unwrap();
+
+    let journal_dir = dir.join("journal");
+    let (segment, first_at) = find_one(&fs, &journal_dir, &plain);
+    let (value_segment, value_at) = find_one(&fs, &journal_dir, &retained);
+    assert_eq!(segment, value_segment);
+    assert_eq!(first_at / BLOCK, value_at / BLOCK);
+    let image = fs.crash();
+    overwrite(
+        &image,
+        &segment,
+        first_at / BLOCK * BLOCK,
+        &[0; RECORD_HEADER_LEN],
+    );
+
+    let recovered = open(&dir, options(&image, &bg));
+    assert_eq!(
+        recovered.snapshot().get(b"s/plain").unwrap().unwrap(),
+        plain
+    );
+    assert_eq!(
+        recovered.snapshot().get(b"s/journal").unwrap().unwrap(),
+        retained
+    );
+    write_kv(&recovered, b"", b"s/new", b"after", false, Durability::Sync);
+
+    let reopened = open(&dir, options(&image.crash(), &bg));
+    assert_eq!(
+        reopened.snapshot().get(b"s/journal").unwrap().unwrap(),
+        retained
+    );
+    assert_eq!(
+        reopened.snapshot().get(b"s/new").unwrap().unwrap(),
+        b"after"[..]
+    );
+}
+/// R3: a missing recorded segment must abort recovery before journal cleanup.
+#[test]
+fn ns07_missing_manifest_segment_refuses_before_cleanup() {
+    let (fs, dir) = fault_fs();
+    let bg = Background::new(2).unwrap();
+    let store = open(&dir, options(&fs, &bg));
+    let value = val("missing-segment");
+    write_kv(&store, b"", b"s/journal", &value, true, Durability::Sync);
+    store.flush().unwrap();
+
+    let journal_dir = dir.join("journal");
+    let (segment, _) = find_one(&fs, &journal_dir, &value);
+    let image = fs.crash();
+    image.remove(&segment).unwrap();
+    let unused = journal_dir.join("0000000000000999.free");
+    image.open(&unused, OpenMode::CreateNew).unwrap();
+    let before = files_under(&image, &journal_dir);
+
+    assert!(matches!(
+        Store::open(&dir, options(&image, &bg)),
+        Err(Error::Corruption {
+            file: FileId::Journal { .. },
+            what: "a journal segment the manifest records is missing",
+            ..
+        })
+    ));
+    assert_eq!(files_under(&image, &journal_dir), before);
+}
+
+/// NS07 R1: the flushed prefix cannot certify a later missing record whose completed
+/// sync is known from a following record. The refusal leaves the live segment intact.
+#[test]
+fn ns07_flushed_prefix_cannot_skip_a_certified_unflushed_gap() {
+    let (fs, dir) = fault_fs();
+    let bg = Background::new(2).unwrap();
+    let store = open(&dir, options(&fs, &bg));
+    let flushed = val("covered-prefix");
+    let unflushed = val("certified-unflushed");
+    write_kv(&store, b"", b"s/covered", &flushed, true, Durability::Sync);
+    store.flush().unwrap();
+    write_kv(&store, b"", b"s/gap", &unflushed, false, Durability::Sync);
+    write_kv(
+        &store,
+        b"",
+        b"s/evidence",
+        b"completed sync",
+        false,
+        Durability::Sync,
+    );
+
+    let journal_dir = dir.join("journal");
+    let (covered_seg, covered_at) = find_one(&fs, &journal_dir, &flushed);
+    let (gap_seg, gap_at) = find_one(&fs, &journal_dir, &unflushed);
+    assert_eq!(covered_seg, gap_seg);
+    assert!(covered_at / BLOCK < gap_at / BLOCK);
+    let image = fs.crash();
+    for at in [covered_at, gap_at] {
+        overwrite(
+            &image,
+            &gap_seg,
+            at / BLOCK * BLOCK,
+            &[0; RECORD_HEADER_LEN],
+        );
+    }
+    let before = image.contents(&gap_seg).unwrap();
+
+    assert!(matches!(
+        Store::open(&dir, options(&image, &bg)),
+        Err(Error::Corruption {
+            file: FileId::Journal { .. },
+            what: "synced journal record damaged (scope unknown)",
+            ..
+        })
+    ));
+    assert_eq!(image.contents(&gap_seg).unwrap(), before);
 }
