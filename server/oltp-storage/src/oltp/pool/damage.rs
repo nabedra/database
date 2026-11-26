@@ -62,6 +62,9 @@ pub(super) fn read_value_damage(store: &Store) -> Result<Vec<Uuid>, ProtocolErro
 }
 fn write_value_damage(store: &Store, groups: &BTreeSet<Uuid>) -> Result<(), ProtocolError> {
     let bytes = serde_json::to_vec(groups).map_err(|_| accepted_unreadable())?;
+    if bytes.len() > MAX_ACCEPTED_BYTES {
+        return Err(accepted_unreadable());
+    }
     let mut batch = WriteBatch::new();
     batch.put(VALUE_DAMAGE_KEY, &bytes);
     let commit = store
@@ -131,7 +134,7 @@ pub(super) struct DamageState {
     refused_writes: AtomicU64,
     releases: AtomicU64,
     /// Groups whose stored vector values failed their own checksum, which kv
-    /// cannot see. Found again at the next read after a restart.
+    /// cannot see. Loaded from the pool's synced record at open.
     values: Mutex<BTreeSet<Uuid>>,
     any_value: AtomicBool,
     /// Orders the rewrites of the value damage record.
@@ -153,8 +156,7 @@ impl DamageState {
     fn values(&self) -> std::sync::MutexGuard<'_, BTreeSet<Uuid>> {
         self.values.lock().unwrap_or_else(|poison| poison.into_inner())
     }
-    /// Groups quarantined for damaged values, from their markers at open or at
-    /// run time.
+    /// Groups quarantined for damaged values, at open or at run time.
     pub(super) fn mark_values(&self, groups: impl IntoIterator<Item = Uuid>) {
         let mut values = self.values();
         values.extend(groups);
@@ -306,44 +308,37 @@ fn write_accepted(store: &Store, accepted: &BTreeSet<Uuid>) -> Result<(), Protoc
 }
 
 impl OltpPool {
-    /// A stored vector value of `group` is missing or fails its checksum: the
-    /// group is quarantined like one whose block kv found damaged (rule 1).
-    /// L6: the quarantine is durable before the caller returns. The group's
-    /// own synced marker survives a restart, and an open finds it, so the
-    /// replica never votes, acknowledges or serves again; releasing the group
-    /// after its replacement deletes it with the group's bytes.
+    /// Quarantines a group with a missing or damaged vector value (L6).
+    /// Publish the quarantine after persisting the pool's set. Serialize the
+    /// complete rewrite with other reports and releases.
     pub(crate) async fn report_value_damage(&self, group: Uuid) {
-        let damage = &self.inner.damage;
-        if damage.value_damaged(group) {
+        if self.inner.damage.value_damaged(group) {
             return;
         }
-        // The group's own marker and the pool's record of every such group,
-        // in one synced batch. An open reads only the record.
-        let submitted = {
+        let pool = self.clone();
+        let saved = nabedra_rt::task::spawn_blocking(move || {
+            let damage = &pool.inner.damage;
             let _serial = damage.value_writes.lock().unwrap_or_else(|poison| poison.into_inner());
-            let mut groups: BTreeSet<Uuid> = damage.values().clone();
-            groups.insert(group);
-            let mut batch = WriteBatch::new();
-            batch.put(&super::value_damage_key(group), b"1");
-            serde_json::to_vec(&groups)
-                .map_err(|_| accepted_unreadable())
-                .and_then(|record| {
-                    batch.put(VALUE_DAMAGE_KEY, &record);
-                    self.submit(&[], batch, Durability::Sync, Box::new(()))
-                })
-        };
-        let written = match submitted {
-            Ok(commit) => commit.done().await.map_err(|error| self.failed(error)),
-            Err(error) => Err(error),
-        };
-        if let Err(error) = written {
-            // The pool is latched or the scope quarantined already: either way
-            // this replica writes nothing more.
-            tracing::error!(%group, %error, "could not persist a vector damage quarantine");
+            let mut groups = damage.values().clone();
+            if !groups.insert(group) {
+                return;
+            }
+            if let Err(error) = pool
+                .healthy()
+                .and_then(|()| write_value_damage(&pool.inner.store, &groups))
+            {
+                pool.latch();
+                tracing::error!(%group, %error, "could not persist a vector damage quarantine");
+            }
+            damage.mark_values([group]);
+            damage.events.send_if_modified(|groups| groups.insert(group));
+            tracing::error!(%group, "OLTP group quarantined: a stored vector value is damaged");
+        })
+        .await;
+        if let Err(error) = saved {
+            self.latch();
+            tracing::error!(%group, %error, "vector damage quarantine was interrupted");
         }
-        damage.mark_values([group]);
-        damage.events.send_if_modified(|groups| groups.insert(group));
-        tracing::error!(%group, "OLTP group quarantined: a stored vector value is damaged");
     }
 
     /// Rewrites the accepted record to the store's current quarantined groups.

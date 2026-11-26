@@ -2097,11 +2097,6 @@ impl<'a> GroupTransaction<'a> {
     }
 }
 
-/// `0x40 ‖ group ‖ 'q'`: the group's vector values are damaged (L6).
-const VALUE_DAMAGE: u8 = b'q';
-fn value_damage_key(id: Uuid) -> Vec<u8> {
-    group_key(id, VALUE_DAMAGE, &[])
-}
 /// `0x40 ‖ group ‖ 'c'`, before the log index of a change record.
 const CHANGE_PREFIX_BYTES: usize = GROUP_SCOPE_BYTES + 1;
 /// `prefix` is the state or log prefix of the same group.

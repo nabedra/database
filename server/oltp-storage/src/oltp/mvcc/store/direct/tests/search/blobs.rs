@@ -663,7 +663,7 @@ async fn vs16_a_queued_plain_put_on_a_search_range_fails_closed() {
 
 /// L6: a vector damage quarantine is durable. The running replica stops
 /// appending, voting and serving at once; after a crash and a restart the pool
-/// finds the group's marker, reports it, and never opens it again.
+/// finds the group's record, reports it, and never opens it again.
 #[tokio::test]
 async fn vs16_a_vector_damage_quarantine_survives_a_restart() {
     let fs = FaultFs::new();
@@ -734,4 +734,31 @@ async fn vs16_a_vector_damage_quarantine_survives_a_restart() {
     let pool = open_on(&dir, &fs.crash(), &pool_identity, &shared);
     assert!(pool.quarantined_groups().is_empty());
     pool.retained_group(group).await.err().unwrap();
+}
+
+
+#[tokio::test]
+async fn vs16_concurrent_value_damage_reports_survive_restart() {
+    let fs = FaultFs::new();
+    let S { f, .. } = S::on(Some(&fs)).await;
+    let Fixture {
+        replica,
+        pool,
+        pool_identity,
+        dir,
+        ..
+    } = f;
+    let shared = replica.shared.clone();
+    let groups: Vec<_> = (1..=8).map(uuid::Uuid::from_u128).collect();
+    for pair in groups.chunks_exact(2) {
+        tokio::join!(
+            pool.report_value_damage(pair[0]),
+            pool.report_value_damage(pair[1]),
+        );
+    }
+    drop((replica, pool));
+    let reopened = open_on(&dir, &fs.crash(), &pool_identity, &shared);
+    for group in groups {
+        assert!(reopened.is_group_quarantined(group), "lost quarantine for {group}");
+    }
 }
