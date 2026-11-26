@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "t1-52300fe-163133--oltp-growth-activation-repeat.log",
+      "sha256": "d084181436d8dd444fd2f9ff7b2502971d2a2ec08bdb3bb1ff7d221a9ed019d6"
+    }
+  ],
+  "assertions": {
+    "executed": 40,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-growth-activation-repeat",
+  "duration_s": 5503.751,
+  "guarantees": [],
+  "kind": "R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-25T16:19:49.300827+00:00",
+    "request_id": "t1-52300fe-163133",
+    "runner": "GitHub Actions 1000014157",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938"
+  },
+  "scenarios": [
+    "O16"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

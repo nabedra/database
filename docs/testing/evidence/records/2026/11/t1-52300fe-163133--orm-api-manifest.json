@@ -1,0 +1,41 @@
+{
+  "artifacts": [
+    {
+      "name": "t1-52300fe-163133--orm-api-manifest.log",
+      "sha256": "e8f4316927e9f42ff7c163cca1a2b73074c772bc9434372f63fc2294b13f5acb"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "orm-api-manifest",
+  "duration_s": 5.898,
+  "guarantees": [
+    "ORM-G01",
+    "ORM-G03"
+  ],
+  "kind": "D",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-25T17:01:35.946282+00:00",
+    "request_id": "t1-52300fe-163133",
+    "runner": "GitHub Actions 1000014230",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "t1-52300fe-163133--oltp-conflict-text-pin.log",
+      "sha256": "7a91a2303adbdb84335780a629840767ecb4d76860d7df1f9fdd98f9136364eb"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-conflict-text-pin",
+  "duration_s": 102.066,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-25T16:16:34.727669+00:00",
+    "request_id": "t1-52300fe-163133",
+    "runner": "GitHub Actions 1000014153",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

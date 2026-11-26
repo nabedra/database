@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "t1-52300fe-163133--check-core.log",
+      "sha256": "c0cb8f7c2a9dca8a6ab8a02aec802bfc437b6e96c25b827f7d5f4c53024ee5d2"
+    }
+  ],
+  "assertions": {
+    "executed": 117,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "ignored",
+        "reason": "1 tests marked #[ignore]"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "check-core",
+  "duration_s": 26.877,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-25T15:44:53.468503+00:00",
+    "request_id": "t1-52300fe-163133",
+    "runner": "GitHub Actions 1000014096",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

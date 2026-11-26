@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "t1-52300fe-163133--orm-contract-vectors-python.log",
+      "sha256": "161e7f81f73403ad9de6705f31a6283ab3b65d9ebaf61fc1107c75e569ca0121"
+    }
+  ],
+  "assertions": {
+    "executed": 2,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "orm-contract-vectors-python",
+  "duration_s": 2.018,
+  "guarantees": [
+    "ORM-G02"
+  ],
+  "kind": "D F",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-25T17:02:01.243821+00:00",
+    "request_id": "t1-52300fe-163133",
+    "runner": "GitHub Actions 1000014231",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938"
+  },
+  "scenarios": [
+    "U02"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

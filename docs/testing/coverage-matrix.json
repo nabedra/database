@@ -7,7 +7,7 @@
       "K03 simulated controller disk loss is `not-run` pending modelled Raft storage."
     ]
   },
-  "head": "4e02e1db89eca062e5558eda4afd8fa2e053b7a2",
+  "head": "ad340c9ae29580ba12d709de2ce76aa3e765da09",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -24,16 +24,32 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-valkey-diff"
+          ],
+          "date": "2026-11-25T15:43:50.970935+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "F": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "fuzz-replay"
+          ],
+          "date": "2026-11-25T15:54:23.090199+00:00",
+          "executed": 5,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "H": {
           "reason": "The checks compare each reply directly",
@@ -84,10 +100,18 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-valkey-diff"
+          ],
+          "date": "2026-11-25T15:43:50.970935+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "F": {
           "reason": "The rule uses well-formed TTL commands",
@@ -120,16 +144,34 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-sim",
+            "cache-sim-loss"
+          ],
+          "date": "2026-11-25T15:32:45.642882+00:00",
+          "executed": 109,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-store-model",
+            "cache-test-hooks"
+          ],
+          "date": "2026-11-25T15:40:15.549905+00:00",
+          "executed": 11,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "Reads never extend a TTL. A non-positive EXPIRE deletes. TTL uses -2 for an absent key and -1 for a key without expiry. Expired keys never return, and each sweep stays within 64 items or 200 \u00b5s.",
@@ -183,16 +225,33 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-sim",
+            "cache-sim-loss"
+          ],
+          "date": "2026-11-25T15:32:45.642882+00:00",
+          "executed": 109,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-store-model"
+          ],
+          "date": "2026-11-25T15:40:15.549905+00:00",
+          "executed": 6,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "Memory never exceeds the cap. `noeviction` returns OOM, and `sampled_lru` evicts only existing keys and frees enough space to admit the write.",
@@ -275,10 +334,20 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-sim",
+            "cache-sim-loss",
+            "check-history"
+          ],
+          "date": "2026-11-25T15:32:45.642882+00:00",
+          "executed": 135,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "A quiescent check after targeted failover tests convergence",
@@ -297,16 +366,33 @@
           "state": "n/a"
         },
         "R": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-cluster-real"
+          ],
+          "date": "2026-11-25T15:39:31.611713+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-sim",
+            "cache-sim-loss"
+          ],
+          "date": "2026-11-25T15:32:45.642882+00:00",
+          "executed": 109,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "Failover spans epochs and replicas",
@@ -335,10 +421,19 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-sim",
+            "cache-sim-loss"
+          ],
+          "date": "2026-11-25T15:32:45.642882+00:00",
+          "executed": 109,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "Directed pauses cross the lease boundary",
@@ -346,10 +441,18 @@
           "state": "n/a"
         },
         "M": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "models"
+          ],
+          "date": "2026-11-25T16:08:22.413079+00:00",
+          "executed": 32,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "P": {
           "reason": "Single-primary authority is a safety assertion",
@@ -357,16 +460,33 @@
           "state": "n/a"
         },
         "R": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-cluster-real"
+          ],
+          "date": "2026-11-25T15:39:31.611713+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-sim",
+            "cache-sim-loss"
+          ],
+          "date": "2026-11-25T15:32:45.642882+00:00",
+          "executed": 109,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "Lease authority spans workers, clocks, and the controller",
@@ -421,10 +541,19 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-sim",
+            "cache-sim-loss"
+          ],
+          "date": "2026-11-25T15:32:45.642882+00:00",
+          "executed": 109,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "Ownership is checked across committed transitions",
@@ -479,10 +608,19 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-sim",
+            "cache-sim-loss"
+          ],
+          "date": "2026-11-25T15:32:45.642882+00:00",
+          "executed": 109,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "Redirects span workers and the controller map",
@@ -537,10 +675,19 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "cache-sim",
+            "cache-sim-loss"
+          ],
+          "date": "2026-11-25T15:32:45.642882+00:00",
+          "executed": 109,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "Cold start concerns worker lifecycle",
@@ -746,10 +893,19 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "check-history",
+            "events-sim"
+          ],
+          "date": "2026-11-25T15:45:47.792504+00:00",
+          "executed": 38,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "Quorum loss and restart are exercised at explicit cuts",
@@ -774,10 +930,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-25T15:50:52.170373+00:00",
+          "executed": 12,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "Majority durability spans replicas and storage",
@@ -807,10 +971,19 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "check-history",
+            "events-sim"
+          ],
+          "date": "2026-11-25T15:45:47.792504+00:00",
+          "executed": 38,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "Finite histories detect gaps and reuse",
@@ -833,16 +1006,32 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-25T15:50:52.170373+00:00",
+          "executed": 12,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "events-state-model"
+          ],
+          "date": "2026-11-25T15:52:59.338086+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "Offsets start at 1, stay contiguous in commit order, and are never reassigned.",
@@ -866,10 +1055,19 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "check-history",
+            "events-sim"
+          ],
+          "date": "2026-11-25T15:45:47.792504+00:00",
+          "executed": 38,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "Targeted lost-reply cases cover the retry",
@@ -893,16 +1091,33 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-25T15:50:52.170373+00:00",
+          "executed": 12,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "events-http",
+            "events-state-model"
+          ],
+          "date": "2026-11-25T15:46:44.677768+00:00",
+          "executed": 11,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "A retried publish with the same UUID returns its original offsets.",
@@ -926,10 +1141,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-25T15:50:52.170373+00:00",
+          "executed": 12,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "Targeted cuts exercise the invariant",
@@ -952,16 +1175,32 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-25T15:50:52.170373+00:00",
+          "executed": 12,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "events-state-model"
+          ],
+          "date": "2026-11-25T15:52:59.338086+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "A batch applies whole or not at all.",
@@ -996,10 +1235,18 @@
           "state": "n/a"
         },
         "M": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "models"
+          ],
+          "date": "2026-11-25T16:08:22.413079+00:00",
+          "executed": 32,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "P": {
           "reason": "Delivery and ack correctness have no performance target",
@@ -1018,10 +1265,19 @@
           "state": "missing"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "events-http",
+            "events-state-model"
+          ],
+          "date": "2026-11-25T15:46:44.677768+00:00",
+          "executed": 11,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "Every event at or after a checkpoint is redelivered until acknowledged. Acks advance a prefix. A stale lease generation gets `409 lease_lost`. The lease clock never moves backward.",
@@ -1071,10 +1327,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "events-sim"
+          ],
+          "date": "2026-11-25T15:50:52.170373+00:00",
+          "executed": 12,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "Quorum and minority behavior need multiple replicas",
@@ -1098,10 +1362,18 @@
           "state": "n/a"
         },
         "F": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "fuzz-replay"
+          ],
+          "date": "2026-11-25T15:54:23.090199+00:00",
+          "executed": 5,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "H": {
           "reason": "Each rejection is asserted directly",
@@ -1134,10 +1406,18 @@
           "state": "n/a"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "events-http"
+          ],
+          "date": "2026-11-25T15:46:44.677768+00:00",
+          "executed": 7,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "Size, count and lease limits hold and fail with the documented errors.",
@@ -1193,10 +1473,18 @@
           "state": "missing"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "events-state-model"
+          ],
+          "date": "2026-11-25T15:52:59.338086+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "Retention removes events by publish time only.",
@@ -1560,10 +1848,21 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "lsm-campaign",
+            "lsm-campaign-sim",
+            "lsm-campaign-sim-repeat",
+            "rt-fs-contract"
+          ],
+          "date": "2026-11-25T15:57:40.963087+00:00",
+          "executed": 60,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "F": {
           "reason": "Generated storage operations are cut at filesystem boundaries",
@@ -1597,16 +1896,38 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "lsm-campaign-sim",
+            "lsm-campaign-sim-repeat",
+            "lsm-campaign-sim-smoke",
+            "lsm-stepped-journal",
+            "lsm-stepped-regressions"
+          ],
+          "date": "2026-11-25T15:57:40.963087+00:00",
+          "executed": 13,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "lsm-campaign",
+            "lsm-stepped-journal",
+            "rt-fs-contract"
+          ],
+          "date": "2026-11-25T15:59:18.093982+00:00",
+          "executed": 59,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "Every write acknowledged as synced survives a crash. A synced group also makes all earlier unsynced writes durable.",
@@ -1624,10 +1945,20 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "lsm-campaign",
+            "lsm-campaign-sim",
+            "lsm-campaign-sim-repeat"
+          ],
+          "date": "2026-11-25T15:57:40.963087+00:00",
+          "executed": 10,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "F": {
           "reason": "The campaign varies filesystem cuts",
@@ -1660,16 +1991,37 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "lsm-campaign-sim",
+            "lsm-campaign-sim-repeat",
+            "lsm-campaign-sim-smoke",
+            "lsm-stepped-journal",
+            "lsm-stepped-regressions"
+          ],
+          "date": "2026-11-25T15:57:40.963087+00:00",
+          "executed": 13,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "lsm-campaign",
+            "lsm-stepped-journal"
+          ],
+          "date": "2026-11-25T15:59:18.093982+00:00",
+          "executed": 9,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "After an NS04 crash cut, recovery yields an exact submitted prefix from the last synced acknowledgment through the last submission. Reopening again preserves that prefix.",
@@ -1684,10 +2036,20 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "lsm-campaign",
+            "lsm-campaign-sim",
+            "lsm-campaign-sim-repeat"
+          ],
+          "date": "2026-11-25T15:57:40.963087+00:00",
+          "executed": 10,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "F": {
           "reason": "The campaign injects sector loss and corruption at known boundaries",
@@ -1720,16 +2082,35 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "lsm-campaign-sim",
+            "lsm-campaign-sim-repeat",
+            "lsm-campaign-sim-smoke",
+            "lsm-stepped-regressions"
+          ],
+          "date": "2026-11-25T15:57:40.963087+00:00",
+          "executed": 10,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "lsm-campaign"
+          ],
+          "date": "2026-11-25T15:59:18.093982+00:00",
+          "executed": 6,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "After an NS05 power-loss cut, a torn tail recovers to an exact allowed prefix. Loss of a record certified durable by a later record triggers scoped quarantine or pool refusal.",
@@ -1756,10 +2137,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-stream-sim"
+          ],
+          "date": "2026-11-25T16:16:08.760708+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "Finite scans cover the batch boundaries",
@@ -1782,10 +2171,18 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-stream-sim"
+          ],
+          "date": "2026-11-25T16:16:08.760708+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "executed": 0,
@@ -1817,10 +2214,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-stream-sim"
+          ],
+          "date": "2026-11-25T16:16:08.760708+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "Targeted open retries cover the race",
@@ -1844,10 +2249,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-stream-sim"
+          ],
+          "date": "2026-11-25T16:16:08.760708+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "executed": 0,
@@ -1877,10 +2290,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-stream-sim"
+          ],
+          "date": "2026-11-25T16:16:08.760708+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "Directed reconnect and delivery cases cover the boundaries",
@@ -1904,10 +2325,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-stream-sim"
+          ],
+          "date": "2026-11-25T16:16:08.760708+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "executed": 0,
@@ -1938,10 +2367,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-stream-sim"
+          ],
+          "date": "2026-11-25T16:16:08.760708+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "Targeted coordinator kills exercise the checkpoint boundaries",
@@ -1965,10 +2402,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-stream-sim"
+          ],
+          "date": "2026-11-25T16:16:08.760708+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "executed": 0,
@@ -1998,10 +2443,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-stream-sim"
+          ],
+          "date": "2026-11-25T16:16:08.760708+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "A single complete stop exercises the run boundary",
@@ -2025,10 +2478,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-stream-sim"
+          ],
+          "date": "2026-11-25T16:16:08.760708+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "The assertion depends on complete worker shutdown",
@@ -2057,10 +2518,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-stream-sim"
+          ],
+          "date": "2026-11-25T16:16:08.760708+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "Planned read and reconnect trials cover the scan boundaries",
@@ -2087,10 +2556,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-stream-sim"
+          ],
+          "date": "2026-11-25T16:16:08.760708+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "executed": 0,
@@ -2133,10 +2610,18 @@
           "state": "n/a"
         },
         "M": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "models"
+          ],
+          "date": "2026-11-25T16:08:22.413079+00:00",
+          "executed": 32,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "P": {
           "reason": "Atomicity has no performance target",
@@ -2193,10 +2678,18 @@
           "state": "n/a"
         },
         "M": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "models"
+          ],
+          "date": "2026-11-25T16:08:22.413079+00:00",
+          "executed": 32,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "P": {
           "reason": "This row covers conflict correctness",
@@ -2210,10 +2703,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-commit-protocol"
+          ],
+          "date": "2026-11-25T16:08:28.921895+00:00",
+          "executed": 10,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "The race requires concurrent committers",
@@ -2253,10 +2754,18 @@
           "state": "n/a"
         },
         "M": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "models"
+          ],
+          "date": "2026-11-25T16:08:22.413079+00:00",
+          "executed": 32,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "P": {
           "reason": "Classification has no performance target",
@@ -2270,10 +2779,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-commit-protocol"
+          ],
+          "date": "2026-11-25T16:08:28.921895+00:00",
+          "executed": 10,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "Outcome resolution spans the writer and object store",
@@ -2312,10 +2829,18 @@
           "state": "n/a"
         },
         "M": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "models"
+          ],
+          "date": "2026-11-25T16:08:22.413079+00:00",
+          "executed": 32,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "P": {
           "reason": "This row covers safety",
@@ -2329,10 +2854,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-commit-protocol"
+          ],
+          "date": "2026-11-25T16:08:28.921895+00:00",
+          "executed": 10,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "Ordering spans an old writer and a new run",
@@ -2388,10 +2921,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-commit-protocol"
+          ],
+          "date": "2026-11-25T16:08:28.921895+00:00",
+          "executed": 10,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "Replay spans operation and receipt state",
@@ -2410,10 +2951,21 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-logic",
+            "olap-logic-orm-python",
+            "olap-logic-orm-typescript",
+            "olap-oracles"
+          ],
+          "date": "2026-11-25T16:08:55.526133+00:00",
+          "executed": 15,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "F": {
           "reason": "Decoder fuzzing belongs to OLAP-G08",
@@ -2451,10 +3003,19 @@
           "state": "n/a"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-logic",
+            "olap-oracles"
+          ],
+          "date": "2026-11-25T16:11:21.952906+00:00",
+          "executed": 13,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "Query results equal the serial evaluation of committed operations on the visible snapshot.",
@@ -2505,16 +3066,35 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "worker-pool-sim"
+          ],
+          "date": "2026-11-25T17:12:32.081091+00:00",
+          "executed": 10,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "queue-scheduler-properties",
+            "scheduler-properties",
+            "worker-pool-sim",
+            "worker-pool-sim-shutdown"
+          ],
+          "date": "2026-11-25T17:03:43.357071+00:00",
+          "executed": 17,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "The scheduler enforces capacity, memory, queue, failure and recovery rules.",
@@ -2552,16 +3132,33 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-logic",
+            "olap-oracles"
+          ],
+          "date": "2026-11-25T16:11:21.952906+00:00",
+          "executed": 13,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "F": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "fuzz-replay"
+          ],
+          "date": "2026-11-25T15:54:23.090199+00:00",
+          "executed": 5,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "H": {
           "reason": "The checks compare results and state after events",
@@ -2594,10 +3191,19 @@
           "state": "n/a"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-logic",
+            "olap-oracles"
+          ],
+          "date": "2026-11-25T16:11:21.952906+00:00",
+          "executed": 13,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "Topologies produce the same results, malformed inputs yield bounded typed errors, and seeded event sequences preserve state and result invariants.",
@@ -2770,16 +3376,33 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "oltp-pool-sim",
+            "oltp-storage-sim"
+          ],
+          "date": "2026-11-25T16:22:29.529678+00:00",
+          "executed": 805,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "rt-fs-sites"
+          ],
+          "date": "2026-11-25T17:04:53.874683+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "An acknowledged write survives any single-AZ failure and a full stop.",
@@ -2814,10 +3437,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "check-history"
+          ],
+          "date": "2026-11-25T15:45:47.792504+00:00",
+          "executed": 26,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "executed": 0,
@@ -2878,10 +3509,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "check-history"
+          ],
+          "date": "2026-11-25T15:45:47.792504+00:00",
+          "executed": 26,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "Targeted retry and activation cuts exercise the rule",
@@ -2889,10 +3528,18 @@
           "state": "n/a"
         },
         "M": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "models"
+          ],
+          "date": "2026-11-25T16:08:22.413079+00:00",
+          "executed": 32,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "P": {
           "reason": "Identity reuse has no performance target",
@@ -2943,10 +3590,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "check-history"
+          ],
+          "date": "2026-11-25T15:45:47.792504+00:00",
+          "executed": 26,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "K": {
           "reason": "Faults are injected at specific decision boundaries",
@@ -2954,10 +3609,18 @@
           "state": "n/a"
         },
         "M": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "models"
+          ],
+          "date": "2026-11-25T16:08:22.413079+00:00",
+          "executed": 32,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "P": {
           "reason": "Outcome classification has no performance target",
@@ -2971,10 +3634,19 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "oltp-sim-net",
+            "transport-sim-parity"
+          ],
+          "date": "2026-11-25T16:43:58.911117+00:00",
+          "executed": 19,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "Outcome proof spans durable and remote state",
@@ -3216,10 +3888,18 @@
           "state": "n/a"
         },
         "M": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "models"
+          ],
+          "date": "2026-11-25T16:08:22.413079+00:00",
+          "executed": 32,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "P": {
           "reason": "Membership safety has no performance target",
@@ -3235,10 +3915,20 @@
           "state": "not-run"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "oltp-pool-sim",
+            "oltp-storage-sim",
+            "transport-sim-parity"
+          ],
+          "date": "2026-11-25T16:22:29.529678+00:00",
+          "executed": 816,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
           "reason": "Safety spans membership, placement, and storage state",
@@ -3298,16 +3988,37 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "oltp-native-executor-sim",
+            "oltp-storage-sim",
+            "transport-sim-parity",
+            "worker-pool-sim"
+          ],
+          "date": "2026-11-25T16:21:34.688268+00:00",
+          "executed": 825,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "oltp-native-executor-sim",
+            "transport-unit",
+            "worker-pool-sim"
+          ],
+          "date": "2026-11-25T16:21:34.688268+00:00",
+          "executed": 249,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "Resources stay within budgets and each reservation settles exactly once.",
@@ -3541,11 +4252,19 @@
           "state": "n/a"
         },
         "P": {
+          "behind": 150,
+          "checks": [
+            "rt-zero-cost"
+          ],
+          "date": "2026-11-25T17:08:03.182462+00:00",
           "deferred": "hardware-deferred",
-          "executed": 0,
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "reason": "hardware-deferred (absolute OLTP latency targets, including the direct-path benchmark)",
           "required": true,
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
           "state": "not-run"
         },
         "R": {
@@ -3577,10 +4296,18 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "orm-api-manifest"
+          ],
+          "date": "2026-11-25T17:01:35.946282+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "F": {
           "reason": "The check concerns API declarations",
@@ -3636,16 +4363,36 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "olap-logic-orm-python",
+            "olap-logic-orm-typescript",
+            "orm-contract-vectors-python",
+            "orm-contract-vectors-typescript"
+          ],
+          "date": "2026-11-25T16:08:55.526133+00:00",
+          "executed": 40,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "F": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "orm-contract-vectors-python",
+            "orm-contract-vectors-typescript"
+          ],
+          "date": "2026-11-25T17:02:01.243821+00:00",
+          "executed": 38,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "H": {
           "reason": "Result, error, and exchange parity are compared directly or in the end-to-end run",
@@ -3698,10 +4445,18 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "orm-api-manifest"
+          ],
+          "date": "2026-11-25T17:01:35.946282+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         },
         "F": {
           "reason": "Version fields are read from package metadata",
@@ -3794,10 +4549,21 @@
           "state": "n/a"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "oltp-native-executor-sim",
+            "scheduler-properties",
+            "worker-pool-sim",
+            "worker-pool-sim-shutdown"
+          ],
+          "date": "2026-11-25T16:21:34.688268+00:00",
+          "executed": 220,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "Admitted resources never exceed capacity.",
@@ -3861,10 +4627,18 @@
           "state": "n/a"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "scheduler-properties"
+          ],
+          "date": "2026-11-25T17:08:18.574015+00:00",
+          "executed": 5,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "Dominant resource shares stay within the fairness bound.",
@@ -3921,10 +4695,18 @@
           "state": "n/a"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "scheduler-properties"
+          ],
+          "date": "2026-11-25T17:08:18.574015+00:00",
+          "executed": 5,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "An eligible request never starves beyond the allowed number of grant rounds.",
@@ -3983,10 +4765,18 @@
           "state": "n/a"
         },
         "U": {
-          "executed": 0,
+          "behind": 150,
+          "checks": [
+            "queue-scheduler-properties"
+          ],
+          "date": "2026-11-25T17:03:43.357071+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938",
+          "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+          "state": "stale"
         }
       },
       "guarantee": "Once every worker stops, the next run abandons old pending requests and preserves committed mutations.",
@@ -4002,5 +4792,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }

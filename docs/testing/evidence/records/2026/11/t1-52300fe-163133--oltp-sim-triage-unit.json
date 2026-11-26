@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "t1-52300fe-163133--oltp-sim-triage-unit.log",
+      "sha256": "16c36ae176c8925dc74efb6008909bd46a5d866707ff3ce79ef4d1d60d412ede"
+    }
+  ],
+  "assertions": {
+    "executed": 15,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim-triage-unit",
+  "duration_s": 0.416,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-25T16:53:57.466008+00:00",
+    "request_id": "t1-52300fe-163133",
+    "runner": "GitHub Actions 1000014219",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

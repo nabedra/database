@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "t1-52300fe-163133--oltp-crate-units.log",
+      "sha256": "fa6c6c25fe59543f3701067a90ec231348994ab57950030518d06996ea5f662e"
+    }
+  ],
+  "assertions": {
+    "executed": 734,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "ignored",
+        "reason": "6 tests marked #[ignore]"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-crate-units",
+  "duration_s": 304.299,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-25T16:16:34.901380+00:00",
+    "request_id": "t1-52300fe-163133",
+    "runner": "GitHub Actions 1000014154",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45646103938"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "52300fe4882d0c87508529507ecf9709cd15e579",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
