@@ -1,0 +1,14 @@
+id = "VECTOR-index-peer-checkpoint-file-alias"
+title = "An interrupted peer copy can install incoming rows under the old checkpoint's manifest"
+class = "fence-lifecycle-order"
+module = "vector"
+guarantees = ["VEC-G03", "VEC-G05"]
+scenarios = ["VS10"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/index/tests/adversary_ck.rs::adv10_interrupted_peer_copy_preserves_the_old_manifest_segments"
+seed = "unknown"
+why_not_caught = "The destination and source checkpoints had different segment lengths, so matched names under interruption caused explicit damage instead of silently accepting the wrong data."
+invariant_added = "Copy stages new segment numbers distinct from every old manifest reservation, then atomically publishes their manifest."
+fix_commits = ["038e7a14cb269d2e8214fcd97db09f31c84d0a1a"]
+revert_patch_ok = true
