@@ -537,9 +537,10 @@ fn nr12_a_panicking_job_is_contained_and_counted() {
         let r = cores.call(i % 2, Class::Interactive, 1, |_, _| -> u8 { std::panic::panic_any("boom") });
         assert!(r.is_err());
     }
-    assert_eq!(cores.panics(), 20);
+    // A core counts a panic after it told the caller, and runs its next job after that.
     assert_eq!(cores.call(0, Class::Interactive, 1, |s, _| *s).unwrap(), 0);
     assert_eq!(cores.call(1, Class::Interactive, 1, |s, _| *s).unwrap(), 0);
+    assert_eq!(cores.panics(), 20);
     assert_eq!(cores.submit(2, Class::Apply, 1, |_, _| ()), Err(Error::Internal("no such core")));
     assert_eq!(cores.submit(usize::MAX, Class::Apply, 1, |_, _| ()), Err(Error::Internal("no such core")));
     assert!(Cores::<usize>::start(0, Limits::default(), false, |_| 0).is_err());
