@@ -5,26 +5,13 @@ import { execFileSync } from "node:child_process"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
 import { runAll } from "./fixtures/scenarioRunner.mjs"
+import { normalize } from "./fixtures/wording.mjs"
 
 const python = process.env.NABEDRA_TEST_PYTHON
 const root = fileURLToPath(new URL("../../python/", import.meta.url))
 
 // Scenarios whose outcome differs by the language's own types, with the reason.
 const language = new Map([])
-
-// Messages that name a language's own types.
-const wording = [
-  [/exact (?:int|str|bigint|string) values/, "exact T values"],
-  [/requires a float32 vector/, "float32 vector"],
-  [/requires finite float32 values/, "float32 vector"],
-  [/Row must be a mapping|Rows must be iterable/, "rows"],
-  [/Primary key must name a (?:str or int|string or bigint) column/, "primary key type"],
-  // An unknown option name is a TypeError in both. Python's interpreter words it, and 3.13 and later
-  // add a suggestion, so the class and the option name are compared.
-  [/^\S+\(\) got an unexpected keyword argument '([^']*)'(?:\. Did you mean '[^']*'\?)?$|^Unknown option '([^']*)'$/,
-    "unknown option '$1$2'"],
-]
-const normalize = (text) => wording.reduce((result, [pattern, replacement]) => result.replace(pattern, replacement), text)
 
 test("the Python and TypeScript SDKs agree on every adversarial scenario", { skip: !python, timeout: 600_000 }, async (t) => {
   const transcript = JSON.parse(execFileSync(python, ["tests/support/scenario_runner.py"], {
