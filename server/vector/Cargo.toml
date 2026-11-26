@@ -11,6 +11,11 @@ publish = ["crates-io"]
 [dependencies]
 nabedra-rt = { path = "../rt", version = "0.1.0" }
 nabedra-simd = { path = "../simd", version = "0.1.0" }
+# Full-text analysis: word boundaries (UAX #29) and Snowball stemmers.
+unicode-segmentation = "=1.13.3"
+rust-stemmers = "=1.2.0"
 
 [dev-dependencies]
 nabedra-check = { path = "../check" }
+# The reference of the BM25 differential (VS tests of `impact`). Tests only.
+tantivy = { version = "=0.27.0", default-features = false }
