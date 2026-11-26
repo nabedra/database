@@ -667,10 +667,14 @@ impl WorkerRuntime {
                         return Err(unknown());
                     }
                     // The restore checks every vector against these columns (L7).
-                    if let Some(search) = search.as_ref().filter(|_| root.is_some() && !searched) {
-                        export
-                            .frame(HistoryFrame::GroupSearch(Box::new(search.schema.clone())))
-                            .await?;
+                    if let Some(search) = search.as_ref().filter(|_| !searched) {
+                        let schema = Box::new(search.schema.clone());
+                        let frame = if root.is_some() {
+                            HistoryFrame::GroupSearch(schema)
+                        } else {
+                            HistoryFrame::SplitSearch(schema)
+                        };
+                        export.frame(frame).await?;
                     }
                     searched = true;
                     for image in images.iter() {

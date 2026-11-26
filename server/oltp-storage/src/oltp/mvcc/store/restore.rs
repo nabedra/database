@@ -196,7 +196,7 @@ async fn install(
 /// Every vector of a batch has the type of its column in the backup, or
 /// nothing of the batch is installed. A mismatch is the operator's, not
 /// damage (L7).
-pub(super) fn check_schema(
+pub(crate) fn check_schema(
     schema: Option<&SearchSchema>,
     images: &[&CommittedImage],
 ) -> Result<(), ProtocolError> {

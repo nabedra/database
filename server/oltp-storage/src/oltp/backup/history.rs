@@ -11,7 +11,8 @@ use crate::{
                 encoded_length,
                 image_archive::CommittedImage,
                 index::{ArchivedIndexClosure, index_closure_row},
-                restore::validate_archive_image,
+                restore::{check_schema, validate_archive_image},
+                search::SearchSchema,
                 split_closure::{
                     ArchivedSplitPublication, CatalogSplitClosed, SplitArchiveOrigin, fold_image,
                     image_seed, split_closure_row,
@@ -173,6 +174,8 @@ pub enum HistoryFrame {
         row: Box<CatalogSplitClosed>,
         publication: ArchivedSplitPublication,
     },
+    /// Search schema carried before the first image of an incremental split child.
+    SplitSearch(Box<SearchSchema>),
     SplitImage(CommittedImage),
     EndSplitChild {
         group_id: Uuid,
@@ -353,7 +356,7 @@ impl OwnedPayload for HistoryFrame {
             Self::Identity { identity, .. } => serialized_size(identity)?,
             Self::BeginTransaction(decision) => serialized_size(decision)?,
             Self::ParticipantEffects(effects) => effects.heap_bytes()?,
-            Self::GroupSearch(schema) => serialized_size(schema)?,
+            Self::GroupSearch(schema) | Self::SplitSearch(schema) => serialized_size(schema)?,
             _ => 0,
         })
     }
@@ -428,6 +431,7 @@ struct SplitProgress {
     count: u64,
     root: Digest,
     last: Option<crate::oltp::mvcc::MvccKey>,
+    search: Option<Box<SearchSchema>>,
 }
 impl SplitProgress {
     fn new(row: CatalogSplitClosed) -> Result<Self, ProtocolError> {
@@ -437,7 +441,16 @@ impl SplitProgress {
             count: 0,
             root: image_seed()?,
             last: None,
+            search: None,
         })
+    }
+
+    fn search(&mut self, schema: &SearchSchema) -> Result<(), ProtocolError> {
+        if self.search.is_some() || self.count != 0 || !schema.valid() {
+            return Err(invalid());
+        }
+        self.search = Some(Box::new(schema.clone()));
+        Ok(())
     }
 
     fn image(&mut self, image: &CommittedImage) -> Result<(), ProtocolError> {
@@ -451,6 +464,7 @@ impl SplitProgress {
         {
             return Err(invalid());
         }
+        check_schema(self.search.as_deref(), &[image])?;
         self.root = fold_image(self.root, image)?;
         self.count = self.count.checked_add(1).ok_or_else(invalid)?;
         self.last = Some(image.key.clone());
@@ -469,6 +483,7 @@ impl SplitProgress {
         self.count = 0;
         self.root = image_seed()?;
         self.last = None;
+        self.search = None;
         Ok(self.child == self.row.children.len())
     }
 }
@@ -565,7 +580,9 @@ impl Chain {
             || self.split.is_some()
                 != matches!(
                     frame,
-                    HistoryFrame::SplitImage(_) | HistoryFrame::EndSplitChild { .. }
+                    HistoryFrame::SplitImage(_)
+                        | HistoryFrame::SplitSearch(_)
+                        | HistoryFrame::EndSplitChild { .. }
                 )
         {
             return Err(invalid());
@@ -736,6 +753,9 @@ impl Chain {
                 publication.validate(row, &publication.catalog.group, commit_ts, scope.cut)?;
                 self.last_split = Some(order);
                 self.split = Some(SplitProgress::new(row.as_ref().clone())?);
+            }
+            HistoryFrame::SplitSearch(schema) => {
+                self.split.as_mut().ok_or_else(invalid)?.search(schema)?;
             }
             HistoryFrame::SplitImage(image) => {
                 self.split.as_mut().ok_or_else(invalid)?.image(image)?;
