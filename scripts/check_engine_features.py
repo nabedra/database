@@ -66,7 +66,8 @@ def assert_no_sim(name, tree):
     """No product graph enables the deterministic simulation (phase 7, O02, NS26)."""
     runtime = False
     for package, features in package_features(tree):
-        assert not package.startswith('nabedra-sim'), (name, package, 'simulation crate in a product graph')
+        simulated = package == 'nabedra-sim' or package.startswith('nabedra-sim-')
+        assert not simulated, (name, package, 'simulation crate in a product graph')
         if package == 'nabedra-rt':
             runtime = True
         # nabedra-rt, nabedra-kv and every crate of the phase 8 split forward `sim`.
