@@ -4,7 +4,7 @@
 id = "sim-sim-disk"
 module = "sim"
 kinds = ["T"]
-guarantees = ["LSM-G01", "LSM-G02", "LSM-G03", "OLTP-G01", "OLTP-G08"]
+guarantees = []
 scenarios = ["NS04", "NS05", "NS15", "O11", "O17"]
 tiers = ["T1"]
 command = ["python3", "scripts/testing/tla_check.py", "specs/sim/disk", "SimDisk", "--module", "sim"]

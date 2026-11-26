@@ -3,7 +3,7 @@
 id = "sim-sim-net-rpc"
 module = "sim"
 kinds = ["T"]
-guarantees = ["EVT-G01", "EVT-G03", "EVT-G06"]
+guarantees = []
 scenarios = ["EV01", "EV02", "EV07"]
 tiers = ["T1"]
 command = ["python3", "scripts/testing/tla_check.py", "specs/sim/net-rpc", "SimNetRpc", "--module", "sim"]

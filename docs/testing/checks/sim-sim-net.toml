@@ -3,7 +3,7 @@
 id = "sim-sim-net"
 module = "sim"
 kinds = ["T"]
-guarantees = ["OLTP-G03", "OLTP-G04", "CACHE-G05", "CACHE-G06"]
+guarantees = []
 scenarios = ["D02", "D10", "O10", "K03"]
 tiers = ["T1"]
 command = ["python3", "scripts/testing/tla_check.py", "specs/sim/net", "SimNet", "--module", "sim"]

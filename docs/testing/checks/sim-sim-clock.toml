@@ -3,7 +3,7 @@
 id = "sim-sim-clock"
 module = "sim"
 kinds = ["T"]
-guarantees = ["CACHE-G06", "OLTP-G02"]
+guarantees = []
 scenarios = ["K03", "O09"]
 tiers = ["T1"]
 command = ["python3", "scripts/testing/tla_check.py", "specs/sim/clock", "SimClock", "--module", "sim"]
