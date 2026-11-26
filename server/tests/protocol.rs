@@ -412,6 +412,7 @@ fn scalar_syntax_survives_rows_and_nested_predicates() {
                         Scalar::Float64(_) => ColumnType::Float64,
                         Scalar::Utf8(_) => ColumnType::Utf8,
                         Scalar::Bool(_) => ColumnType::Bool,
+                        _ => unreachable!("not a scalar"),
                     },
                 )]
                 .into();
@@ -432,6 +433,7 @@ fn scalar_syntax_survives_rows_and_nested_predicates() {
                                     LogicalPredicate::And { args } | LogicalPredicate::Or { args },
                                 ) => &args[0],
                                 Predicate::Logical(LogicalPredicate::Not { arg }) => arg,
+                                Predicate::Text(_) => unreachable!("not a scalar predicate"),
                             };
                         }
                     }

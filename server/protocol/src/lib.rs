@@ -6,3 +6,5 @@ pub mod query_semantics;
 mod queue_error;
 
 pub use queue_error::QueueError;
+#[cfg(test)]
+mod golden_tests;

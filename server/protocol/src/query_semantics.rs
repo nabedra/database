@@ -1,7 +1,7 @@
 //! Pure comparison and predicate semantics for schema-validated rows.
 //! Both engines use the same ordering and float signed-zero behavior.
 use crate::protocol::{
-    ComparisonOp, LogicalPredicate, Predicate, Query, Row, Scalar, TableDescriptor,
+    ComparisonOp, LogicalPredicate, Predicate, Query, Row, Scalar, TableDescriptor, TextPredicate,
 };
 use std::cmp::Ordering;
 
@@ -43,6 +43,22 @@ fn matches_predicate(predicate: &Predicate, row: &Row) -> bool {
             args.iter().any(|p| matches_predicate(p, row))
         }
         Predicate::Logical(LogicalPredicate::Not { arg }) => !matches_predicate(arg, row),
+        Predicate::Text(p) => matches_text(p, row),
+    }
+}
+
+fn matches_text(predicate: &TextPredicate, row: &Row) -> bool {
+    match predicate {
+        TextPredicate::Contains { column, value } => {
+            matches!(&row[column], Scalar::Utf8List(list) if list.contains(value))
+        }
+        TextPredicate::ContainsAny { column, values } => matches!(
+            &row[column],
+            Scalar::Utf8List(list) if list.iter().any(|item| values.contains(item))
+        ),
+        TextPredicate::StartsWith { column, value } => {
+            matches!(&row[column], Scalar::Utf8(text) if text.starts_with(value.as_str()))
+        }
     }
 }
 

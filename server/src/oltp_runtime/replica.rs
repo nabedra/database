@@ -70,7 +70,7 @@ fn validate_context(context: &AcceptedContext, scope: &QueueScope, record: &Requ
         record.run_id,
         record.request_id,
         Digest::parse(&record.digest).map_err(invalid)?,
-        protocol::parse_request(&record.body)
+        protocol::parse_oltp_request(&record.body)
             .map_err(invalid)?
             .operation
             .is_mutation(),
@@ -1081,7 +1081,7 @@ impl WorkerReplica {
         now_ms: u64,
     ) -> Result<RecordFrame, QueueError> {
         self.mutating_owner(current)?;
-        let request = protocol::parse_request(&body).map_err(invalid)?;
+        let request = protocol::parse_oltp_request(&body).map_err(invalid)?;
         if context.authorization.database != self.scope.database
             || context.authorization.policy_revision == 0
             || context.authorization.ingress_id.is_nil()

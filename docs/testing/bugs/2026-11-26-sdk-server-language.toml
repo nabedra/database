@@ -1,0 +1,17 @@
+id = "sdk-server-language"
+title = "The SDKs send full-text languages that the server refuses"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G12"]
+scenarios = ["VS18"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/protocol/tests/sdk_replay.rs::sdk_languages_are_server_languages"
+seed = "unknown"
+why_not_caught = "The shared fixtures hold valid languages only."
+invariant_added = "A language the SDK sends is a language the server accepts, or the SDK refuses it first. The regression is ignored and fails today."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "oltp-vector lead"
+expires = "2026-12-22"

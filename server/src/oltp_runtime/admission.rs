@@ -146,7 +146,7 @@ impl DurableAdmission {
                     })
                     .ok_or_else(|| invalid("request decode budget overflow"))?;
                 let _working = shared.reserve_scratch(ByteClass::Data, bound)?;
-                let request = crate::protocol::parse_request(held.as_ref())?;
+                let request = crate::protocol::parse_oltp_request(held.as_ref())?;
                 let kind = if request.operation.is_mutation() {
                     RequestKind::Mutation
                 } else {

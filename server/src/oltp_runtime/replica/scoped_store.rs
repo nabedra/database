@@ -278,7 +278,7 @@ impl PreparedScopedPayload {
         let working = shared
             .reserve_scratch(ByteClass::Data, working_bytes)
             .map_err(|_| QueueError::Overloaded)?;
-        let request = protocol::parse_request(body).map_err(invalid)?;
+        let request = protocol::parse_oltp_request(body).map_err(invalid)?;
         let (kind, table, key) = match &request.operation {
             Operation::Get(payload) => (RequestKind::Read, payload.table_id, &payload.key),
             Operation::Update(payload) => (RequestKind::Mutation, payload.table_id, &payload.key),

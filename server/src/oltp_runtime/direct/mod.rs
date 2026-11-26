@@ -20,6 +20,9 @@
 //! 6. on a conflict from a leadership race, a stale timestamp or a waiter
 //!    failed by a leadership change, goes back to step 3 within the deadline.
 //!
+//! `table.upsert_many` and `table.delete_many` run each row as a request of
+//! its own, in windows that share latching and entries.
+//!
 //! `table.get` skips latches and timestamps: barrier, wait for any pending
 //! commit on its key, read the newest version.
 //!

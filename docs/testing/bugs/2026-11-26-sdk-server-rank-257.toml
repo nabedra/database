@@ -1,0 +1,17 @@
+id = "sdk-server-rank-257"
+title = "rank() sends more than 256 rankings and the server refuses the request"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G12", "VEC-G11"]
+scenarios = ["VS18", "VS17"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/protocol/tests/sdk_replay.rs::sdk_rank_sends_at_most_256_rankings"
+seed = "unknown"
+why_not_caught = "Only rank_many had a client bound."
+invariant_added = "The SDK refuses more than 256 rankings before it sends. The regression is ignored and fails today."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "oltp-vector lead"
+expires = "2026-12-22"

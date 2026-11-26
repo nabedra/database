@@ -1013,3 +1013,6 @@ async fn cap1_o02_o12_enabled_index_reclaim_refuses_a_gc2_build_joiner() {
         "durable"
     );
 }
+
+#[path = "vector.rs"]
+mod vector;

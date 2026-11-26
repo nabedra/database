@@ -59,6 +59,7 @@ use std::{
 };
 use tokio::{net::TcpListener, sync::oneshot};
 
+mod many;
 #[path = "../../../../tests/support/tls.rs"]
 mod tls;
 
@@ -116,10 +117,15 @@ impl DirectTimestampSource for Counter {
     }
 }
 
-struct Gate;
+/// `data.direct.batch`, off until a test enables it.
+#[derive(Default)]
+struct Gate(AtomicBool);
 impl DirectGate for Gate {
     fn direct_active(&self) -> bool {
         true
+    }
+    fn direct_batch(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 
@@ -172,6 +178,7 @@ struct Cluster {
     authority: Authority,
     timestamps: Arc<Counter>,
     schema: Arc<StaticSchema>,
+    gate: Arc<Gate>,
     _dir: Dir,
 }
 
@@ -185,6 +192,7 @@ fn descriptor(table: Uuid) -> TableDescriptor {
         ]),
         key: "id".into(),
         format: TableFormat::Parquet,
+        search: Default::default(),
     }
 }
 
@@ -232,6 +240,7 @@ impl Cluster {
             lifecycle_id: table,
         });
         let timestamps = Arc::new(Counter(AtomicU64::new(1_000)));
+        let gate = Arc::new(Gate::default());
         let mut nodes = Vec::new();
         for (index, ((worker, tls), listener)) in
             workers.iter().zip(&certificates).zip(listeners).enumerate()
@@ -270,7 +279,7 @@ impl Cluster {
             let executor = DirectExecutor::new(
                 shared.clone(),
                 DirectConfig::default(),
-                Arc::new(Gate),
+                gate.clone(),
                 schema.clone(),
                 DirectTimestampClient::new(None, timestamps.clone()),
             );
@@ -300,6 +309,7 @@ impl Cluster {
             },
             timestamps,
             schema,
+            gate,
             _dir: dir,
         }
     }

@@ -254,7 +254,11 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
             super::stage_timing::perf_stage!("gw.route"),
             // A streamed body takes the queued path, but the gateway must
             // first replay a result already committed at the anchor (BUG1).
-            gateway.route(&bytes, asynchronous || length.is_none()),
+            gateway.route_with(
+                &bytes,
+                asynchronous || length.is_none(),
+                Some(&super::application::direct::HttpQueue(state.runtime.clone())),
+            ),
         )
         .await
         {
@@ -342,7 +346,13 @@ async fn enqueue(
     bytes: Vec<u8>,
     staging: crate::scheduling::MemoryCharge,
 ) -> Dispatched {
-    let parsed = match protocol::parse_request(&bytes) {
+    let vector = state
+        .runtime
+        .direct_gateway()
+        .is_some_and(|gateway| gateway.vector());
+    let parsed = match protocol::parse_oltp_request(&bytes)
+        .and_then(|parsed| parsed.operation.check_queued(vector).map(|()| parsed))
+    {
         Ok(parsed) => parsed,
         Err(error) => return (state, scan_request_id(&bytes), Ok(Err(error))),
     };

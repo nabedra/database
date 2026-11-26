@@ -118,6 +118,11 @@ impl<B: ObjectStore> Engine<B> {
             Operation::Collect(payload) => self.collect(payload).await.map(ExecuteResult::Rows),
             Operation::Count(payload) => self.count(payload).await.map(ExecuteResult::Count),
             Operation::Explain(payload) => self.explain(payload).await.map(ExecuteResult::Explain),
+            // `parse_request` refuses these.
+            _ => Err(failure(
+                ErrorCode::UnsupportedOperation,
+                "unsupported operation",
+            )),
         }
     }
 
@@ -154,6 +159,7 @@ impl<B: ObjectStore> Engine<B> {
             schema: payload.schema,
             key: payload.key,
             format: payload.format,
+            search: payload.search,
         };
         let mut candidate = session.candidate();
         candidate.tables.insert(

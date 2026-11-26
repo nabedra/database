@@ -1,0 +1,17 @@
+id = "many-queue-refusal-after-earlier-attempt"
+title = "A row whose id the queue may already hold is reported not_applied when the queue refuses it again"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["VEC-G09", "OLTP-G04"]
+scenarios = ["VS15"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/src/oltp_runtime/application/direct/tests/adv_many.rs::adv_oltp_g04_a_queue_that_refuses_a_resent_row_does_not_prove_it_was_not_applied"
+seed = "unknown"
+why_not_caught = "The unit test of row outcomes covers the leader's answers only. The queued branch of queue_row returns the queue's refusal as it is."
+invariant_added = "A row that took the queued path after a marker or an earlier attempt is outcome_unknown unless the queue accepted nothing under its id. The regression is ignored and fails today."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "oltp-vector lead"
+expires = "2026-12-22"

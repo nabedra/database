@@ -202,6 +202,7 @@ mod resource_tests {
                 ("text".into(), ColumnType::Utf8),
             ]
             .into(),
+            search: Default::default(),
         };
         let operation = Operation::Update(UpdatePayload {
             table_id: table.id,

@@ -45,6 +45,7 @@ async fn fixture_with_legacy(legacy: bool) -> (Engine<Fake>, TableDescriptor, Wo
         .into(),
         key: "id".into(),
         format: TableFormat::Parquet,
+        search: Default::default(),
     };
     let table = if legacy {
         let table = TableDescriptor {
@@ -53,6 +54,7 @@ async fn fixture_with_legacy(legacy: bool) -> (Engine<Fake>, TableDescriptor, Wo
             schema: payload.schema,
             key: payload.key,
             format: payload.format,
+            search: Default::default(),
         };
         let rows = vec![row(5, "five", 5.0), row(-1, "minus", 1.0)];
         let session = engine.coordinator().begin().await.unwrap();
@@ -281,6 +283,7 @@ async fn workflow_persists_rows_and_exact_results() {
             schema: table.schema.clone(),
             key: table.key.clone(),
             format: table.format,
+            search: Default::default(),
         })
         .await
         .unwrap();
@@ -573,6 +576,7 @@ async fn mutation_workers_overlap_and_drain_without_publication_on_error() {
                 .into(),
                 key: "id".into(),
                 format: TableFormat::Parquet,
+                search: Default::default(),
             })
             .await
             .unwrap();
@@ -731,6 +735,7 @@ async fn utf8_keys_route_by_typed_order_and_reuse_adjacent_files() {
             .into(),
             key: "id".into(),
             format: TableFormat::Parquet,
+            search: Default::default(),
         })
         .await
         .unwrap();

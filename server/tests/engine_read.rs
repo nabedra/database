@@ -86,6 +86,7 @@ async fn fixture() -> (Engine<Backend>, TableDescriptor, Vec<Row>, WorkerThreads
         .into(),
         key: "id".into(),
         format: TableFormat::Parquet,
+        search: Default::default(),
     };
     let rows = vec![
         row(3, "three", 2.5, true),
@@ -500,6 +501,7 @@ async fn captured_snapshot_completes_across_update_drop_and_name_reuse() {
             schema: table.schema.clone(),
             key: table.key.clone(),
             format: table.format,
+            search: Default::default(),
         })
         .await
         .unwrap();
