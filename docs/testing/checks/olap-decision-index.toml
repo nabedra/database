@@ -1,7 +1,7 @@
 id = "olap-decision-index"
 module = "olap"
 kinds = ["T"]
-guarantees = ["OLAP-G01", "OLAP-G02", "OLAP-G03", "OLAP-G04", "OLAP-G05"]
+guarantees = []
 scenarios = ["T01", "T03", "T04", "T05", "T06"]
 tiers = ["T1"]
 command = ["python3", "scripts/testing/tla_check.py", "specs/olap/index", "OlapDecisionIndex", "--module", "olap"]
