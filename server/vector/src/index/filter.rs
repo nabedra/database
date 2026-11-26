@@ -216,7 +216,7 @@ impl Scalar {
 #[derive(Clone)]
 struct ColumnSummary {
     /// Value → entries per partition. `None` once the column has too many values to count.
-    values: Option<HashMap<Scalar, BTreeMap<PartId, u32>>>,
+    values: Option<BTreeMap<Scalar, BTreeMap<PartId, u32>>>,
     pairs: usize,
     spans: HashMap<PartId, (Value, Value)>,
 }
@@ -234,7 +234,7 @@ pub struct Summary {
 impl Summary {
     pub fn new(columns: usize, max_pairs: usize) -> Summary {
         let col = ColumnSummary {
-            values: Some(HashMap::new()),
+            values: Some(BTreeMap::new()),
             pairs: 0,
             spans: HashMap::new(),
         };
@@ -360,6 +360,27 @@ impl Summary {
         }
     }
 
+    /// Counts matching text values when the column is still within the summary budget.
+    fn count_text(
+        &self,
+        column: usize,
+        lower: Bound<Scalar>,
+        accept: impl Fn(&str) -> bool,
+    ) -> Option<f64> {
+        let values = self.cols.get(column)?.values.as_ref()?;
+        Some(
+            values
+                .range((lower, Bound::Unbounded))
+                .map_while(|(value, parts)| match value {
+                    Scalar::Text(text) if accept(text) => Some(parts),
+                    _ => None,
+                })
+                .flat_map(BTreeMap::values)
+                .map(|&n| f64::from(n))
+                .sum(),
+        )
+    }
+
     /// About how many entries match.
     pub fn estimate(&self, filter: &Filter) -> f64 {
         let total = || self.sizes.values().map(|&n| f64::from(n)).sum::<f64>();
@@ -377,10 +398,37 @@ impl Summary {
                 sum.min(total())
             }
             Filter::Range(c, lo, hi) => {
-                let part = |(p, n): (&PartId, &u32)| self.share(*c, *p, lo, hi) * f64::from(*n);
-                self.sizes.iter().map(part).sum()
+                let range = || {
+                    let part = |(p, n): (&PartId, &u32)| self.share(*c, *p, lo, hi) * f64::from(*n);
+                    self.sizes.iter().map(part).sum()
+                };
+                let text = |bound: &Bound<Value>| {
+                    matches!(
+                        bound,
+                        Bound::Included(Value::Text(_)) | Bound::Excluded(Value::Text(_))
+                    )
+                };
+                if text(lo) || text(hi) {
+                    let lower = match lo {
+                        Bound::Included(Value::Text(s)) => Bound::Included(Scalar::Text(s.clone())),
+                        Bound::Excluded(Value::Text(s)) => Bound::Excluded(Scalar::Text(s.clone())),
+                        _ => Bound::Unbounded,
+                    };
+                    self.count_text(*c, lower, |s| match hi {
+                        Bound::Included(Value::Text(end)) => s <= end.as_ref(),
+                        Bound::Excluded(Value::Text(end)) => s < end.as_ref(),
+                        _ => true,
+                    })
+                    .unwrap_or_else(range)
+                } else {
+                    range()
+                }
             }
-            Filter::StartsWith(..) => total(),
+            Filter::StartsWith(c, prefix) => self
+                .count_text(*c, Bound::Included(Scalar::Text(prefix.clone())), |s| {
+                    s.starts_with(prefix.as_ref())
+                })
+                .unwrap_or_else(total),
             Filter::And(all) => all.iter().map(|f| self.estimate(f)).fold(total(), f64::min),
             Filter::Or(all) => all
                 .iter()

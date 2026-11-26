@@ -51,19 +51,16 @@ fn identical(n: u64, distinct: u64, lengths: bool) {
 }
 
 #[test]
-#[ignore = "known defect B-D3: a partition of identical vectors splits forever"]
 fn adv07_identical_vectors_split_into_bounded_partitions() {
     identical(3000, 0, false);
 }
 
 #[test]
-#[ignore = "known defect B-D3: a partition of vectors of one direction splits forever"]
 fn adv07_vectors_of_one_direction_and_other_lengths_split_into_bounded_partitions() {
     identical(3000, 0, true);
 }
 
 #[test]
-#[ignore = "known defect B-D3: a partition of identical vectors splits forever"]
 fn adv07_a_crowd_of_duplicates_among_other_rows_ends() {
     identical(1500, 100, false);
 }
@@ -77,7 +74,7 @@ fn rss_mb() -> u64 {
 fn tenants(n: u64) -> (Index, std::time::Duration) {
     let cfg = Config::new(schema(2, &[ColumnType::Int], Some(0)), 4);
     let mut ix = serving(cfg, ExactCodec, None);
-    let start = std::time::Instant::now();
+    let start = nabedra_rt::time::now_std();
     let mut at = 0;
     while at < n {
         let to = (at + 20_000).min(n);
@@ -87,7 +84,7 @@ fn tenants(n: u64) -> (Index, std::time::Duration) {
         feed(&mut ix, RANGE, &page(at, changes));
         at = to;
     }
-    (ix, start.elapsed())
+    (ix, nabedra_rt::time::elapsed(start))
 }
 
 /// A tenant with one row, and many tenants with one row each, take bounded time and memory, and a
@@ -99,22 +96,22 @@ fn adv07_many_tenants_with_one_row_each() {
     let (mut ix, took) = tenants(n);
     let after = rss_mb();
     println!("{n} tenants: feed {took:?}, memory {} MB, {} partitions", after - before.min(after), ix.shared.dir.len());
-    let start = std::time::Instant::now();
+    let start = nabedra_rt::time::now_std();
     let filter = Filter::Eq(0, Value::Int(n as i64 / 2));
     let pin = latest(&mut ix, Some(&filter));
-    let pinned = start.elapsed();
+    let pinned = nabedra_rt::time::elapsed(start);
     let q = Query { filter: Some(filter), ..query(Op::L2, &[1.0, 0.0], 10) };
     let hits = ix.search(&pin, &q).unwrap();
-    println!("one tenant: pin {pinned:?}, query {:?}", start.elapsed());
+    println!("one tenant: pin {pinned:?}, query {:?}", nabedra_rt::time::elapsed(start));
     assert_eq!(hits.len(), 1);
-    let start = std::time::Instant::now();
+    let start = nabedra_rt::time::now_std();
     let _ = latest(&mut ix, None);
-    println!("pin without a tenant: {:?}", start.elapsed());
-    let start = std::time::Instant::now();
+    println!("pin without a tenant: {:?}", nabedra_rt::time::elapsed(start));
+    let start = nabedra_rt::time::now_std();
     for _ in 0..10 {
         ix.maintain(64);
     }
-    println!("10 maintenance calls: {:?}", start.elapsed());
+    println!("10 maintenance calls: {:?}", nabedra_rt::time::elapsed(start));
     assert!(after - before.min(after) < 40 * n / 1000, "memory per tenant is too large");
 }
 
@@ -124,12 +121,12 @@ fn adv07_a_pin_of_one_tenant_does_not_depend_on_their_number() {
     let cost = |n: u64| {
         let (mut ix, _) = tenants(n);
         let filter = Filter::Eq(0, Value::Int(3));
-        let start = std::time::Instant::now();
+        let start = nabedra_rt::time::now_std();
         for _ in 0..200 {
             let pin = latest(&mut ix, Some(&filter));
             drop(pin);
         }
-        start.elapsed()
+        nabedra_rt::time::elapsed(start)
     };
     let (small, large) = (cost(2_000), cost(40_000));
     println!("small {small:?}, large {large:?}");
@@ -473,7 +470,6 @@ fn adv07_a_tenant_with_one_row_costs_little_beyond_the_row() {
 /// Tenants that were deleted leave nothing behind once retention passed: no partition, tree, summary
 /// entry or row, so that memory follows the live data and not the history.
 #[test]
-#[ignore = "known defect B-D2: deleted tenants leave their empty partitions and trees"]
 fn adv07_deleted_tenants_leave_no_partitions_behind() {
     let cfg = Config::new(schema(2, &[ColumnType::Int], Some(0)), 2);
     let mut ix = serving(cfg, ExactCodec, None);
@@ -496,7 +492,6 @@ fn adv07_deleted_tenants_leave_no_partitions_behind() {
 
 /// The same after the range is dropped.
 #[test]
-#[ignore = "known defect B-D2: a dropped range leaves its empty partitions and trees"]
 fn adv07_a_dropped_range_leaves_no_partitions_behind() {
     let cfg = Config::new(schema(2, &[ColumnType::Int], Some(0)), 2);
     let mut ix = serving(cfg, ExactCodec, None);

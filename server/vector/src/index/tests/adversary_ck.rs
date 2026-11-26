@@ -536,11 +536,10 @@ fn adv17_checkpoints_with_right_checksums_and_wrong_contents_never_panic() {
             bytes[n..].copy_from_slice(&crc);
         } else {
             // Mend the checksum of every frame: lengths first, then the payload.
-            let (mut at, mut ok) = (8usize, true);
-            while at + 8 <= bytes.len() && ok {
+            let mut at = 8usize;
+            while at + 8 <= bytes.len() {
                 let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
                 if at + 8 + len > bytes.len() {
-                    ok = false;
                     break;
                 }
                 let crc = crc32c(&bytes[at + 8..at + 8 + len]).to_le_bytes();

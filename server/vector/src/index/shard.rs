@@ -231,7 +231,15 @@ impl<C: Codec> Shard<C> {
             _ if !current => {}
             _ => return Some(Msg::Copy(c)),
         }
-        if lands {
+        // A drain can follow a reassignment to the same destination. Its version is
+        // already safe there unless the existing instance is waiting to leave.
+        let already_here = self.parts.get(&c.to).is_some_and(|part| {
+            part.entries().any(|e| {
+                (e.generation, e.slot, e.at) == (c.entry.generation, c.entry.slot, c.entry.at)
+                    && !part.removing(e)
+            })
+        });
+        if lands && !already_here {
             self.put(sh, codec, c.to, c.entry);
         } else {
             sh.forget(c.entry.generation, c.entry.slot, c.entry.at);
@@ -283,7 +291,8 @@ impl<C: Codec> Shard<C> {
         true
     }
 
-    /// `SendCopy`, for up to `n` entries. Each goes to the target with the nearest centroid.
+    /// `SendCopy`, for up to `n` entries. A split keeps its balanced assignment for entries
+    /// already present at the split and sends any late entry to the nearest target.
     pub fn send_copies(&mut self, sh: &mut Shared, part: PartId, n: usize) -> usize {
         let Some(meta) = sh.dir.get(&part).filter(|m| m.state == State::Draining) else {
             return 0;
@@ -302,14 +311,23 @@ impl<C: Codec> Shard<C> {
         let todo: Vec<Entry> = unsent.take(n).copied().collect();
         let mut sent = 0;
         for e in todo {
-            let Some((_, dir, _)) = row_of(sh, e.slot, e.at) else {
+            let nearest = || {
+                let (_, dir, _) = row_of(sh, e.slot, e.at)?;
+                let cos = |t: &(PartId, Arc<[f32]>)| super::codec::dot(&t.1, &dir);
+                targets
+                    .iter()
+                    .max_by(|a, b| cos(a).total_cmp(&cos(b)))
+                    .map(|target| target.0)
+            };
+            let Some(to) = sh.dir[&part]
+                .split_targets
+                .get(&e.id)
+                .copied()
+                .or_else(nearest)
+            else {
                 continue;
             };
-            let cos = |t: &(PartId, Arc<[f32]>)| super::codec::dot(&t.1, &dir);
-            let Some(to) = targets.iter().max_by(|a, b| cos(a).total_cmp(&cos(b))) else {
-                continue;
-            };
-            if !self.send(sh, e, part, to.0, false) {
+            if !self.send(sh, e, part, to, false) {
                 break;
             }
             sent += 1;
@@ -386,7 +404,9 @@ impl<C: Codec> Shard<C> {
             self.take(sh, codec, part, id);
         }
         self.parts.remove(&part);
-        sh.dir.remove(&part);
+        if let Some(meta) = sh.dir.remove(&part) {
+            sh.remove_empty_root(&meta.group);
+        }
         true
     }
 
@@ -446,12 +466,12 @@ impl<C: Codec> Shard<C> {
         }
     }
 
-    /// The directions of the wanted entries of a partition, for a split.
-    pub fn directions(&self, sh: &Shared, part: PartId) -> Vec<Vec<f32>> {
+    /// The instance IDs and directions of the wanted entries of a partition, for a split.
+    pub fn directions(&self, sh: &Shared, part: PartId) -> Vec<(u64, Vec<f32>)> {
         let all = self.parts.get(&part).into_iter().flat_map(|p| p.entries());
         let wanted = all.filter(|e| sh.wanted(e.generation, e.slot, e.at));
         wanted
-            .filter_map(|e| Some(row_of(sh, e.slot, e.at)?.1))
+            .filter_map(|e| Some((e.id, row_of(sh, e.slot, e.at)?.1)))
             .collect()
     }
 

@@ -122,7 +122,8 @@ fn adv20_the_stop_rule_stops_exactly_at_its_recall() {
 /// `units` counts those units and no other.
 #[test]
 fn adv20_the_stop_rule_is_asked_after_every_unit_with_a_match_and_only_then() {
-    struct Spy(Arc<Mutex<Vec<(usize, usize, Vec<usize>)>>>);
+    type Observation = (usize, usize, Vec<usize>);
+    struct Spy(Arc<Mutex<Vec<Observation>>>);
     impl StopRule for Spy {
         fn enough(&mut self, p: &Progress<'_>) -> bool {
             self.0.lock().unwrap().push((p.limit, p.units, p.origins.to_vec()));
@@ -382,7 +383,9 @@ fn cols(g: &mut Gen) -> Vec<Value> {
 
 /// A history of `positions` writes, some with several rows and some closing a timestamp, as the feed,
 /// as the model, the last position and the closes.
-fn history(g: &mut Gen, positions: u64) -> (Vec<Record>, Vec<Rec>, Pos, Vec<(Pos, CommitTs)>) {
+type History = (Vec<Record>, Vec<Rec>, Pos, Vec<(Pos, CommitTs)>);
+
+fn history(g: &mut Gen, positions: u64) -> History {
     let (mut records, mut recs, mut closes) = (Vec::new(), Vec::new(), Vec::new());
     let mut at = 0;
     for _ in 0..positions {
@@ -896,10 +899,12 @@ fn adv23_no_sequence_of_calls_with_any_arguments_panics() {
                 }
             }
             for id in 0..3 {
-                if let Ok(s) = ix.status(RangeId(id)) {
-                    if s.damage.is_none() && s.serving && (s.low > s.applied || s.applied > s.delivered) {
-                        return Err(format!("{s:?} breaks the order of the positions"));
-                    }
+                if let Ok(s) = ix.status(RangeId(id))
+                    && s.damage.is_none()
+                    && s.serving
+                    && (s.low > s.applied || s.applied > s.delivered)
+                {
+                    return Err(format!("{s:?} breaks the order of the positions"));
                 }
             }
         }
@@ -960,7 +965,6 @@ fn adv24_a_filter_that_few_rows_match_is_scored_in_full() {
 }
 
 #[test]
-#[ignore = "known defect B-D7: StartsWith and a range of text are estimated as matching every row, so a filter with few matches is planned as a many-match one"]
 fn adv24_a_prefix_or_text_range_that_few_rows_match_is_scored_in_full() {
     let text = |t: &str| Value::Text(Arc::from(t));
     let filters = [
@@ -1009,7 +1013,6 @@ fn adv24_a_filter_nested_without_end_is_refused_and_does_not_overflow_the_stack(
 /// source waits for a pin to end. A drain of the source meanwhile must not copy the same version to
 /// the same target again: both copies would stay for good, each named, counted and scanned.
 #[test]
-#[ignore = "known defect B-D6: a drain copies an entry that a reassign already moved, and the target keeps both"]
 fn adv25_an_entry_that_a_reassign_moved_is_not_copied_again_by_a_drain_of_its_source() {
     let cfg = Config { part_min: 1, part_max: 8, ..Config::new(schema(2, &[ColumnType::Int], None), 1) };
     let mut ix = serving(cfg, ExactCodec, None);

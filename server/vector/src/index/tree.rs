@@ -39,6 +39,10 @@ pub struct Tree {
 }
 
 impl Tree {
+    pub fn is_empty(&self) -> bool {
+        self.root.is_none()
+    }
+
     pub fn insert(&mut self, leaf: Leaf) {
         let Some(root) = self.root.take() else {
             self.root = Some(Arc::new(Node::new(Kids::Leaves(vec![leaf]))));

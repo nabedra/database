@@ -130,6 +130,8 @@ struct Meta {
     radius: f32,
     /// Where it drains to, and how many partitions drain into it.
     targets: Vec<PartId>,
+    /// The bisection's target for each entry that was present when the split began.
+    split_targets: BTreeMap<u64, PartId>,
     drained_into: usize,
     /// Copies in flight from it and to it.
     leaving: usize,
@@ -379,6 +381,7 @@ impl Shared {
             entries: 0,
             radius: 1.0,
             targets: Vec::new(),
+            split_targets: BTreeMap::new(),
             drained_into: 0,
             leaving: 0,
             arriving: 0,
@@ -425,8 +428,14 @@ impl Shared {
         meta.state = State::Retired;
         meta.waits = waits;
         let targets = std::mem::take(&mut meta.targets);
-        let root = self.roots.entry(meta.group.clone()).or_default();
-        root.tree.remove(part);
+        meta.split_targets = BTreeMap::new();
+        let group = meta.group.clone();
+        let root = self.roots.entry(group.clone()).or_default();
+        if root.undirected == Some(part) {
+            root.undirected = None;
+        } else {
+            root.tree.remove(part);
+        }
         for t in &targets {
             let Some(meta) = self.dir.get_mut(t) else {
                 continue;
@@ -437,6 +446,15 @@ impl Shared {
                 let near = root.tree.near(&meta.centroid, None, NEIGHBOURS);
                 self.recheck.extend(near.into_iter().map(|(p, _)| p));
             }
+        }
+        self.remove_empty_root(&group);
+    }
+
+    fn remove_empty_root(&mut self, group: &Group) {
+        let empty =
+            |root: &Root| root.entries == 0 && root.undirected.is_none() && root.tree.is_empty();
+        if self.roots.get(group).is_some_and(empty) {
+            self.roots.remove(group);
         }
     }
 }
@@ -963,7 +981,12 @@ impl<C: Codec> Index<C> {
         self.shared.dir.get(&part).is_some_and(ok)
     }
 
-    fn start_drain(&mut self, part: PartId, targets: Vec<PartId>) {
+    fn start_drain(
+        &mut self,
+        part: PartId,
+        targets: Vec<PartId>,
+        split_targets: BTreeMap<u64, PartId>,
+    ) {
         let sh = &mut self.shared;
         for t in &targets {
             if let Some(meta) = sh.dir.get_mut(t) {
@@ -973,6 +996,7 @@ impl<C: Codec> Index<C> {
         if let Some(meta) = sh.dir.get_mut(&part) {
             meta.state = State::Draining;
             meta.targets = targets;
+            meta.split_targets = split_targets;
             if let Some(root) = sh.roots.get_mut(&meta.group) {
                 root.tree.set_draining(part);
             }
@@ -986,11 +1010,11 @@ impl<C: Codec> Index<C> {
         }
         let (sh, shard, _) = self.owner(part);
         let dirs = shard.directions(sh, part);
-        let points: Vec<&[f32]> = dirs.iter().map(Vec::as_slice).collect();
-        if points.is_empty() {
+        let points: Vec<&[f32]> = dirs.iter().map(|(_, dir)| dir.as_slice()).collect();
+        if points.is_empty() || sh.next_part.checked_add(2).is_none() {
             return false;
         }
-        let (_, centroids) = bisect(&points);
+        let (sides, centroids) = bisect(&points);
         let Some(group) = sh.dir.get(&part).map(|m| m.group.clone()) else {
             return false;
         };
@@ -998,7 +1022,12 @@ impl<C: Codec> Index<C> {
         let [Some(a), Some(b)] = new else {
             return false;
         };
-        self.start_drain(part, vec![a, b]);
+        let split_targets = dirs
+            .into_iter()
+            .zip(sides)
+            .map(|((id, _), second)| (id, if second { b } else { a }))
+            .collect();
+        self.start_drain(part, vec![a, b], split_targets);
         true
     }
 
@@ -1011,7 +1040,7 @@ impl<C: Codec> Index<C> {
         if !fits || !self.may_drain(part) {
             return false;
         }
-        self.start_drain(part, vec![into]);
+        self.start_drain(part, vec![into], BTreeMap::new());
         true
     }
 
@@ -1093,7 +1122,13 @@ impl<C: Codec> Index<C> {
             }
             State::Ready => {
                 let removed = self.remove_moved(part) + self.collect(part) > 0;
-                let entries = self.shared.dir.get(&part).map_or(0, |m| m.entries);
+                let meta = &self.shared.dir[&part];
+                let entries = meta.entries;
+                if entries == 0 && meta.drained_into == 0 && meta.arriving == 0 && meta.leaving == 0
+                {
+                    self.shared.retire(part);
+                    return true;
+                }
                 if entries > self.cfg.part_max {
                     return self.split(part) || removed;
                 }
