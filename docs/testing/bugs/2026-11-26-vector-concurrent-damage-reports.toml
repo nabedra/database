@@ -12,5 +12,3 @@ why_not_caught = "The restart test reported one damaged group at a time."
 invariant_added = "Every group reported damaged concurrently remains quarantined after restart."
 fix_commits = ["9ea24de68f0d7955908390ddc0ace88db1dd0750"]
 revert_patch_ok = true
-owner = "oltp-vector lead"
-expires = "2026-12-22"

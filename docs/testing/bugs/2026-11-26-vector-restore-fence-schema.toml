@@ -12,4 +12,3 @@ why_not_caught = "Restore tests installed a matching first fence."
 invariant_added = "The first search fence uses the backup column identities, dimensions and high-water mark."
 fix_commits = ["631cd727a1597d93b33540c8b83318bef8936a58"]
 revert_patch_ok = true
-owner = "oltp-vector lead"
