@@ -182,10 +182,15 @@ LookupReceipt(r) ==
           \/ l.kind = "absent" /\ UNCHANGED clientReplies
              /\ claims' = claims \cup {<<r, curFence.run - 1>>}
        /\ UNCHANGED <<store, curFence, fenceBase, att, queue, rds, budget>>
-    \/ /\ Mutant = "prefix_stale_receipt"        \* F4: a process of an older run
-       /\ colds > 0 /\ q[r] \in {"queued", "running"}
+    \* A process of an older run that survived the cold start is asked about a
+    \* live request of the current run. With the fix it sees the newer fence on
+    \* the root it loads and answers unavailable (no state change); the shipped
+    \* local serve (F4, mutant prefix_stale_receipt) answers abandoned.
+    \/ /\ colds > 0 /\ q[r] \in {"queued", "running"}
        /\ l.kind = "absent"
-       /\ claims' = claims \cup {<<r, curFence.run>>}
+       /\ IF Mutant = "prefix_stale_receipt"
+          THEN claims' = claims \cup {<<r, curFence.run>>}
+          ELSE UNCHANGED claims
        /\ UNCHANGED <<store, curFence, fenceBase, att, queue, rds, clientReplies, budget>>
 
 -----------------------------------------------------------------------------
