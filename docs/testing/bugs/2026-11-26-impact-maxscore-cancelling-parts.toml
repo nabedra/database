@@ -1,0 +1,14 @@
+id = "VECTOR-impact-maxscore-cancelling-parts"
+title = "MaxScore returns a worse row when large sparse parts of opposite sign cancel, because the slack of a bound followed the bound and not the mass of its parts"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G05"]
+scenarios = ["VS07"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/impact/tests/unit.rs::vs07_cancelling_sparse_parts_keep_the_best_row"
+seed = "unknown"
+why_not_caught = "The generators drew weights whose parts never cancel to a residue below the f64 error of a sum in another order."
+invariant_added = "A limited MaxScore result equals brute force by rounded f32 score and then key, also when parts of opposite sign cancel."
+fix_commits = ["24a4fd74a80e5cbe771ee81b5a51f9cda9c70899"]
+revert_patch_ok = true

@@ -1,0 +1,14 @@
+id = "VECTOR-index-degenerate-split"
+title = "Duplicate directions prevent an oversized partition from splitting"
+class = "fence-lifecycle-order"
+module = "vector"
+guarantees = ["VEC-G05", "VEC-G11"]
+scenarios = ["VS07"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/index/tests/adversary.rs::adv07_identical_vectors_split_into_bounded_partitions"
+seed = "unknown"
+why_not_caught = "The centroid tests exercised balanced membership independently of the copy path."
+invariant_added = "With a fixed input, splits of even identical directions settle with partitions within the configured size."
+fix_commits = ["139d08682867ff5230cfa4ea8018be0242f7b1a2"]
+revert_patch_ok = false
