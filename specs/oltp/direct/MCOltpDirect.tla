@@ -31,6 +31,8 @@ Sc(q1, q2, rows, qkey) ==
 
 \* S1 (O08, D02, DR-1): an update races an insert of its row.
 S1 == Sc(Rq("i1", "upd", "k1", "a"), Rq("i2", "ins", "k1", "b"), Rows("none"), "none")
+\* S1D (O08, D02, DR-1 as the vector session traced it): a delete of a missing row races an insert of it.
+S1D == Sc(Rq("i1", "del", "k1", "x"), Rq("i2", "ins", "k1", "b"), Rows("none"), "none")
 \* S2 (D03): one id with two bodies on one key.
 S2 == Sc(Rq("i1", "upd", "k1", "a"), Rq("i1", "upd", "k1", "b"), Rows("z"), "none")
 \* S3 (D03): one id on two keys of two ranges: both execute.
@@ -41,6 +43,7 @@ S5 == Sc(Rq("i1", "ins", "k1", "a"), Rq("i2", "del", "k1", "x"), Rows("z"), "non
 SQ == Sc(Rq("i1", "upd", "k1", "a"), Rq("i2", "ins", "k2", "b"), Rows("none"), "k1")
 
 MC1 == {S1}
+MC1D == {S1D}
 MC2 == {S2}
 MC3 == {S3}
 MC5 == {S5}
