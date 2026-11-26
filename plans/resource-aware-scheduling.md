@@ -187,15 +187,18 @@ and takeover consults the Status decision first, so a holder's Running copy chan
 | --- | --- | --- | --- | --- |
 | `OltpQueue.cfg` at 3 workers, 1 request (probe) | local, unattested | 38,221 | 30 | pass |
 | `OltpQueue.live.cfg` | local, unattested | 138,744 | 30 | pass, liveness checked |
-| `OltpQueue.cfg` (4 workers, 2 requests) | Actions run 45805091930 on `fbb0b2e7` | 13,478,194 | 58 | pass, exhaustive, 1,767 s |
-| `OltpQueue.live.cfg` | Actions run 45805091930 on `fbb0b2e7` | 138,744 | 30 | pass, liveness checked |
+| `OltpQueue.cfg` (4 workers, 2 requests) | Actions runs 45805091930 (`fbb0b2e7`) and 45811091969 (`a73045d0`) | 13,478,194 | 58 | pass, exhaustive, 1,767 s |
+| `OltpQueue.live.cfg` | Actions runs 45805091930 and 45811091969 | 138,744 | 30 | pass, liveness checked |
 
 Coverage: 29 actions, each with a nonzero count (minimum 97, local). Mutant counterexample lengths are local, at 3 workers
 and 1 request; the controls of the liveness mutants are `OltpQueue.live.cfg` with the lane fault off. On run
 https://github.com/zPy52/nabedra-database/actions/runs/45805091930 (`fbb0b2e7`) every baseline passed, coverage was
 complete (minimum 810) and 19 of 20 mutants were caught on their property. `no_settle_superseded` was caught by a
 deadlock first (21 states) with several TLC workers, so its cfg now checks only `L_ReservationsSettle` with deadlock
-checking off. The check verdict on that run is `fail` for that reason only. The rerun on the next head is pending.
+checking off. The check verdict on that run is `fail` for that reason only. The rerun
+https://github.com/zPy52/nabedra-database/actions/runs/45811091969 on `a73045d0` passes `oltp-queue-spec`: both baselines
+as above (13,478,194 and 138,744 states), coverage complete, and all 20 mutants caught on their property after their
+controls passed.
 
 ### Mutants
 
