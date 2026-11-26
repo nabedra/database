@@ -677,3 +677,44 @@ fn vs07_nothing_moves_to_another_tree() {
         .unwrap();
     assert!(!ix.split(list));
 }
+
+#[test]
+fn vs07_the_direction_codec_is_used_and_exact_search_still_matches_raw() {
+    let mut cfg = Config::new(schema(3, &[], None), 2);
+    cfg.flat = 0;
+    cfg.part_max = 8;
+    cfg.part_min = 1;
+    let codec = DirectionCodec::new(3, 37).unwrap();
+    assert!(DirectionCodec::new(0, 37).is_err());
+    assert!(Index::new(cfg.clone(), DirectionCodec::new(2, 37).unwrap(), None).is_err());
+    let mut indexed = serving(cfg.clone(), codec, None);
+    let mut raw = serving(cfg, ExactCodec, None);
+    let changes = page(
+        0,
+        (0..32)
+            .map(|i| {
+                let direction = [i as f32 + 1.0, i as f32 % 7.0 - 3.0, 9.0];
+                (i, Some(row(&direction, Vec::new(), i)))
+            })
+            .collect(),
+    );
+    feed(&mut indexed, RANGE, &changes);
+    feed(&mut raw, RANGE, &changes);
+    settle(&mut indexed);
+    let pin = latest(&mut indexed, None);
+    let raw_pin = latest(&mut raw, None);
+    for op in [Op::Cosine, Op::Dot, Op::L2] {
+        let mut q = query(op, &[9.0, 1.0, 9.0], 5);
+        let want = raw.search(&raw_pin, &q).unwrap();
+        assert_eq!(indexed.search(&pin, &q).unwrap(), want);
+        q.exact = false;
+        let approximate = indexed.search(&pin, &q).unwrap();
+        assert_eq!(approximate.len(), 5);
+        for hit in approximate {
+            assert_eq!(
+                Some(hit.score),
+                exact(op, hit.row.vec.as_deref().unwrap(), &q.vec)
+            );
+        }
+    }
+}

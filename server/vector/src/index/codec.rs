@@ -1,19 +1,22 @@
 //! The seam to `quant`: direction codes and score bounds. [`ExactCodec`] keeps whole directions.
 
-use crate::types::Op;
+use std::sync::Arc;
 
-/// An estimated cosine and its one-sided error bound.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Estimate {
-    pub cos: f32,
-    pub err: f32,
-}
+use crate::{
+    quant::{self, CodeBlock, QueryCode, Rotation},
+    types::{Error, Op, Result},
+};
+
+pub use crate::quant::Estimate;
 
 /// Codes of the directions in a partition band, relative to its centroid. Directions and centroids
 /// are unit vectors that went through `rotate`.
 pub trait Codec: Clone + Send + Sync + 'static {
     type Block: Clone + Send;
     type Query;
+    fn fits(&self, _dim: usize) -> bool {
+        true
+    }
     fn rotate(&self, dir: &[f32]) -> Vec<f32>;
     fn block(&self) -> Self::Block;
     fn push(&self, block: &mut Self::Block, dir: &[f32], centroid: &[f32], len: f32);
@@ -23,6 +26,58 @@ pub trait Codec: Clone + Send + Sync + 'static {
     fn scan(&self, q: &Self::Query, block: &Self::Block, out: &mut Vec<Estimate>);
     /// A finer estimate of one entry.
     fn refine(&self, q: &Self::Query, block: &Self::Block, i: usize) -> Estimate;
+}
+
+/// Seeded direction codes for the approximate index. Raw vectors still
+/// decide every result score, and exact scans do not visit the codes.
+#[derive(Clone)]
+pub struct DirectionCodec {
+    dim: usize,
+    rotation: Arc<Rotation>,
+}
+
+impl DirectionCodec {
+    pub fn new(dim: usize, seed: u64) -> Result<Self> {
+        if !(1..=quant::MAX_DIM).contains(&dim) {
+            return Err(Error::InvalidQuery("invalid code dimension"));
+        }
+        Ok(Self {
+            dim,
+            rotation: Arc::new(Rotation::new(dim, seed)),
+        })
+    }
+}
+
+impl Codec for DirectionCodec {
+    type Block = CodeBlock;
+    type Query = QueryCode;
+
+    fn fits(&self, dim: usize) -> bool {
+        dim == self.dim
+    }
+    fn rotate(&self, dir: &[f32]) -> Vec<f32> {
+        let mut rotated = vec![0.0; self.rotation.padded()];
+        self.rotation.apply(dir, &mut rotated);
+        rotated
+    }
+    fn block(&self) -> CodeBlock {
+        CodeBlock::new(self.rotation.padded())
+    }
+    fn push(&self, block: &mut CodeBlock, dir: &[f32], centroid: &[f32], len: f32) {
+        block.push(dir, centroid, len);
+    }
+    fn swap_remove(&self, block: &mut CodeBlock, i: usize) {
+        block.swap_remove(i);
+    }
+    fn query(&self, dir: &[f32], centroid: &[f32]) -> QueryCode {
+        QueryCode::new(dir, centroid)
+    }
+    fn scan(&self, query: &QueryCode, block: &CodeBlock, out: &mut Vec<Estimate>) {
+        query.append_scan(block, out);
+    }
+    fn refine(&self, query: &QueryCode, block: &CodeBlock, i: usize) -> Estimate {
+        query.refine(block, i)
+    }
 }
 
 #[derive(Clone, Copy, Default, Debug)]

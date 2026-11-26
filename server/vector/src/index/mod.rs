@@ -26,7 +26,7 @@ mod tree;
 mod tests;
 
 pub use checkpoint::{Damage, Store, copy_checkpoint};
-pub use codec::{Codec, Estimate, ExactCodec, exact};
+pub use codec::{Codec, DirectionCodec, Estimate, ExactCodec, exact};
 pub use filter::Filter;
 pub use scan::{Hit, Progress, Query, RecallEstimate, Scan, StopRule};
 
@@ -515,6 +515,9 @@ impl<C: Codec> Index<C> {
     /// An empty index. `store` keeps its checkpoints.
     pub fn new(cfg: Config, codec: C, store: Option<Store>) -> Result<Self> {
         cfg.check()?;
+        if !codec.fits(cfg.schema.dim) {
+            return Err(Error::Internal("code dimension does not match the index"));
+        }
         let shared = Shared {
             ranges: BTreeMap::new(),
             gens: BTreeMap::new(),
@@ -761,7 +764,11 @@ impl<C: Codec> Index<C> {
                 };
                 if let Err(error) = put {
                     let store = matches!(error, Error::Store(_));
-                    let why = if store { "the vector store failed" } else { "the feed is invalid" };
+                    let why = if store {
+                        "the vector store failed"
+                    } else {
+                        "the feed is invalid"
+                    };
                     self.fail_range(id, why);
                     return Err(error);
                 }
