@@ -206,6 +206,16 @@ pub(crate) fn image_seed() -> Result<Digest, ProtocolError> {
 }
 
 pub(crate) fn fold_image(root: Digest, image: &CommittedImage) -> Result<Digest, ProtocolError> {
+    // This root also verifies an archived split baseline. The split page
+    // separately authenticates the exact pending records it installs; a backup
+    // carries the inputs that can derive those records at restore.
+    if image.search.as_ref().is_some_and(|search| !search.records.is_empty()) {
+        let mut archived = image.clone();
+        if let Some(search) = archived.search.as_mut() {
+            search.records.clear();
+        }
+        return fold_image(root, &archived);
+    }
     hash(b"nabedra/split-child-image/v1\0", &(root, image))
 }
 
