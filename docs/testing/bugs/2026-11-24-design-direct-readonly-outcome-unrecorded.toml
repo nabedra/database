@@ -1,0 +1,24 @@
+# Design review 2026-11-26 (wave-rv, rv-oltp-direct, finding OD-2; earlier DR-1, draft PR #118, reproduced on one
+# simulator seed, local). Found in TLC: specs/oltp/direct, mutant prefix_dr1_readonly_unrecorded, 9 states, no fault.
+# The shipped executor answers a no-op (update or delete of a missing row) and a row conflict (insert of a present row)
+# without a dedup record (direct/executor.rs prepare, "A read-only outcome commits nothing", and compute,
+# already_exists()). An earlier attempt of the same identity that is still running, or a later repeat after the row
+# changed, then gets another definite result. Plan section 4 "Retry results" (lead decision 2026-11-24) requires the
+# first definite result.
+id = "OLTP-design-readonly-outcome-unrecorded"
+title = "A direct no-op or row conflict is not recorded, so a retry of the same request can return another definite result"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G03", "OLTP-G04"]
+scenarios = ["D02", "D03", "O08", "O10"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "specs/oltp/direct/mutants/prefix_dr1_readonly_unrecorded.cfg"
+seed = "unknown"
+why_not_caught = "D02 and D03 lost their no-op and conflict assertions (c8c12413, e46ea63d), and the plan's rule names no mechanism, so nothing proposes a record for these outcomes."
+invariant_added = "G03_SameResult: every definite answer of an identity with the same body is the same and equals its dedup record, including no-ops and row conflicts."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

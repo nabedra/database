@@ -1,0 +1,23 @@
+# Design review 2026-11-26 (wave-rv, rv-oltp-direct, finding OD-1). Found in TLC: specs/oltp/direct, mutant
+# prefix_settle_unknown, 6 states, no fault. The shipped executor removes a commit from the RangeClock after any
+# proposal error (direct/executor.rs, the Err arm after propose: clock.settle(commit_ts)), including the `by` deadline,
+# whose outcome is unknown: the entry is in the leader's log and can still commit under the same leader. A snapshot read
+# at a later timestamp then passes rule 2 (observe_snapshot) without it, and the entry commits below that snapshot.
+# Plan section 5 rule 1 says a commit leaves pending on apply or rejection only. Not reproduced in the simulator yet.
+id = "OLTP-design-settle-unknown-proposal"
+title = "A direct commit whose proposal timed out leaves the RangeClock, so a snapshot read can miss a commit at or below it"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G02"]
+scenarios = ["D06", "O07", "O09"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/oltp/direct/mutants/prefix_settle_unknown.cfg"
+seed = "unknown"
+why_not_caught = "No simulator checker repeats a snapshot read at one timestamp, and no fault schedule lets a direct proposal outlive its executor's deadline and then commit."
+invariant_added = "G02_SnapshotStable: the versions at or below a served snapshot timestamp never change afterwards; a proposal whose outcome is unknown stays pending until it applies or leadership changes."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"
