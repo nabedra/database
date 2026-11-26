@@ -55,14 +55,14 @@ VARIABLES
     expiredIds, \* ids removed by retention
     maxAckCkpt, \* highest checkpoint in an ack reply sent
     maxRcpt,    \* highest offset in a publish receipt sent
-    lastRead,   \* the last poll's read, with the bounds it must respect
+    staleRead,  \* some poll read a checkpoint or tail below one already acknowledged
     fence,      \* a poll for a superseded generation got a page
     saw410      \* some consumer received checkpoint_expired
 
 logVars == <<sm, ldr, pend, stale>>
 envVars == <<now, skew>>
 clientVars == <<req, rep, pst, cst>>
-ghostVars == <<receipts, seen, delivered, expiredIds, maxAckCkpt, maxRcpt, lastRead,
+ghostVars == <<receipts, seen, delivered, expiredIds, maxAckCkpt, maxRcpt, staleRead,
                fence, saw410>>
 vars == <<logVars, envVars, clientVars, used, ghostVars>>
 
@@ -95,7 +95,7 @@ Init ==
     /\ expiredIds = {}
     /\ maxAckCkpt = 0
     /\ maxRcpt = 0
-    /\ lastRead = [ckpt |-> 0, tail |-> 0, minCkpt |-> 0, minTail |-> 0]
+    /\ staleRead = FALSE
     /\ fence = FALSE
     /\ saw410 = FALSE
 
@@ -126,7 +126,7 @@ CommitNext ==
           /\ pend' = Tail(pend)
           /\ rep' = IF cmd.rq # NoReq THEN rep \cup {Reply(cmd.rq, st.r)} ELSE rep
           /\ Observe(cmd, st.r, st.s)
-    /\ UNCHANGED <<ldr, stale, envVars, req, pst, cst, used, delivered, lastRead, fence,
+    /\ UNCHANGED <<ldr, stale, envVars, req, pst, cst, used, delivered, staleRead, fence,
                    saw410>>
 
 \* Apply a prefix of the old leader's tail without replies (the new leader
@@ -147,7 +147,7 @@ LeaderFails(k, b) ==
     /\ Budget("fail", MaxFailovers) /\ k \in 0..Len(pend) /\ b \in Nodes
     /\ FailoverTo(k, b)
     /\ Spend("fail")
-    /\ UNCHANGED <<stale, envVars, clientVars, delivered, lastRead, fence, saw410>>
+    /\ UNCHANGED <<stale, envVars, clientVars, delivered, staleRead, fence, saw410>>
 
 \* A partition isolates the leader; the majority elects b. The old leader keeps
 \* its applied state and still believes it leads until the partition heals.
@@ -157,7 +157,7 @@ LeaderIsolated(k, b) ==
     /\ stale' = IF Mutant = "poll_local_read" THEN [on |-> TRUE, b |-> ldr, sm |-> sm]
                 ELSE stale
     /\ Spend("part")
-    /\ UNCHANGED <<envVars, clientVars, delivered, lastRead, fence, saw410>>
+    /\ UNCHANGED <<envVars, clientVars, delivered, staleRead, fence, saw410>>
 
 Heal ==
     /\ stale.on
@@ -248,8 +248,7 @@ Poll(c) ==
            m == PollReq(c, cst[c].gen)
            res == PollResult(S, m, clock)
        IN /\ seen' = seen \cup res.evs
-          /\ lastRead' = [ckpt |-> S.ckpt, tail |-> TailOff(S),
-                          minCkpt |-> maxAckCkpt, minTail |-> maxRcpt]
+          /\ staleRead' = (staleRead \/ S.ckpt < maxAckCkpt \/ TailOff(S) < maxRcpt)
           /\ fence' = (fence \/ (res.type # "lost" /\ m.gen < sm.lease.gen))
           /\ CASE res.type = "lost" ->
                     /\ cst' = [cst EXCEPT ![c] = LoseLease(c)]
@@ -295,7 +294,7 @@ ConsumerReceive(c) ==
               /\ cst' = [cst EXCEPT ![c] = Ready(c, cst[c].gen)]
               /\ UNCHANGED <<req, delivered, saw410>>
     /\ UNCHANGED <<logVars, envVars, pst, used, receipts, seen, expiredIds, maxAckCkpt,
-                   maxRcpt, lastRead, fence>>
+                   maxRcpt, staleRead, fence>>
 
 \* A reply nobody waits for any more.
 DiscardReply ==
@@ -443,7 +442,7 @@ G05_NoRevivedLease == ~sm.revived
 \* EVT-G06, EVT-G05: a poll reads at least every acknowledged checkpoint and
 \* every acknowledged publish (acks advance a prefix, polls are linearizable).
 G06_PollLinearizable ==
-    lastRead.ckpt >= lastRead.minCkpt /\ lastRead.tail >= lastRead.minTail
+    ~staleRead
 
 \* EVT-G08: retention removes events by publish time only, never before their
 \* retention period, and publish time is nondecreasing in offset order. The
