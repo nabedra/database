@@ -41,7 +41,7 @@ VARIABLES
     sm,         \* the state machine after the committed log (durable, replicated)
     ldr,        \* the current leader
     pend,       \* commands the leader appended and has not committed, in log order
-    stale,      \* an isolated former leader and its applied state (poll_local_read only)
+    stale,      \* an isolated former leader and its applied state (its state is kept only for poll_local_read)
     now,        \* true time
     skew,       \* broker n's clock reads now - skew[n]; negative is ahead
     req, rep,   \* client channel
@@ -154,8 +154,7 @@ LeaderFails(k, b) ==
 LeaderIsolated(k, b) ==
     /\ Budget("part", MaxPartitions) /\ k \in 0..Len(pend) /\ b \in Nodes /\ b # ldr
     /\ FailoverTo(k, b)
-    /\ stale' = IF Mutant = "poll_local_read" THEN [on |-> TRUE, b |-> ldr, sm |-> sm]
-                ELSE stale
+    /\ stale' = [on |-> TRUE, b |-> ldr, sm |-> IF Mutant = "poll_local_read" THEN sm ELSE Init0]
     /\ Spend("part")
     /\ UNCHANGED <<envVars, clientVars, delivered, staleRead, fence, saw410>>
 
@@ -242,7 +241,9 @@ Ready(c, g) == [ph |-> "ready", cid |-> cst[c].cid, gen |-> g, cur |-> NoReq]
 \* (subscriptions::read, http::poll and http::ack).
 Poll(c) ==
     /\ cst[c].ph = "ready"
-    /\ \E src \in {"leader"} \cup (IF stale.on THEN {"stale"} ELSE {}) :
+    \* The isolated former leader fails Group::read's quorum confirmation and
+    \* answers 503, so only the mutant lets it serve a page.
+    /\ \E src \in {"leader"} \cup (IF stale.on /\ Mutant = "poll_local_read" THEN {"stale"} ELSE {}) :
        LET S == IF src = "leader" THEN sm ELSE stale.sm
            clock == IF src = "leader" THEN Clock(ldr) ELSE Clock(stale.b)
            m == PollReq(c, cst[c].gen)
