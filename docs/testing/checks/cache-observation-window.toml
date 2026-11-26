@@ -1,0 +1,11 @@
+id = "cache-observation-window"
+module = "cache"
+kinds = ["U"]
+guarantees = []
+scenarios = ["K03"]
+tiers = ["T0", "T1"]
+command = ["cargo", "test", "--locked", "-j", "4", "--no-default-features", "--features", "cache", "--lib", "cache::cluster::controller::tests::k03_new_controller_waits_for_the_first_worker_reports", "--", "--exact", "--test-threads=1"]
+cwd = "server"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"

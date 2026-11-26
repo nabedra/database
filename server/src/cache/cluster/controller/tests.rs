@@ -736,6 +736,81 @@ fn k03_stalled_move_resumes_source_under_a_new_epoch_only_after_fence() {
 }
 
 #[test]
+fn k03_new_controller_waits_for_the_first_worker_reports() {
+    use super::placement::Change;
+
+    let mut state = fixture();
+    let slot = state.topology.slots[0];
+    let primary = slot.primary.unwrap();
+    let replica = slot.replica.unwrap();
+    renew(&mut state, primary, 4_000);
+    let progress = Progress {
+        slot: 0,
+        epoch: slot.epoch,
+        sequence: 20,
+        baseline: true,
+        serving_primary: false,
+        frozen: None,
+    };
+
+    let slot_plan = |observations: &mut Observations, at| {
+        observations
+            .plan(&state, bounds(at))
+            .into_iter()
+            .find_map(|change| {
+                if let Change::Slot { index: 0, next, .. } = change {
+                    Some(next)
+                } else {
+                    None
+                }
+            })
+    };
+    let mut failover = Observations::default();
+    failover.reset_if_changed(2, state.topology.generation, bounds(4_000));
+    report(&mut failover, &state, replica, 4_100, Some(progress));
+    assert!(
+        slot_plan(&mut failover, 6_999).is_none(),
+        "a leader proposed failover before the primary's first report window elapsed"
+    );
+    assert_eq!(
+        slot_plan(&mut failover, 7_000).unwrap().primary,
+        Some(replica)
+    );
+
+    let replacement = state
+        .topology
+        .workers
+        .values()
+        .find(|member| {
+            member.id != replica && member.zone != state.topology.member(primary).unwrap().zone
+        })
+        .unwrap()
+        .id;
+    let mut rebuild = Observations::default();
+    rebuild.reset_if_changed(2, state.topology.generation, bounds(4_000));
+    report(
+        &mut rebuild,
+        &state,
+        primary,
+        6_950,
+        Some(Progress {
+            serving_primary: true,
+            ..progress
+        }),
+    );
+    report(&mut rebuild, &state, replacement, 6_950, None);
+    assert!(
+        slot_plan(&mut rebuild, 6_999).is_none(),
+        "a leader proposed replacement before the replica's first report window elapsed"
+    );
+    report(&mut rebuild, &state, replica, 6_999, Some(progress));
+    assert!(
+        slot_plan(&mut rebuild, 7_001).is_none(),
+        "a late first report must age from its receipt time"
+    );
+}
+
+#[test]
 fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
     use super::placement::{Change, MAX_CUTOVER_LAG};
 
