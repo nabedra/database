@@ -378,3 +378,35 @@ the queue is `specs/oltp/queue`. Results are local and unattested until the T ch
 | Counterexamples | (1) RANGES-0, design bug, record `2026-11-26-design-stale-pool-copy-rejoins`: a pool restored from an older copy rejoins under its identity, votes again and loses an acknowledged write (11 states; plan fixed in "Shards, disk layout, and indexes"). (2) The known open record `2026-11-25-oltp-sim-emptied-volume-votes`: system groups rejoin on an empty pool (9 states); the plan rule now names every group kind. (3) RANGES-1, code bug, record `2026-11-26-design-split-without-barrier`: without the addendum's `DirectPause` a direct commit above the cut refuses the freeze, every automatic slot can be used up, and the split never publishes under load; the addendum gains two details the fix needs (release the barrier of an attempt aborted before Bind; refuse the pause of a settled attempt). (4) RANGES-2, design bug, record `2026-11-26-design-split-coordinator-loss`: a manual split whose coordinator is lost leaves the source frozen and the Exclusive guard held until an operator retries; plan fixed in "Scale-up" (a resume sweep). (5) RANGES-3, design gap, record `2026-11-26-design-lease-no-drift-margin`: the lease has no clock margin; plan fixed in "Read execution". (6) The known open records `2026-11-24-oltp-sim-move-owner-loss` and `2026-11-25-oltp-sim-removal-owner-lost`: a lost owner blocks owner change; the fix is in `plans/oltp-shard-refactor.md` "Ownership and memory". |
 | Cost | Counted from the spec actions and the shipped code (code review measures them with `scripts/testing/ab.py`). Direct write: one Data entry, one append round trip to one follower, one group-committed fsync per replica; target one entry and two of three voters (direct-path plan): met. Lease read: no round trip while the lease holds, one quorum round trip (ReadIndex) otherwise; the fixed lease is `L(1 − 2ρ) − ε`, so a lease of 3 s at ρ = 200 ppm loses 1.2 ms. Leader loss: followers refuse votes until the lease ends, so a range takes no writes for between `election_timeout_min` (1.5 s) and the lease (3 s, `bootstrap.rs:1098-1108`) plus an election and a blank commit; no plan target exists. Voter replacement: 3 membership entries (learner, joint, final), 4 Control commands, a Catalog guard acquire and release, and one full snapshot in 64 KiB chunks with no byte-rate limit; one move per cluster. Split: 1 Status reservation, 4 Timestamps entries (Open, Cut, Bind, Close), 2 Catalog guard steps and 1 publication transaction, 2 source entries (freeze, finish; 3 with the barrier), and per child a host, a fence, a stage and one import per page; the source refuses writes for the whole copy, about (range bytes / page bytes) x 2 children x one import round trip (no plan bound; finding SPLIT-COST). Owner change: one fence round trip and one Control command per group, sequential (finding CONTROL-4). Heartbeats: one per group per follower every 500 ms, up to 272 resident groups per worker. Control state: receipts and fence acknowledgements are never deleted (finding CONTROL-2). |
 | Independent read | `wave-dr/reads/oltp-ranges.md`, 27 scenarios; the encoding of each is in `wave-rv/reports/rv-oltp-ranges.md`. R-06, R-07, R-09, R-10, R-14 and R-20 are OltpRanges actions or properties; R-01, R-04, R-05 and R-24 are OltpSplit's; R-08 and R-24 also OltpControl's. R-02, R-03, R-19, R-23, R-26 and R-27 belong to the direct and queue specs. R-11, R-12, R-15 to R-18, R-21, R-22 and R-25B are not modelled, with the reason recorded there. |
+
+
+### Range liveness election bound
+
+Actions run 45831410746 found an 18-state `G10_WritesComplete` lasso at the four-term bound. Term 1 elects n2,
+which acknowledges c2 and adds a learner for n1's replacement. A partition elects n3 at term 2. The partition
+heals and n3 loses its pool. Term 3 elects n1, which crashes before committing its blank. It restarts and wins
+term 4, commits the joint and final configurations, then retires from the old pool. The surviving voters n2
+and n4 hold the complete final log and form a quorum. Electing a successor requires term 5. The term cutoff
+instead leaves c1 pending at the terminal stutter.
+
+The liveness baseline and its two mutants allow term 5 to cover that post-retirement election. The safety
+checks keep their existing term bounds. The fault and operation budgets, fairness and checked properties
+match the prior liveness configuration. The original 18-state trace is recorded in the Actions artifact.
+
+Both liveness mutants use the same temporal semantics as the baseline. A blocked protocol can stutter in
+TLA+. TLC's optional deadlock check can stop before it reports the named temporal counterexample, so the
+two mutant configs request temporal checking of the blocked behavior. The baseline retains deadlock checking.
+A scratch replay of CI state 18 with `commit_needs_all` elects n2, commits its term-5 blank, then stutters with
+c1 pending. A replay of CI state 13 with `learner_not_replicated` elects n1, commits its blank and c1, advances
+n4's term without copying its log, then stutters with the move incomplete.
+
+### Lease stamp projection
+
+After a true-time tick to t, every present or future local clock is at least t minus the effective drift bound B.
+The model collapses a leader stamp at or below t minus B plus the effective margin, and a voter block strictly
+below t minus B, to their expired values. The different inequalities match the unchanged lease and vote checks.
+The lower bound is monotone, so subsequent offsets cannot reactivate a collapsed stamp. Heartbeats, appends and
+restarts construct replacement stamps from the current clock or a reset value. No action derives a fresh stamp
+from an older one. This preserves the sequence of enabled actions and their observations while merging states
+that differ only in expired stamps. The same projection uses each mutant's effective drift bound and margin.
+The number of clock ticks, drift steps, crashes, partitions, writers and terms stays fixed.

@@ -426,8 +426,17 @@ Heal ==
 \* True time advances; every clock with it.
 Tick ==
     /\ LeaseOn /\ now < MaxTime
-    /\ now' = now + 1
-    /\ UNCHANGED <<hist, nodeVars, off, iso, plan, ghostVars, bud>>
+    /\ LET nextTime == now + 1
+           earliestClock == nextTime - DriftBound
+           expiredLease == -DriftBound + EffMargin - 1
+       IN /\ now' = nextTime
+          \* Even future drift cannot revive these stamps. Keep their distinct
+          \* boundaries: leader validity is strict and voter blocking includes equality.
+          /\ lease' = [n \in Node |-> IF lease[n] <= earliestClock + EffMargin
+                                      THEN expiredLease ELSE lease[n]]
+          /\ vblock' = [n \in Node |-> IF vblock[n] < earliestClock
+                                       THEN MinClock ELSE vblock[n]]
+    /\ UNCHANGED <<hist, term, mlen, gone, up, role, bkp, off, iso, plan, ghostVars, bud>>
 
 \* A clock runs a tick fast or slow, within the bound.
 Drift(n, d) ==
