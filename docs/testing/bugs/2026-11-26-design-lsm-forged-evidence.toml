@@ -1,0 +1,19 @@
+# Design review rv-lsm (wave-rv), finding LSM-1. Open: the fix (keyed CRCs) changes the on-disk format and waits for
+# the user; the reproduction is rv-lsm-lsm1-test.patch in wave-rv/reports/rv-lsm-patches.
+id = "RV-LSM-1"
+title = "Client bytes inside a journal value pass as recovery evidence after a torn header: the pool is refused, or a forged batch is replayed"
+class = "other"
+module = "lsm"
+guarantees = ["LSM-G02", "LSM-G03"]
+scenarios = ["NS05", "NS25", "LSM01"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "NS05"
+seed = "unknown"
+why_not_caught = "The campaign generates values from a seeded generator and never writes a value that embeds a valid record header at a 4 KiB boundary, and the specs model records, not bytes."
+invariant_added = "Recovery accepts as evidence or as a resync point only a record that bytes a client wrote cannot produce: a header keyed by a per-store salt, and never a record with durable_seq >= first_seq."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"
