@@ -193,9 +193,10 @@ ProposeLate(c) ==
 \* The entry commits and applies, or applies as a rejection
 \* (SplitInProgress, DirectPaused).
 ApplyDirectCommit(c) ==
-    LET rejected == \/ pause # 0 /\ Mutant # "apply_ignores_pause"
-                    \/ frozen # 0 /\ Mutant # "apply_ignores_freeze"
-                    \/ pub
+    LET rejected == /\ Mutant # "apply_ignores_split"
+                    /\ \/ pause # 0 /\ Mutant # "apply_ignores_pause"
+                       \/ frozen # 0 /\ Mutant # "apply_ignores_freeze"
+                       \/ pub
     IN
     /\ w[c] # "idle" /\ Can("src")
     /\ w' = [w EXCEPT ![c] = "idle"]
@@ -207,7 +208,7 @@ ApplyDirectCommit(c) ==
             /\ missing' = IF phase \in {"staged", "published"} \/ route = "kids"
                           THEN missing \cup {c} ELSE missing
     /\ UNCHANGED <<hostV, ldr, auth, pause, frozen, pub, receipts, attV, coV, route, gw,
-                   lateV, bud>>
+                   lateV, badPub, bud>>
 
 \* StaleRoute: the published source answers it, and the gateway refreshes.
 RefreshRoute(c) ==
