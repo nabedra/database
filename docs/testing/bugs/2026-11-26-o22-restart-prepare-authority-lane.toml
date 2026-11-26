@@ -1,0 +1,31 @@
+# Observed on main 78334d4e in Actions run 45727968538 (request verify-78334d4-012010), job 139602642867, check
+# oltp-protected-progress-repeat: O22 direct_oltp=off attempt 19 of 20 failed, the other 39 attempts passed (on 20/20,
+# off 19/20). Test oltp_acceptance::acc6::acceptance_o22, which panicked at src/oltp_acceptance/acc6.rs:22:5 with
+# "O22 process assertions failed".
+# Failing line: server/tests/oltp_runtime_acceptance.py:767 in prepare_rolling_restart, called from
+# server/tests/oltp_acc6_acceptance.py:955 (o22), after the first three O22 clauses had passed. The fixture killed the
+# non-owner worker, saw the two survivors ready, and sent worker.restart.prepare to the queue owner. The reply was
+# {'code': 'overloaded', 'message': 'worker outgoing lane full (Authority)', 'outcome': 'not_applied'}, so the
+# scheduler-contract clause did not run.
+# The panic at src/worker_pool.rs:993 in the same log ("injected unwind") is the expected one of
+# worker_pool::scheduling_tests::c06_f01_f02_f03_actual_overlap_refill_errors_panic_and_receiver_drop, which passed in
+# every attempt. It is not this failure.
+# Not diagnosed. Not known: whether the Authority lane stays full or a single refusal under load is the product's
+# legitimate overload answer that the fixture does not handle, and whether it happens on other SHAs. No local repro.
+id = "O22-RESTART-PREPARE-AUTHORITY-LANE"
+title = "O22 worker.restart.prepare was refused with worker outgoing lane full (Authority) after a worker loss"
+class = "other"
+module = "oltp"
+guarantees = []
+scenarios = ["O22"]
+found_by = "ci-flake"
+found_date = "2026-11-26"
+lowest_regression = "check oltp-protected-progress-repeat (server/tests/oltp_acc6_acceptance.py o22, prepare_rolling_restart)"
+seed = "unknown"
+why_not_caught = "The failure is intermittent, 1 of 40 O22 attempts in this run, and the fixture sends the prepare once. Other runs of the check were not read for it."
+invariant_added = "Intended, not met: in O22's C03 same-store reconfiguration, worker.restart.prepare sent to the queue owner after a worker loss returns 200 with the renewed identity. Whether an overloaded not_applied answer there is allowed is undecided."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-26"
