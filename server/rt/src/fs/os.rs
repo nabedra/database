@@ -683,6 +683,20 @@ pub fn sync_dir(path: impl AsRef<Path>) -> io::Result<()> {
     std::fs::File::open(path)?.sync_all()
 }
 
+/// `O_DIRECT` for [`OpenOptions::custom_flags`]: reads and writes bypass the page cache, and
+/// their buffers, offsets and lengths are multiples of the device's logical block size.
+#[cfg(target_os = "linux")]
+pub const O_DIRECT: i32 = libc::O_DIRECT;
+
+/// The descriptor, for `fs::uring`. A simulated file has none and never reaches a ring.
+#[cfg(not(feature = "sim"))]
+impl File {
+    #[inline]
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
 /// The effective user id (`geteuid`). In a simulated node with volumes it is the uid that
 /// owns every file on them ([`super::FaultFs::UID`]).
 #[inline]

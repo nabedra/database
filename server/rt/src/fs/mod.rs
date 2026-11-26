@@ -16,6 +16,8 @@ mod fault;
 #[cfg(unix)]
 pub mod os;
 mod real;
+#[cfg(unix)]
+pub mod uring;
 
 pub use fault::*;
 pub use real::RealFs;
