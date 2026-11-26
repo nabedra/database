@@ -6,7 +6,7 @@ import unittest
 from typing import List
 
 import nabedra
-from nabedra import Query, ValidationError, Vector, col
+from nabedra import LimitExceededError, Query, ValidationError, Vector, col
 from nabedra.expr import Ranking
 from nabedra.validation import schema_from_wire, schema_to_wire, validate_row, validate_schema, validate_value
 
@@ -104,6 +104,22 @@ class VectorTests(unittest.TestCase):
                      lambda: query.rank_many([ranking], limit=1, exct=True)):
             with self.assertRaises(TypeError):
                 call()
+
+    def test_ranked_query_vectors_fit_the_wire_word_limit(self):
+        context = TableContext()
+        context.schema = {**context.schema, 'tokens': list[Vector(4096)]}
+        query = Query(context).limit(1)
+        sparse = dict.fromkeys(range(1 << 18), 1.0)
+        dense = array('f', [1]) * 4096
+
+        query.rank(col('weights').dot(sparse))
+        sparse[1 << 18] = 1.0
+        with self.assertRaises(LimitExceededError):
+            query.rank(col('weights').dot(sparse))
+
+        query.rank(col('tokens').dot([dense] * 64))
+        with self.assertRaises(LimitExceededError):
+            query.rank(col('tokens').dot([dense] * 65))
 
     def test_contains_any_orders_sets_by_utf8_bytes_and_keeps_sequence_order(self):
         query = Query(TableContext())

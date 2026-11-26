@@ -6,6 +6,13 @@ import { isRecord, scalarToWire, schemaToWire, validateIdentifier, validateSchem
 export const scoreColumn = "_score"
 const maxSearchColumns = 8
 const optionFields = ["partition_by", "full_text", "embed"]
+const modelName = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
+// Keep in step with the language set published by the server's text analyzers.
+const languages = new Set([
+  "arabic", "danish", "dutch", "english", "finnish", "french", "german", "greek", "hungarian",
+  "italian", "norwegian", "portuguese", "romanian", "russian", "simple", "spanish", "swedish",
+  "tamil", "turkish",
+])
 
 export interface EmbedOptions {
   source: string
@@ -64,7 +71,8 @@ export function buildLayout(schema: Schema, partitionBy?: unknown, fullText?: un
     if (columnType(schema, column) !== String) {
       throw new ValidationError(`Column '${column}' must be a string column for full text`)
     }
-    text(language, "Language")
+    const name = text(language, "Language")
+    if (!languages.has(name)) throw new ValidationError(`Unsupported full-text language '${name}'`)
   }
   const embedded = Object.fromEntries(Object.entries(options(embed ?? {}, "embed")).map(([column, value]) => {
     if (columnKind(columnType(schema, column)) !== "dense") {
@@ -109,7 +117,9 @@ export function checkEmbed(value: unknown, schema: Schema): EmbedOptions {
   if (columnType(schema, checked.source) !== String) {
     throw new ValidationError("Embed source must name a string column")
   }
-  return { source: checked.source as string, model: text(checked.model, "Embed model") }
+  const model = text(checked.model, "Embed model")
+  if (!modelName.test(model)) throw new ValidationError("Invalid embed model name")
+  return { source: checked.source as string, model }
 }
 
 /** Check a new vector column against the table it joins. */

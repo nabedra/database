@@ -82,8 +82,10 @@ export function typeFromWire(wire: unknown, response: boolean): Vector | List {
   }
   if (hasFields(wire, "type", "item") && wire.type === "list") {
     if (wire.item === "utf8") return list(String)
-    const item = typeFromWire(wire.item, response)
-    if (columnKind(item) === "dense") return list(item as Vector<false>)
+    const item = wire.item
+    if (hasFields(item, "type", "dim") && item.type === "vector" && (typeof item.dim === "bigint") === response) {
+      return list(vector(response ? Number(item.dim) : item.dim as number))
+    }
   }
   throw new ValidationError("Unsupported wire schema type")
 }
@@ -171,6 +173,7 @@ export function queryValue(value: unknown, column: string): QueryValue {
 
 /** Match a detached query value against its column's type. */
 export function checkQuery(value: QueryValue, type: unknown, column: string): void {
+  const maxWords = 2 ** 18
   const kind = columnKind(type)
   if (kind === "dense") {
     if (!(value instanceof Float32Array)) throw invalidVector(column)
@@ -179,9 +182,15 @@ export function checkQuery(value: QueryValue, type: unknown, column: string): vo
     if (!isJsonObject(value)) {
       throw new ValidationError(`Column '${column}' requires a mapping of index to weight`)
     }
+    if (Object.keys(value).length > maxWords) {
+      throw new LimitExceededError(`Column '${column}' exceeds ${maxWords} query vector words`)
+    }
   } else if (!Array.isArray(value)) {
     throw new ValidationError(`Column '${column}' requires a sequence of float32 vectors`)
   } else {
+    if (value.reduce((words, item) => words + item.length, 0) > maxWords) {
+      throw new LimitExceededError(`Column '${column}' exceeds ${maxWords} query vector words`)
+    }
     multi(value, column, itemDim(type))
   }
 }

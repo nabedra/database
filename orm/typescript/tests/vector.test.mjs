@@ -6,7 +6,7 @@ import { createServer } from "node:http"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
-import { Database, Query, SearchUnavailableError, ValidationError, col, list, vector } from "nabedra"
+import { Database, LimitExceededError, Query, SearchUnavailableError, ValidationError, col, list, vector } from "nabedra"
 import { Ranking } from "nabedra/expr"
 import { expressionToWire } from "../dist/expr.js"
 import { schemaFromWire, schemaToWire, validateRow, validateSchema, validateValue } from "nabedra/validation"
@@ -58,6 +58,20 @@ test("options objects refuse unknown names and null like Python keyword argument
   const db = new Database({ url: "http://127.0.0.1:9", token: "test" })
   await assert.rejects(db.createTable("t", { id: String }, { key: "id", partition: "id" }), TypeError)
   await assert.rejects(db.createTable("t", { id: String }, null), ValidationError)
+})
+
+test("ranked query vectors fit the wire word limit", () => {
+  const table = { ...context, schema: { ...schema, tokens: list(vector(4096)) } }
+  const query = new Query(table).limit(1)
+  const maxWords = 2 ** 18
+  const sparse = Object.fromEntries(Array.from({ length: maxWords }, (_, index) => [index, 1]))
+  const dense = new Float32Array(4096).fill(1)
+
+  assert.doesNotThrow(() => query.rank(col("weights").dot(sparse)))
+  sparse[maxWords] = 1
+  assert.throws(() => query.rank(col("weights").dot(sparse)), LimitExceededError)
+  assert.doesNotThrow(() => query.rank(col("tokens").dot(Array(64).fill(dense))))
+  assert.throws(() => query.rank(col("tokens").dot(Array(65).fill(dense))), LimitExceededError)
 })
 
 test("containsAny sorts only a Set; Map keys and other iterables keep their order", () => {
