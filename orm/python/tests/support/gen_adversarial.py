@@ -237,7 +237,7 @@ for extra in (0, 1):
 
 # Base64 padding does not count against the 1 MiB row limit.
 def padded_row(pad):
-    wire = {"id": "a", "n": 1, "f": 1.0, "b": True, "vec": {"f32": base64.b64encode(struct.pack("<2f", 1, 2)).decode()},
+    wire = {"id": "a", "n": 1, "f": 0, "b": True, "vec": {"f32": base64.b64encode(struct.pack("<2f", 1, 2)).decode()},
             "sp": {"sparse": {"i": base64.b64encode(struct.pack("<I", 3)).decode(),
                               "f32": base64.b64encode(struct.pack("<f", 1)).decode()}},
             "mu": {"f32s": base64.b64encode(struct.pack("<2f", 1, 2)).decode(), "n": 1}, "tags": [pad]}
