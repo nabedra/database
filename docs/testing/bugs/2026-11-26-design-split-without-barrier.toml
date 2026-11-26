@@ -1,0 +1,17 @@
+id = "OLTP-design-split-without-barrier"
+title = "Without the replicated DirectPause barrier a split is refused under sustained direct writes, and the automatic splitter gives the range up after three attempts"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G06"]
+scenarios = ["D07", "O16"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/oltp/split/mutants/prefix_split_refused_under_load.cfg"
+seed = "unknown"
+why_not_caught = "D07 retries the same split id after a refused freeze and checks only that writes are not lost, not that the split publishes."
+invariant_added = "OltpSplit G06_NoRefusalForLoad, G06_SplitNotExhausted and G06_SplitPublishes: the source applies DirectPause before the cut, every decided attempt releases it, and a pause of a settled attempt is refused."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-26"

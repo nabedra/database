@@ -1,0 +1,17 @@
+id = "OLTP-design-split-coordinator-loss"
+title = "A manual split whose coordinator is lost after the freeze leaves the source refusing writes and the table's lifecycle guard held until an operator retries"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = ["OLTP-G06"]
+scenarios = ["D07", "O16"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/oltp/split/mutants/prefix_no_resume_sweep.cfg"
+seed = "unknown"
+why_not_caught = "Only the owner loop resumes automatic splits; no test loses the coordinator of a manual split after its freeze."
+invariant_added = "OltpSplit G06_FreezeEnds: a sweep on the run owner resumes every opened split attempt until it publishes or aborts."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-26"

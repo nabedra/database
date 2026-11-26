@@ -94,6 +94,7 @@ VARIABLES
     missing,     \* ghost: committed writes the child image lacks
     badOwner,    \* ghost: a write applied at the source after publication
     badPub,      \* ghost: a publication under a fenced authority
+    loadRefused, \* ghost: a freeze was refused for a direct commit above the cut
     bud
 
 hostV == <<up, iso>>
@@ -102,7 +103,7 @@ attV == <<att, kind, phase, attAuth, dec, refused>>
 coV == <<coord, pausedOk>>
 cliV == <<gw, w>>
 lateV == <<lateReq, latePause>>
-ghostV == <<missing, badOwner, badPub>>
+ghostV == <<missing, badOwner, badPub, loadRefused>>
 vars == <<hostV, ldr, srcV, attV, coV, route, cliV, lateV, ghostV, bud>>
 
 Conn(n) == up[n] /\ iso # n
@@ -120,7 +121,7 @@ Init ==
     /\ route = "src"
     /\ gw = [c \in Client |-> "src"] /\ w = [c \in Client |-> "idle"]
     /\ lateReq = {} /\ latePause = {}
-    /\ missing = {} /\ badOwner = FALSE /\ badPub = FALSE
+    /\ missing = {} /\ badOwner = FALSE /\ badPub = FALSE /\ loadRefused = FALSE
     /\ bud = [crash |-> 0, part |-> 0, coord |-> 0, give |-> 0, lead |-> 0, dup |-> 0,
               fence |-> 0]
 
@@ -204,11 +205,12 @@ ApplyDirectCommit(c) ==
        ELSE /\ hi' = (hi \/ w[c] = "above")
             /\ above' = IF w[c] = "above" THEN above \cup {c} ELSE above
             /\ badOwner' = (badOwner \/ route = "kids")
-            \* Applied after the children took their image.
-            /\ missing' = IF phase \in {"staged", "published"} \/ route = "kids"
+            \* Applied after the children took their image (of an attempt that
+            \* was not aborted: an aborted image is never published).
+            /\ missing' = IF (phase \in {"staged", "published"} /\ dec # "abort") \/ route = "kids"
                           THEN missing \cup {c} ELSE missing
     /\ UNCHANGED <<hostV, ldr, auth, pause, frozen, pub, receipts, attV, coV, route, gw,
-                   lateV, badPub, bud>>
+                   lateV, badPub, loadRefused, bud>>
 
 \* StaleRoute: the published source answers it, and the gateway refreshes.
 RefreshRoute(c) ==
@@ -292,8 +294,9 @@ ProposeSplitFreeze ==
     /\ coord /\ phase = "bound" /\ dec = None /\ ~refused /\ Can("src")
     /\ IF refuse THEN refused' = TRUE /\ UNCHANGED <<frozen, pause, phase>>
        ELSE frozen' = att /\ pause' = 0 /\ phase' = "frozen" /\ UNCHANGED refused
+    /\ loadRefused' = (loadRefused \/ (refuse /\ hi))
     /\ UNCHANGED <<hostV, ldr, auth, pub, receipts, hi, above, att, kind, attAuth, dec, coV,
-                   route, cliV, lateV, ghostV, bud>>
+                   route, cliV, lateV, missing, badOwner, badPub, bud>>
 
 \* Host, fence, stage and import both children at the cut (endpoint.rs
 \* 756-985). The copy is paged; the source stays frozen throughout.
@@ -303,7 +306,7 @@ StageChildren ==
     /\ phase' = "staged"
     /\ missing' = missing \cup above
     /\ UNCHANGED <<hostV, ldr, srcV, att, kind, attAuth, dec, refused, coV, route, cliV,
-                   lateV, badOwner, badPub, bud>>
+                   lateV, badOwner, badPub, loadRefused, bud>>
 
 \* The Catalog transaction: the commit decision and the route swap, with
 \* the pinned authority (planner/split.rs:176, 258-373).
@@ -316,7 +319,8 @@ PublishSplit ==
             /\ missing' = IF phase = "staged" THEN missing ELSE Client
             /\ badPub' = (badPub \/ attAuth # auth)
             /\ UNCHANGED refused
-    /\ UNCHANGED <<hostV, ldr, srcV, att, kind, attAuth, coV, cliV, lateV, badOwner, bud>>
+    /\ UNCHANGED <<hostV, ldr, srcV, att, kind, attAuth, coV, cliV, lateV, badOwner, loadRefused,
+                   bud>>
 
 \* The abort decision, after a refusal or after repeated transient failures
 \* of an automatic split.
@@ -327,7 +331,7 @@ DecideAbort ==
     /\ dec' = "abort"
     /\ missing' = {}
     /\ UNCHANGED <<hostV, ldr, srcV, att, kind, phase, attAuth, refused, coV, route, cliV,
-                   lateV, badOwner, badPub>>
+                   lateV, badOwner, badPub, loadRefused>>
 
 \* SplitFinishSource (lineage.rs finish_source). Without the fix it is sent
 \* only when the children were bound.
@@ -446,6 +450,7 @@ TypeOK ==
     /\ coord \in BOOLEAN /\ pausedOk \in BOOLEAN /\ route \in {"src", "kids"}
     /\ gw \in [Client -> {"src", "kids"}] /\ w \in [Client -> {"idle", "below", "above"}]
     /\ missing \subseteq Client /\ badOwner \in BOOLEAN /\ badPub \in BOOLEAN
+    /\ loadRefused \in BOOLEAN
 
 \* OLTP-G01, G06: no committed write is missing from the published owner.
 G06_NoWriteLostAcrossSplit == route = "kids" => missing = {}
@@ -456,7 +461,7 @@ G06_NoWriteAtOldOwner == ~badOwner
 G06_PublishUnderOwner == ~badPub
 \* The addendum: the barrier comes first, so every direct commit that
 \* applied is below the cut and the freeze is never refused for it.
-G06_NoRefusalForLoad == ~(refused /\ hi)
+G06_NoRefusalForLoad == ~loadRefused
 \* A range with attempts left is not abandoned: the automatic splitter does
 \* not use up its slots without publishing.
 G06_SplitNotExhausted == ~(att = MaxAttempts /\ phase = "none" /\ route = "src")

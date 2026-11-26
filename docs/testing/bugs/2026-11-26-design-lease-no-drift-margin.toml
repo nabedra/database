@@ -1,0 +1,17 @@
+id = "OLTP-design-lease-no-drift-margin"
+title = "Lease reads (table.get, AllocateDirect) use openraft's lease with no clock-rate margin, so a drifting deposed leader can serve a stale read"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G02"]
+scenarios = ["D06"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/oltp/ranges/mutants/prefix_no_lease_margin.cfg"
+seed = "unknown"
+why_not_caught = "The simulator clock freezes but has no rate drift, and the leader lease equals the follower's vote-refusal window."
+invariant_added = "OltpRanges G02_LeaseReadFresh with clock drift: the leader uses its lease minus a margin that covers both clocks' drift over one lease."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-26"

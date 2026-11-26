@@ -75,3 +75,17 @@ Run both engines at 3, 6 and 12 workers with RF3, equal per-node resources, equa
 - Keep the historical ten-write serial run for continuity. For a p99 claim, collect at least 10,000 successful operations per reported cell across at least three independent paired runs, publish sample counts and confidence intervals, and report insufficient samples explicitly. Sweep through saturation. Report offered and completed rates, rejection reasons, unresolved outcomes, scheduled-arrival p50/p95/p99, storage amplification, peak RSS, and time to recover service after loss of a worker. Keep each optimization only when it improves the target workload reproducibly and preserves the relevant correctness assertions. Run equivalent node-loss, network-partition, replacement and rejoin workloads on both systems. Report successful-operation rate during the fault, time to resume service, time to restore RF3 and post-recovery data verification. Compare each system against its declared acknowledgment contract. A partitioned Nabedra minority must fence writes. Record whether a delayed worker belongs to the affected queue or data quorum and whether unrelated shards continue to admit work. Publish these differences alongside healthy-node speed.
 
 Each stage delivers a reversible change, a baseline/candidate comparison and an evidence record naming the executed scenario IDs. The first implementation milestone pairs a critical-path baseline with a scoped-queue prototype and the slow-third-replica fault test. Subsequent milestones qualify shard-local execution and reduce the remaining serial commit steps. End-to-end ScyllaDB parity and distributed failure behavior remain acceptance targets.
+
+## Design review
+
+Reviewed 2026-11-26 with `plans/oltp-engine.md` (its "Design review" section has the full table). This plan's
+routing, ownership and movement rules are checked by three specs: `specs/oltp/ranges` (replica identity, leases,
+voter replacement), `specs/oltp/split` (splits under direct load, publication only under the pinned owner) and
+`specs/oltp/control` (the run owner and the steps only it advances). The queue contract is `specs/oltp/queue`
+(rv-oltp-direct).
+
+| Part | Content |
+| --- | --- |
+| Guarantees | OLTP-G06 (routing published only after the source is fenced, under the pinned owner), OLTP-G07 (a lost owner is replaced; no step under a retired owner term), OLTP-G08 (replacement keeps zones, retires only after the configuration without the old voter commits). The queue rows (G03, G07 for queued work) are OltpQueue's. |
+| Topology, spec, results, mutants, cost, independent read | See `plans/oltp-engine.md`, "Design review". |
+| Counterexamples | The owner fence refused while a move is active (`prefix_move_blocks_owner_fence`, 6 states) and no owner fence while a removal is pending (`prefix_remove_owner_lost`, 4 states), open records `2026-11-24-oltp-sim-move-owner-loss` and `2026-11-25-oltp-sim-removal-owner-lost`. Plan fixed in "Ownership and memory": a new owner's fence adopts the steps the lost owner had in flight. Code pending. |
