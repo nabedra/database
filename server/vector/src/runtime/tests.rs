@@ -258,8 +258,10 @@ fn vs17_a_panicking_task_is_contained() {
     let cores = Cores::start(1, Limits::default(), false, |_| 7u32).unwrap();
     let r = cores.call(0, Class::Batch, 1, |_, _| -> u32 { panic!("boom") });
     assert!(matches!(r, Err(Error::Internal(_))));
-    assert_eq!(cores.panics(), 1);
+    // Unwinding drops the answer before the core increments its counter.
+    // The next call runs after the core has finished processing that panic.
     assert_eq!(cores.call(0, Class::Interactive, 1, |s, _| *s).unwrap(), 7);
+    assert_eq!(cores.panics(), 1);
 }
 
 #[test]
