@@ -214,10 +214,10 @@ Filter(E, sn, bottom) ==
     {e \in E :
         \* A snapshot pins its version, so a live snapshot never reads this
         \* output; the stripes protect the journal values a snapshot needs
-        \* (with the retire rule) and the tombstone rule below. Mutant
-        \* snapshot_values_unprotected drops the stripe rule and the
-        \* snapshot's locators from the retire rule together; either alone is
-        \* an equivalent mutant.
+        \* (with the retire rule) and the tombstone rule below. The case
+        \* snapshot_values_unprotected (the stripe rule and the snapshot's
+        \* locators dropped together) is not caught at the T1 bounds and has
+        \* no mutant cfg (rv-lsm report, open gaps).
         /\ ~\E f \in E : f.k = e.k /\ f.s > e.s
               /\ (Mutant = "snapshot_values_unprotected" \/ Stripe(f.s, sn) = Stripe(e.s, sn))
         /\ ~(e.op = "del" /\ bottom /\
@@ -993,7 +993,9 @@ OpenReplayStep ==
                    fl, cp, obsolete, rd, hist, ack, lastSub, crashes, media, wipes,
                    prev, quiet>>
 
-OpenReplayJournal == (TornTailAtOpen /\ UNCHANGED vars) \/ OpenReplayStep
+\* One action, so that coverage counts it: under the mutant a torn tail makes the
+\* open retry without progress; otherwise the replay step.
+OpenReplayJournal == IF TornTailAtOpen THEN UNCHANGED vars ELSE OpenReplayStep
 
 \* ManifestWriter::create (write the snapshot record, sync, sync the
 \* directory), then switch_current up to its rename: CURRENT.tmp written
@@ -1079,6 +1081,17 @@ Refused ==
     /\ status = "refused"
     /\ UNCHANGED vars
 
+\* The run can finish: every sequence is used and no journal, flush or
+\* compaction work is in flight. An explicit terminal step, so deadlock
+\* checking stays on (a run without the reader otherwise ends in a state
+\* with no step at all).
+Finished ==
+    /\ status = "open"
+    /\ nextSeq > MaxSeq
+    /\ queue = <<>> /\ grp = <<>> /\ imm = <<>>
+    /\ fl.ph = "idle" /\ cp.ph = "idle"
+    /\ UNCHANGED vars
+
 -----------------------------------------------------------------------------
 
 Next ==
@@ -1106,6 +1119,7 @@ Next ==
     \/ OpenSyncCurrent
     \/ OpenCleanup
     \/ Refused
+    \/ Finished
 
 Spec == Init /\ [][Next]_vars
 
