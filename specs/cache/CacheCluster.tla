@@ -53,13 +53,15 @@ CONSTANTS
     GST,            \* no fault action after this true instant
     MaxEpoch,       \* epochs per slot
     MaxWrites,      \* client mutations in a behaviour
-    MaxCrashes, MaxRestarts, MaxReplaces, MaxCuts, MaxLoss, MaxDelays,
+    MaxCrashes, MaxRestarts, MaxReplaces, MaxCtrlCuts, MaxPeerCuts, MaxLoss, MaxDelays,
     MaxLeaderChanges, MaxDriftSteps, MaxResets, MaxMoves,
+    Ops,            \* the client operations a run issues, within {"set", "ttl", "del"}
     Mutant,         \* "none" or a mutant name, see mutants/*.cfg
     Variant         \* a set of candidate design fixes, {} for the shipped design
 
 ASSUME D \in Nat /\ MaxDrift \in 0..D /\ L > 2 * D /\ RA > 2 * D /\ MaxEpoch >= 1
 ASSUME Variant \subseteq {"follow_retired", "observe_window"}
+ASSUME Ops \subseteq {"set", "ttl", "del"}
 
 \* Candidate fixes.  Each prefix_* mutant reverts one of them (design bug loop).
 \* follow_retired: a copy keeps pulling from a retired source incarnation
@@ -251,7 +253,7 @@ Init ==
     /\ pk = [w \in Workers |-> [s \in Slots |-> NoPkt]]
     /\ now = 0
     /\ ccut = {} /\ pcut = {}
-    /\ fb = [crash |-> 0, restart |-> 0, replace |-> 0, cut |-> 0, loss |-> 0,
+    /\ fb = [crash |-> 0, restart |-> 0, replace |-> 0, ccut |-> 0, pcut |-> 0, loss |-> 0,
              delay |-> 0, lead |-> 0, drift |-> 0, reset |-> 0, moves |-> 0]
     /\ nWrites = 0
     /\ steady = [w \in Workers |-> TRUE]
@@ -639,13 +641,15 @@ AdminColdReset(scope, fleet) ==
 (* Worker data path (actor.rs execute, maintenance, publish)                 *)
 
 \* A client mutation.  The final authority check and the journal append are
-\* one actor turn: the linearization point.
+\* one actor turn: the linearization point.  The effect does not record
+\* which client wrote it: no property reads the author, and keeping it would
+\* only multiply equivalent journals.
 Write(c, w, s, k, op) ==
     LET x == sh[w][s]
         v == nWrites + 1
-        eff == CASE op = "set" -> [k |-> k, v |-> v, d |-> NoDl, c |-> c]
-                 [] op = "ttl" -> [k |-> k, v |-> v, d |-> WU(w) + TTL, c |-> c]
-                 [] op = "del" -> [k |-> k, v |-> 0, d |-> NoDl, c |-> c]
+        eff == CASE op = "set" -> [k |-> k, v |-> v, d |-> NoDl, c |-> "client"]
+                 [] op = "ttl" -> [k |-> k, v |-> v, d |-> WU(w) + TTL, c |-> "client"]
+                 [] op = "del" -> [k |-> k, v |-> 0, d |-> NoDl, c |-> "client"]
         st == Step(StateOf(x), eff)
     IN
     /\ Authorized(w, s)
@@ -798,16 +802,16 @@ Replace(w) ==
     /\ UNCHANGED <<cs, lease, stg, gen, cur, leaderVars, workerVars, now, ccut, pcut, nWrites, ghostVars>>
 
 CutCtrl(w) ==
-    /\ FaultOK /\ w \notin ccut /\ fb.cut < MaxCuts
+    /\ FaultOK /\ w \notin ccut /\ fb.ccut < MaxCtrlCuts
     /\ ccut' = ccut \cup {w}
-    /\ fb' = [fb EXCEPT !.cut = @ + 1]
+    /\ fb' = [fb EXCEPT !.ccut = @ + 1]
     /\ steady' = [steady EXCEPT ![w] = FALSE]
     /\ UNCHANGED <<ctrlVars, leaderVars, workerVars, now, pcut, nWrites, ghostVars>>
 
 CutPeer(w) ==
-    /\ FaultOK /\ w \notin pcut /\ fb.cut < MaxCuts
+    /\ FaultOK /\ w \notin pcut /\ fb.pcut < MaxPeerCuts
     /\ pcut' = pcut \cup {w}
-    /\ fb' = [fb EXCEPT !.cut = @ + 1]
+    /\ fb' = [fb EXCEPT !.pcut = @ + 1]
     /\ UNCHANGED <<ctrlVars, leaderVars, workerVars, now, ccut, nWrites, steady, ghostVars>>
 
 \* Healing is the environment, not a fault; it is fair after GST.
@@ -897,7 +901,7 @@ Next ==
     \/ Tick \/ Done
     \/ \E w \in Workers : Heartbeat(w, TRUE) \/ Heartbeat(w, FALSE)
     \/ \E s \in Slots : Reconcile(s) \/ MoveStart(s)
-    \/ \E c \in Clients, w \in Workers, s \in Slots, k \in Keys, op \in {"set", "ttl", "del"} :
+    \/ \E c \in Clients, w \in Workers, s \in Slots, k \in Keys, op \in Ops :
          Write(c, w, s, k, op)
     \/ \E w \in Workers, s \in Slots, k \in Keys : Expire(w, s, k)
     \/ \E w \in Workers, s \in Slots : Replicate(w, s) \/ HoldReply(w, s) \/ DeliverHeld(w, s)
