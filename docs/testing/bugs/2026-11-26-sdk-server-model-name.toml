@@ -1,0 +1,17 @@
+id = "sdk-server-model-name"
+title = "The SDKs send embedding model names that the server refuses"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G12"]
+scenarios = ["VS18"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/protocol/tests/sdk_replay.rs::sdk_model_names_are_server_model_names"
+seed = "unknown"
+why_not_caught = "The shared fixtures hold valid names only."
+invariant_added = "A name the SDK sends is a name the server accepts, or the SDK refuses it first. The regression is ignored and fails today."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "oltp-vector lead"
+expires = "2026-12-22"

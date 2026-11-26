@@ -1,0 +1,17 @@
+id = "sdk-server-query-vector-size"
+title = "The SDKs send query vectors above the server's 2^18 words"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G12", "VEC-G11"]
+scenarios = ["VS18", "VS17"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/protocol/tests/sdk_replay.rs::sdk_query_vectors_fit_the_server_bound"
+seed = "unknown"
+why_not_caught = "The SDKs bound a vector by the 8 MiB body only."
+invariant_added = "The SDK refuses a query vector the server would refuse. The regression is ignored and fails today."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "oltp-vector lead"
+expires = "2026-12-22"

@@ -1,0 +1,17 @@
+id = "many-delete-no-dedup-record"
+title = "A resent delete_many of a missing key deletes a row created after the first attempt"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["VEC-G09", "OLTP-G03"]
+scenarios = ["VS15"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/src/oltp_runtime/direct/tests/adv_many.rs::adv_dr1_a_resent_delete_many_does_not_delete_a_row_created_after_its_first_attempt"
+seed = "unknown"
+why_not_caught = "A read-only outcome writes no dedup record and is recomputed on retry. The single table.delete does the same (adv_dr1_baseline_a_resent_single_delete_of_a_missing_key), so no test of the group looked at a missing key."
+invariant_added = "A row reported applied that wrote nothing still leaves its request id decided, so a resend returns the first result. The regression is ignored and fails today."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "oltp-vector lead"
+expires = "2026-12-22"

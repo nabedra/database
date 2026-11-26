@@ -67,6 +67,7 @@ mod cap1;
 mod fixa;
 mod gc1;
 mod gc2;
+mod adv_many;
 mod many;
 #[cfg(target_os = "linux")]
 mod reservations;

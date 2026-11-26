@@ -670,3 +670,9 @@ async fn vs20_vector_tables_and_unserved_operations_are_refused_explicitly() {
     ));
     cluster.shutdown().await;
 }
+
+#[path = "adv_many.rs"]
+mod adv;
+
+#[path = "adv_http.rs"]
+mod adv_http;
