@@ -9,7 +9,7 @@ found_date = "2026-11-24"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
 seed = 186
 why_not_caught = "The D05 runner writes only through a gateway that has just served a write."
-invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, direct seeds 186 and 357 of 1 to 720 (OnePausedProgress, direct route unavailable): at the 10 s deadline every write through either gateway succeeds with one follower paused. At an earlier head direct seed 8 showed the same refusal. There the gateway asked Control once a second and never contacted the Data leader. That it waited for the paused scheduler owner is an inference."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, direct seeds 186 and 357 of 1 to 720 (OnePausedProgress, direct route unavailable): at the 10 s deadline every write through either gateway succeeds with one follower paused. At an earlier head direct seed 8 showed the same refusal. There the gateway asked Control once a second and never contacted the Data leader. That it waited for the paused scheduler owner is an inference. At c2aad866, where every run installs the probes and has another schedule: direct seeds 186 (5c74c58777e7bf04) and 639 (dc599983f5bec2bb) (Actions run 45687381596, each replayed equal). 357 does not show it there."
 fix_commits = []
 revert_patch_ok = false
 status = "open"

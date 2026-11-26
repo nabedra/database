@@ -9,7 +9,7 @@ found_date = "2026-11-25"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
 seed = 382
 why_not_caught = "Runners read through a gateway only after it has refreshed its directory."
-invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, cold seeds 382 and 538 of 1 to 720, DedupUnique: the retry of a committed request returns its result. The answer is target incarnation differs from cached enrollment. Seeds 208, 395 and 696 showed it at an earlier head. Seed 415 of that head did not: its requests had changed no row."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=mixed, default profile, cold seeds 382 and 538 of 1 to 720, DedupUnique: the retry of a committed request returns its result. The answer is target incarnation differs from cached enrollment. Seeds 208, 395 and 696 showed it at an earlier head. Seed 415 of that head did not: its requests had changed no row. At c2aad866, where every run installs the probes and has another schedule: cold seeds 334 (5adae28bc93d30a2) and 382 (dcb3f3f270661df8), not 538 (Actions run 45687381596, each replayed equal)."
 fix_commits = []
 revert_patch_ok = false
 status = "open"

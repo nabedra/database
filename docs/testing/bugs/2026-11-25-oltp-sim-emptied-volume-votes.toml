@@ -1,0 +1,17 @@
+id = "OLTP-sim-emptied-volume-votes"
+title = "A worker in its first incarnation starts on an emptied data volume and takes part in its system groups again"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G08"]
+scenarios = ["O06", "O17"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 10
+why_not_caught = "The lost mount test starts a prepared incarnation, and Control refuses that one. No test starts the first bootstrap file again on an emptied volume."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=membership, NABEDRA_SIM_MEMBERSHIP=wipe, NABEDRA_SIM_PROFILE=none, seeds 10, 14, 16, 17, 23 and 24 of 1 to 24 at d63ba0dc (check oltp-sim-membership-wipe, Actions run 45648985850, each replayed equal; seed 10 is trace a3298c3a9e96408b): votes under a node identity come from the storage generation that first voted under it. With one retained voter frozen, a Control write is acknowledged by one retained voter and the emptied one. The marker names the volume and not its contents, and the Raft groups open before Control checks the worker. No lost committed entry has been shown. Reached without restoring a file: removing every name in the mount that does not start with a dot leaves the marker (scratch harness at 98c86c41, seeds 3 and 10). At c2aad866, where every run installs the probes and has another schedule: WipedNeverVotes in the same seeds 10 (e65548468aa99ec3), 14, 16, 17, 23 and 24 of the wipe check. The probe rule MonotonicVote reports the vote itself: replica 1 saves (1, 1, false) after a vote of term 3 to 5, in wipe seeds 3, 4, 10, 12, 14, 16, 17, 18, 21, 23 and 24 and in default seeds 12, 20, 23 and 31 (Actions run 45687381596, each replayed equal). In wipe seed 18 (d62d03a0c831fb3f) MajorityReached reports an applied entry of the group that is durable on replica 2 alone at that start. The wipe is the fault plan, and no acknowledged write is shown lost."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

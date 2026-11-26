@@ -1,0 +1,17 @@
+id = "OLTP-sim-submit-answers-200"
+title = "POST /v1/requests answers 200 with data for an ID that the direct path committed; the documents and the Python client disagree about it"
+class = "other"
+module = "oltp"
+guarantees = []
+scenarios = ["Q05"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 2
+why_not_caught = "Not checked which runner, if any, sends POST /v1/requests for an ID that /v1/operations already committed directly."
+invariant_added = "Fault model, unattested, NABEDRA_SIM_WORKLOAD=queued, profile mixed,process,network,pause: SubmitAnswer in seed 2 (f07deb72cf06fd35 at 6b20e211, repeated by an independent reviewer; 02ab95159065980b at bff842ef, where seeds 1, 2, 8, 11 and 15 of 1 to 16 report it). plans/resource-aware-scheduling.md gives 202. plans/oltp-direct-path.md says the settle step returns Replayed and gives no HTTP form. Undecided which is right. At c2aad866, where every run installs the probes and has another schedule: SubmitAnswer in the same seeds 1, 2 (4bb876cbc0a2277e), 8, 11 and 15 of 1 to 16 (Actions run 45687457689, unattested scratch check on the same code, each replayed equal)."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

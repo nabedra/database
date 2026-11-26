@@ -1,0 +1,17 @@
+id = "OLTP-sim-interrupted-index-declaration"
+title = "An index declaration that ends between taking its table's guard and its commit is never settled, and the table refuses every schema change"
+class = "fence-lifecycle-order"
+module = "oltp"
+guarantees = []
+scenarios = ["O12", "D11"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 23
+why_not_caught = "The O12 and D11 runners publish an index under load and do not lose a worker or a reply while a declaration runs."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=topology, default profile. Instrumented at 715e062f with an unchanged trace hash, seed 23: declaration b8bf2481 took the guard of main, its next step failed with an unknown outcome (`no registered group leader completed the strong service call`) while it held the guard, and its fence call never returned. 502 later exclusive acquisitions of that table were rejected, and an index declaration was refused for 180 s after the heal. Instrumented at 9a6bc79e with unchanged trace hashes (review-136). Seed 4: declaration 96dc193f took the guard and its fence call returned, then its commit answered `commit permit: worker outgoing lane full (Authority)` not_applied. 1,071 later exclusive acquisitions of that table were rejected, and the final writes were refused with 409. Seed 24: declaration 95f75d2b took the guard and its fence call never returned. 998 later acquisitions were rejected, and 267 s after the heal direct mutations still fall back for the schema. Whether that fence reached Data is not known. That these declarations are the holders is inferred from the order. Read in the code: IndexService::declare returns a commit error without settling the attempt. At 715e062f seeds 4 and 24 end in a failed cold start before that. Review-136: a product behaviour, supported by the instrumented runs and the code. At c2aad866, where every run installs the probes and has another schedule: default seed 23 (78570e78bd67e271) refuses the declaration of main_value for 180 s after the heal with captured schema or lifecycle changed (Actions run 45687381596, each replayed equal). The holder was not instrumented at this code. Seeds 4 and 24 end in a failed cold start before that."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-23"

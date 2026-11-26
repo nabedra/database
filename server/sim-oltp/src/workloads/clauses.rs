@@ -16,7 +16,7 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
     ("D03", &["D03:same-key", "D03:other-key"]),
     ("D04", &["D04:before-quorum", "D04:after-quorum"]),
     ("D05", &["D05:one-paused", "D05:rejoin", "D05:two-paused"]),
-    ("D07", &["D07:split", "D07:leader-move"]),
+    ("D07", &["D07:split", "D07:leader-move", "D07:stale-routes"]),
     (
         "D10",
         &["D10:session-drop", "D10:lane", "D10:one-shot-peer"],
@@ -49,6 +49,132 @@ pub(crate) const SCENARIOS: &[(&str, &[&str])] = &[
         ],
     ),
     ("O29", &["O29:ambiguous-write"]),
+    (
+        "F03",
+        &[
+            "F03:reservation",
+            "F03:dispatch",
+            "F03:receipt",
+            "F03:reduction",
+            "F03:cleanup",
+        ],
+    ),
+    (
+        "Q03",
+        &[
+            "Q03:one-frozen",
+            "Q03:two-frozen",
+            "Q03:coordinator-killed",
+            "Q03:copies-on-every-ready-worker",
+        ],
+    ),
+    ("Q04", &["Q04:closed-socket", "Q04:api-restart"]),
+    (
+        "Q05",
+        &[
+            "Q05:same-id-two-apis",
+            "Q05:other-body",
+            "Q05:path-boundary",
+        ],
+    ),
+    ("Q06", &["Q06:expired-receipt", "Q06:lost-terminal"]),
+    (
+        "O14",
+        &[
+            "O14:rolling-restart",
+            "O14:last-copy",
+            "O14:restored-from-last-copy",
+        ],
+    ),
+    ("R01", &["R01:worker-killed"]),
+    ("R02", &["R02:last-holder"]),
+    ("R04", &["R04:full-stop", "R04:abandoned"]),
+    ("R05", &["R05:partition", "R05:paused-owner"]),
+    (
+        "O30",
+        &[
+            "O30:third-holder-delayed",
+            "O30:two-holders-delayed",
+            "O30:each-copy-phase",
+        ],
+    ),
+    ("O31", &["O31:payload-quorum", "O31:marker-quorum"]),
+    ("O32", &["O32:full-stop", "O32:isolated-holder"]),
+    ("D11", &["D11:drop", "D11:index"]),
+    (
+        "O12",
+        &[
+            "O12:build-under-load",
+            "O12:build-paused",
+            "O12:worker-lost",
+            "O12:incomplete-not-chosen",
+            "O12:present-once",
+            "O12:retired",
+            "O12:refused-declaration",
+            "O12:refused-under-guard",
+            "O12:unique-validation",
+            "O12:each-phase",
+            "O12:restarted-build",
+            "O12:bounded-space",
+        ],
+    ),
+    (
+        "O16",
+        &[
+            "O16:split-during-scans",
+            "O16:split-during-commits",
+            "O16:move-during-commits",
+            "O16:restart-during-scans",
+            "O16:coverage",
+            "O16:queue-takeover",
+            "O16:snapshot-interrupted",
+        ],
+    ),
+    (
+        "O21",
+        &[
+            "O21:split-keeps-table",
+            "O21:rows-past-100000",
+            "O21:automatic-split",
+        ],
+    ),
+    (
+        "O28",
+        &[
+            "O28:routes-after-split",
+            "O28:paged-metadata",
+            "O28:interrupted-pagination",
+        ],
+    ),
+    (
+        "O17",
+        &[
+            "O17:replacement",
+            "O17:replacement-fault",
+            "O17:abandoned-intent",
+            "O17:removed-worker",
+            "O17:wiped-voter-refused",
+            "O17:wiped-voter-control",
+            "O17:wiped-voter-ddl",
+            "O17:wiped-voter-data",
+            "O17:move-sequence",
+            "O17:data-worker",
+            "O17:low-disk",
+            "O17:revocation-storm",
+        ],
+    ),
+    // Lead decision 21.1: two definitions, each set only by its own workload's assertion. In
+    // `queued` a receipt outlives the rolling restart; in `membership` the joiner is seen to hold
+    // the outstanding copies. R03 is complete only when every clause ran.
+    (
+        "R03",
+        &[
+            "R03:queued-rolling-restart",
+            "R03:membership-rolling-restart",
+            "R03:membership-replacement-joiner",
+            "R03:membership-last-holder",
+        ],
+    ),
 ];
 
 /// Why a clause cannot run yet, for the sweep record.
@@ -59,7 +185,52 @@ pub(crate) fn unreachable(clause: &str) -> Option<&'static str> {
         "O26:pinned-snapshot" => "a pinned query needs the queued path's barriers (phase 11)",
         "O26:split-across-pools" => "no phase 10 schedule splits a range across pools",
         "O26:failed-mount" => "no phase 10 schedule loses a mount",
+        "F03:reservation" | "F03:dispatch" => {
+            "only the resources overlay cuts such a request, and no seed of this range did"
+        }
+        "F03:receipt" | "F03:cleanup" => "no probe says that a caller was cancelled there",
+        "F03:reduction" => "the resources overlay sends direct-path requests only",
         "O26:worker-4" => "the data worker process binds a real TCP listener",
+        "O14:restored-from-last-copy" => {
+            "two lost voters leave Control without a quorum, so only a cold start follows"
+        }
+        "R05:paused-owner" => "no public observation names the queue owner",
+        "O30:each-copy-phase" | "O31:payload-quorum" | "O31:marker-quorum" => {
+            "needs a probe at each copy phase to place the fault"
+        }
+        "O32:isolated-holder" => "needs a probe that names the holders of a request",
+        "D11:index" => {
+            "its assertion is SchemaEpochAtCommit, which needs the schema epoch of each commit and of each Catalog publication (probes)"
+        }
+        "O12:worker-lost" => "no public observation names the worker that runs a build",
+        "O12:unique-validation" => {
+            "the product has no unique index: IndexDefinition has no such field"
+        }
+        "O12:refused-under-guard" => {
+            "a rival that reads the Catalog before the winner commits loses the guard, and a later one is refused before it"
+        }
+        "O12:each-phase" => {
+            "placing a fault in backfill, replay, validation or publication needs a probe at each"
+        }
+        "O12:restarted-build" => "no operator request starts a newer attempt of a build",
+        "O12:bounded-space" => "no rule reads the LedgerSnapshot probe of a build",
+        "O16:queue-takeover" => "no public observation names the queue owner",
+        "O16:snapshot-interrupted" => "needs a probe at the start of a snapshot installation",
+        "O21:rows-past-100000" => {
+            "100,001 rows on three replicas and their disk images do not fit this run's memory"
+        }
+        "O21:automatic-split" => "the shard target is 64 MiB; the runs stay far below it",
+        "O28:paged-metadata" | "O28:interrupted-pagination" => {
+            "needs more ranges than one routing page holds"
+        }
+        "O17:data-worker" => "the data worker process binds a real TCP listener",
+        "O17:low-disk" => "a simulated volume has no capacity limit",
+        "R03:membership-last-holder" => {
+            "the script settles every receipt before the next worker stops"
+        }
+        "O17:revocation-storm" => {
+            "1,025 replacements, each with its own worker and certificate, need a separate large range"
+        }
         _ => return None,
     })
 }
