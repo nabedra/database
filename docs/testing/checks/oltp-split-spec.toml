@@ -1,0 +1,15 @@
+# The design spec of a range split under sustained direct writes: the barrier, the cut, the source
+# freeze, the child image, the Catalog publication, abort, retry, coordinator loss and a run-owner
+# fence racing the split. Safety and liveness baselines at L3 bounds, coverage and every mutant.
+# See plans/oltp-direct-path.md, "Design review".
+id = "oltp-split-spec"
+module = "oltp"
+kinds = ["T"]
+guarantees = ["OLTP-G01", "OLTP-G06", "OLTP-G07"]
+scenarios = ["O16", "D07"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/oltp/split", "OltpSplit", "--module", "oltp"]
+cwd = "."
+timeout_s = 19800
+needs = ["tlc"]
+result_parser = "tlc"
