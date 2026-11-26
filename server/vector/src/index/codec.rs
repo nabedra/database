@@ -62,9 +62,9 @@ impl Codec for DirectionCodec {
     }
     fn query_cost(&self, _dim: usize) -> (u64, u64) {
         let padded = self.rotation.padded() as u64;
-        // Float buffers for rotation, its interleaving scratch, the residual and
-        // rounding, plus signed levels and the four bit-slices.
-        let bytes = padded * (4 * size_of::<f32>() as u64 + 2) + 256;
+        // Rotation output and interleaving scratch, residual, rounding and
+        // distance scratch, plus signed levels and the four bit-slices.
+        let bytes = padded * (5 * size_of::<f32>() as u64 + 2) + 256;
         (self.rotation.work() + 24 * padded, bytes)
     }
     fn rotate(&self, dir: &[f32]) -> Vec<f32> {
