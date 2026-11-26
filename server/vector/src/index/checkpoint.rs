@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -109,12 +109,18 @@ impl Store {
         }
     }
 
-    /// The directory itself is on disk. Its parent has to be.
+    /// Persist each directory link, including links left by a failed prepare.
     fn prepare(&self) -> io::Result<()> {
         self.fs.create_dir_all(&self.dir)?;
-        self.dir
-            .parent()
-            .map_or(Ok(()), |parent| self.fs.sync_dir(parent))
+        for parent in self.dir.ancestors().skip(1) {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            self.fs.sync_dir(parent)?;
+        }
+        Ok(())
     }
 
     fn path(&self, name: &str) -> PathBuf {

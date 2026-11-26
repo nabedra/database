@@ -492,7 +492,6 @@ fn adv10_every_error_of_every_call_of_a_drop_and_a_resync() {
 /// A checkpoint that reports success survives a power loss, also when its directory and the ones
 /// above it were made by this very call.
 #[test]
-#[ignore = "known defect B-D4: only the parent of the checkpoint directory is synced, not the new levels above it"]
 fn adv10_an_installed_checkpoint_in_new_directories_survives_a_power_loss() {
     for (name, deep) in [("one new level", "/data/ck"), ("three new levels", "/a/b/c/ck")] {
         let fs = FaultFs::new();

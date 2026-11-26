@@ -513,7 +513,6 @@ fn adv07_a_dropped_range_leaves_no_partitions_behind() {
 
 /// A configuration that can never finish a split is refused when the index is made.
 #[test]
-#[ignore = "known defect B-D1: Config::check accepts copies = 0, and then no drain ends"]
 fn adv07_a_configuration_without_copies_is_refused() {
     let cfg = Config { copies: 0, ..Config::new(schema(2, &[], None), 1) };
     assert!(Index::<ExactCodec>::new(cfg, ExactCodec, None).is_err(), "copies: 0 never ends a drain");

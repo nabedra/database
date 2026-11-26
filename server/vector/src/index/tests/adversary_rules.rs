@@ -976,7 +976,6 @@ fn adv24_a_prefix_or_text_range_that_few_rows_match_is_scored_in_full() {
 /// A hostile filter nested as deep as a request can make it fails with an error, and does not
 /// overflow the stack of the thread that pins or scans.
 #[test]
-#[ignore = "known defect B-D5: Index::pin calls Filter::only, which recurses without a bound, before anything checks the depth"]
 fn adv24_a_filter_nested_without_end_is_refused_and_does_not_overflow_the_stack() {
     const CHILD: &str = "NABEDRA_DEEP_FILTER_CHILD";
     if std::env::var_os(CHILD).is_some() {

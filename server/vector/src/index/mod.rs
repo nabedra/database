@@ -88,6 +88,7 @@ impl Config {
         let by = schema.partition_by.map(|c| schema.columns.get(c));
         let sizes = self.shards > 0
             && self.queue > 0
+            && self.copies > 0
             && self.part_max > 1
             && self.part_min < self.part_max / 2;
         let dims = (1..=MAX_DIM).contains(&schema.dim);
@@ -814,6 +815,9 @@ impl<C: Codec> Index<C> {
     /// `StartScan`: fixes the read points and the partitions in one step, after the caller's barrier.
     /// `filter` may limit the partitions to one tree.
     pub fn pin(&mut self, ranges: &[(RangeId, ReadAt)], filter: Option<&Filter>) -> Result<Pin> {
+        if let Some(filter) = filter {
+            filter.check(&self.cfg.schema)?;
+        }
         let (group, roots) = self.roots(filter);
         self.pin_roots(ranges, group, roots)
     }
