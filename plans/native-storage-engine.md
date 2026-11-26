@@ -208,7 +208,22 @@ Recovery reads the journal from `flushed_seq` in segment order and classifies ea
 - **Damaged, scope unknown**: a non-zero header whose CRC fails.
 - **Unreadable**: the read returned an I/O error. An unreadable region is never treated as a torn write.
 
-At the first non-valid position P, recovery scans the rest of the readable journal for evidence. After a damaged header it resumes at the next 4 KiB boundary that holds a valid header, because every group commit after a sync starts on one. **Evidence** is any later valid current-epoch record with `durable_seq >= seq(P)`, where `seq(P)` is the previous valid record's `first_seq + count`. Evidence proves a completed sync covered P, so P's damage hit acknowledged data. `flushed_seq` is evidence too: flush syncs the journal first, so a position with `seq(P) <= flushed_seq` was covered by a completed sync. Such damage is skipped (its state is in runs), and recovery never re-epochs or frees a segment the manifest records, so journal values that runs reference stay readable; the check that every recorded segment is still live runs before any repair (design review, LSM-2).
+At the first non-valid position P, recovery scans the rest of the readable journal for evidence. After a damaged
+header it resumes at the next 4 KiB boundary that holds a valid header, because every group commit after a sync
+starts on one. **Evidence** is any later valid current-epoch record with `durable_seq >= seq(P)`, where `seq(P)` is the
+previous valid record's `first_seq + count`. The durable manifest's `flushed_seq` also certifies the sequence prefix it
+covers, because a flush syncs the journal before it publishes the manifest edit.
+
+Skip a known-length damaged record whose last sequence is covered by `flushed_seq`. For unknown-length damage starting
+in that prefix, preserve the segment and find a validated resync point. Classify any gap above `flushed_seq` using
+its own durability evidence and scope. If the only remainder is covered state or an uncertified tail, and the scan
+cannot establish a safe append offset, preserve the recorded segment and start a fresh writable segment at the next
+sequence after the recovered prefix, at least one past the flush. Its directory entry and header follow the existing
+durable segment activation order.
+
+Before repair writes, derive the proposed post-repair segment identities from the scan. Validate that each segment
+number and epoch recorded by the manifest exists both on disk and in that result. A missing identity returns R3
+before cleanup. Keep each recorded segment's epoch and the bytes referenced by its live journal locators (LSM-2).
 
 | # | Case | Outcome | ScyllaDB analogue |
 | --- | --- | --- | --- |
@@ -574,3 +589,18 @@ Specs in `specs/lsm/`. Local TLC runs are `local, unattested`; the T check resul
 | Counterexamples | Plan text fixed in this revision (code already right): group-commit pad and multi-segment sync, roll pad, directory sync of every run output (mutants `pad_after_sync`, `sync_prev_segment_only`, `no_sync_pad`, `roll_gap_is_end`, `no_run_dir_sync`; record `2026-11-26-design-lsm-plan-sync-order`); flush and journal GC tied to durable state (`JournalGc` mutants); quarantine durability, release order and replacement placement (`Quarantine` mutants). Design gaps with records: LSM-2 (`2026-11-26-design-lsm-u1-flushed-values`, recovery classification text fixed here, code pending), LSM-5 (residual written into section 3, code pending), LSM-6 (run-time R6 rule, code pending). User decision: LSM-1, keyed record CRCs (`2026-11-26-design-lsm-forged-evidence`), an on-disk format change, not made in this plan. |
 | Cost | Synced write (group of n writers): one pwrite of the group, one `fdatasync` per segment with unsynced bytes (one, or two across a roll), and a pad of at most 4 KiB + 48 bytes per sync; an unsynced write: one pwrite, no sync. Flush: one `fdatasync` if the journal is behind, one `fsync` per output run, one `runs/` directory `fsync`, one manifest append and `fsync` (four syncs when the manifest rolls), then retirement (a rename and a journal directory `fsync`). Compaction: one `fsync` per output, one directory `fsync`, one manifest `fsync`. Journal GC: each live journal value in a relocated segment is written once more (`relocated_bytes`), in NoSync records, plus one journal sync if no writer synced. Open: an `fsync` of every live segment (at most `max_journal_bytes / segment_bytes` = 8), the journal directory, the new manifest, CURRENT and the directory, plus a read of every referenced run's footer (O(runs)). Plan targets: "one pwrite, one fdatasync if any waiter asked for a sync" holds except across a roll (two); the others are not stated in the plan. |
 | Independent read | `wave-dr/reads/lsm.md` (2026-11-24; the plan has not changed since). R-lsm-01 `pad_after_sync`; 02 pads are `Pad` records with a minimum length (code `format.rs:257`), not modelled at byte level; 03 `roll_gap_is_end` with `EarlyRoll`; 04 `sync_prev_segment_only`; 05 `roll_no_dir_sync` and the segment set recording only segments whose first record is durable; 06 `flush_no_journal_sync` (both specs); 07 `gc_ignores_durable`; 08 `gc_no_scan_floor`; 09 `retire_before_edit`; 10 not modelled (segment numbers are never reused; the code gives a recycled file a new number and epoch and syncs its header in `segment::activate`); 11 `keep_later_segments`, `no_zero_tail`; 12 not modelled (manifest edits are atomic in the spec): open gap; 13 not modelled: the code serializes edits under the `vs` lock; 14 `cleanup_before_current_sync` and the open steps; 15 `no_run_dir_sync`; 16 out of scope (pool identity layer): open gap; 17 `g1_unpersisted`; 18 not modelled: Control refuses a replacement on the damaged pool; 19 `release_without_flush`; 20 `DamageStored` on runs with `ReadFindsDamage` (`quarantine_run` writes its edit before the run leaves the version); 21 not modelled: `quarantine_run` removes the damaged run from the version, so compaction no longer picks it; 22 `reloc_unconditional`, with the check at `first_seq - 1` on apply and replay; 23 `no_open_sync`; 24 out of scope (fsync errors; NS09); 25 `no_damage_report`; 26 `gc_ignores_snapshot`; 27 the freeze is one step (`switch_locked` under the `active` lock); 28 LSM-1, not modelled (byte layout); 29 `MediaDamage` with a zeroed sector, under the U1 exception, and LSM-2. |
+
+### Flushed prefix and recovery preflight
+
+The `FlushedPrefixRecovery.tla` refinement checks LSM-G03 (NS07) at the boundary between the read-only scan,
+manifest validation and disk mutation. It starts with a durable manifest, a recorded locator, and a crash.
+The scan may find a covered header or payload fault, an uncertified torn tail, a missing recorded segment,
+or separate evidence of a durable gap above the flush. The projected repair must retain recorded identities
+and the intact value bytes they reference. A missing identity causes refusal before repair, and a gap above
+the flush follows its own evidence.
+
+The T1 check is `lsm-flushed-prefix`. Local pinned TLC completed 27 distinct states at depth 6 and reached all
+six actions. It caught re-epoching before validation in five states, refusing a recoverable covered header
+in four, cleanup before validation in five, and accepting a certified unflushed gap in six. The broad LSM
+baselines remain applicable for liveness, multiple scopes, physical file cuts and reopening. Phase 2 needs
+an NS07 regression against the recovery implementation.
