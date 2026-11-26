@@ -2,7 +2,7 @@
 id = "oltp-outcome-rollout-spec"
 module = "oltp"
 kinds = ["T"]
-guarantees = ["OLTP-G03"]
+guarantees = []
 scenarios = ["D02", "O02", "O15"]
 tiers = ["T1"]
 command = ["python3", "scripts/testing/tla_check.py", "specs/oltp/rollout", "OltpDirectRollout", "--module", "oltp"]
