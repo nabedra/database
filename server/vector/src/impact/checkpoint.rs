@@ -935,4 +935,13 @@ impl Checkpoints {
     pub(super) fn files(&self) -> Vec<PathBuf> {
         self.fs.list(&self.dir).unwrap_or_default()
     }
+
+    /// Installs the manifest again under another identity, as another build would have written it.
+    pub(super) fn set_identity(&self, identity: &[u8]) -> io::Result<()> {
+        let mut manifest = self
+            .load_manifest()?
+            .ok_or_else(|| damaged("no manifest"))?;
+        manifest.identity = identity.to_vec();
+        self.install(&manifest)
+    }
 }

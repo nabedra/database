@@ -184,6 +184,11 @@ impl Analyzer {
 
     /// Names everything that decides the terms of a text: the identity and the preparation. A
     /// checkpoint of another format is not loaded.
+    ///
+    /// The preparation has a version of its own, rather than a bump of `VERSION`, because the
+    /// identity also says which words a language yields: the tests of the adversarial tester pin it
+    /// at `/1` and forge a manifest of `/2`, and both stay meaningful this way. A checkpoint written
+    /// before NFC names `text/<language>/1` without `+prepare/2`, and is refused.
     pub fn format(&self) -> String {
         format!("{}+prepare/{PREPARATION}", self.identity())
     }

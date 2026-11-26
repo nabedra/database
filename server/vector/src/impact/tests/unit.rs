@@ -658,3 +658,35 @@ fn vs11_memory_returns_after_churn() {
     assert_eq!(ix.segments().1, 0);
     assert!(ix.segments().0 <= 1, "{:?}", ix.segments());
 }
+
+/// Review G, B1: key 0's large parts cancel and leave 0.00105, which beats key 1's 0.001.
+fn cancelling_parts() -> std::result::Result<(), String> {
+    let big = (1u32 << 20) as f32;
+    for op in [Op::Dot, Op::Cosine] {
+        let mut ix = serving(sparse_cfg());
+        let mut m = Model::default();
+        feed(&mut ix, &mut m, vec![
+            (1, Some(sparse(&[(2, 0.001)], vec![tags(&[])], 1))),
+            (0, Some(sparse(&[(0, big), (1, -big), (2, 0.00105)], vec![tags(&[])], 0))),
+        ]);
+        let pin = latest(&mut ix);
+        for exact in [false, true] {
+            let q = Query {
+                exact,
+                ..sparse_query(op, &[(0, big), (1, big), (2, 1.0)], 1)
+            };
+            let got = keys_and_scores(&ix.search(&pin, &q).unwrap());
+            let want = brute(&Kind::Sparse, &m.visible(m.now()), &q, None);
+            if got != want || (op == Op::Dot && got.first().map(|h| h.0) != Some(0)) {
+                return Err(format!("{op:?} exact {exact}: {got:?}, brute force {want:?}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn vs07_cancelling_sparse_parts_keep_the_best_row() {
+    cancelling_parts().unwrap();
+    assert!(with_mutant("slack_of_the_bound", cancelling_parts).is_err());
+}

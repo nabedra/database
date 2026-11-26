@@ -11,7 +11,10 @@ publish = ["crates-io"]
 [dependencies]
 nabedra-rt = { path = "../rt", version = "0.1.0" }
 nabedra-simd = { path = "../simd", version = "0.1.0" }
-# Full-text analysis: word boundaries (UAX #29) and Snowball stemmers.
+# Full-text analysis: word boundaries (UAX #29), NFC and Snowball stemmers. They decide the terms
+# of a text, so a new version of any of them, or of its Unicode data, or a change to the table of
+# format characters in `text`, bumps `VERSION` or `PREPARATION` there, and old checkpoints are
+# refused instead of misread.
 unicode-segmentation = "=1.13.3"
 unicode-normalization = "=0.1.26"
 rust-stemmers = "=1.2.0"

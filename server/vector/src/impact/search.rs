@@ -156,15 +156,26 @@ fn round(x: f64) -> f32 {
     (x as f32).clamp(f32::MIN, f32::MAX) + 0.0
 }
 
-/// Whether a bound surely stays below the result's worst score. The slack covers sums in another
-/// order. The comparison is of scores as they are returned, rounded to f32, because rounding is
-/// monotone: a row whose bound rounds to the worst score may tie with it and win by key, also where
-/// f32 underflows to zero.
-fn below(bound: f64, worst: Option<f64>) -> bool {
+/// Whether a bound surely stays below the result's worst score. `mass` is the sum of the absolute
+/// values of the terms that the bound added up.
+///
+/// A bound adds parts and block bounds in another order than the score, which sums the parts in the
+/// order of the query's terms (decision L1). Each f64 sum of n terms is off by at most n·ε of their
+/// absolute mass, and parts of opposite sign can cancel, so the slack follows the mass, never the
+/// bound: n is at most `MAX_QUERY_TERMS` + 2, so `SLACK` holds both sums with room to spare. The
+/// comparison is of scores as they are returned, rounded to f32, because rounding is monotone: a
+/// row whose bound rounds to the worst score may tie with it and win by key, also where f32
+/// underflows to zero.
+fn below(bound: f64, mass: f64, worst: Option<f64>) -> bool {
+    const SLACK: f64 = 1e-9;
     let Some(worst) = worst else {
         return false;
     };
-    let slack = (bound.abs() + worst.abs()) * 1e-6;
+    let slack = if mutant("slack_of_the_bound") {
+        (bound.abs() + worst.abs()) * 1e-6
+    } else {
+        mass.abs() * SLACK
+    };
     f64::from(round(bound + slack)) < worst
 }
 
@@ -395,10 +406,11 @@ impl<S: PostingStore> ImpactIndex<S> {
             })
             .collect();
         lanes.sort_by(|a, b| a.ub.total_cmp(&b.ub).then(a.i.cmp(&b.i)));
-        // prefix[e]: the most that the lists before `e` add together.
-        let mut prefix = vec![0.0f64];
+        // prefix[e]: the most that the lists before `e` add together, and the mass of that sum.
+        let mut prefix = vec![(0.0f64, 0.0f64)];
         for l in &lanes {
-            prefix.push(prefix[prefix.len() - 1] + l.ub);
+            let (sum, mass) = prefix[prefix.len() - 1];
+            prefix.push((sum + l.ub, mass + l.ub.abs()));
         }
         let mut parts: Vec<Option<f64>> = vec![None; p.terms.len()];
         let mut rest: Vec<f64> = Vec::with_capacity(lanes.len());
@@ -408,7 +420,7 @@ impl<S: PostingStore> ImpactIndex<S> {
             let worst = scan.worst();
             // Lists before `ess` cannot lift a row into the result on their own.
             let mut ess = 0;
-            while ess < lanes.len() && below(prefix[ess + 1], worst) {
+            while ess < lanes.len() && below(prefix[ess + 1].0, prefix[ess + 1].1, worst) {
                 ess += 1;
             }
             if ess == lanes.len() {
@@ -425,15 +437,17 @@ impl<S: PostingStore> ImpactIndex<S> {
             };
             // Whole blocks: no row up to the end of the first essential block can reach the result.
             if worst.is_some() {
-                let mut sum = prefix[ess];
+                let (mut sum, mut mass) = prefix[ess];
                 let mut end = Doc::MAX;
                 for l in &lanes[ess..] {
                     if let Some((last, b)) = l.cursor.block() {
-                        sum += p.bound(l.i, b).max(0.0);
+                        let bound = p.bound(l.i, b).max(0.0);
+                        sum += bound;
+                        mass += bound;
                         end = end.min(last);
                     }
                 }
-                if below(sum, worst) {
+                if below(sum, mass, worst) {
                     for l in &mut lanes[ess..] {
                         l.cursor.seek(end.saturating_add(1), store)?;
                     }
@@ -446,14 +460,16 @@ impl<S: PostingStore> ImpactIndex<S> {
             scan.considered += 1;
             let norm = norm_of(doc);
             // The candidate's essential parts are exact, the others bounded by their blocks.
-            let mut sum = 0.0;
+            let (mut sum, mut mass) = (0.0, 0.0);
             for l in &mut lanes[ess..] {
                 if let Some(x) = l.cursor.current(store)?
                     && x.doc == doc
                 {
                     let part = p.part(l.i, x.value, norm);
                     parts[l.i] = Some(part);
-                    sum += p.scaled(part, norm);
+                    let scaled = p.scaled(part, norm);
+                    sum += scaled;
+                    mass += scaled.abs();
                     l.cursor.advance();
                 }
             }
@@ -465,8 +481,11 @@ impl<S: PostingStore> ImpactIndex<S> {
                         .map_or(0.0, |b| p.bound(l.i, b).max(0.0)),
                 );
             }
-            let mut hope = sum + rest.iter().sum::<f64>();
-            let mut out = below(hope, worst);
+            let rests = rest.iter().sum::<f64>();
+            let mut hope = sum + rests;
+            // The mass only grows: a block bound that a part replaces stays in it.
+            mass += rests;
+            let mut out = below(hope, mass, worst);
             for j in (0..ess).rev() {
                 if out {
                     break;
@@ -478,9 +497,11 @@ impl<S: PostingStore> ImpactIndex<S> {
                 {
                     let part = p.part(l.i, x.value, norm);
                     parts[l.i] = Some(part);
-                    hope += p.scaled(part, norm);
+                    let scaled = p.scaled(part, norm);
+                    hope += scaled;
+                    mass += scaled.abs();
                 }
-                out = below(hope, worst);
+                out = below(hope, mass, worst);
             }
             if !out {
                 self.rank(parts.iter().flatten().sum(), doc, seg, scan)?;

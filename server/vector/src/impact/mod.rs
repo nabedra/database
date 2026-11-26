@@ -164,11 +164,12 @@ struct Counts {
 
 impl Counts {
     fn add(&mut self, row: &Stored, text: bool) {
-        self.docs += 1;
+        self.docs = self.docs.saturating_add(1);
         if text {
             self.words = self.words.saturating_add(row.norm as u64);
             for (t, _) in row.terms.iter() {
-                *self.df.entry(*t).or_default() += 1;
+                let n = self.df.entry(*t).or_default();
+                *n = n.saturating_add(1);
             }
         }
     }
@@ -924,11 +925,11 @@ impl<S: PostingStore> ImpactIndex<S> {
         };
         for id in ranges {
             let c = &self.range(*id)?.counts;
-            stats.docs += c.docs;
+            stats.docs = stats.docs.saturating_add(c.docs);
             stats.words = stats.words.saturating_add(c.words);
             for (n, (name, _)) in stats.df.iter_mut().zip(&terms) {
                 let t = self.dict.get(name);
-                *n += t.and_then(|t| c.df.get(&t)).copied().unwrap_or(0);
+                *n = n.saturating_add(t.and_then(|t| c.df.get(&t)).copied().unwrap_or(0));
             }
         }
         Ok(stats)

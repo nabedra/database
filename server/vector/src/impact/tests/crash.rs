@@ -331,3 +331,17 @@ fn vs10_a_dropped_range_does_not_come_back_and_a_peer_copy_recovers() {
         "a peer without a checkpoint"
     );
 }
+
+/// A checkpoint of a build before decisions L10 and L11 holds terms of unprepared text, so it is
+/// refused, not misread.
+#[test]
+fn vs10_a_checkpoint_from_before_nfc_is_not_loaded() {
+    let fs = disk();
+    prepared(&fs).checkpoint().unwrap();
+    let (ix, damage) = ImpactIndex::recover(cfg(), RamStore::default(), store(&fs)).unwrap();
+    assert_eq!((damage.len(), ix.status(RANGE).is_ok()), (0, true));
+    store(&fs).set_identity(b"text/english/1:t").unwrap();
+    let (ix, damage) = ImpactIndex::recover(cfg(), RamStore::default(), store(&fs)).unwrap();
+    assert_eq!(damage.len(), 1);
+    assert!(ix.status(RANGE).is_err());
+}

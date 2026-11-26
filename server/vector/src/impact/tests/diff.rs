@@ -10,7 +10,10 @@ use super::*;
 const WORDS: [&str; 9] = [
     "apple", "apples", "bread", "cheese", "dates", "eggs", "figs", "grapes", "honey",
 ];
-const WEIGHTS: [f32; 10] = [-2.5, -1.0, -0.0, 0.0, 0.25, 1.0, 1.0, 3.0, 1e-30, 1e30];
+// Large parts of both signs with small residues make sums cancel (review G, B1).
+const WEIGHTS: [f32; 14] = [
+    -2.5, -1.0, -0.0, 0.0, 0.25, 1.0, 1.0, 3.0, 1e-30, 1e30, 1048576.0, -1048576.0, 0.001, 0.00105,
+];
 const TAGS: [&str; 3] = ["a", "b", "c"];
 
 fn doc_text(g: &mut Gen) -> String {
@@ -415,4 +418,57 @@ fn vs19_micro_benchmark_of_maxscore() {
             t / probes.len() as u32
         );
     }
+}
+
+/// Rows whose large parts cancel, beside rows of small parts only: a bound summed in another order
+/// than the score must not lose the row whose residue is best (review G, B1).
+fn cancelling(g: &mut Gen) -> std::result::Result<(), String> {
+    let big = 2f32.powi(5 + g.below(30) as i32);
+    let mut ix = serving(Config {
+        segment_rows: 1 + g.below(8) as usize,
+        ..sparse_cfg()
+    });
+    let mut m = Model::default();
+    let n = 2 + g.below(12);
+    let rows = (0..n)
+        .map(|k| {
+            let tiny = 2f32.powi(-(g.below(40) as i32)) * (1.0 + g.below(1000) as f32 / 1000.0);
+            let pairs: Vec<(u32, f32)> = match g.below(3) {
+                0 => vec![(0, big), (1, -big), (2, tiny)],
+                1 => vec![(0, -big), (1, big), (2, tiny), (50, big)],
+                _ => vec![(2, tiny), (50, big)],
+            };
+            (k, Some(sparse(&pairs, vec![tags(&[])], k)))
+        })
+        .collect();
+    let page = m.page(rows, false);
+    ix.apply(RANGE, &page).map_err(|e| e.to_string())?;
+    let pin = latest(&mut ix);
+    for op in [Op::Dot, Op::Cosine] {
+        for limit in [1, 2, 3] {
+            let q = sparse_query(op, &[(0, big), (1, big), (2, 1.0)], limit);
+            let want = brute(&Kind::Sparse, &m.visible(m.now()), &q, None);
+            for exact in [false, true] {
+                let q = Query { exact, ..q.clone() };
+                let got = keys_and_scores(&ix.search(&pin, &q).map_err(|e| e.to_string())?);
+                if got != want {
+                    return Err(format!("{op:?} limit {limit} exact {exact}:\n got {got:?}\nwant {want:?}"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn vs07_cancelling_parts_equal_brute_force() {
+    check_with(Runs { cases: 600, ..Runs::default() }, "vs07_cancelling_parts_equal_brute_force", cancelling);
+}
+
+#[test]
+fn vs07_a_slack_of_the_bound_alone_is_caught() {
+    let caught = with_mutant("slack_of_the_bound", || {
+        (0..600).any(|seed| cancelling(&mut Gen::from_seed(seed)).is_err())
+    });
+    assert!(caught);
 }

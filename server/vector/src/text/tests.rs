@@ -185,3 +185,13 @@ fn vs17_a_huge_text_is_analyzed_in_bounds() {
     assert_eq!(a.terms("").words, 0);
     assert_eq!(a.terms(" ,.;!? \n").words, 0);
 }
+
+/// A format character between a letter and its mark goes, and the two compose (L10 after L11).
+#[test]
+fn vs17_a_format_character_inside_a_letter_leaves_it_whole() {
+    let a = Analyzer::new("simple").unwrap();
+    for marked in ["cafe\u{ad}\u{301}", "cafe\u{200b}\u{301}", "ca\u{2060}fe\u{301}", "café\u{feff}"] {
+        assert_eq!(names(&a, marked), ["caf\u{e9}"], "{marked:?}");
+    }
+    assert_eq!(a.terms("cafe\u{ad}\u{301}"), a.terms("café"));
+}
