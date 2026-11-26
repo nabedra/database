@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
 import { Database, Query, SearchUnavailableError, ValidationError, col, list, vector } from "nabedra"
 import { Ranking } from "nabedra/expr"
+import { expressionToWire } from "../dist/expr.js"
 import { schemaFromWire, schemaToWire, validateRow, validateSchema, validateValue } from "nabedra/validation"
 
 const schema = {
@@ -57,6 +58,14 @@ test("options objects refuse unknown names and null like Python keyword argument
   const db = new Database({ url: "http://127.0.0.1:9", token: "test" })
   await assert.rejects(db.createTable("t", { id: String }, { key: "id", partition: "id" }), TypeError)
   await assert.rejects(db.createTable("t", { id: String }, null), ValidationError)
+})
+
+test("containsAny sorts only a Set; Map keys and other iterables keep their order", () => {
+  const values = (input) => expressionToWire(col("tags").containsAny(input), schema).values
+  assert.deepEqual(values(new Map([["b", 1], ["a", 2], ["é", 3]]).keys()), ["b", "a", "é"])
+  assert.deepEqual(values(new Set(["b", "a", "é"]).values()), ["b", "a", "é"])
+  assert.deepEqual(values(["b", "a"]), ["b", "a"])
+  assert.deepEqual(values(new Set(["é", "b", "a"])), ["a", "b", "é"])
 })
 
 test("rows detach every value", () => {

@@ -4,7 +4,7 @@ import {
   scalarToWire, validateIdentifier, validateScalar,
   type Scalar, type ScalarType, type Schema, type VectorValue,
 } from "./validation.js"
-import { checkQuery, columnKind, hasZeroVector, queryValue, vectorToWire, type QueryValue } from "./vector.js"
+import { checkQuery, columnKind, hasZeroVector, queryValue, text, vectorToWire, type QueryValue } from "./vector.js"
 import type { Layout } from "./layout.js"
 
 type Comparison = "eq" | "ne" | "gt" | "ge" | "lt" | "le"
@@ -54,7 +54,7 @@ function columnName(expression: Expr, method: string): string {
 
 function stringValue(value: unknown, column: string): string {
   if (typeof value !== "string") throw new ValidationError(`Column '${column}' requires string values`)
-  return value
+  return text(value, column)
 }
 
 function rankingOf(expression: Expr, op: Operation, query: unknown): Ranking {

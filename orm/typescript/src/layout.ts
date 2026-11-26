@@ -32,6 +32,7 @@ export function setTableLayout(table: object, layout: Layout): void {
 
 function text(value: unknown, label: string): string {
   if (typeof value !== "string" || value.length === 0) throw new ValidationError(`${label} must be a nonempty string`)
+  if (!value.isWellFormed()) throw new ValidationError(`${label} must be a well-formed string`)
   return value
 }
 

@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from ._vector import column_kind, to_wire
+from ._vector import column_kind, to_wire, well_formed
 from .errors import LimitExceededError, ValidationError
 from .validation import Schema, validate_identifier, validate_schema
 
@@ -18,6 +18,8 @@ OPTION_FIELDS = ('partition_by', 'full_text', 'embed')
 def _text(value: object, label: str) -> str:
     if type(value) is not str or not value:
         raise ValidationError(f'{label} must be a nonempty string')
+    if not well_formed(value):
+        raise ValidationError(f'{label} must be a well-formed string')
     return value
 
 

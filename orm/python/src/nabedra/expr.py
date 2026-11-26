@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
-from ._vector import check_query, column_kind, has_zero_vector, query_value, to_wire
+from ._vector import check_query, column_kind, has_zero_vector, query_value, text, to_wire
 from .errors import ValidationError
 from .validation import ColumnType, Scalar, VectorValue, validate_identifier, validate_value
 
@@ -168,7 +168,7 @@ class Ranking:
 def _string(value: object, column: str) -> str:
     if type(value) is not str:
         raise ValidationError(f"Column {column!r} requires string values")
-    return value
+    return text(value, column)
 
 
 def col(name: str) -> Expr:

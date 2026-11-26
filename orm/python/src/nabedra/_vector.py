@@ -77,6 +77,21 @@ def type_from_wire(wire: object) -> object:
     raise ValidationError('Unsupported wire schema type')
 
 
+def well_formed(value: str) -> bool:
+    """A string without lone surrogates, so it encodes as UTF-8."""
+    try:
+        value.encode('utf-8')
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def text(value: str, column: str) -> str:
+    if not well_formed(value):
+        raise ValidationError(f'Column {column!r} requires well-formed strings')
+    return value
+
+
 def _float32(values: object, column: str) -> array:
     """Copy Python floats to finite float32 values."""
     if not set(map(type, values)) <= {float, int}:
@@ -136,7 +151,7 @@ def multi(value: object, column: str, dim: int | None = None) -> list[array]:
 def tags(value: object, column: str) -> list[str]:
     if type(value) not in (list, tuple) or not set(map(type, value)) <= {str}:
         raise ValidationError(f'Column {column!r} requires a list of strings')
-    return list(value)
+    return [text(item, column) for item in value]
 
 
 def check_value(value: object, typ: object, column: str) -> object:
@@ -156,7 +171,7 @@ def check_value(value: object, typ: object, column: str) -> object:
 def query_value(value: object, column: str) -> str | array | dict[int, float] | list[array]:
     """Detach a query value before its column type is known."""
     if type(value) is str:
-        return value
+        return text(value, column)
     if isinstance(value, Mapping):
         return sparse(value, column)
     if type(value) in (list, tuple) and value and type(value[0]) not in (float, int, bool):

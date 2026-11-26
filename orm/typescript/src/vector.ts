@@ -88,6 +88,12 @@ export function typeFromWire(wire: unknown, response: boolean): Vector | List {
   throw new ValidationError("Unsupported wire schema type")
 }
 
+/** A string without lone surrogates, so it encodes as UTF-8. */
+export function text(value: string, column: string): string {
+  if (!value.isWellFormed()) throw new ValidationError(`Column '${column}' requires well-formed strings`)
+  return value
+}
+
 function invalidVector(column: string): ValidationError {
   return new ValidationError(`Column '${column}' requires a float32 vector`)
 }
@@ -140,7 +146,7 @@ export function tags(value: unknown, column: string): string[] {
   if (!Array.isArray(value) || Array.from(value as unknown[]).some((item) => typeof item !== "string")) {
     throw new ValidationError(`Column '${column}' requires a list of strings`)
   }
-  return [...value as string[]]
+  return (value as string[]).map((item) => text(item, column))
 }
 
 /** Copy one row value of a nonscalar column. Only vector columns accept null. */
@@ -155,7 +161,7 @@ export function checkValue(value: unknown, type: unknown, column: string): unkno
 
 /** Detach a query value before its column type is known. */
 export function queryValue(value: unknown, column: string): QueryValue {
-  if (typeof value === "string") return value
+  if (typeof value === "string") return text(value, column)
   if (isJsonObject(value)) return sparse(value, column)
   if (Array.isArray(value) && value.length > 0 && typeof value[0] !== "number" && typeof value[0] !== "boolean") {
     return multi(value, column)
