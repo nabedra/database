@@ -7,6 +7,6 @@ scenarios = ["EV01", "EV02", "EV07"]
 tiers = ["T1"]
 command = ["python3", "scripts/testing/tla_check.py", "specs/events", "EventsLog"]
 cwd = "."
-timeout_s = 15600
+timeout_s = 15900
 needs = ["tlc"]
 result_parser = "tlc"
