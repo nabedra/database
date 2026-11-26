@@ -1,0 +1,37 @@
+id = "oltp-probes-planted"
+module = "oltp"
+kinds = ["S", "H"]
+# Fault model. Sensitivity of the probe-driven invariants (P10-PROBES). In a scratch worktree the
+# same seeds run twice. The clean twin must report nothing, on seed 18 too. Then
+# server/sim-oltp/src/probes/double-apply.patch makes every replica apply each normal Raft entry
+# twice. The state machine's replay check hides the repeat from clients, so the history checkers
+# and public stats stay clean, and only MonotonicCommit (from the Applied probes) reports it. Both
+# tests require that each seed replays with the same trace hash, history and violations, and
+# print how often each rule ran.
+# It proves no product guarantee by itself.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+root="$(git rev-parse --show-toplevel)"
+export CARGO_TARGET_DIR="$PWD/target/sim"
+mkdir -p "$PWD/target"
+scratch="$(mktemp -d "$PWD/target/probes-planted.XXXXXX")"
+trap 'git -C "$root" worktree remove --force "$scratch" >/dev/null 2>&1 || true' EXIT
+git -C "$root" worktree add --detach "$scratch" HEAD >/dev/null
+probes=server/sim-oltp/src/probes
+cd "$scratch/server"
+sweep() {
+    cargo test --locked --release -p nabedra-sim-oltp --lib --no-run
+    timeout 900s cargo test --locked --release -p nabedra-sim-oltp --lib -- \
+        --exact --ignored --nocapture --test-threads=1 "probes::tests::$1"
+}
+sweep clean_twin_reports_nothing
+git -C "$scratch" apply --verbose "$probes/double-apply.patch"
+sweep planted_double_apply_is_caught_only_by_probes
+''']
+cwd = "server"
+timeout_s = 3600
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", NABEDRA_SEED = "1", NABEDRA_SEEDS = "3" }

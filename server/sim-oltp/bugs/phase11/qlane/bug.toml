@@ -1,0 +1,68 @@
+# Reverted fix QLANE (phase 11, design section 4.2, row 21).
+schema = "nabedra.sim-bug/1"
+id = "qlane"
+bug = "QLANE"
+set = "queued"
+phase = 11
+class = "resource-release-order"
+guarantees = ["OLTP-G05", "OLTP-G07", "OLTP-G09"]
+scenarios = ["O07", "O08"]
+fix_commits = ["b179b5840b06d2ec7bf0bf001325101b06629dad", "7ddad3bbf4c3871c2db88a579312e81dc33fbd2a"]
+reverts = ["7ddad3bbf4c3871c2db88a579312e81dc33fbd2a"]
+port = "hand"
+port_notes = """
+7ddad3bb reversed at its decision in service_rpc/participant_full.rs: PreparePage, Seal and Resolve use
+client.call again, so a full outgoing Storage lane refuses an accepted batch. The boxed lane wait
+(b179b584) stays for its other callers.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
+workload = "queued"
+profile = ["lane-exhaust", "cross-range-batches"]
+# Lead decisions are in designs/lead-decisions.md, outside this repository.
+expect = []
+expect_reason = """\
+Lead decision 9, count after review-121: "Rows 12 and 21: the quoted text ("Retain accepted work through \
+individual failures while a request copy survives", OLTP-G07) doesn't forbid a definite refusal after \
+acceptance, so they don't count." The texts are docs/testing/scheduler-contract.md, "Retain accepted work \
+through individual failures while a request copy survives.", and docs/testing/guarantees/oltp.md, OLTP-G07, \
+"Accepted queued work stays recoverable while a complete copy survives. A full worker stop abandons outstanding \
+work." The patched build gives such a refusal: 429 `worker outgoing lane full (Storage)`, not_applied.\
+"""
+seeds = [1, 10000]
+
+[regression]
+kind = "lib-test"
+test = "oltp_runtime::worker_runtime::direct_gateway::tests::o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane"
+mode = "on"
+assertion = "state"
+failure_contains = ["worker outgoing lane full (Storage)"]
+
+# The patch author's own runs.
+[regression.evidence]
+digest = "07e2d4b3d81c1a77a5f74a66d092131c6494925bd5035a8837dc02425522aec9"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45436008436", sha = "ce3343ba76532cc93bd6d1eea882d9d2cba6cd42", result = "failed", note = "request p11-bugs-qlane-ce3343b-172042, o07_o13_q01_accepted_batch_waits_for_prepare_storage_lane, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+nabedra-db: transaction e94baff9-bbfe-497c-80c4-68c1e5e6becd preparation failed: Overloaded: worker outgoing lane full (Storage)
+assertion `left == right` failed
+  left: (429, Object {"error": Object {"code": String("overloaded"), "message": String("worker outgoing lane full (Storage)"), "outcome": String("not_applied")}, "request_id": String("e94baff9-bbfe-497c-80c4-68c1e5e6becd")})
+ right: (200, Object {"data": Number(2), "request_id": String("e94baff9-bbfe-497c-80c4-68c1e5e6becd")})
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 196 filtered out; finished in 0.98s
+""" }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact inverse of 7ddad3bb, including the error mapping. Kept apart from the author's evidence above. These
+# are workflow `tests`, `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - the [regression] test: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456693715 (17c0a6ee) 3 of 3 failed: the accepted batch ended 429 `worker outgoing lane full (Storage)`.
+# Transcribed from review-121, which judged head 58fa013b. These are the bytes it read. The assertion type is read from
+# the failure text it reports.
+[review]
+digest = "828c1e0bb85dff2c8e64b6fff9d6d3ea4128fa87d9ba128df033b3f935cd0dd1"
+verdict = "sensitive"
+assertion = "state"
+reviewer = "Claude Opus 5.5 (REVIEW-121, independent reviewer of PR #121, wrote no patch)"
+source = "wave-p8/reports/review-121.md, 2026-11-24, on 58fa013bbcc5047a6d12529cc388514362ca57eb. The report is outside this repository."
+notes = """\
+Patch read: exact inverse of 7ddad3bb, including the error mapping. Patched: the accepted batch ended 429 \
+`worker outgoing lane full (Storage)`.\
+"""

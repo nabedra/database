@@ -869,3 +869,251 @@ fn the_same_seed_gives_the_same_network_trace() {
     assert_eq!(first, traced_run(21));
     assert_ne!(first, traced_run(22));
 }
+
+/// The addresses a scan over the connections finds held. `gone` remembers the connections
+/// whose client closed before they were accepted, also once they are accepted.
+fn assert_held(world: &Arc<World>, gone: &mut std::collections::BTreeSet<u64>) {
+    let net = super::net_of(world);
+    let state = net.lock();
+    let mut held = std::collections::BTreeMap::new();
+    for (id, conn) in &state.conns {
+        if !conn.open[0] && !conn.accepted {
+            gone.insert(*id);
+        }
+        if conn.reset || conn.power_cut {
+            continue;
+        }
+        for end in conn.ends.iter().skip(usize::from(gone.contains(id))) {
+            *held.entry(end.addr).or_default() += 1;
+        }
+    }
+    assert_eq!(state.ports.lock().ends, held);
+}
+
+fn lookups(world: &Arc<World>) -> u64 {
+    super::net_of(world).lock().ports.lock().lookups
+}
+
+fn connections(world: &Arc<World>) -> usize {
+    super::net_of(world).lock().conns.len()
+}
+
+async fn plain(addr: SocketAddr) -> SimStream {
+    in_node(1, dial(Target::Addr(addr))).await.unwrap().plain()
+}
+
+/// The client has closed, but its request is still there, and then the end of the stream.
+#[test]
+fn a_connection_closed_before_it_is_accepted_arrives_with_its_data() {
+    run(50, |world| async move {
+        nodes(&world, &[1, 2]);
+        let listener = world.listen(2, any(0)).unwrap();
+        let addr = listener.local_addr();
+        let mut client = plain(addr).await;
+        send(&mut client, b"GET / HTTP/1.1").await.unwrap();
+        let port = client.local_addr();
+        drop(client);
+        // A second one that says nothing.
+        drop(plain(addr).await);
+        time::sleep(ms(5_000)).await;
+
+        let (pending, peer) = in_node(2, listener.accept()).await.unwrap();
+        assert_eq!((peer, pending.peer_addr()), (port, port));
+        let mut server = pending.plain();
+        let mut text = Vec::new();
+        server.read_to_end(&mut text).await.unwrap();
+        assert_eq!(text, b"GET / HTTP/1.1");
+        let (pending, _) = in_node(2, listener.accept()).await.unwrap();
+        let mut rest = Vec::new();
+        pending.plain().read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+        drop(server);
+        assert_eq!(connections(&world), 0);
+        assert_held(&world, &mut Default::default());
+    });
+}
+
+/// Only a client that closed before it was accepted gives its port back early.
+#[test]
+fn an_unaccepted_connection_frees_its_port_when_the_client_closes() {
+    run(51, |world| async move {
+        nodes(&world, &[1, 2]);
+        let listener = world.listen(2, any(80)).unwrap();
+        let addr = listener.local_addr();
+        let taken = |port| {
+            let error = world.listen(1, port).err();
+            error.map(|error| error.kind()) == Some(io::ErrorKind::AddrInUse)
+        };
+        let waiting = plain(addr).await;
+        let port = waiting.local_addr();
+        assert!(taken(port));
+        drop(waiting);
+        assert!(!taken(port));
+
+        // Accepted first: half closed, and the port stays taken until the server closes too.
+        let client = plain(addr).await;
+        let port = client.local_addr();
+        let stale = in_node(2, listener.accept()).await.unwrap();
+        let server = in_node(2, listener.accept()).await.unwrap();
+        assert_eq!(server.1, port);
+        drop(client);
+        assert!(taken(port));
+        drop((server, stale));
+        assert!(!taken(port));
+        assert_held(&world, &mut Default::default());
+    });
+}
+
+/// Closing the listener ends the server's side of what it has not accepted, so a connection
+/// whose client closed first has no handle left and is forgotten.
+#[test]
+fn a_closed_listener_forgets_what_its_clients_closed() {
+    run(54, |world| async move {
+        nodes(&world, &[1, 2]);
+        let listener = world.listen(2, any(80)).unwrap();
+        let addr = listener.local_addr();
+        let kept = plain(addr).await;
+        drop(plain(addr).await);
+        assert_eq!(connections(&world), 2);
+        drop(listener);
+        assert_eq!(connections(&world), 1);
+        drop(kept);
+        assert_eq!(connections(&world), 0);
+
+        // The same when the node crashes.
+        let _listener = world.listen(2, any(80)).unwrap();
+        drop(plain(addr).await);
+        assert_eq!(connections(&world), 1);
+        world.crash(2);
+        assert_eq!(connections(&world), 0);
+        assert_held(&world, &mut Default::default());
+    });
+}
+
+/// A frozen node accepts nothing. Its peers redial and give up, for much longer than there
+/// are ports.
+#[test]
+fn dials_to_a_frozen_listener_never_run_out_of_ports() {
+    run(52, |world| async move {
+        nodes(&world, &[1, 2]);
+        let listener = world.listen(2, any(0)).unwrap();
+        let addr = listener.local_addr();
+        world.freeze(2);
+        // Two ports are in use throughout, and the counter passes them once.
+        let kept =
+            [plain(addr).await, plain(addr).await].map(|stream| (stream.local_addr(), stream));
+        let range = u32::from(u16::MAX - FIRST_EPHEMERAL_PORT) + 1;
+        let mut seen = std::collections::BTreeSet::new();
+        for n in 0..20_000 {
+            let before = lookups(&world);
+            let client = plain(addr).await;
+            let steps = lookups(&world) - before;
+            assert!(steps <= 3, "dial {n} looked {steps} times");
+            assert!(kept.iter().all(|(port, _)| *port != client.local_addr()));
+            seen.insert(client.local_addr().port());
+        }
+        // Every port of the range but the two that are kept.
+        assert_eq!(seen.len(), range as usize - kept.len());
+        // The backlog keeps every one of them.
+        assert_eq!(connections(&world), 20_000 + kept.len());
+        let mut gone = std::collections::BTreeSet::new();
+        assert_held(&world, &mut gone);
+        world.thaw(2);
+        for _ in 0..20_000 + kept.len() {
+            drop(in_node(2, listener.accept()).await.unwrap());
+        }
+        assert_eq!(connections(&world), kept.len());
+        assert_held(&world, &mut gone);
+    });
+}
+
+/// With every port really in use a dial looks at each port once, however many connections
+/// there are, and fails.
+#[test]
+fn a_dial_looks_at_each_port_at_most_once() {
+    run(53, |world| async move {
+        nodes(&world, &[1, 2]);
+        let listener = world.listen(2, any(80)).unwrap();
+        let addr = listener.local_addr();
+        let range = u64::from(u16::MAX - FIRST_EPHEMERAL_PORT) + 1;
+        let mut open = Vec::new();
+        for _ in 0..range {
+            open.push(in_node(1, dial(Target::Addr(addr))).await.unwrap());
+        }
+        let before = lookups(&world);
+        let error = in_node(1, dial(Target::Addr(addr))).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(lookups(&world) - before, range);
+        // Another node has its own ports.
+        let before = lookups(&world);
+        let other = in_node(2, dial(Target::Addr(addr))).await.unwrap();
+        assert_eq!(lookups(&world) - before, 1);
+        drop(other);
+        // One port comes back, and it is the one that is chosen.
+        let freed = open.swap_remove(700).local_addr();
+        let again = in_node(1, dial(Target::Addr(addr))).await.unwrap();
+        assert_eq!(again.local_addr(), freed);
+    });
+}
+
+/// Random dials, accepts, closes, resets, crashes and cuts: the addresses held are always
+/// those of a scan over the connections, so each choice is the one the scan would make.
+#[test]
+fn held_ports_agree_with_a_scan_of_the_connections() {
+    for seed in 60..70 {
+        run(seed, |world| async move {
+            nodes(&world, &[1, 2, 3]);
+            let mut rng = SplitMix64::new(seed);
+            let mut listeners = std::collections::BTreeMap::new();
+            let mut handles: Vec<Pending> = Vec::new();
+            let mut gone = std::collections::BTreeSet::new();
+            for _ in 0..600 {
+                let node = 1 + rng.below(3);
+                if !world.is_up(node) {
+                    world.restart(node);
+                }
+                let listener = listeners
+                    .entry(node)
+                    .or_insert_with(|| world.listen(node, any(0)).unwrap());
+                let addr = SimListener::local_addr(listener);
+                match rng.below(20) {
+                    0..=8 => {
+                        let from = 1 + rng.below(3);
+                        if let Ok(dialed) = in_node(from, dial(Target::Addr(addr))).await {
+                            handles.push(dialed);
+                        }
+                    }
+                    9..=11 => {
+                        let accepted = in_node(node, listener.accept());
+                        if let Ok(Ok((pending, _))) = time::timeout(ms(1), accepted).await {
+                            handles.push(pending);
+                        }
+                    }
+                    12..=15 if !handles.is_empty() => {
+                        let at = rng.below(handles.len() as u64) as usize;
+                        drop(handles.swap_remove(at));
+                    }
+                    16 => {
+                        let ids: Vec<ConnId> =
+                            world.connections().iter().map(|conn| conn.id).collect();
+                        if !ids.is_empty() {
+                            world.reset_connection(ids[rng.below(ids.len() as u64) as usize]);
+                        }
+                    }
+                    17 => {
+                        world.crash(node);
+                        listeners.remove(&node);
+                    }
+                    18 => {
+                        world.power_off(node);
+                        listeners.remove(&node);
+                    }
+                    _ => {
+                        listeners.remove(&node);
+                    }
+                }
+                assert_held(&world, &mut gone);
+            }
+        });
+    }
+}

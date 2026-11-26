@@ -1,0 +1,29 @@
+# Traces that carry less than their actions need, or something a checker misreads, must not be
+# accepted: a required variable omitted, misspelt or given twice, an unknown variable, only action
+# names, a message missing or wrong, and an integer TLC wraps to the right one. The trace writer cannot
+# write or refuses to write each of them (two_phase_trace.rs), so these are edited by hand, and what is
+# checked is the trace spec and tla_trace.py. Six are refused by TLC at the line in the name, two by the
+# lint (.at-lint). The two unedited traces they were made from must be accepted, so the check cannot
+# pass without a trace to accept or by refusing everything. Before TraceStep and RequireMsg in specs/lib
+# and the lint's rules on keys and integers, all eight were accepted.
+id = "sim-two-phase-trace-incomplete"
+module = "sim"
+kinds = ["T"]
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+traces="$PWD/target/sim-two-phase-trace-incomplete"
+rm -rf "$traces"
+export NABEDRA_TRACE_DIR="$traces/accepted"
+export RUSTFLAGS="--cfg tokio_unstable"
+export CARGO_TARGET_DIR="$PWD/server/target/sim"
+cargo test --locked -p nabedra-sim --manifest-path server/Cargo.toml --test two_phase_trace
+test "$(find "$traces/incomplete" -name "TwoPhase-*.ndjson" | wc -l)" -eq 8
+test "$(find "$traces/clean" -name "TwoPhase-*.ndjson" | wc -l)" -eq 2
+exec python3 scripts/testing/tla_trace.py check specs/selftest TwoPhase "$traces/clean" --expect-rejected "$traces/incomplete" --module sim
+''']
+cwd = "."
+timeout_s = 1800
+needs = ["tlc"]
+result_parser = "tlc"

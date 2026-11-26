@@ -5,7 +5,8 @@
 //! | [`linearizable::check_kv`] | per-key registers are linearizable | `non-linearizable` |
 //! | [`txn::check`] | transactions are (strictly) serializable | `G0` `G1a` `G1b` `G1c` `G-single` `G2`, the `-realtime` variants, `incompatible-order`, `garbage-read`, `duplicate-elements` |
 //! | [`outcome::check`] | a failed or `not_applied` write never takes effect | `failed-write-observed` |
-//! | [`direct::check`] | direct-path registers and single-range batches are linearizable, each request identity commits at most once, and failed attempts have no effects | `non-linearizable` `failed-write-observed` `dedup-miss` `request-id-reuse-undetected` `request-id-reuse-misdetected` |
+//! | [`direct::check`] | direct-path registers and single-range batches are linearizable, each request identity commits at most once and keeps its first definite result, and failed attempts have no effects | `non-linearizable` `failed-write-observed` `dedup-miss` `unstable-result` `request-id-reuse-undetected` `request-id-reuse-misdetected` |
+//! | [`direct::check_with`] | an opt-in rule about refusals, off by default ([`direct::request_rules`]) | `not-applied-took-effect` |
 //! | [`queue::check`] | log offsets, ordering, durability and redelivery | `duplicate-offset` `duplicate-event` `offset-gap` `out-of-order` `lost-publish` `redelivery-missing` |
 //! | [`relaxed_kv::check`] | asynchronous Cache replica promise (CACHE-G05) | `invented-value` `resurrection` `stale-read` `lost-write` |
 //!
@@ -13,6 +14,7 @@
 //! `malformed-history`, so it can never pass silently.
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 pub mod direct;
 pub mod edn;
@@ -35,6 +37,19 @@ pub struct Verdict {
     pub valid: bool,
     pub anomalies: Vec<Anomaly>,
     pub checked_ops: usize,
+    /// Refused inserts that [`direct::check`] could not classify and therefore did not take as a
+    /// result. Not an anomaly, but with many of them the retry rule checks little, so a caller has
+    /// to print the count. See [`direct::results`].
+    #[serde(skip_serializing_if = "none")]
+    pub unclassified_conflicts: usize,
+    /// What [`direct::check`] accepted because no text decides it, by name. Not anomalies, but a
+    /// caller has to print them. See [`direct::results`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub not_judged: BTreeMap<String, usize>,
+}
+
+fn none(count: &usize) -> bool {
+    *count == 0
 }
 
 impl Verdict {
@@ -43,6 +58,8 @@ impl Verdict {
             valid: anomalies.is_empty(),
             anomalies,
             checked_ops,
+            unclassified_conflicts: 0,
+            not_judged: BTreeMap::new(),
         }
     }
 
@@ -73,11 +90,22 @@ impl Verdict {
     pub fn merge(verdicts: impl IntoIterator<Item = Verdict>) -> Verdict {
         let mut anomalies = Vec::new();
         let mut checked = 0;
+        let mut unclassified = 0;
+        let mut not_judged = BTreeMap::<String, usize>::new();
         for v in verdicts {
             checked = checked.max(v.checked_ops);
+            unclassified = unclassified.max(v.unclassified_conflicts);
+            for (name, times) in v.not_judged {
+                let most = not_judged.entry(name).or_default();
+                *most = times.max(*most);
+            }
             anomalies.extend(v.anomalies);
         }
-        Verdict::new(checked, anomalies)
+        Verdict {
+            unclassified_conflicts: unclassified,
+            not_judged,
+            ..Verdict::new(checked, anomalies)
+        }
     }
 }
 

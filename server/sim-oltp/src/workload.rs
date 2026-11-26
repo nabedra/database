@@ -25,29 +25,63 @@ use crate::{
     history::{Client, Completion, History, Operation},
     invariants::{Invariants, STEP, TraceObserver, elapsed_ms},
     node::Cluster,
-    sweep::{Defect, RunResult},
+    panics::{self, PANIC, Watch},
+    sweep::{Defect, RunResult, Setup},
+    workloads::{self, Scenarios, Workload},
 };
 
 const OPERATIONS: &str = "/v1/operations";
 const SETUP_DEADLINE: Duration = Duration::from_secs(20);
 const SETTLE_LIMIT: Duration = Duration::from_secs(2);
 
-pub(crate) fn run_seed(seed: u64, generator: &mut Gen, defect: Defect) -> RunResult {
-    run(seed, generator, defect, None)
+pub(crate) fn run_seed(seed: u64, generator: &mut Gen, defect: Defect, setup: &Setup) -> RunResult {
+    run(seed, generator, defect, None, setup)
 }
 
-fn run(seed: u64, generator: &mut Gen, defect: Defect, cold_start: Option<DiskCut>) -> RunResult {
-    let config = Config::sample(seed);
-    let program = Program::generate(generator);
-    let (mut result, world) = nabedra_sim::runtime::run(seed, |world| async move {
-        let result = execute(seed, config, program, defect, cold_start, world.clone()).await;
-        (result, world)
+fn run(
+    seed: u64,
+    generator: &mut Gen,
+    defect: Defect,
+    cold_start: Option<DiskCut>,
+    setup: &Setup,
+) -> RunResult {
+    let workload = setup.workloads.of(seed);
+    assert!(
+        !panics::poisoned(),
+        "an earlier run of this process panicked without its teardown"
+    );
+    let mut config = Config::sample(seed);
+    if workloads::paused::samples(seed, workload) || setup.selection.focus.d05 {
+        let deadline = workloads::paused::DEADLINE.as_millis() as u64;
+        config.force("request_deadline_ms", json!(deadline));
+    }
+    if setup.selection.focus.batch {
+        config.force("data.direct.batch", json!(true));
+    }
+    let program = (workload == Workload::Smoke).then(|| Program::generate(generator));
+    let (mut result, world, panics) = nabedra_sim::runtime::run(seed, |world| async move {
+        let panics = Watch::new(&world);
+        #[cfg(test)]
+        if let Some(at) = setup.panic_at {
+            world.insert_ext(crate::panics::Planted { at, fired: false });
+        }
+        let body = Body {
+            seed,
+            config,
+            program,
+            defect,
+            cold_start,
+            workload,
+            setup,
+            generator,
+        };
+        let result = execute(body, world.clone()).await;
+        (result, world, panics)
     });
-    // The runtime has dropped, including cancelled task futures and blocking helpers.
-    // Filter the weak registry by this World so parallel seeds cannot alias its mount.
+    // The runtime has dropped, including cancelled task futures.
     result.blocking_cpu = world.blocking_cpu_time();
-    let live = world.live_registries();
-    let clean = registries_empty(&world) && live.is_empty();
+    let live = live_after(world);
+    let clean = live.is_empty();
     result.assertions.insert("registries empty", clean);
     if !clean {
         result.run.violations.push(format!(
@@ -55,7 +89,47 @@ fn run(seed: u64, generator: &mut Gen, defect: Defect, cold_start: Option<DiskCu
             result.run.virtual_ms
         ));
     }
+    // Last, so that a panic while the runtime or the world was dropped counts as well.
+    let panicked = panics.finish();
     result
+        .assertions
+        .insert("no task panicked", panicked.is_empty());
+    for panic in panicked {
+        result
+            .run
+            .violations
+            .push(format!("t={}ms {PANIC}: {panic}", result.run.virtual_ms));
+    }
+    if panics::poisoned() {
+        // Another run of this process escaped while this one ran.
+        result.run.violations =
+            vec!["harness: another run of this process panicked without its teardown".into()];
+    }
+    result
+}
+
+/// What a finished run still keeps alive. The registries hold weak references, so they
+/// miss a cycle through the world itself, which owns every mounted image: the world must
+/// be gone once this last handle drops. Entries are filtered by this world, so parallel
+/// seeds cannot alias its mounts.
+pub(crate) fn live_after(world: Arc<World>) -> Vec<&'static str> {
+    // The blocking helper replies before it drops its job's handle on the world, and it
+    // takes one job at a time, so a later job's reply means that handle is gone.
+    nabedra_sim::runtime::run(0, |_| async {
+        nabedra_rt::task::spawn_blocking(|| ())
+            .await
+            .expect("simulation blocking helper");
+    });
+    let mut live = world.live_registries();
+    if !registries_empty(&world) {
+        live.push("disk budget registry");
+    }
+    let released = Arc::downgrade(&world);
+    drop(world);
+    if released.strong_count() != 0 {
+        live.push("World");
+    }
+    live
 }
 
 struct Program {
@@ -80,14 +154,30 @@ impl Program {
     }
 }
 
-async fn execute(
+struct Body<'a> {
     seed: u64,
     config: Config,
-    program: Program,
+    program: Option<Program>,
     defect: Defect,
     cold_start: Option<DiskCut>,
-    world: Arc<World>,
-) -> RunResult {
+    workload: Workload,
+    setup: &'a Setup,
+    generator: &'a mut Gen,
+}
+
+async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
+    let Body {
+        seed,
+        config,
+        program,
+        defect,
+        cold_start,
+        workload,
+        setup,
+        generator,
+    } = body;
+    let mut scenarios = Scenarios::new();
+    let mut summary = Value::Null;
     config.setup(&world);
     let configuration = config.report();
     let trace = Arc::new(Mutex::new(RunTrace::default()));
@@ -98,8 +188,9 @@ async fn execute(
     observer(0, format!("configuration {}", configuration["hash"]));
     let checks = Invariants::new();
     checks.set_trace(observer.clone());
-    let mut history = History::default();
-    history.set_trace(observer.clone());
+    checks.install_probes(&world, workload.name());
+    let history = Arc::new(Mutex::new(History::default()));
+    history.lock().unwrap().set_trace(observer.clone());
     let mut assertions = BTreeMap::new();
     // This ticker uses runtime time. Drifting node clocks never alter the
     // invariant sampling frequency.
@@ -109,6 +200,8 @@ async fn execute(
         nabedra_rt::task::spawn(async move {
             loop {
                 time::sleep(STEP).await;
+                #[cfg(test)]
+                crate::panics::plant(&world, crate::panics::At::Ticker);
                 checks.step(&world);
             }
         })
@@ -127,52 +220,92 @@ async fn execute(
     .await
     {
         Ok(mut cluster) => {
-            let startup = cluster.start().await;
-            assertions.insert("cluster readiness", startup.is_ok());
-            match startup {
-                Ok(()) => {
-                    match smoke(&mut cluster, &config, &program, defect, &mut history).await {
-                        Ok(table) => {
-                            assertions.insert("public HTTP workload completed", true);
-                            if let Some(cut) = cold_start {
-                                let started = world.elapsed();
-                                let recovered = verify_cold_start(
-                                    &mut cluster,
-                                    &mut history,
-                                    &table,
-                                    &program,
-                                    cut,
-                                )
-                                .await;
-                                assertions.insert(
-                                    "cold start preserved acknowledged data",
-                                    recovered.is_ok(),
-                                );
-                                if let Err(error) = recovered {
-                                    checks.violate(&world, "ColdLifecycle", error);
+            let body = panics::caught(async {
+                let startup = cluster.start().await;
+                assertions.insert("cluster readiness", startup.is_ok());
+                // Only then: a sweep is a test build too, and extra tasks change its schedule.
+                #[cfg(test)]
+                if setup.panic_at.is_some() {
+                    plant_panics(&world);
+                }
+                match startup {
+                    Ok(()) if workload != Workload::Smoke => {
+                        let report = workloads::direct::run(
+                            &mut cluster,
+                            &config,
+                            history.clone(),
+                            generator,
+                            seed,
+                            workload,
+                            &setup.selection,
+                            setup.quiet,
+                        )
+                        .await;
+                        match report {
+                            Ok(report) => {
+                                for (name, passed) in report.assertions {
+                                    assertions.insert(name, passed);
                                 }
-                                println!(
-                                    "fault model cold bootstrap seed {seed}: {:?} virtual",
-                                    world.elapsed() - started
-                                );
+                                scenarios = report.scenarios;
+                                summary = report.summary;
                             }
-                            for (name, violation) in [
-                                ("direct path observed", "DirectPath"),
-                                ("public resource baseline", "ResourceBaseline"),
-                                ("original keyed retry result", "DedupUnique"),
-                            ] {
-                                assertions.insert(name, !has_violation(&checks, violation));
+                            Err(error) => {
+                                assertions.insert("public HTTP workload completed", false);
+                                checks.violate(&world, "Workload", error);
                             }
-                        }
-                        Err(error) => {
-                            assertions.insert("public HTTP workload completed", false);
-                            checks.violate(&world, "SmokeWorkload", error);
                         }
                     }
+                    Ok(()) => {
+                        let program = program.as_ref().expect("smoke program");
+                        let mut history = history.lock().unwrap();
+                        match smoke(&mut cluster, &config, program, defect, &mut history).await {
+                            Ok(table) => {
+                                assertions.insert("public HTTP workload completed", true);
+                                if let Some(cut) = cold_start {
+                                    let started = world.elapsed();
+                                    let recovered = verify_cold_start(
+                                        &mut cluster,
+                                        &mut history,
+                                        &table,
+                                        program,
+                                        cut,
+                                    )
+                                    .await;
+                                    assertions.insert(
+                                        "cold start preserved acknowledged data",
+                                        recovered.is_ok(),
+                                    );
+                                    if let Err(error) = recovered {
+                                        checks.violate(&world, "ColdLifecycle", error);
+                                    }
+                                    println!(
+                                        "fault model cold bootstrap seed {seed}: {:?} virtual",
+                                        world.elapsed() - started
+                                    );
+                                }
+                                for (name, violation) in [
+                                    ("direct path observed", "DirectPath"),
+                                    ("public resource baseline", "ResourceBaseline"),
+                                    ("original keyed retry result", "DedupUnique"),
+                                ] {
+                                    assertions.insert(name, !has_violation(&checks, violation));
+                                }
+                            }
+                            Err(error) => {
+                                assertions.insert("public HTTP workload completed", false);
+                                checks.violate(&world, "SmokeWorkload", error);
+                            }
+                        }
+                    }
+                    Err(error) => checks.violate(&world, "Bootstrap", error),
                 }
-                Err(error) => checks.violate(&world, "Bootstrap", error),
+            });
+            if let Err(panic) = body.await {
+                checks.violate(&world, "harness", format!("panic: {panic}"));
             }
             cluster.teardown().await;
+            #[cfg(test)]
+            panics::plant(&world, panics::At::Escapes);
             assertions.insert(
                 "crash teardown",
                 !has_violation(&checks, "CrashOrder") && !has_violation(&checks, "ProcessExit"),
@@ -188,14 +321,21 @@ async fn execute(
         !has_violation(&checks, "MountedDeviceIdentity"),
     );
     assertions.insert("liveness", !has_violation(&checks, "Liveness"));
+    let history = std::mem::take(&mut *history.lock().unwrap());
+    let mut unclassified_conflicts = 0;
+    let mut not_judged = BTreeMap::new();
     if history.events().iter().any(|event| event.key.is_some()) {
         let verdict = history.check_direct();
+        unclassified_conflicts = verdict.unclassified_conflicts;
+        not_judged = verdict.not_judged.clone();
         assertions.insert(
             "linearizability and keyed dedup",
             verdict.anomalies.is_empty(),
         );
         checks.check_history(&world, &verdict);
     }
+    checks.check_outcomes(&world, history.events(), history.bodies());
+    assertions.insert("probe invariants", checks.probe_invariants_hold());
     let mut capture = trace.lock().unwrap();
     capture.flush_frames();
     let trace = &capture.trace;
@@ -214,7 +354,34 @@ async fn execute(
         },
         assertions,
         blocking_cpu: None,
+        workload,
+        scenarios,
+        summary,
+        exercised: checks
+            .probes()
+            .map(|probes| probes.exercised())
+            .unwrap_or_default(),
+        unclassified_conflicts,
+        not_judged,
     }
+}
+
+/// The panics of `panics::tests` that a started cluster can have anywhere.
+#[cfg(test)]
+fn plant_panics(world: &Arc<World>) {
+    use crate::panics::{At, plant};
+
+    plant(world, At::Body);
+    let run = |at| {
+        let world = world.clone();
+        async move { plant(&world, at) }
+    };
+    nabedra_rt::task::spawn(run(At::Task));
+    nabedra_rt::task::spawn(in_node(WORKERS[0], run(At::Node)));
+    let blocking = world.clone();
+    drop(nabedra_rt::task::spawn_blocking(move || {
+        plant(&blocking, At::Blocking);
+    }));
 }
 
 #[derive(Default)]
@@ -285,6 +452,7 @@ impl Scenario<'_> {
                 .cloned()
                 .unwrap_or_else(|| payload.clone()),
         };
+        let body = operation(id, name, payload);
         let attempt = self.history.invoke(
             client,
             &self.cluster.world,
@@ -297,6 +465,7 @@ impl Scenario<'_> {
                 value: input,
             },
         );
+        self.history.sends(&attempt, &body);
         let deadline = if table.is_none() {
             SETUP_DEADLINE
         } else {
@@ -307,7 +476,7 @@ impl Scenario<'_> {
             gateway,
             OPERATIONS,
             &self.cluster.config.data_token,
-            Some(operation(id, name, payload)),
+            Some(body),
             deadline,
         )
         .await
@@ -391,8 +560,7 @@ async fn smoke(
     let table = created["id"]
         .as_str()
         .ok_or_else(|| format!("table.create lacks table id: {created}"))?;
-    for node in WORKERS {
-        let stats = cluster.stats(node).await?;
+    for (node, stats) in steady(cluster).await? {
         cluster
             .checks
             .capture_resources(&cluster.world, node, &stats);
@@ -523,6 +691,27 @@ async fn verify_cold_start(
     Ok(())
 }
 
+/// Waits until every worker's resources stay the same, so that the baseline holds no charge
+/// of a message in flight.
+pub(crate) async fn steady(cluster: &Cluster) -> Result<Vec<(u64, Value)>, String> {
+    let deadline = cluster.world.elapsed() + SETTLE_LIMIT;
+    loop {
+        let mut steady = true;
+        let mut snapshots = Vec::new();
+        for node in WORKERS {
+            let stats = cluster.stats(node).await?;
+            steady &= cluster
+                .checks
+                .resources_steady(&cluster.world, node, &stats);
+            snapshots.push((node, stats));
+        }
+        if steady || cluster.world.elapsed() >= deadline {
+            return Ok(snapshots);
+        }
+        time::sleep(STEP).await;
+    }
+}
+
 async fn settle(cluster: &Cluster) -> Result<Vec<(u64, Value)>, String> {
     let deadline = cluster.world.elapsed() + SETTLE_LIMIT;
     loop {
@@ -546,6 +735,32 @@ mod tests {
 
     use nabedra_sim::sweep::{SweepConfig, sweep};
 
+    /// Seed 66: with fewer session slots than peers the second gateway never activates the
+    /// direct path, and its retry of a committed insert is answered `outcome_unknown` for ever.
+    /// Red and kept (lead decision 12.4).
+    #[test]
+    fn smoke_seed_66_reaches_the_direct_path_through_both_gateways() {
+        let mut config = SweepConfig::new("oltp-sim-smoke-66", 66, 1);
+        config.require_seeded = true;
+        config.verify_replay = 1.0;
+        config.replay = concat!(
+            "RUST_MIN_STACK=16777216 RUSTFLAGS=\"--cfg tokio_unstable\" ",
+            "CARGO_TARGET_DIR=target/sim cargo test --locked --release ",
+            "-p nabedra-sim-oltp --lib ",
+            "workload::tests::smoke_seed_66_reaches_the_direct_path_through_both_gateways ",
+            "-- --exact --nocapture --test-threads=1",
+        )
+        .into();
+        if let Some(dir) = std::env::var_os("NABEDRA_SIM_ARTIFACTS") {
+            config.artifacts = dir.into();
+        }
+        let setup = Setup::smoke();
+        let report = sweep(&config, |seed, generator| {
+            run(seed, generator, Defect::None, None, &setup).run
+        });
+        report.assert_passed();
+    }
+
     #[test]
     fn cold_start_reopens_mounted_workers() {
         let mut config = SweepConfig::new("oltp-sim-cold-start", 1, 1);
@@ -561,8 +776,9 @@ mod tests {
         if let Some(dir) = std::env::var_os("NABEDRA_SIM_ARTIFACTS") {
             config.artifacts = dir.into();
         }
+        let setup = Setup::smoke();
         let report = sweep(&config, |seed, generator| {
-            run(seed, generator, Defect::None, Some(DiskCut::Power)).run
+            run(seed, generator, Defect::None, Some(DiskCut::Power), &setup).run
         });
         report.assert_passed();
         let seed = &report.seeds[0];

@@ -1,10 +1,11 @@
 //! Simulation-mode tests. Each one fails when the property it names is broken.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use super::{NodeClock, World, current_node, in_node, run};
+use super::{NodeClock, SplitMix64, World, current_node, in_node, run};
+use crate::time::Instant;
 use crate::{ids, task, time};
 
 fn ms(value: u64) -> Duration {
@@ -312,6 +313,57 @@ fn crash_aborts_the_nodes_tasks_and_their_descendants() {
 }
 
 #[test]
+fn a_task_dropped_after_its_node_restarted_is_not_of_the_running_incarnation() {
+    struct Dropped(Arc<World>, Arc<Mutex<Vec<(Option<u64>, bool)>>>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            let seen = (current_node(), self.0.current_incarnation_runs());
+            self.1.lock().unwrap().push(seen);
+        }
+    }
+    run(5, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.add_node(2, NodeClock::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let held = || Dropped(world.clone(), seen.clone());
+        let pending = |dropped: Dropped| async move {
+            let _dropped = dropped;
+            std::future::pending::<()>().await;
+        };
+        let retired = world.spawn_node(1, pending(held()));
+        let other = world.spawn_node(2, pending(held()));
+        tokio::task::yield_now().await;
+
+        world.crash(1);
+        assert!(!in_node(1, async { world.current_incarnation_runs() }).await);
+        world.restart(1);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the task is not dropped yet"
+        );
+        assert!(retired.await.unwrap_err().is_cancelled());
+        assert_eq!(*seen.lock().unwrap(), [(Some(1), false)]);
+
+        // The new incarnation, its jobs, the other node and code outside every node run.
+        let dropped = held();
+        world.spawn_node(1, async { drop(dropped) }).await.unwrap();
+        let dropped = held();
+        let job = in_node(1, async { task::spawn_blocking(move || drop(dropped)) });
+        job.await.await.unwrap();
+        other.abort();
+        assert!(other.await.unwrap_err().is_cancelled());
+        drop(held());
+        let running = [
+            (Some(1), true),
+            (Some(1), true),
+            (Some(2), true),
+            (None, true),
+        ];
+        assert_eq!(seen.lock().unwrap()[1..], running);
+    });
+}
+
+#[test]
 #[allow(clippy::async_yields_async)] // in_node returns a handle spawned inside the node.
 fn spawn_on_registers_with_the_node() {
     run(6, |world| async move {
@@ -490,5 +542,124 @@ fn a_drift_that_stops_the_clock_is_refused() {
                 ..NodeClock::default()
             },
         );
+    });
+}
+
+/// Drift stays within this many parts per million either way.
+const BOUND_PPM: i64 = 200;
+
+/// How far before its deadline, on the node clock, the earliest of many timers fired while
+/// the drift kept changing within the bound.
+fn earliest_timer(seed: u64, floor: Option<i64>) -> Duration {
+    run(seed, move |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.set_timer_floor_ppm(1, floor);
+        let early = Arc::new(Mutex::new(Duration::ZERO));
+        let mut timers = Vec::new();
+        for kind in 0..6_u64 {
+            let early = early.clone();
+            timers.push(world.spawn_node(1, async move {
+                let missed = |deadline: Instant| {
+                    let mut worst = early.lock().unwrap();
+                    *worst = worst.max(deadline.saturating_duration_since(time::now()));
+                };
+                let pending = std::future::pending::<()>;
+                let length = Duration::from_millis(700 + 600 * kind);
+                let deadline = time::now() + length;
+                match kind {
+                    0 => time::sleep(length).await,
+                    1 => time::sleep_until(deadline).await,
+                    2 => assert!(time::timeout(length, pending()).await.is_err()),
+                    3 => assert!(time::timeout_at(deadline, pending()).await.is_err()),
+                    4 => drop(time::interval_at(deadline, length).tick().await),
+                    _ => {
+                        let (start, period) = (time::now(), length / 10);
+                        let mut ticks = time::interval(period);
+                        for tick in 0..10 {
+                            ticks.tick().await;
+                            missed(start + period * tick);
+                        }
+                        return;
+                    }
+                }
+                missed(deadline);
+            }));
+        }
+        let mut rng = SplitMix64::new(seed);
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_micros(rng.below(150_000))).await;
+            let range = 2 * BOUND_PPM as u64 + 1;
+            world.set_drift_ppm(1, rng.below(range) as i64 - BOUND_PPM);
+        }
+        for timer in timers {
+            timer.await.unwrap();
+        }
+        *early.lock().unwrap()
+    })
+}
+
+/// Finding 1 of the fault-model review: a timer armed before a slowdown fired early.
+#[test]
+fn a_timer_floor_keeps_timers_from_firing_early() {
+    let early = |floor| {
+        (0..200)
+            .filter(|&seed| !earliest_timer(seed, floor).is_zero())
+            .count()
+    };
+    assert!(
+        early(None) > 0,
+        "a drift change no longer makes timers early"
+    );
+    assert_eq!(early(Some(-BOUND_PPM)), 0);
+}
+
+/// Seeds on which a lease holder still serves when its successor starts. The holder's only
+/// fence is a timer, and its clock may be slow by the bound. The planted holder allows for
+/// no drift; its clean twin does.
+fn overlaps(planted: bool, floor: Option<i64>) -> usize {
+    (0..200)
+        .filter(|&seed| {
+            run(seed, move |world| async move {
+                const LEASE: Duration = Duration::from_secs(30);
+                world.add_node(1, NodeClock::default());
+                world.set_timer_floor_ppm(1, floor);
+                let serving = Arc::new(AtomicBool::new(true));
+                let flag = serving.clone();
+                world.spawn_node(1, async move {
+                    let margin = LEASE * (2 * BOUND_PPM as u32) / 1_000_000;
+                    let margin = if planted { Duration::ZERO } else { margin };
+                    time::sleep_until(time::now() + LEASE - margin).await;
+                    flag.store(false, Ordering::SeqCst);
+                });
+                let mut rng = SplitMix64::new(seed);
+                let slow_at = Duration::from_millis(1 + rng.below(10_000));
+                tokio::time::sleep(slow_at).await;
+                world.set_drift_ppm(1, -BOUND_PPM);
+                // Two milliseconds cover tokio's timer granularity.
+                tokio::time::sleep(LEASE - slow_at + Duration::from_millis(2)).await;
+                serving.load(Ordering::SeqCst)
+            })
+        })
+        .count()
+}
+
+/// The early timers hid a fence with no allowance for a slow clock: the timer ran on the
+/// rate of the moment it was armed, so the slowed holder still stopped on true time.
+#[test]
+fn a_timer_floor_exposes_a_fence_without_a_drift_margin() {
+    let floor = Some(-BOUND_PPM);
+    assert_eq!(overlaps(true, None), 0, "unreachable without the fault");
+    assert_eq!(overlaps(true, floor), 200, "caught on every seed");
+    assert_eq!(overlaps(false, None), 0);
+    assert_eq!(overlaps(false, floor), 0, "the clean twin allows for drift");
+}
+
+#[test]
+#[should_panic(expected = "is below the node's timer floor")]
+fn a_drift_below_the_timer_floor_panics() {
+    run(1, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.set_timer_floor_ppm(1, Some(-BOUND_PPM));
+        world.set_drift_ppm(1, -BOUND_PPM - 1);
     });
 }

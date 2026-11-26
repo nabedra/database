@@ -1,0 +1,44 @@
+id = "oltp-probes-restart-key"
+module = "oltp"
+kinds = ["S"]
+# The failing assertion of the open bug OLTP-sim-restart-key-entropy. In a scratch worktree,
+# probes::tests::control_digests_replay must fail: two runs of a seed apply Control entries with
+# different digests. With fixed-restart-key.patch, which fixes the key that registered/restart.rs
+# draws from SystemRandom, the same assertion must pass. A pass of this check is not a fix: it says
+# that the bug is still there and that this key is its whole cause on these seeds. Once the key is
+# seeded, the first half fails: close the record and run the assertion in oltp-probes instead.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+root="$(git rev-parse --show-toplevel)"
+export CARGO_TARGET_DIR="$PWD/target/sim"
+mkdir -p "$PWD/target"
+scratch="$(mktemp -d "$PWD/target/probes-restart-key.XXXXXX")"
+trap 'git -C "$root" worktree remove --force "$scratch" >/dev/null 2>&1 || true' EXIT
+git -C "$root" worktree add --detach "$scratch" HEAD >/dev/null
+probes=server/sim-oltp/src/probes
+cd "$scratch/server"
+build() { cargo test --locked --release -p nabedra-sim-oltp --lib --no-run; }
+run() {
+    timeout 900s cargo test --locked --release -p nabedra-sim-oltp --lib -- \
+        --exact --ignored --nocapture --test-threads=1 probes::tests::control_digests_replay
+}
+build
+if run > "$scratch/red.log" 2>&1; then
+    sed "s/^/open bug: /" "$scratch/red.log"
+    echo "control_digests_replay passes without the patch: the open bug is gone, close its record"
+    exit 1
+fi
+# The prefix keeps the expected failure out of the result counts.
+sed "s/^/open bug: /" "$scratch/red.log"
+grep -q "applied Control digests differ between two runs of one seed" "$scratch/red.log"
+git -C "$scratch" apply --verbose "$probes/fixed-restart-key.patch"
+build
+run
+''']
+cwd = "server"
+timeout_s = 4800
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", NABEDRA_SEED = "1", NABEDRA_SEEDS = "3" }

@@ -1,0 +1,91 @@
+diff --git a/server/src/oltp_runtime/direct/tests.rs b/server/src/oltp_runtime/direct/tests.rs
+index 187a06cf..0bc559a9 100644
+--- a/server/src/oltp_runtime/direct/tests.rs
++++ b/server/src/oltp_runtime/direct/tests.rs
+@@ -2813,6 +2813,86 @@ async fn o12_d11_rd1_a_fence_after_the_descriptor_lookup_restarts_the_mutation()
+     cluster.shutdown().await;
+ }
+ 
++/// Scratch probe for RD1 (never shipped): a mutation looks its descriptor up, then waits for
++/// a key latch. A DDL fence applies meanwhile. The mutation must not commit the old descriptor
++/// under the new epoch.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn probe_rd1_a_fence_during_the_latch_wait_is_not_bypassed() {
++    use crate::oltp::mvcc::store::direct::DirectSchemaChange;
++    let source = Arc::new(Steered {
++        next: AtomicU64::new(1_000),
++        calls: AtomicU64::new(0),
++        answered: AtomicU64::new(0),
++        abandoned: AtomicU64::new(0),
++        hold: AtomicBool::new(false),
++        stale: AtomicBool::new(false),
++    });
++    let cluster = Cluster::new(Options {
++        timestamps: Some(source.clone()),
++        ..Options::default()
++    })
++    .await;
++    let leader = cluster.leader().await;
++    let handle = cluster.voters[leader].handle.clone();
++    assert_eq!(
++        cluster
++            .op(
++                leader,
++                "table.insert",
++                serde_json::json!({"row": {"id": 1, "value": 1, "tag": "a", "score": 0.0}}),
++            )
++            .await,
++        done("null")
++    );
++    // The first update holds the key latch until its timestamp arrives.
++    source.hold.store(true, Ordering::SeqCst);
++    let calls = source.calls.load(Ordering::SeqCst);
++    let holder = cluster.op(
++        leader,
++        "table.update",
++        serde_json::json!({"key": 1, "values": {"value": 2}}),
++    );
++    let waiter = async {
++        while source.calls.load(Ordering::SeqCst) == calls {
++            nabedra_rt::time::sleep(Duration::from_millis(5)).await;
++        }
++        cluster
++            .op(
++                leader,
++                "table.update",
++                serde_json::json!({"key": 1, "values": {"tag": "b"}}),
++            )
++            .await
++    };
++    let fence = async {
++        while source.calls.load(Ordering::SeqCst) == calls {
++            nabedra_rt::time::sleep(Duration::from_millis(5)).await;
++        }
++        // The second update has looked its descriptor up and waits for the latch.
++        nabedra_rt::time::sleep(Duration::from_millis(500)).await;
++        handle
++            .change_direct_schema(DirectSchemaChange::Fence {
++                lifecycle: Some(nabedra_rt::ids::uuid_v4()),
++            })
++            .await
++            .unwrap();
++        source.hold.store(false, Ordering::SeqCst);
++    };
++    let (held, waited, ()) = tokio::join!(holder, waiter, fence);
++    assert!(
++        !matches!(held, DirectResponse::Done(_)),
++        "the holder's commit carries the old epoch: {held:?}"
++    );
++    assert_eq!(
++        waited,
++        DirectResponse::Fallback {
++            reason: FallbackReason::Schema
++        },
++        "the old descriptor must not commit under the new epoch"
++    );
++    cluster.shutdown().await;
++}
++
+ /// RD1 (D01): after the first mutation on a group, the leader's mutations
+ /// take their table lookup from the epochs of the previous snapshot: no
+ /// store read (one native job) before the latch. A get's snapshot counts too.

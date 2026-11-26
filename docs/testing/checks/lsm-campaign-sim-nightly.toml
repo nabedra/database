@@ -6,7 +6,7 @@ scenarios = ["LSM01", "NS04", "NS05"]
 tiers = ["T2", "T3"]
 # Fault model. The sim module runs the exhaustive NS04 smoke seed, the NS05
 # smoke seed, and the sampled sweep. Every run must match its second replay.
-command = ["cargo", "test", "--locked", "--release", "-j", "2", "-p", "nabedra-kv", "--features", "sim", "--test", "campaign", "sim::", "--", "--nocapture", "--test-threads=1"]
+command = ["cargo", "test", "--locked", "--release", "-p", "nabedra-kv", "--features", "sim", "--test", "campaign", "sim::", "--", "--nocapture", "--test-threads=1"]
 cwd = "server"
 timeout_s = 18000
 needs = []

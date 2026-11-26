@@ -36,7 +36,7 @@ env = { NABEDRA_CASES = "1000" } # optional
 | `timeout_s` | yes | Positive. On timeout the process group is killed and the result is `error`. |
 | `needs` | no | Environment the check requires. See below. |
 | `result_parser` | yes | How assertion counts are read from the output. See below. |
-| `env` | no | String values added to the environment. `NABEDRA_REQUEST_ID` is always set. |
+| `env` | no | String values added to the environment. `NABEDRA_REQUEST_ID` is always set. `CARGO_BUILD_JOBS` is 2 unless `env` or the caller sets it (Actions: 4), so leave `-j` out of Cargo commands in `command`. |
 | `not_run_marker` | no | A nonblank literal string, up to 300 characters. If the command exits successfully and prints this string without any parsed test failures, the record is `not-run` with zero executed assertions. Use it only when the entire check was skipped. |
 
 Unknown fields are errors.
@@ -78,11 +78,23 @@ The result follows these rules, in order:
 
 The `tlc` parser also takes the runner's own verdict: a `not-run` (a baseline stopped at the time
 budget or a state cap) or an `error` (a TLC error) with no failed assertion is recorded as such, never
-as `pass`. Its record carries a `tla` object (mode, distinct states, depth, coverage, mutants with
-their counterexample lengths, or trace counts) and lists the TLC logs and counterexamples in
-`artifacts`. Output with more than one summary line is `error`, so a later pass cannot hide an
-earlier failure. When the facts would push the record over 20 KB, passing runs, caught mutants and
-details are dropped, failures are kept, and `tla.truncated` is set; `summary.json` has them all.
+as `pass`. Its record carries a `tla` object (mode, distinct states, depth, coverage, declared limits,
+mutants with their counterexample lengths, or trace counts) and lists the TLC logs and counterexamples
+in `artifacts`.
+
+It records `error` for everything it does not understand: an unknown verdict, counts that are not
+`0 <= failed <= executed`, an exit status that is not the verdict's, a summary that does not start its
+line, and a `pass` without `tla` facts, with `not_run` entries, or with facts that contradict it. Output
+with more than one summary is `error` too, so a later pass cannot hide an earlier failure.
+
+A T check that ran always leaves a record. When the facts exceed the schema's lengths or the 20 KB
+limit, the least important go first: details of passing runs and caught mutants, artifacts that belong
+to no failure, caught mutants, passing controls and runs, mutants' settings, then longer texts, and failures and baselines' settings last. `tla.truncated` says
+that something was dropped or cut. `tla.dropped` counts it by list, with failures apart, and the last
+`not_run` entry counts the dropped ones. The command log and `tla/summary.json` stay in `artifacts`, and
+`summary.json` keeps every fact. Facts the schema refuses are dropped, and the result is `error` unless
+it is already `fail`. The `not_run` entries and artifacts then stay as far as they fit, without counts
+for the facts.
 [specs/README.md](../../../specs/README.md) describes the runners and how their results map.
 
 Ignored, skipped and todo tests are listed in the record's `assertions.not_run`.

@@ -1,0 +1,108 @@
+diff --git a/server/src/oltp_acceptance.rs b/server/src/oltp_acceptance.rs
+index 02d563e1..f62d9fa8 100644
+--- a/server/src/oltp_acceptance.rs
++++ b/server/src/oltp_acceptance.rs
+@@ -93,6 +93,28 @@ fn acceptance_o01() {
+     );
+ }
+ 
++/// Scratch probe for ACC3-ready-fence (never shipped).
++#[cfg(target_os = "linux")]
++#[test]
++#[ignore = "real RF3 processes and loopback mounts, run through the CI tests input"]
++fn probe_acc3_ready_fence_survives_a_timestamp_outage() {
++    let status = process_driver("probe_ready_fence.py")
++        .arg("--binary")
++        .arg(process_binary().expect("shared-build OLTP binary"))
++        .arg("--test-executable")
++        .arg(std::env::current_exe().unwrap())
++        .env(
++            "PYTHONPATH",
++            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../orm/python/src"),
++        )
++        .env("PYTHONDONTWRITEBYTECODE", "1")
++        .status();
++    assert!(
++        status.expect("launch ready-fence probe").success(),
++        "the rolling join did not survive the Timestamp outage"
++    );
++}
++
+ #[test]
+ #[ignore = "run through scripts/acceptance_oltp.py"]
+ fn acceptance_o06() {
+diff --git a/server/src/oltp_runtime/bootstrap/registered.rs b/server/src/oltp_runtime/bootstrap/registered.rs
+index 842c6818..65495eab 100644
+--- a/server/src/oltp_runtime/bootstrap/registered.rs
++++ b/server/src/oltp_runtime/bootstrap/registered.rs
+@@ -548,6 +548,8 @@ impl LocalServices {
+             if let Some(restart) = &worker.rolling {
+                 super::super::recovery_tests::pause("rolling_before_join", restart.intent.id).await;
+             }
++            #[cfg(test)]
++            let probe_restart = worker.rolling.as_ref().map(|restart| restart.intent.id);
+             let operator = Arc::new(worker.operator);
+             system_replacement::spawn(
+                 manager.clone(),
+@@ -683,6 +685,10 @@ impl LocalServices {
+                 "nabedra-db: registered {} queue ready revision sealed",
+                 local.worker_id
+             );
++            #[cfg(test)]
++            if let Some(id) = probe_restart {
++                super::super::recovery_tests::pause("probe_before_ready_fence", id).await;
++            }
+             let fence = TimestampClient::new(
+                 placements.timestamps.identity.clone(),
+                 shared.clone(),
+diff --git a/server/tests/probe_ready_fence.py b/server/tests/probe_ready_fence.py
+new file mode 100644
+index 00000000..898cedd2
+--- /dev/null
++++ b/server/tests/probe_ready_fence.py
+@@ -0,0 +1,45 @@
++"""Scratch probe for ACC3-ready-fence (never shipped).
++
++A retained worker rejoins. It is held after it sealed its ready revision and before its
++Timestamp ready fence. Both other workers, so the Timestamp quorum, are then stopped for
++longer than one service call, and resumed. The join must finish on the original run.
++"""
++import argparse
++from pathlib import Path
++import sys
++import time
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++from oltp_runtime_acceptance import *  # noqa: F401,F403
++from oltp_runtime_acceptance import WORKERS, launch_retained, native_cluster, prepare_rolling_restart
++from oltp_runtime_acceptance import release, same_run_ready, wait_reached, write_json
++
++parser = argparse.ArgumentParser()
++parser.add_argument('--binary', required=True)
++parser.add_argument('--test-executable', required=True)
++parser.add_argument('--hold', type=float, default=15)
++args = parser.parse_args()
++
++with native_cluster(args.binary, args.test_executable, 'ready-fence', mounts=True) as cluster:
++    run = cluster.run_id
++    joining, others = WORKERS[2], WORKERS[:2]
++    cluster.workers[joining].kill()
++    same_run_ready(cluster, run, others, 2)
++    restart = prepare_rolling_restart(cluster, joining, others[0])
++    join_dir = cluster.barrier_dir(joining)
++    write_json(join_dir / 'gates.json', {restart['request_id']: 'probe_before_ready_fence'})
++    launch_retained(cluster, joining)
++    wait_reached([join_dir], restart, 'probe_before_ready_fence')
++    for name in others:
++        cluster.workers[name].pause()
++    try:
++        release(join_dir, restart)
++        time.sleep(args.hold)
++        alive = cluster.workers[joining].alive()
++    finally:
++        for name in others:
++            cluster.workers[name].resume()
++    print(f'PROBE ready fence: joining worker alive after the outage: {alive}', flush=True)
++    assert alive, 'the joining worker exited when one ready-fence call failed'
++    same_run_ready(cluster, run, WORKERS, 3)
++    print('PROBE ready fence: three workers ready on the original run', flush=True)

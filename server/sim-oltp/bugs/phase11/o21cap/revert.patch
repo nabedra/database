@@ -1,0 +1,52 @@
+diff --git a/server/src/oltp_runtime/coordinator.rs b/server/src/oltp_runtime/coordinator.rs
+index 88e808b0..fc288a08 100644
+--- a/server/src/oltp_runtime/coordinator.rs
++++ b/server/src/oltp_runtime/coordinator.rs
+@@ -495,17 +495,6 @@ impl QueueCoordinator {
+         {
+             super::recovery_tests::observe_o21_stale_proposal(&body);
+         }
+-        // The captured snapshot names Control's published view. Wait for the
+-        // local queue to install it before any copy phase can start.
+-        wait_for_local_ready_view(&self.replica, current)
+-            .await
+-            .map_err(|error| {
+-                // submit_original still proves absence under its UUID gate
+-                // and seals the rejection in Status before exposing this.
+-                let mut error = error.protocol();
+-                error.outcome = Outcome::NotApplied;
+-                error
+-            })?;
+         if self.current().await? != current {
+             return Err(QueueError::Stale.protocol());
+         }
+diff --git a/server/src/oltp_runtime/worker_endpoint.rs b/server/src/oltp_runtime/worker_endpoint.rs
+index 87bcb4b8..51017162 100644
+--- a/server/src/oltp_runtime/worker_endpoint.rs
++++ b/server/src/oltp_runtime/worker_endpoint.rs
+@@ -1328,21 +1328,11 @@ impl Endpoint for QueueEndpoint {
+                 // Preflight authorizes reception. Check the local view before
+                 // decoding, then recheck Control immediately before installation.
+                 let local = self.replica.lock().map_err(|_| unavailable())?.authority();
+-                let current = if local.view_is_behind(record.ready.view) {
+-                    #[cfg(test)]
++                #[cfg(test)]
++                if local.view_is_behind(record.ready.view) {
+                     super::recovery_tests::observe_o21_stale_copy(record.request_id);
+-                    // Control published this view before the local membership
+-                    // actor installed it. Keep the charged frame and wait
+-                    // only for that exact view. An old owner or old frame
+-                    // still fails the authoritative checks.
+-                    let current = self.check(&session, &request).await?;
+-                    wait_for_local_ready_view(&self.replica, current)
+-                        .await
+-                        .map_err(QueueError::protocol)?;
+-                    current
+-                } else {
+-                    local
+-                };
++                }
++                let current = local;
+                 if session.remote() != current.owner {
+                     return Err(QueueError::Stale.protocol());
+                 }

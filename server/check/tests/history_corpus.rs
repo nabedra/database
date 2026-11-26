@@ -94,12 +94,54 @@ const CASES: &[(&str, &str, Checker, &[&str])] = &[
         &["non-linearizable"],
     ),
     // Direct-path request identity (OLTP-G03) and outcome truth (OLTP-G04): D02, D03, D04.
-    ("direct_valid_retries", "direct", direct::check, &[]),
+    // Superseded: `direct_valid_retries` predates the retry rule of 2026-11-24 (lead decision 11,
+    // "Retry results" in plans/oltp-direct-path.md) and was expected valid until the default
+    // followed that rule. Its `update` r2 answers `false` and later `true`, which is the shipped
+    // recomputing that the plan calls a known gap. The rest of it is legal (see
+    // `the_superseded_case_is_illegal_only_where_it_recomputes`). `direct_retry_replays` is the
+    // legal case now.
+    (
+        "direct_valid_retries",
+        "direct",
+        direct::check,
+        &["unstable-result"],
+    ),
     (
         "direct_valid_retries",
         "linearizable",
         linearizable::check_kv,
         &[],
+    ),
+    ("direct_retry_replays", "direct", direct::check, &[]),
+    (
+        "direct_no_op_recomputed",
+        "direct",
+        direct::check,
+        &["unstable-result"],
+    ),
+    (
+        "direct_row_conflict_recomputed",
+        "direct",
+        direct::check,
+        &["unstable-result"],
+    ),
+    (
+        "direct_overlapping_results",
+        "direct",
+        direct::check,
+        &["unstable-result"],
+    ),
+    (
+        "direct_no_op_took_effect",
+        "direct",
+        direct::check,
+        &["non-linearizable"],
+    ),
+    (
+        "direct_row_conflict_took_effect",
+        "direct",
+        direct::check,
+        &["non-linearizable"],
     ),
     (
         "direct_retry_reapplied",
@@ -347,6 +389,7 @@ fn corpus_covers_every_anomaly_class() {
         "out-of-order",
         "redelivery-missing",
         "dedup-miss",
+        "unstable-result",
         "request-id-reuse-undetected",
         "request-id-reuse-misdetected",
     ];
@@ -365,6 +408,26 @@ fn corpus_covers_every_anomaly_class() {
             "corpus file {name} has no expectation"
         );
     }
+}
+
+/// With the recorded `false` in place of the two recomputed `true`, and the row as the other client
+/// left it, nothing in `direct_valid_retries` is flagged.
+#[test]
+fn the_superseded_case_is_illegal_only_where_it_recomputes() {
+    let mut events = load("direct_valid_retries");
+    let verdict = direct::check(&events);
+    assert_eq!(verdict.kinds(), ["unstable-result"], "{verdict:#?}");
+    assert_eq!(verdict.anomalies.len(), 1, "{verdict:#?}");
+    for event in &mut events {
+        if event.f == "update" && event.value == serde_json::json!(true) {
+            event.value = serde_json::json!(false);
+        }
+        if event.value == serde_json::json!({"id": "k3", "value": 4}) {
+            event.value = serde_json::json!({"id": "k3", "value": 5});
+        }
+    }
+    let verdict = direct::check(&events);
+    assert!(verdict.valid, "{verdict:#?}");
 }
 
 /// Mutating one value in a valid history turns it invalid: the checkers really look at values.

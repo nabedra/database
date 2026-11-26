@@ -1,0 +1,19 @@
+id = "oltp-sim-panics"
+module = "testing"
+kinds = ["U"]
+# Fault model. A panic planted anywhere in a run, in every workload and swept profile, is a
+# violation of that seed (the full matrix of `panics::tests`).
+guarantees = []
+scenarios = []
+tiers = ["T2"]
+command = ["bash", "-euc", '''
+build=(cargo test --locked --release -p nabedra-sim-oltp --lib)
+"${build[@]}" --no-run
+exec timeout 2400s "${build[@]}" -- --ignored --exact --nocapture --test-threads=1 \
+    panics::tests::no_panic_is_a_clean_seed_anywhere
+''']
+cwd = "server"
+timeout_s = 5400
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim" }

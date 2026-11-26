@@ -323,9 +323,76 @@ struct End {
     addr: SocketAddr,
 }
 
+/// The addresses that live connections hold, with how many ends hold each, so that a free
+/// port is found without looking at any connection.
+#[derive(Clone, Debug, Default)]
+struct Ports(Arc<Mutex<Held>>);
+
+#[derive(Debug, Default)]
+struct Held {
+    ends: BTreeMap<SocketAddr, usize>,
+    /// Addresses looked up, for the tests.
+    #[cfg(test)]
+    lookups: u64,
+}
+
+impl Ports {
+    fn lock(&self) -> MutexGuard<'_, Held> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn hold(&self, addr: SocketAddr) -> Hold {
+        *self.lock().ends.entry(addr).or_default() += 1;
+        Hold {
+            ports: self.clone(),
+            addr,
+        }
+    }
+
+    fn is_held(&self, addr: SocketAddr) -> bool {
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut held = self.lock();
+        #[cfg(test)]
+        {
+            held.lookups += 1;
+        }
+        held.ends.contains_key(&addr)
+    }
+}
+
+/// One end's claim on its address, until it drops.
+#[derive(Debug)]
+struct Hold {
+    ports: Ports,
+    addr: SocketAddr,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let mut held = self.ports.lock();
+        if let Some(count) = held.ends.get_mut(&self.addr) {
+            *count -= 1;
+            if *count == 0 {
+                held.ends.remove(&self.addr);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Connection {
     ends: [End; 2],
+    /// What each end holds of its address. A reset or cut connection holds nothing, and a
+    /// client that closed before it was accepted holds nothing either: the peer's kernel
+    /// acknowledges the FIN, even for a stopped process, and the port is used again.
+    ///
+    /// Simplified: the client's port is free at the close even when that FIN cannot arrive
+    /// yet, because its link is held, or never will, because a dropped message stalled its
+    /// direction. A real kernel keeps the port until it gives up. An explicit bind to a port
+    /// freed this way succeeds at once, also before the counter wraps.
+    holds: [Option<Hold>; 2],
+    /// Whether the listener has accepted it.
+    accepted: bool,
     /// `pipes[0]` carries client to server, `pipes[1]` server to client.
     pipes: [Pipe; 2],
     /// Whether each side's handle (pending or stream) is alive.
@@ -342,6 +409,7 @@ impl Connection {
 
     fn black_hole(&mut self) {
         self.power_cut = true;
+        self.holds = [None, None];
         for pipe in &mut self.pipes {
             pipe.queue.clear();
             pipe.fin = Fin::Open;
@@ -354,6 +422,7 @@ impl Connection {
 
     fn reset(&mut self) {
         self.reset = true;
+        self.holds = [None, None];
         for pipe in &mut self.pipes {
             pipe.queue.clear();
             if let Some(waker) = pipe.reader.take() {
@@ -425,6 +494,7 @@ struct State {
     next_conn: u64,
     next_listener: u64,
     next_port: u16,
+    ports: Ports,
 }
 
 impl State {
@@ -438,10 +508,7 @@ impl State {
 
     fn port_free(&self, ip: IpAddr, port: u16) -> bool {
         let addr = SocketAddr::new(ip, port);
-        !self.listeners.contains_key(&addr)
-            && !self.conns.values().any(|conn| {
-                !conn.reset && !conn.power_cut && conn.ends.iter().any(|end| end.addr == addr)
-            })
+        !self.listeners.contains_key(&addr) && !self.ports.is_held(addr)
     }
 
     /// The next free port on `ip`, from the world-wide counter.
@@ -810,16 +877,19 @@ async fn dial_one(net: &Arc<Net>, from: Option<u64>, addr: SocketAddr) -> io::Re
                 };
                 let id = state.next_conn;
                 state.next_conn += 1;
+                let client = SocketAddr::new(ip, port);
                 state.conns.insert(
                     id,
                     Connection {
                         ends: [
                             End {
                                 node: from,
-                                addr: SocketAddr::new(ip, port),
+                                addr: client,
                             },
                             End { node: to, addr },
                         ],
+                        holds: [client, addr].map(|addr| Some(state.ports.hold(addr))),
+                        accepted: false,
                         pipes: [Pipe::default(), Pipe::default()],
                         open: [true, true],
                         reset: false,
@@ -922,10 +992,10 @@ impl SimListener {
             };
             match slot.backlog.pop_front() {
                 Some(id) => {
-                    let peer = state
-                        .conns
-                        .get(&id)
-                        .map_or(self.addr, |conn| conn.end(Side::Client).addr);
+                    let peer = state.conns.get_mut(&id).map_or(self.addr, |conn| {
+                        conn.accepted = true;
+                        conn.end(Side::Client).addr
+                    });
                     Poll::Ready(Ok((
                         Pending {
                             half: Half::new(self.net.clone(), id, Side::Server),
@@ -1183,12 +1253,18 @@ impl Drop for Half {
         let mut state = self.net.lock();
         if let Some(conn) = state.conns.get_mut(&self.conn) {
             conn.open[self.side.tx()] = false;
+            if self.side == Side::Client && !conn.accepted {
+                conn.holds[self.side.tx()] = None;
+            }
             let pipe = &mut conn.pipes[self.side.tx()];
             if !pipe.stalled {
                 pipe.finish();
             }
+            // Forgotten once both handles are gone.
+            if !conn.open.iter().any(|open| *open) {
+                state.conns.remove(&self.conn);
+            }
         }
-        state.collect();
     }
 }
 

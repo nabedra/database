@@ -7,7 +7,7 @@ tiers = ["T2", "T3"]
 # The olap-stream-sim property with ten times the cases. The base seed is still
 # derived from the property name, so a failure replays from the printed
 # NABEDRA_SEED with NABEDRA_CASES=1. The planted-bug tests run in olap-stream-sim.
-command = ["cargo", "test", "-j", "2", "--locked", "--lib", "node::stream::sim_tests::st01_st06_olap_stream_simulation", "--", "--exact", "--nocapture", "--test-threads=1"]
+command = ["cargo", "test", "--locked", "--lib", "node::stream::sim_tests::st01_st06_olap_stream_simulation", "--", "--exact", "--nocapture", "--test-threads=1"]
 cwd = "server"
 timeout_s = 7200
 needs = []

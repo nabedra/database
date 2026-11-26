@@ -1,0 +1,17 @@
+id = "oltp-conflict-text-pin"
+module = "oltp"
+kinds = ["U"]
+# The texts by which nabedra-check's direct-path checker tells row conflicts from others, against
+# the answers of the direct and the queued path. It says nothing about a guarantee.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = [
+    "cargo", "test", "--locked", "-j", "4", "--no-default-features", "--features", "oltp", "--lib",
+    "oltp_runtime::worker_runtime::direct_gateway::tests::d03_o08_insert_conflict_texts_are_the_ones_the_history_checker_knows",
+    "--", "--exact",
+]
+cwd = "server"
+timeout_s = 2400
+needs = []
+result_parser = "cargo-test"

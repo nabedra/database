@@ -36,21 +36,14 @@ runners, and integration changes as tasks where the plan calls for them.
    own stops editing that file. It sends the exact change (a diff or a precise
    description) and the reason to the lead, in its report or a message, and
    continues with work that does not depend on it. The lead forwards the
-   change to the owner, or schedules it after the owner's branch is
-   integrated. Ownership ends when the owner's branch is integrated. Put the
-   hot-file list and owners in every brief of the wave.
+   change to the owner. When another task waits for it, the owner lands it at
+   once as its own small PR, ahead of the rest of the branch. Ownership ends
+   when the owner's branch is integrated. Put the hot-file list and owners in
+   every brief of the wave.
 5. Review the CI quarantine (`.github/quarantine.tsv`) at the start of each
    wave. Assign an owner task to every `unassigned` row and decide every
    expired row, following
    [the quarantine protocol](../../code-review/references/gh-actions.md#quarantine).
-   Follow the dispatch procedure in
-   [GitHub Actions for checks](../../code-review/references/gh-actions.md).
-
-For worker execution or recovery changes, follow [AGENTS.md](../../../../AGENTS.md).
-Use the [scheduling plan](../../../../plans/resource-aware-scheduling.md) and
-[scheduler test contract](../../../../docs/testing/scheduler-contract.md) in
-the affected task briefs and acceptance checks. Record the scenario IDs and
-actual assertion results. An unexecuted scenario remains unverified.
 
 ## Keep independent tasks running
 
@@ -61,6 +54,7 @@ actual assertion results. An unexecuted scenario remains unverified.
   slots for task reviews or newly unblocked tasks. A large plan can use many
   agents over its lifetime. Active agents, including reviewers, are limited by
   the harness and by the work that can safely run together.
+- When a PR merges, finish the PRs that waited for it before starting new tasks.
 - Serialize writers that share files or use the harness's isolated checkouts
   when parallel work on them makes sense. Review the combined result after
   integrating overlapping changes and before unblocking dependents. For
@@ -72,6 +66,8 @@ actual assertion results. An unexecuted scenario remains unverified.
   Sol on high for Codex or the latest Claude Opus on high for Claude Code,
   subject to harness availability and dispatch rules. The lead dispatches
   implementations and reviews. Children work directly on their assignment.
+  For research and reading tasks, default to GPT Luna for Codex or Claude Haiku
+  for Claude Code.
 - Local simulation and property runs use one thread per agent
   (`--test-threads=1`, and `-j 2` for builds). Larger seed counts go to Actions.
 

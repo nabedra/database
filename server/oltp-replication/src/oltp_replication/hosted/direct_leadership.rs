@@ -73,6 +73,15 @@ async fn follow(
             if leader {
                 // A no-op while the term is unchanged.
                 clock.lead(current.current_term);
+                #[cfg(feature = "sim")]
+                if !leading {
+                    nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::LeaderSeen {
+                        group: clock.group(),
+                        replica: node,
+                        term: current.current_term,
+                        leader: node,
+                    });
+                }
             } else if leading {
                 clock.step_down();
             }

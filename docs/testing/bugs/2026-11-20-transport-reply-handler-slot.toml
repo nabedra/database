@@ -1,0 +1,14 @@
+id = "TRANSPORT-REPLY-HANDLER-SLOT"
+title = "A sequential caller was refused with worker handler lane full by its own previous call"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G04", "OLTP-G09"]
+scenarios = ["D10", "O05"]
+found_by = "ci-flake"
+found_date = "2026-11-20"
+lowest_regression = "server/transport/src/transport/session.rs d10_o05_reply_frees_its_handler_slot_before_its_bytes_are_written"
+seed = "unknown"
+why_not_caught = "The session tests ran on lightly loaded hosts, where the stream task always dropped its handler slot before the peer's next request arrived."
+invariant_added = "A reply's handler lane slot is free before any byte of the reply reaches the socket, on the loopback mTLS backend and on the simulated network."
+fix_commits = ["abc404d217418f4acc237b33e61d492cde2f5bdd"]
+revert_patch_ok = false

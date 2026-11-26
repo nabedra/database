@@ -1,0 +1,63 @@
+# Reverted fix FLAKE3-epoch (phase 11, design section 4.2, row 19).
+schema = "nabedra.sim-bug/1"
+id = "flake3-epoch"
+bug = "FLAKE3-epoch"
+set = "resources"
+phase = 11
+class = "resource-release-order"
+guarantees = ["OLTP-G01"]
+scenarios = ["O06", "O11"]
+fix_commits = ["38fc414df670cdfae981184e4721c0bbd79ff0e9"]
+reverts = ["38fc414df670cdfae981184e4721c0bbd79ff0e9"]
+port = "hand"
+port_notes = """
+38fc414d reversed in typed_log.rs (a test-hooks cfg and crate moves around it): take() uses the head job's
+epoch again, so a task whose own append was already covered can take jobs queued behind a pending vote,
+truncation or purge.
+"""
+# The phase 11 workloads do not exist yet: workload, profile and expect are what this patch needs,
+# not a detection. ../simulator.toml says which faults and trigger, and what is missing.
+workload = "resources"
+profile = ["leader-move", "append-load", "crash-leader"]
+# expect is the plan. The text an expected kind enforces is in [[rules]] at the end. A kind without text there detects
+# nothing.
+# No [[rules]] for LogMatching and MajorityReached: its only text is design 3.7, and lead decision 13.1 lists design
+# rules for rows 6, 9, 20 and the Liveness rows (read as 10, 11, 13 and 16), not for row 19.
+expect = ["LogMatching", "MajorityReached"]
+hold = """\
+Row 19. The in-tree assertion is a counter (how many syncs happened). Missing: (1) a state check in the tree, \
+such as the review's r121_flake3_a_crash_never_keeps_a_post_vote_entry_without_its_vote, which is on \
+scratch/review-121-clean2 only; (2) [regression] naming it, with clean and patched runs of it; (3) a [review] of \
+that test with assertion state. The row also looks unreachable through a RaftCore (read by author and reviewer, \
+not run), and decision 13.1 lists no design rule for it.\
+"""
+seeds = [1, 10000]
+
+# The assertion below is a counter (how many syncs happened), not a state check.
+[regression]
+kind = "lib-test"
+test = "oltp_replication::typed_log::tests::o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote"
+mode = "on"
+assertion = "counter"
+failure_contains = ["the vote must sync before the post-vote batch starts"]
+
+# The patch author's own runs.
+[regression.evidence]
+digest = "44a619dbc910f2fcad82e491bf5684e07498864f92366e8afb48e3d606f115ae"
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote, 3 of 3 attempts, on mode, over main c8426fe1" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435960323", sha = "ab0b5567e26a47350fc2c3e3881679d03967baec", result = "failed", note = "request p11-bugs-flake3-epoch-ab0b556-172028, o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote, 20 of 20 attempts, on mode, over main c8426fe1", output = """
+assertion `left == right` failed: the vote must sync before the post-vote batch starts
+  left: 5
+ right: 6
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.02s
+""" }
+
+# Independent review of PR #121 (2026-11-24, Claude Opus 5.5, wrote no patch): sensitive.
+# Patch read: exact inverse of 38fc414d. Kept apart from the author's evidence above. These are workflow `tests`,
+# `scenarios` or growth runs in mode on, not attested checks, and not a detection.
+# - sensitive by the review's own test: the in-tree assertion is a counter (see [regression]).
+# - oltp_replication::typed_log::tests::r121_flake3_a_crash_never_keeps_a_post_vote_entry_without_its_vote: clean https://github.com/zPy52/nabedra-database/actions/runs/45461651504 (01c4af20) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45461667560 (236975bd) 3 of 3 failed: the durable image taken when the first post-vote append is acknowledged holds entry 3 and `vote: None`.
+# - the [regression] test, the counter: clean https://github.com/zPy52/nabedra-database/actions/runs/45456378227 (f75c41a7) 3 of 3 passed; patched https://github.com/zPy52/nabedra-database/actions/runs/45456657296 (e72bbff0) 3 of 3 failed: `left: 5`, `right: 6`.
+# No [review] table. The review calls the patch sensitive by its own state test only, which is not in the tree. The tool
+# ties [review] to [regression], whose assertion is a counter, and refuses `sensitive` with it. Any other verdict would
+# not be the review's. See hold.

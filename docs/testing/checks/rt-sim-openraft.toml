@@ -11,7 +11,7 @@ kinds = ["U"]
 guarantees = ["OLTP-G02"]
 scenarios = ["O09"]
 tiers = ["T0", "T1"]
-command = ["sh", "-ec", "cargo test --locked -j 2 -p nabedra-rt --features sim,sim-openraft && RUSTFLAGS='--cfg tokio_unstable' CARGO_TARGET_DIR=target/sim cargo test --locked -j 2 -p nabedra-rt --features sim,sim-openraft --lib"]
+command = ["sh", "-ec", "cargo test --locked -p nabedra-rt --features sim,sim-openraft && RUSTFLAGS='--cfg tokio_unstable' CARGO_TARGET_DIR=target/sim cargo test --locked -p nabedra-rt --features sim,sim-openraft --lib"]
 cwd = "server"
 timeout_s = 900
 needs = []

@@ -21,7 +21,7 @@ selected checks. Cover each guarantee or explain why it does not apply.
 Give a reason for every check you add or skip. See [guarantees](references/guarantees.md).
 
 For a docs-only diff, review the content, examples and links and record the
-local results. Use the [docs-only CI rule](../nabedra-change/SKILL.md).
+local results. Follow the [docs-only merge rule](../nabedra-change/SKILL.md).
 
 ## Build the review rubric
 
@@ -79,8 +79,11 @@ checks the register requires. Follow the [evidence rules](references/evidence.md
 - Update the plan before changing a public interface, such as a wire
   protocol, HTTP API, ORM signature, configuration, CLI or on-disk format.
   The plan gives a success measure and the scenario IDs.
-- Merge only after a non-author reviewer approves and all blocking findings
-  are resolved.
+- Before accepting a T pass, read the [settings](../design-review/references/tla.md#limits-on-the-search)
+  it ran with. The tool cannot tell whether a bound or a cut `NEXT` leaves
+  behavior out.
+- Resolve all blocking findings before merging. Require non-author approval
+  for PRs outside the docs-only merge rule above.
 - Put every new or changed test through `scripts/testing/repeat_gate.py`.
   Run unit tests 50 times and real-environment cases 5 times. Run simulation
   workloads with 5 times their usual seeds. The test catalog at
@@ -97,7 +100,6 @@ checks the register requires. Follow the [evidence rules](references/evidence.md
 ## Pull request body
 
 Every pull request body carries the following four lines.
-`scripts/testing/pr_lint.py` checks them in the pull-request gate.
 
 ```text
 Guarantees: <affected guarantee IDs, or none>
@@ -108,6 +110,15 @@ Reviewers: <non-author reviewers and their verdicts, or pending cross-model revi
 
 A pull request that carries a reviewed plan adds the `Design:` line from
 the [design review](../design-review/SKILL.md#pull-request-body).
+
+Actions does not check the body. The author and the reviewer run
+`scripts/testing/pr_lint.py` by hand on the final body. It also says when
+the diff needs the `Design:` line.
+
+```sh
+gh pr view "$PR" --json body --jq .body | python3 scripts/testing/pr_lint.py - \
+  --base "$(git merge-base origin/main HEAD)" --head "$(git rev-parse HEAD)"
+```
 
 ## Rubric-style reviewing
 
