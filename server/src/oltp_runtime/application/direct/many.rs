@@ -413,12 +413,13 @@ impl DirectGateway {
         } else {
             GatewayStats::bump(&self.stats.queued);
         }
-        // From here only the queued path knows the row: an earlier call may
-        // have queued the same id.
+        // A forward marker rules out a direct commit. An earlier call may
+        // already have entered the queue with the same id, so an admission
+        // error or timeout leaves the identity's outcome unknown.
         let queue = queue.ok_or_else(unknown)?;
-        let reply = nabedra_rt::time::timeout_at(deadline, queue.run(body))
-            .await
-            .map_err(|_| unknown())??;
+        let Ok(Ok(reply)) = nabedra_rt::time::timeout_at(deadline, queue.run(body)).await else {
+            return Err(unknown());
+        };
         if reply.status == 200 {
             return Ok(());
         }

@@ -293,12 +293,11 @@ impl QueuedRows for RefusingQueue {
     }
 }
 
-/// Known to fail. OLTP-G04: a row that cannot run directly is queued after its id is settled.
+/// OLTP-G04: a row that cannot run directly is queued after its id is settled.
 /// If the call is resent, an earlier attempt may have queued and executed it
 /// (the reply was lost). A queued path that then refuses admission says
 /// nothing about that earlier attempt, so the row is `outcome_unknown`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open bug 2026-11-26-many-queue-refusal-after-earlier-attempt"]
 async fn adv_oltp_g04_a_queue_that_refuses_a_resent_row_does_not_prove_it_was_not_applied() {
     let mut cluster = Cluster::batching().await;
     let group = cluster.add_group(span(None, None), 1, &[1]).await;
