@@ -207,7 +207,7 @@ failed scan sends no reply and the client retries), and table drop or recreate.
 | Symmetry | Nodes, and request IDs in the join spec, in safety runs only. Not in any liveness run. |
 | State constraints | None. Every run is finite because every fault has a finite budget. |
 | Fairness | Weak fairness on the ORM's retry timer, the coordinator's handlers and transfers, delivery of in-flight transfers, the operator's cold start, and partition healing (join spec). Strong fairness on the join's readiness publication: the provider retries the join loop. Each is named next to its mechanism in the spec. Election and recovery are inside the loss step. |
-| T checks | `olap-stream-olap-stream`, `olap-stream-olap-stream-join`, `olap-stream-olap-stream-large` (T2, simulation) |
+| T checks | `olap-stream-olap-stream`, `olap-stream-olap-stream-join`, `olap-stream-olap-stream-long` (T2, exhaustive with a 5-hour budget), `olap-stream-olap-stream-large` (T2, simulation) |
 
 Abstractions, stated in the specs:
 
@@ -227,21 +227,29 @@ Abstractions, stated in the specs:
 
 Reduced bounds, for reviewer approval: the liveness run of the data protocol uses 2 workers and 1 client, because
 the exhaustive temporal check at the safety bounds does not fit the 15-minute budget. Safety and the join liveness
-use the L2 minimums.
+use the L2 minimums. The safety baseline at the L2 minimums (`OlapStream.cfg`) does not finish within the 15-minute
+T1 budget either (re-checked 2026-11-26: stopped with about 2M states on the queue), so the T1 check reports it
+`not-run`, and the T2 check `olap-stream-olap-stream-long` runs it exhaustively with a 5-hour budget. Neither bound is
+cut: the open work is an abstraction or an Apalache run that fits T1.
 
 ### Results
 
-TLC v1.8.0, pinned image. The local results below are unattested. The attested ones are the Actions runs listed in
-the pull request for the SHA under review.
+Re-checked against main e6b4040b on 2026-11-26 (wave rv, task rv-olap); the code locations above still hold. TLC
+v1.8.0, pinned image.
 
 | Run | Result | Distinct states | Depth |
 | --- | --- | --- | --- |
-| `OlapStream.live` (2 workers, 1 client, all faults), local | pass, safety and liveness, exhaustive | 210,676 | 16 |
-| `OlapStreamJoin.cfg` (plan rule), local | pass, exhaustive | 18,401 | 14 |
-| `OlapStreamJoin.fanout.cfg` (candidate fix), local | pass, exhaustive | 18,001 | 13 |
-| `OlapStreamJoin.repair.cfg` (candidate fix), local | pass, exhaustive | 23,421 | 13 |
-| `OlapStreamJoin.live.cfg`, local | pass, exhaustive | 192,840 | 14 |
-| `OlapStream.cfg` (3 workers, 2 clients) | see the pull request | | |
+| `OlapStream.cfg` (3 workers, 2 clients), Actions run 45800777105 at 0f075ab3 | not-run: stopped at the 900 s budget, 1,985,088 states left on the queue | | |
+| `OlapStream.live` (2 workers, 1 client, all faults), Actions run 45800777105 | pass, safety and liveness, exhaustive | 210,676 | 16 |
+| `OlapStreamJoin.cfg` (plan rule), Actions run 45805193196 at b46b0e5c | pass, exhaustive | 18,401 | 14 |
+| `OlapStreamJoin.fanout.cfg` (candidate fix), same run | pass, exhaustive | 18,001 | 14 |
+| `OlapStreamJoin.repair.cfg` (candidate fix), same run | pass, exhaustive | 23,421 | 14 |
+| `OlapStreamJoin.live.cfg`, same run | pass, exhaustive | 192,840 | 14 |
+| `OlapStream` with a 5-hour budget (`olap-stream-olap-stream-long`) | pending | | |
+
+Every mutant of both specs was caught on its expected property in run 45800777105, except `no_client_retry`, which
+deadlocked before its liveness check with several TLC workers (and `seal_never_released` the same way in the join
+spec). Both now run without deadlock checking; the join spec's mutants all pass in run 45805193196.
 
 ### Mutants
 
@@ -337,8 +345,14 @@ The read (`wave-dr/reads/olap-stream.md`) lists 17 scenarios. Encoding:
 
 Gaps: the terminal-error frame (R-06), byte-level replay across mixed versions (R-05), reclamation of pinned files
 (R-11, R-12), and the trace corpus. No simulation workload emits traces yet, and none exercises `distributed.rs`, so
-no `-trace` check exists. The first implementation change on the stream protocol adds trace output; the mapping is
-in `wave-dr/sim-mapping/olap-stream.md`.
+no `-trace` check exists. The draft trace spec used the trace helpers that the tooling has since removed, so it is
+not carried over; the first implementation change on the stream protocol writes it against `TraceStep` and adds
+trace output. The mapping is in the review wave's `sim-mapping/olap-stream.md`.
+
+Performance (review 2026-11-26): every stream batch in the cluster is committed by the scheduler under one lock per
+worker, with a sequential transfer to every other ready worker and about four control-root and catalog reads on the
+scheduler plus two per holder, so the cluster's stream throughput falls as workers are added (finding OLAPS-2). A
+join stalls admission and every stream commit for the whole copy (OLAPS-3). Neither changes the protocol steps above.
 
 Simulation coverage of the same design stays partial: the in-process workload has one worker registry, so it cannot
 reproduce F1 or any transfer loss.
