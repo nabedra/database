@@ -200,6 +200,9 @@ pub(super) fn check_schema(
     schema: Option<&SearchSchema>,
     images: &[&CommittedImage],
 ) -> Result<(), ProtocolError> {
+    if schema.is_some_and(|schema| !schema.valid()) {
+        return Err(schema_mismatch());
+    }
     // Every vector has the type of its column in the backup, or nothing of the
     // batch is installed. A mismatch is the operator's, not damage (L7).
     for image in images {

@@ -764,9 +764,10 @@ impl Chain {
                     return Err(invalid());
                 }
             }
-            HistoryFrame::GroupSearch(_) => {
+            HistoryFrame::GroupSearch(schema) => {
                 let group = self.group.as_mut().ok_or_else(invalid)?;
                 if group.searched
+                    || !schema.valid()
                     || group.count != 0
                     || !matches!(group.scope.group.kind, GroupKind::Data { .. })
                 {
