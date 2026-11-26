@@ -1,0 +1,14 @@
+id = "VECTOR-index-selective-text-filter"
+title = "Rare prefix and text range filters enter the approximate scan path"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G13"]
+scenarios = ["VS07", "VS19"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/index/tests/adversary_rules.rs::adv24_a_prefix_or_text_range_that_few_rows_match_is_scored_in_full"
+seed = 5
+why_not_caught = "Selectivity tests covered equality and Boolean combinations without text prefixes or text ranges."
+invariant_added = "When tracked text values give a count below the flat threshold, the approximate query scores every matching row."
+fix_commits = ["139d08682867ff5230cfa4ea8018be0242f7b1a2"]
+revert_patch_ok = false

@@ -1,0 +1,14 @@
+id = "VECTOR-index-checkpoint-ancestor-sync"
+title = "An installed checkpoint can vanish under new directories"
+class = "fence-lifecycle-order"
+module = "vector"
+guarantees = ["VEC-G03", "VEC-G05"]
+scenarios = ["VS10"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/index/tests/adversary_ck.rs::adv10_an_installed_checkpoint_in_new_directories_survives_a_power_loss"
+seed = "unknown"
+why_not_caught = "Power-loss tests began with the checkpoint's ancestor directories already durable."
+invariant_added = "An acknowledged checkpoint remains readable after a power loss when its ancestor directories were created during installation."
+fix_commits = ["3f76c3e21a03e0d620118b5ef02dc94bfe30432c"]
+revert_patch_ok = false

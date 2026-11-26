@@ -1,0 +1,14 @@
+id = "VECTOR-index-zero-copy-budget"
+title = "A drain cannot end when its copy budget is zero"
+class = "fence-lifecycle-order"
+module = "vector"
+guarantees = ["VEC-G05", "VEC-G11"]
+scenarios = ["VS07", "VS17"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/index/tests/adversary.rs::adv07_a_configuration_without_copies_is_refused"
+seed = "unknown"
+why_not_caught = "Configuration tests exercised small queues but left the maintenance copy budget positive."
+invariant_added = "A local index refuses a zero copy budget before any drain can begin."
+fix_commits = ["3f76c3e21a03e0d620118b5ef02dc94bfe30432c"]
+revert_patch_ok = false
