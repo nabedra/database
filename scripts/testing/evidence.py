@@ -28,6 +28,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 SCHEMA_ID = "nabedra.evidence/1"
+GITHUB_REPOSITORY = "nabedra/database"
+PRE_TRANSFER_REPOSITORY = "zPy52/nabedra-database"
+GITHUB_REPOSITORY_ID = "1459052341"
 MAX_RECORD_BYTES = 20 * 1024
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = REPO_ROOT / "docs" / "testing" / "evidence" / "schema.json"

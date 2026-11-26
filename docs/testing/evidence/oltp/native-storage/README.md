@@ -35,8 +35,8 @@ with a lightweight transaction (Paxos); the ScyllaDB numbers use a plain prepare
 | System | Binary | Notes |
 | --- | --- | --- |
 | Baseline | `nabedra-db-b29a178`, SHA-256 `953a35f3…e1012e` | `--pool-format-version 1` and the `b29a178` Python ORM tree for the API CLI |
-| Candidate (final) | `nabedra-db-c74c2d4`, SHA-256 `bf370a7e…2015ac2`; server sources identical to lead `20747f8` | Built on Actions in `rust:1.94.1-bookworm` (glibc 2.36), [run 44811636932](https://github.com/zPy52/nabedra-database/actions/runs/44811636932), 426 s |
-| Candidate (earlier) | `nabedra-db-83d7a0b`, SHA-256 `261f8521…efb1d5`; sources identical to `a7f03c2` | [Run 44804204143](https://github.com/zPy52/nabedra-database/actions/runs/44804204143), 443 s; the e7453a1 build produced the same SHA-256 |
+| Candidate (final) | `nabedra-db-c74c2d4`, SHA-256 `bf370a7e…2015ac2`; server sources identical to lead `20747f8` | Built on Actions in `rust:1.94.1-bookworm` (glibc 2.36), [run 44811636932](https://github.com/nabedra/database/actions/runs/44811636932), 426 s |
+| Candidate (earlier) | `nabedra-db-83d7a0b`, SHA-256 `261f8521…efb1d5`; sources identical to `a7f03c2` | [Run 44804204143](https://github.com/nabedra/database/actions/runs/44804204143), 443 s; the e7453a1 build produced the same SHA-256 |
 | ScyllaDB | `scylladb/scylla:6.2.3@sha256:a9d90408…` | RF3, QUORUM, `--commitlog-sync=batch`, `--smp=1`, `--memory=1700M` |
 
 All Nabedra runs used the image `nabedra-oltp-perf-builder:1.94.1` (`sha256:1547483c…`), the same image as the
@@ -323,7 +323,7 @@ writers took 69.6 ms, and the stall counter rose by 69 ms in that step. The same
 | Build | Time | Size | Source |
 | --- | --- | --- | --- |
 | Release `nabedra-db` (oltp), cold, 4 jobs, no cache | 401 to 443 s | 93.3 MB (`20747f8`), 95.8 MB (`a7f03c2`) | `bench` job, this branch |
-| OLTP image, cold plus cache export | 515 s | 240 MB | [run 44733897949](https://github.com/zPy52/nabedra-database/actions/runs/44733897949) (`bbc0ae0`) |
+| OLTP image, cold plus cache export | 515 s | 240 MB | [run 44733897949](https://github.com/nabedra/database/actions/runs/44733897949) (`bbc0ae0`) |
 | OLTP image after a one-line change | 392 to 428 s | | ledger, BLD1 to BLD3 |
 | Events image, cold plus cache export | 303 s | 109 MB | run 44733897949 |
 

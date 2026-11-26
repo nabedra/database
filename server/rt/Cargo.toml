@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94.1"
 description = "Nabedra's runtime seam: clock, task spawning, ids and the filesystem, with a deterministic simulation mode"
 license = "MIT"
-repository = "https://github.com/zPy52/nabedra-database"
+repository = "https://github.com/nabedra/database"
 publish = ["crates-io"]
 
 [lib]

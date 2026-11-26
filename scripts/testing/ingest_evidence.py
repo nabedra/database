@@ -3,6 +3,7 @@
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -16,7 +17,7 @@ import evidence
 import matrix
 
 
-DEFAULT_REPO = "zPy52/nabedra-database"
+DEFAULT_REPO = evidence.GITHUB_REPOSITORY
 BUILD_WORKFLOW = ".github/workflows/nabedra-build.yml"
 SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -58,22 +59,35 @@ def get_artifacts(repo, run_id):
             if artifact["name"] == "evidence" or artifact["name"].startswith("evidence-")]
 
 
-def verify_attestation(data, repo, run, attempt):
-    with tempfile.NamedTemporaryFile(suffix=".json") as subject:
-        subject.write(data)
-        subject.flush()
+def verify_attestation(data, repo, run, info, signer_repo):
+    certificate = ".[].verificationResult.signature.certificate"
+    with tempfile.TemporaryDirectory() as tmp:
+        subject = Path(tmp) / "record.json"
+        subject.write_bytes(data)
         try:
+            bundle_arg = []
+            if signer_repo != repo:
+                # Download from the repository's current location and verify against the
+                # identity in the historical signing certificate.
+                bundle = Path(tmp) / "attestations.jsonl"
+                digest = hashlib.sha256(data).hexdigest()
+                bundle.write_bytes(gh(
+                    "api", "--paginate", f"repos/{repo}/attestations/sha256:{digest}",
+                    "--jq", ".attestations[].bundle | @json",
+                ))
+                bundle_arg = ["--bundle", str(bundle)]
+                certificate += f' | select(.sourceRepositoryIdentifier == "{evidence.GITHUB_REPOSITORY_ID}")'
             invocations = json.loads(gh(
-                "attestation", "verify", subject.name, "--repo", repo,
-                "--signer-workflow", f"{repo}/{BUILD_WORKFLOW}", "--source-digest", run["head_sha"],
+                "attestation", "verify", str(subject), "--repo", signer_repo, *bundle_arg,
+                "--signer-workflow", f"{signer_repo}/{BUILD_WORKFLOW}", "--source-digest", run["head_sha"],
                 "--format", "json",
-                "--jq", "[.[].verificationResult.signature.certificate.runInvocationURI]",
+                "--jq", f"[{certificate} | .runInvocationURI]",
             ))
         except subprocess.CalledProcessError as exc:
             raise ValueError(f"attestation verification failed: {gh_error(exc)}") from exc
         except subprocess.TimeoutExpired as exc:
             raise ValueError("attestation verification timed out") from exc
-    if f"{run['html_url']}/attempts/{attempt}" not in invocations:
+    if f"{info['url']}/attempts/{info['attempt']}" not in invocations:
         raise ValueError("attestation belongs to a different run or attempt")
 
 
@@ -87,14 +101,21 @@ def import_record(data, schema, dest, repo, run, tested_sha, request_id, verify)
     if record["sha"] != tested_sha:
         raise ValueError(f"SHA mismatch: record {record['sha']}, run tested {tested_sha}")
     info = record["run"]
-    if info["url"] != run["html_url"] or (request_id and info["request_id"] != request_id):
+    signer_repo = repo
+    if (repo.lower() == DEFAULT_REPO
+            and info["url"] == f"https://github.com/{evidence.PRE_TRANSFER_REPOSITORY}/actions/runs/{run['id']}"):
+        # GitHub now reports the canonical URL even for runs whose signed bytes use the old URL.
+        signer_repo = evidence.PRE_TRANSFER_REPOSITORY
+    elif info["url"] != run["html_url"]:
+        raise ValueError("record belongs to a different run")
+    if request_id and info["request_id"] != request_id:
         raise ValueError("record belongs to a different run")
     if info["attempt"] is None or info["attempt"] > run["run_attempt"]:
         raise ValueError("record has an invalid run attempt")
     date = datetime.fromisoformat(info["date"].upper()).astimezone(timezone.utc)
     path = evidence.record_path(record, dest, now=date)
     if verify:
-        verify_attestation(data, repo, run, info["attempt"])
+        verify_attestation(data, repo, run, info, signer_repo)
     else:
         # Readers of trusted records only scan *.json. Keep the original bytes for later verification.
         path = path.with_suffix(".json.unattested")

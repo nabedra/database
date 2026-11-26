@@ -51,8 +51,8 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(list(condition), ['StringEquals'])  # no wildcard StringLike
         self.assertEqual(condition['StringEquals']['token.actions.githubusercontent.com:aud'], 'sts.amazonaws.com')
         self.assertEqual(condition['StringEquals']['token.actions.githubusercontent.com:sub'], [
-            'repo:zPy52@36101760/nabedra-database@1459052341:ref:refs/heads/main:event_name:workflow_dispatch',
-            'repo:zPy52@36101760/nabedra-database@1459052341:ref:refs/heads/main:event_name:schedule',
+            'repo:nabedra@361663474/database@1459052341:ref:refs/heads/main:event_name:workflow_dispatch',
+            'repo:nabedra@361663474/database@1459052341:ref:refs/heads/main:event_name:schedule',
         ])
         for subject in condition['StringEquals']['token.actions.githubusercontent.com:sub']:
             self.assertNotIn('*', subject)

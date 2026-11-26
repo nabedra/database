@@ -13,9 +13,9 @@ and slot moves in simulation. Its absolute scale-out qualification needs
 dedicated hardware. K05 keeps deploy, replace, and drain on kind.
 See the [cache benchmark](../cache-benchmark.md).
 
-Coverage note: K01 Tcl canary is `not-run` for coverage. It executed zero assertions and reported five setup exceptions. [Canary run](https://github.com/zPy52/nabedra-database/actions/runs/45301342381/job/138134435377).
+Coverage note: K01 Tcl canary is `not-run` for coverage. It executed zero assertions and reported five setup exceptions. [Canary run](https://github.com/nabedra/database/actions/runs/45301342381/job/138134435377).
 
-Coverage note: K03 Docker has an intermittent full-placement timeout. [Main baseline](https://github.com/zPy52/nabedra-database/actions/runs/45233126481/job/137897811340).
+Coverage note: K03 Docker has an intermittent full-placement timeout. [Main baseline](https://github.com/nabedra/database/actions/runs/45233126481/job/137897811340).
 
 Coverage note: K03 simulated controller disk loss is `not-run` pending modelled Raft storage.
 
