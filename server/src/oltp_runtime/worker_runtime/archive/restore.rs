@@ -254,6 +254,23 @@ impl VerifiedNativeRestore {
                         .await?;
                         group = Some((scope.clone(), active));
                     }
+                    HistoryFrame::GroupSearch(schema) => {
+                        let (scope, active) = group.as_ref().ok_or_else(unknown)?;
+                        let store = pool
+                            .group(map_native_group(
+                                &scope.group,
+                                target.statement().target_pool.cluster_id,
+                            ))
+                            .await?;
+                        crate::oltp::mvcc::store::restore::install_search_schema(
+                            &store,
+                            target.clone(),
+                            scope.clone(),
+                            active.clone(),
+                            (**schema).clone(),
+                        )
+                        .await?;
+                    }
                     HistoryFrame::Image(image) => {
                         let (scope, active) = group.as_ref().ok_or_else(unknown)?;
                         if let Some(value) = &image.value {
