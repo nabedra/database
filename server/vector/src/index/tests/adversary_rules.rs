@@ -8,6 +8,7 @@ use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
 use nabedra_check::Gen;
+use nabedra_rt::fs::FaultFs;
 use nabedra_check::prop::{Config as Runs, check_with};
 
 use super::super::codec::{dot, exact, goodness};
@@ -1038,4 +1039,62 @@ fn adv25_an_entry_that_a_reassign_moved_is_not_copied_again_by_a_drain_of_its_so
     assert!(census.iter().all(|c| c.versions.len() == 1 && c.versions[0].1 == 1), "{:?}", census.iter().map(|c| (c.slot, c.versions.clone())).collect::<Vec<_>>());
     let entries: usize = ix.shards[0].parts.values().map(|p| p.entries().count()).sum();
     assert_eq!(entries, angles.len(), "one entry for each row");
+}
+
+// ----- Survivors of the mutation pass.
+
+/// The meaning of each filter on values written by hand, not through the code under test.
+#[test]
+fn adv26_filters_mean_what_they_say() {
+    let t = |s: &str| Value::Text(Arc::from(s));
+    let one = |c: Value| vec![c];
+    let range = |lo: Bound<Value>, hi: Bound<Value>| Filter::Range(0, lo, hi);
+    let ints = |f: &Filter| (0..6).filter(|n| f.matches(&one(Value::Int(*n)))).collect::<Vec<i64>>();
+    assert_eq!(ints(&range(Bound::Excluded(Value::Int(2)), Bound::Included(Value::Int(4)))), vec![3, 4]);
+    assert_eq!(ints(&range(Bound::Included(Value::Int(2)), Bound::Excluded(Value::Int(4)))), vec![2, 3]);
+    assert_eq!(ints(&range(Bound::Unbounded, Bound::Excluded(Value::Int(1)))), vec![0]);
+    let prefix = Filter::StartsWith(0, Arc::from("ab"));
+    assert!(prefix.matches(&one(t("abc"))) && prefix.matches(&one(t("ab"))));
+    assert!(!prefix.matches(&one(t("cab"))) && !prefix.matches(&one(t("a"))));
+    // Through the index, with summaries and bitmaps.
+    let mut ix = serving(Config::new(schema(2, &[ColumnType::Int, ColumnType::Text], None), 1), ExactCodec, None);
+    let rows = (0..6u64).map(|k| (k, Some(row(&[1.0, k as f32], vec![Value::Int(k as i64), t(["abc", "cab", "ab", "b", "xab", "abab"][k as usize])], k))))
+        .collect();
+    feed(&mut ix, RANGE, &page(0, rows));
+    let search = |ix: &mut Index, f: Filter| {
+        let pin = latest(ix, Some(&f));
+        let mut v = images(&ix.search(&pin, &Query { filter: Some(f), ..query(Op::Dot, &[1.0, 1.0], 10) }).unwrap());
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(search(&mut ix, Filter::StartsWith(1, Arc::from("ab"))), vec![0, 2, 5]);
+    assert_eq!(search(&mut ix, Filter::Range(0, Bound::Excluded(Value::Int(1)), Bound::Excluded(Value::Int(4)))), vec![2, 3]);
+}
+
+/// A page whose records lie outside its own bounds is refused and takes nothing.
+#[test]
+fn adv26_a_record_outside_its_page_is_refused() {
+    let mut ix = serving(Config::new(schema(2, &[ColumnType::Int], None), 1), ExactCodec, None);
+    for (after, through, at) in [(0, 2, 3), (2, 4, 2), (0, 2, 0)] {
+        let page = Page { after, through, records: vec![record(at, 1)] };
+        let r = ix.apply(RANGE, &page);
+        assert!(matches!(r, Err(Error::InvalidFeed(_)) | Err(Error::Gap { .. })), "{after}..{through} holds {at}: {r:?}");
+        assert_eq!(ix.status(RANGE).unwrap().delivered, 0);
+    }
+}
+
+/// A checkpoint of other dimensions is damage of the whole manifest, never served.
+#[test]
+fn adv26_a_checkpoint_of_other_dimensions_is_damage() {
+    let fs = FaultFs::new();
+    fs.create_dir_all_durable(std::path::Path::new("/data"));
+    let store = Store::new(Arc::new(fs.clone()), "/data/ck");
+    let cfg = Config::new(schema(2, &[ColumnType::Int], None), 1);
+    let mut ix = serving(cfg, ExactCodec, Some(store.clone()));
+    feed(&mut ix, RANGE, &page(0, vec![(1, Some(row(&[1.0, 0.0], vec![Value::Int(0)], 1)))]));
+    ix.checkpoint().unwrap();
+    let other = Config::new(schema(3, &[ColumnType::Int], None), 1);
+    let (back, damage) = Index::recover(other, ExactCodec, store).unwrap();
+    assert_eq!(damage.len(), 1, "{damage:?}");
+    assert!(back.status(RANGE).is_err(), "nothing is held");
 }
