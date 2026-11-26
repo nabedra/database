@@ -163,6 +163,9 @@ pub enum HistoryFrame {
     Scope(HistoryScope),
     StatusClosure(ArchiveClosureStatement),
     BeginGroup(GroupImageScope),
+    /// The search columns of the group that began, before its first image,
+    /// only for a table with search columns (L7).
+    GroupSearch(Box<crate::oltp::mvcc::store::search::SearchSchema>),
     Image(CommittedImage),
     CatalogIndexClosure(ArchivedIndexClosure),
     CatalogSplitPublication(ArchivedSplitPublication),
@@ -350,6 +353,7 @@ impl OwnedPayload for HistoryFrame {
             Self::Identity { identity, .. } => serialized_size(identity)?,
             Self::BeginTransaction(decision) => serialized_size(decision)?,
             Self::ParticipantEffects(effects) => effects.heap_bytes()?,
+            Self::GroupSearch(schema) => serialized_size(schema)?,
             _ => 0,
         })
     }
@@ -399,6 +403,7 @@ struct GroupProgress {
     scope: GroupImageScope,
     count: u64,
     root: Digest,
+    searched: bool,
 }
 struct TxnProgress {
     decision: ArchivedDecision,
@@ -654,6 +659,7 @@ impl Chain {
                 group.group.validate().map_err(|_| invalid())?;
                 self.previous_group = Some(order);
                 self.group = Some(GroupProgress {
+                    searched: false,
                     scope: group.clone(),
                     count: 0,
                     root: serialized_digest(&(b"nabedra/history-group/v1", group))?,
@@ -757,6 +763,16 @@ impl Chain {
                 }) {
                     return Err(invalid());
                 }
+            }
+            HistoryFrame::GroupSearch(_) => {
+                let group = self.group.as_mut().ok_or_else(invalid)?;
+                if group.searched
+                    || group.count != 0
+                    || !matches!(group.scope.group.kind, GroupKind::Data { .. })
+                {
+                    return Err(invalid());
+                }
+                group.searched = true;
             }
             HistoryFrame::EndGroup {
                 group_id,

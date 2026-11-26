@@ -240,7 +240,7 @@ impl ParticipantMachine {
                 },
             )
             .await;
-        self.note_damage(result)
+        self.note_damage(result).await
     }
 }
 

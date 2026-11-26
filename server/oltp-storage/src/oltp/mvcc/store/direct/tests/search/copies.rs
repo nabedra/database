@@ -549,3 +549,57 @@ async fn vs08_split_usage_counts_vectors() {
     let page = s.f.machine().committed_image_page(request(&s, 60, usage.1, None)).await.unwrap();
     assert!(matches!(page.payload().unwrap(), ImagePage::Images { images, .. } if !images.is_empty()));
 }
+
+/// L7: a restore checks every vector against the backup's search columns, and
+/// a mismatch refuses the batch as a schema error before anything is written,
+/// without quarantining anything.
+#[tokio::test]
+async fn vs16_a_restore_refuses_vectors_that_do_not_fit_the_backups_columns() {
+    let mut s = S::new().await;
+    fill(&mut s).await;
+    let backup = images(&s, 50).await;
+    let images: Vec<&CommittedImage> = backup.iter().collect();
+    let schema = |columns| crate::oltp::mvcc::store::search::SearchSchema {
+        epoch: 1,
+        columns,
+        high: MULTI,
+    };
+    restore::check_schema(Some(&schema(columns())), &images).unwrap();
+    // Another dimension, another kind, a column the backup does not have, none.
+    let mut wider = columns();
+    wider[0].dim = 3;
+    let mut sparse = columns();
+    sparse[3] = column(MULTI, VectorKind::Sparse, 0);
+    let mut fewer = columns();
+    fewer.remove(0);
+    for (name, columns) in [("dimension", Some(wider)), ("kind", Some(sparse)), ("column", Some(fewer)), ("none", None)] {
+        let mut target = s.f.group.clone();
+        target.group_id = nabedra_rt::ids::uuid_v4();
+        let store = s.f.pool.group(target.clone()).await.unwrap();
+        let backup = backup.clone();
+        let schema = columns.map(schema);
+        let refused = store
+            .transaction(
+                ApplyMeta { position: position(0), command_digest: digest(7), membership: None },
+                BUDGET,
+                move |tx| {
+                    let images: Vec<_> = backup.iter().collect();
+                    // As `install_images` does: check, then install.
+                    restore::check_schema(schema.as_ref(), &images)?;
+                    restore::install_rows(tx, &target, &full_span(), ts(50), &images)?;
+                    Ok(Transition::Commit(tx.copy_output(b"null")?))
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(refused.code, ErrorCode::ValidationError, "{name}");
+        assert!(refused.message.contains("search columns"), "{name}: {}", refused.message);
+        let replica = Replica { machine: ParticipantMachine::new(store).unwrap(), shared: s.f.shared().clone(), index: 0 };
+        assert!(replica.dump().await.is_empty(), "{name}: nothing installed");
+        assert!(!s.f.pool.is_group_quarantined(replica.machine.store().identity().group_id), "{name}");
+    }
+    // Rows without vectors need no columns.
+    let plain: Vec<_> = backup.iter().filter(|image| image.search.is_none()).collect();
+    restore::check_schema(None, &plain).unwrap();
+}

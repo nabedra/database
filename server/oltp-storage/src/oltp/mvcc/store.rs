@@ -443,7 +443,7 @@ impl ParticipantMachine {
                 apply(tx, &identity, position, command_digest, command.payload()?)
             })
             .await;
-        let applied = self.note_damage(applied)?;
+        let applied = self.note_damage(applied).await?;
         // The entry applied (or was rejected) durably: its pending entry, if
         // this node proposed it, leaves the range clock.
         self.clock.observe_applied(position);

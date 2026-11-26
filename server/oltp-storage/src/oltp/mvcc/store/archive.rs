@@ -258,7 +258,7 @@ impl ParticipantMachine {
                 },
             )
             .await;
-        self.note_damage(page)
+        self.note_damage(page).await
     }
 }
 impl ParticipantHandle {

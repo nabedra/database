@@ -240,7 +240,8 @@ impl ParticipantMachine {
                         }
                         None => prefix.to_vec(),
                     };
-                    let search = search::SplitSearch::of(&config, request.read_ts);
+                    let search = search::SplitSearch::of(&config);
+                    let records = search::SplitSearch::frozen_at(&config, request.read_ts);
                     let mut images = Vec::with_capacity(request.max_items as usize);
                     let mut used = 4096
                         + images.capacity() * std::mem::size_of::<CommittedImage>()
@@ -344,7 +345,7 @@ impl ParticipantMachine {
                             }
                             let value = row::Version::decode(version.value())?;
                             let vectors =
-                                row::image_cost(view, logical, &value, search.is_some())?
+                                row::image_cost(view, logical, &value, records)?
                                     .ok_or_else(row::damaged_value)?;
                             let cost = encoded_length(&key, super::super::MAX_FIXED_COMMAND_BYTES)?
                                 .checked_add(value.value.map_or(0, |v| v.get().len()))
@@ -367,7 +368,7 @@ impl ParticipantMachine {
                                 .and_then(|n| n.checked_add(IMAGE_METADATA_BYTES))
                                 .ok_or_else(invalid)?;
                             let image =
-                                row::image(view, &config, logical, &value, search.is_some(), &owner)?;
+                                row::image(view, &config, logical, &value, records, &owner)?;
                             let value = value
                                 .value
                                 .map(|value| {
@@ -466,7 +467,7 @@ impl ParticipantMachine {
                 },
             )
             .await;
-        self.note_damage(page)
+        self.note_damage(page).await
     }
 }
 impl ParticipantHandle {

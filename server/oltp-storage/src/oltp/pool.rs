@@ -333,6 +333,8 @@ impl OltpPool {
             let healthy = count_healthy_groups(&store)?;
             damage::admit(path, &store, &opened.quarantined, healthy)?
         };
+        // L6: the groups quarantined for damaged vectors, from one synced record.
+        let value_damage = damage::read_value_damage(&store)?;
         if opened.recovery.tail_truncations > 0 {
             tracing::warn!(
                 path = %path.display(),
@@ -342,6 +344,7 @@ impl OltpPool {
         }
         let recovery = Arc::new(AtomicBool::new(false));
         let damage_state = Arc::new(damage::DamageState::new());
+        damage_state.mark_values(value_damage);
         {
             let path = path.to_owned();
             let damage_state = damage_state.clone();
@@ -1765,7 +1768,8 @@ impl<'a> GroupRead<'a> {
         }))
     }
     /// The first change record at or after log index `index` (`feed`).
-    pub(crate) fn change_from(&mut self, index: u64) -> Result<Option<(u64, Bytes)>, ProtocolError> {
+    #[doc(hidden)]
+    pub fn change_from(&mut self, index: u64) -> Result<Option<(u64, Bytes)>, ProtocolError> {
         let start = change_key(&self.prefix, index);
         let mut upper = start[..CHANGE_PREFIX_BYTES].to_vec();
         upper[CHANGE_PREFIX_BYTES - 1] += 1;
@@ -2057,7 +2061,8 @@ impl<'a> GroupTransaction<'a> {
     }
     /// The change record of log index `index`, in the same batch as the entry.
     /// Like the log it belongs to this replica: no generation, no snapshot.
-    pub(crate) fn put_change(&mut self, index: u64, value: &[u8]) -> Result<(), ProtocolError> {
+    #[doc(hidden)]
+    pub fn put_change(&mut self, index: u64, value: &[u8]) -> Result<(), ProtocolError> {
         self.put_meta(change_key(&self.read.prefix, index), value)
     }
     /// Deletes the change records of log indexes `from..=through`. The log's
@@ -2092,6 +2097,11 @@ impl<'a> GroupTransaction<'a> {
     }
 }
 
+/// `0x40 ‖ group ‖ 'q'`: the group's vector values are damaged (L6).
+const VALUE_DAMAGE: u8 = b'q';
+fn value_damage_key(id: Uuid) -> Vec<u8> {
+    group_key(id, VALUE_DAMAGE, &[])
+}
 /// `0x40 ‖ group ‖ 'c'`, before the log index of a change record.
 const CHANGE_PREFIX_BYTES: usize = GROUP_SCOPE_BYTES + 1;
 /// `prefix` is the state or log prefix of the same group.

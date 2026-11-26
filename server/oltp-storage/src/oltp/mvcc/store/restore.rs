@@ -1,6 +1,7 @@
 //! Install verified fixed committed images before a new target begins Raft.
 //! Source request execution, Prepare and mutation decisions are never replayed.
 use super::image_archive::CommittedImage;
+use super::search::SearchSchema;
 use super::*;
 use crate::oltp::{
     backup::{
@@ -11,6 +12,8 @@ use crate::oltp::{
 };
 pub(super) const RESTORE_GENESIS: &[u8] = b"mvcc/restore-genesis/v1";
 const RESTORE_INACTIVE: &[u8] = b"mvcc/restore-inactive/v1";
+/// The backup's search columns of the restored group (L7).
+const RESTORE_SEARCH: &[u8] = b"mvcc/restore-search/v1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParticipantGenesis {
@@ -79,6 +82,27 @@ pub async fn install_images(
     target: Arc<OfflineRestoreTarget>,
     scope: GroupImageScope,
     active: Option<GroupImageScope>,
+    images: Vec<crate::oltp::backup::history::OwnedImage>,
+) -> Result<(), ProtocolError> {
+    install(store, target, scope, active, None, images).await
+}
+/// Records the backup's search columns of the group (`HistoryFrame::GroupSearch`)
+/// before its images, which are then checked against them (L7).
+pub async fn install_search_schema(
+    store: &GroupStore,
+    target: Arc<OfflineRestoreTarget>,
+    scope: GroupImageScope,
+    active: Option<GroupImageScope>,
+    schema: SearchSchema,
+) -> Result<(), ProtocolError> {
+    install(store, target, scope, active, Some(schema), Vec::new()).await
+}
+async fn install(
+    store: &GroupStore,
+    target: Arc<OfflineRestoreTarget>,
+    scope: GroupImageScope,
+    active: Option<GroupImageScope>,
+    search: Option<SearchSchema>,
     mut images: Vec<crate::oltp::backup::history::OwnedImage>,
 ) -> Result<(), ProtocolError> {
     let historical = ParticipantGenesis::new(&scope, target.statement())?;
@@ -140,6 +164,17 @@ pub async fn install_images(
                     }
                     tx.put_serialized(RESTORE_INACTIVE, &historical.restore_id)?;
                 }
+                if let Some(search) = &search {
+                    match load::<SearchSchema>(tx, RESTORE_SEARCH)? {
+                        Some(previous) if previous != *search => return Err(schema_mismatch()),
+                        Some(_) => {}
+                        None => tx.put_serialized(RESTORE_SEARCH, search)?,
+                    }
+                }
+                let schema = match search {
+                    Some(search) => Some(search),
+                    None => load::<SearchSchema>(tx, RESTORE_SEARCH)?,
+                };
                 let mut kept = Vec::with_capacity(images.len());
                 for owned in &images {
                     let image: &CommittedImage = owned.image()?;
@@ -147,6 +182,7 @@ pub async fn install_images(
                         kept.push(image);
                     }
                 }
+                check_schema(schema.as_ref(), &kept)?;
                 install_rows(tx, &group, &historical.span, historical.cut, &kept)
             },
         )
@@ -157,6 +193,24 @@ pub async fn install_images(
 /// records, so a row whose newest version has a source text and no vector gets a
 /// new one. Its identity is above every timestamp of the restored history, so a
 /// report that was made for a record of the source matches nothing (DB-22).
+/// Every vector of a batch has the type of its column in the backup, or
+/// nothing of the batch is installed. A mismatch is the operator's, not
+/// damage (L7).
+pub(super) fn check_schema(
+    schema: Option<&SearchSchema>,
+    images: &[&CommittedImage],
+) -> Result<(), ProtocolError> {
+    // Every vector has the type of its column in the backup, or nothing of the
+    // batch is installed. A mismatch is the operator's, not damage (L7).
+    for image in images {
+        if let Some(search) = &image.search
+            && !schema.is_some_and(|schema| search.fits(schema))
+        {
+            return Err(schema_mismatch());
+        }
+    }
+    Ok(())
+}
 pub(super) fn install_rows(
     tx: &mut GroupTransaction<'_>,
     group: &GroupIdentity,
@@ -188,6 +242,12 @@ pub(super) fn install_rows(
     Ok(())
 }
 
+fn schema_mismatch() -> ProtocolError {
+    failure(
+        ErrorCode::ValidationError,
+        "restore refused: the backup's vectors do not fit its search columns",
+    )
+}
 /// Write one committed image into a restore target, idempotently. Dedup
 /// images go to the `'D'` namespace; every other key becomes a version.
 pub(super) fn install_image(

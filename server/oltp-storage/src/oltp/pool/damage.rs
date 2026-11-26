@@ -46,6 +46,30 @@ const ACCEPTED_KEY: &[u8] = b"\0typed-pool-quarantine-v1";
 /// Created by an operator to accept the damage of a pool that R6 refused.
 pub const ACCEPT_DAMAGE_FILE: &str = "NABEDRA_OLTP_POOL_ACCEPT_DAMAGE";
 const MAX_ACCEPTED_BYTES: usize = 1 << 20;
+/// The synced set of groups quarantined for damaged vector values (L6, JSON
+/// `[Uuid]`). Store-wide scope, like the accepted record.
+const VALUE_DAMAGE_KEY: &[u8] = b"\0typed-pool-value-damage-v1";
+
+/// The groups an earlier run quarantined for damaged vector values.
+pub(super) fn read_value_damage(store: &Store) -> Result<Vec<Uuid>, ProtocolError> {
+    let Some(raw) = store.snapshot().get(VALUE_DAMAGE_KEY).map_err(storage_error)? else {
+        return Ok(Vec::new());
+    };
+    if raw.len() > MAX_ACCEPTED_BYTES {
+        return Err(accepted_unreadable());
+    }
+    serde_json::from_slice(&raw).map_err(|_| accepted_unreadable())
+}
+fn write_value_damage(store: &Store, groups: &BTreeSet<Uuid>) -> Result<(), ProtocolError> {
+    let bytes = serde_json::to_vec(groups).map_err(|_| accepted_unreadable())?;
+    let mut batch = WriteBatch::new();
+    batch.put(VALUE_DAMAGE_KEY, &bytes);
+    let commit = store
+        .submit(batch, Durability::Sync, Box::new(()))
+        .map_err(|error| commit_error(error).1)?;
+    wait_commit(commit).map_err(|error| commit_error(error).1)?;
+    Ok(())
+}
 /// R6: more than this many groups quarantined by one open refuses the pool.
 const R6_MAX_GROUPS: usize = 8;
 
@@ -110,6 +134,8 @@ pub(super) struct DamageState {
     /// cannot see. Found again at the next read after a restart.
     values: Mutex<BTreeSet<Uuid>>,
     any_value: AtomicBool,
+    /// Orders the rewrites of the value damage record.
+    value_writes: Mutex<()>,
 }
 impl DamageState {
     pub(super) fn new() -> Self {
@@ -121,10 +147,20 @@ impl DamageState {
             releases: AtomicU64::new(0),
             values: Mutex::new(BTreeSet::new()),
             any_value: AtomicBool::new(false),
+            value_writes: Mutex::new(()),
         }
     }
     fn values(&self) -> std::sync::MutexGuard<'_, BTreeSet<Uuid>> {
         self.values.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+    /// Groups quarantined for damaged values, from their markers at open or at
+    /// run time.
+    pub(super) fn mark_values(&self, groups: impl IntoIterator<Item = Uuid>) {
+        let mut values = self.values();
+        values.extend(groups);
+        if !values.is_empty() {
+            self.any_value.store(true, Ordering::Release);
+        }
     }
     pub(super) fn damaged_values(&self) -> Vec<Uuid> {
         self.values().iter().copied().collect()
@@ -272,14 +308,44 @@ fn write_accepted(store: &Store, accepted: &BTreeSet<Uuid>) -> Result<(), Protoc
 impl OltpPool {
     /// A stored vector value of `group` is missing or fails its checksum: the
     /// group is quarantined like one whose block kv found damaged (rule 1).
-    pub(crate) fn report_value_damage(&self, group: Uuid) {
+    /// L6: the quarantine is durable before the caller returns. The group's
+    /// own synced marker survives a restart, and an open finds it, so the
+    /// replica never votes, acknowledges or serves again; releasing the group
+    /// after its replacement deletes it with the group's bytes.
+    pub(crate) async fn report_value_damage(&self, group: Uuid) {
         let damage = &self.inner.damage;
-        if damage.values().insert(group) {
-            damage.any_value.store(true, Ordering::Release);
-            damage.events.send_if_modified(|groups| groups.insert(group));
-            tracing::error!(%group, "OLTP group quarantined: a stored vector value is damaged");
+        if damage.value_damaged(group) {
+            return;
         }
+        // The group's own marker and the pool's record of every such group,
+        // in one synced batch. An open reads only the record.
+        let submitted = {
+            let _serial = damage.value_writes.lock().unwrap_or_else(|poison| poison.into_inner());
+            let mut groups: BTreeSet<Uuid> = damage.values().clone();
+            groups.insert(group);
+            let mut batch = WriteBatch::new();
+            batch.put(&super::value_damage_key(group), b"1");
+            serde_json::to_vec(&groups)
+                .map_err(|_| accepted_unreadable())
+                .and_then(|record| {
+                    batch.put(VALUE_DAMAGE_KEY, &record);
+                    self.submit(&[], batch, Durability::Sync, Box::new(()))
+                })
+        };
+        let written = match submitted {
+            Ok(commit) => commit.done().await.map_err(|error| self.failed(error)),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = written {
+            // The pool is latched or the scope quarantined already: either way
+            // this replica writes nothing more.
+            tracing::error!(%group, %error, "could not persist a vector damage quarantine");
+        }
+        damage.mark_values([group]);
+        damage.events.send_if_modified(|groups| groups.insert(group));
+        tracing::error!(%group, "OLTP group quarantined: a stored vector value is damaged");
     }
+
     /// Rewrites the accepted record to the store's current quarantined groups.
     /// Blocks on a synced write: call it off the async runtime.
     fn accept_current(&self) -> Result<(), ProtocolError> {
@@ -405,7 +471,12 @@ impl OltpPool {
                     .release_scope(&group_scope(id))
                     .map_err(|error| pool.failed(error))?;
                 pool.inner.damage.releases.fetch_add(1, Ordering::Relaxed);
-                pool.inner.damage.values().remove(&id);
+                let damage = &pool.inner.damage;
+                let _serial = damage.value_writes.lock().unwrap_or_else(|poison| poison.into_inner());
+                if damage.values().remove(&id) {
+                    let rest = damage.values().clone();
+                    write_value_damage(&pool.inner.store, &rest).inspect_err(|_| pool.latch())?;
+                }
                 ReleaseOutcome::Released
             } else {
                 ReleaseOutcome::AlreadyReleased

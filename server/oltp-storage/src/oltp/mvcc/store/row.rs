@@ -630,7 +630,7 @@ pub(super) fn damaged_value() -> ProtocolError {
 }
 impl ParticipantMachine {
     /// Quarantines the group when a read or an apply met a damaged vector.
-    pub(super) fn note_damage<T>(
+    pub(super) async fn note_damage<T>(
         &self,
         result: Result<T, ProtocolError>,
     ) -> Result<T, ProtocolError> {
@@ -640,7 +640,8 @@ impl ParticipantMachine {
         {
             self.store
                 .pool()
-                .report_value_damage(self.store.identity().group_id);
+                .report_value_damage(self.store.identity().group_id)
+                .await;
         }
         result
     }
@@ -791,7 +792,7 @@ impl ParticipantMachine {
                 },
             )
             .await;
-        self.note_damage(result)
+        self.note_damage(result).await
     }
 }
 impl ParticipantHandle {

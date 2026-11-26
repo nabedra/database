@@ -54,7 +54,11 @@ sees every gap. Readers serve only vectors of the range's search columns
 that have their column's type, and a split import or a snapshot install refuses
 one that does not. A Resolve at or below the closed floor fails its apply and
 quarantines the group: it cannot be refused without breaking atomicity, and the
-coordinator's timestamp order should make it impossible (defense in depth).
+coordinator's timestamp order should make it impossible (defense in depth). A
+damaged vector quarantines its group durably: a synced group marker and pool
+record survive a restart, so the replica never opens, votes or serves again
+until its release. A restore checks every vector against the backup's search
+columns (`HistoryFrame::GroupSearch`) and refuses a mismatch as a schema error.
 There is no MVCC version collection. A collector must use
 `store::row::unreferenced` for vectors.
 

@@ -660,3 +660,78 @@ async fn vs16_a_queued_plain_put_on_a_search_range_fails_closed() {
     assert_eq!(after, before, "the row, its vectors and nothing staged");
     assert_eq!(s.get(1).await.vectors[&PLAIN], (10, vec![1; 8]));
 }
+
+/// L6: a vector damage quarantine is durable. The running replica stops
+/// appending, voting and serving at once; after a crash and a restart the pool
+/// finds the group's marker, reports it, and never opens it again.
+#[tokio::test]
+async fn vs16_a_vector_damage_quarantine_survives_a_restart() {
+    let fs = FaultFs::new();
+    let mut s = S::on(Some(&fs)).await;
+    let write = s.write(1, None, Some(row(1, "a")), vec![s.set(PLAIN, s.dense(1))]);
+    s.direct(10, write).await;
+    let (key, mut frame) = s.records(VECTOR).await.remove(0);
+    frame[6] ^= 1;
+    s.tamper(move |tx| tx.put(&key, &frame)).await;
+    let group = s.f.group.clone();
+    let store = s.f.machine().store().clone();
+    let error = got(s.f.machine(), s.f.key(1), 10).await.err().unwrap();
+    assert!(error.message.starts_with("storage corrupt"), "{}", error.message);
+    let quarantined = |error: ProtocolError| {
+        assert!(error.message.contains("quarantined"), "{}", error.message);
+    };
+    // A vote or an append is a log write; an acknowledgment needs an apply.
+    let vote = store
+        .log_transaction(BUDGET, |tx| {
+            tx.put(b"vote", b"term 2")?;
+            Ok(Transition::Commit(tx.copy_output(b"")?))
+        })
+        .await;
+    quarantined(vote.err().unwrap());
+    let commit = s.commit(11, vec![s.write(2, None, Some(row(2, "b")), Vec::new())]);
+    let entry =
+        OwnedCommand::new_owned(ParticipantCommand::Direct(commit), s.f.shared(), ByteClass::Data).unwrap();
+    let meta = ApplyMeta {
+        position: position(s.f.replica.index),
+        command_digest: digest(1),
+        membership: None,
+    };
+    quarantined(s.f.machine().apply(meta, entry).await.err().unwrap());
+    // Its host stops on the published damage (rule 1); the group is not served
+    // again, since no restart opens it.
+    assert!(s.f.pool.watch_damage().borrow().contains(&group.group_id));
+
+    let S { f, .. } = s;
+    let Fixture {
+        replica,
+        pool,
+        pool_identity,
+        dir,
+        ..
+    } = f;
+    let shared = replica.shared.clone();
+    drop((replica, store, pool));
+    let fs = fs.crash();
+    let pool = open_on(&dir, &fs, &pool_identity, &shared);
+    assert!(pool.quarantined_groups().contains(&group.group_id));
+    assert!(pool.is_group_quarantined(group.group_id));
+    assert!(pool.group_damage(group.group_id).is_some(), "Control is told");
+    quarantined(pool.retained_group(group.clone()).await.err().unwrap());
+    quarantined(pool.group(group.clone()).await.err().unwrap());
+    // Released after its replacement committed, the record forgets it.
+    let removed = crate::oltp::pool::DamagedReplicaRemoved {
+        group: group.clone(),
+        removed: nabedra_oltp_types::types::ReplicaMember {
+            node_id: 2,
+            worker_id: pool_identity.worker_id,
+            pool_id: pool_identity.pool_id,
+        },
+        committed_at: position(40),
+    };
+    pool.release_damaged_group(removed).await.unwrap();
+    assert!(!pool.is_group_quarantined(group.group_id));
+    drop(pool);
+    let pool = open_on(&dir, &fs.crash(), &pool_identity, &shared);
+    assert!(pool.quarantined_groups().is_empty());
+    pool.retained_group(group).await.err().unwrap();
+}

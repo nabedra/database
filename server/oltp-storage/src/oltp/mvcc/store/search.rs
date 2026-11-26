@@ -34,19 +34,23 @@ pub struct SplitSearch {
     pub closed_floor: Option<CommitTs>,
 }
 impl SplitSearch {
-    /// What a page of a frozen source carries at its cut.
-    pub(super) fn of(config: &Config, read_ts: ReadTs) -> Option<Box<Self>> {
+    /// What every image page of a search range carries: a split child takes
+    /// it over, and a backup records it for the restore's check (L7).
+    pub(super) fn of(config: &Config) -> Option<Box<Self>> {
+        config.search.as_ref().map(|schema| {
+            Box::new(Self {
+                schema: schema.clone(),
+                closed_floor: config.closed_floor,
+            })
+        })
+    }
+    /// A page of a frozen split source at its cut also carries the records,
+    /// which the split copies as they are.
+    pub(super) fn frozen_at(config: &Config, read_ts: ReadTs) -> bool {
         config
             .split_source
             .as_ref()
-            .filter(|source| source.statement.read_ts == read_ts)
-            .and(config.search.as_ref())
-            .map(|schema| {
-                Box::new(Self {
-                    schema: schema.clone(),
-                    closed_floor: config.closed_floor,
-                })
-            })
+            .is_some_and(|source| source.statement.read_ts == read_ts)
     }
     pub(super) fn heap_bytes(&self) -> usize {
         std::mem::size_of::<Self>() + columns_bytes(&self.schema.columns)
