@@ -187,6 +187,8 @@ class VectorContract(unittest.TestCase):
         cls.contract = json.loads(VECTORS.read_text(encoding="utf-8"))
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Peer)
         cls.server.daemon_threads = True
+        # Each test can run alone, so the fixture starts with no table, reply or requests.
+        cls.server.table, cls.server.response, cls.server.requests = None, {"data": "null"}, []
         cls.thread = Thread(target=cls.server.serve_forever, kwargs={"poll_interval": 0.01})
         cls.thread.start()
         cls.db = Database(f"http://127.0.0.1:{cls.server.server_port}", "fixture", timeout=5)
