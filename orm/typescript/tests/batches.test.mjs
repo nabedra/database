@@ -196,10 +196,16 @@ test("VS15 later input errors keep the applied count", async (t) => {
   assert.deepEqual(server.chunks, [])
 })
 
-test("a key may repeat in a later chunk", async (t) => {
+test("VS15 duplicate delete keys stop at the chunk boundary", async (t) => {
   const server = await setUp(t)
-  assert.equal(await (await server.table()).deleteMany([...numbers(10_000), 0].map(BigInt)), 10_001)
-  assert.deepEqual(server.sizes(), [10_000, 1])
+  const table = await server.table()
+  await assert.rejects(table.deleteMany([...numbers(10_000), 0].map(BigInt)), ValidationError)
+  assert.deepEqual(server.sizes(), [])
+
+  const error = await batchError(table.deleteMany([...numbers(10_001), 0].map(BigInt)))
+  assert.deepEqual(server.sizes(), [10_000])
+  assert.deepEqual([error.applied, error.outcome], [10_000, "partial"])
+  assert.ok(error.cause instanceof ValidationError)
 })
 
 function embedded(server) {

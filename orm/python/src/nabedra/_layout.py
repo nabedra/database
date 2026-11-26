@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import re
 from types import MappingProxyType
 
 from ._vector import column_kind, to_wire, well_formed
@@ -13,6 +14,13 @@ MAX_SEARCH_COLUMNS = 8
 SCORE = '_score'
 _VECTOR_KINDS = ('dense', 'sparse', 'multi')
 OPTION_FIELDS = ('partition_by', 'full_text', 'embed')
+_MODEL_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}')
+# Keep in step with the language set published by the server's text analyzers.
+_LANGUAGES = frozenset((
+    'arabic', 'danish', 'dutch', 'english', 'finnish', 'french', 'german', 'greek', 'hungarian',
+    'italian', 'norwegian', 'portuguese', 'romanian', 'russian', 'simple', 'spanish', 'swedish',
+    'tamil', 'turkish',
+))
 
 
 def _text(value: object, label: str) -> str:
@@ -48,7 +56,8 @@ class Layout:
         for column, language in texts.items():
             if schema.get(validate_identifier(column)) is not str:
                 raise ValidationError(f'Column {column!r} must be a string column for full text')
-            _text(language, 'Language')
+            if _text(language, 'Language') not in _LANGUAGES:
+                raise ValidationError(f'Unsupported full-text language {language!r}')
         embedded = {
             column: _embed(column, options, schema)
             for column, options in _options({} if embed is None else embed, 'embed').items()
@@ -102,7 +111,10 @@ def check_embed(options: object, schema: Mapping[str, type]) -> dict[str, str]:
         raise ValidationError('Embed options must contain exactly source and model')
     if schema.get(validate_identifier(checked['source'])) is not str:
         raise ValidationError('Embed source must name a string column')
-    return {'source': checked['source'], 'model': _text(checked['model'], 'Embed model')}
+    model = _text(checked['model'], 'Embed model')
+    if not _MODEL_NAME.fullmatch(model):
+        raise ValidationError('Invalid embed model name')
+    return {'source': checked['source'], 'model': model}
 
 
 def extend(layout: Layout, name: str, typ: object, embed: object) -> Layout:

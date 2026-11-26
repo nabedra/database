@@ -185,11 +185,17 @@ class BatchTests(unittest.TestCase):
                 table.upsert_many(first())
         self.assertEqual(self.server.chunks, [])
 
-    def test_a_key_may_repeat_in_a_later_chunk(self):
+    def test_vs15_duplicate_delete_keys_stop_at_the_chunk_boundary(self):
         table = self.table()
-        keys = [*range(10_000), 0]
-        self.assertEqual(table.delete_many(keys), 10_001)
-        self.assertEqual(self.sizes(), [10_000, 1])
+        with self.assertRaises(ValidationError):
+            table.delete_many([*range(10_000), 0])
+        self.assertEqual(self.sizes(), [])
+
+        with self.assertRaises(BatchError) as caught:
+            table.delete_many([*range(10_001), 0])
+        self.assertEqual(self.sizes(), [10_000])
+        self.assertEqual((caught.exception.applied, caught.exception.outcome), (10_000, 'partial'))
+        self.assertIsInstance(caught.exception.__cause__, ValidationError)
 
     def embedded(self):
         self.server.descriptor['schema']['vec'] = {'type': 'vector', 'dim': 2}

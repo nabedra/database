@@ -69,11 +69,11 @@ def type_from_wire(wire: object) -> object:
         if set(wire) == {'type', 'sparse'} and wire['sparse'] is True:
             return Vector(sparse=True)
     elif type(wire) is dict and wire.get('type') == 'list' and set(wire) == {'type', 'item'}:
-        if wire['item'] == 'utf8':
+        item = wire['item']
+        if item == 'utf8':
             return list[str]
-        item = type_from_wire(wire['item'])
-        if column_kind(item) == 'dense':
-            return list[item]
+        if type(item) is dict and item.get('type') == 'vector' and set(item) == {'type', 'dim'}:
+            return list[Vector(item['dim'])]
     raise ValidationError('Unsupported wire schema type')
 
 
@@ -181,6 +181,7 @@ def query_value(value: object, column: str) -> str | array | dict[int, float] | 
 
 def check_query(value: object, typ: object, column: str) -> None:
     """Match a detached query value against its column's type."""
+    max_words = 1 << 18
     kind = column_kind(typ)
     if kind == 'dense':
         if type(value) is not array:
@@ -189,9 +190,13 @@ def check_query(value: object, typ: object, column: str) -> None:
     elif kind == 'sparse':
         if type(value) is not dict:
             raise ValidationError(f'Column {column!r} requires a mapping of index to weight')
+        if len(value) > max_words:
+            raise LimitExceededError(f'Column {column!r} exceeds {max_words} query vector words')
     elif type(value) is not list:
         raise ValidationError(f'Column {column!r} requires a sequence of float32 vectors')
     else:
+        if sum(map(len, value)) > max_words:
+            raise LimitExceededError(f'Column {column!r} exceeds {max_words} query vector words')
         multi(value, column, get_args(typ)[0].dim)
 
 
