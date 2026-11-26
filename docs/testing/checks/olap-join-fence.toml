@@ -1,0 +1,11 @@
+id = "olap-join-fence"
+module = "olap-stream"
+kinds = ["T"]
+guarantees = ["OLAP-STR-G04", "OLAP-G07"]
+scenarios = ["ST04", "R03"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/olap-stream/join/fence", "OlapJoinFence", "--module", "olap-stream"]
+cwd = "."
+timeout_s = 1800
+needs = ["tlc"]
+result_parser = "tlc"
