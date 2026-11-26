@@ -13,5 +13,3 @@ why_not_caught = "Only panics inside tasks were tested."
 invariant_added = "A core that failed to start answers its callers with an error."
 fix_commits = ["8c074ad387f4bd94151129a45f9b5f691e157dfc"]
 revert_patch_ok = true
-owner = "oltp-vector lead"
-expires = "2026-12-22"

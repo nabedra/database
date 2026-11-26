@@ -13,5 +13,3 @@ why_not_caught = "No test put a value the index would have refused."
 invariant_added = "A put either fails or reads back bit for bit."
 fix_commits = ["8c074ad387f4bd94151129a45f9b5f691e157dfc"]
 revert_patch_ok = true
-owner = "oltp-vector lead"
-expires = "2026-12-22"
