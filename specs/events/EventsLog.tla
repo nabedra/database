@@ -520,7 +520,9 @@ Fairness ==
     \* OpenRaft replication and heartbeats (heartbeat_interval 120 ms)
     /\ \A l, f \in Nodes : WF_vars(HandleAppendEntries(l, f)) /\ WF_vars(StepDown(l, f))
     \* HTTP publish handler on the leader, reached through route refresh
-    /\ \A l \in Nodes : WF_vars(\E m \in req : HandlePublish(l, m, FALSE))
+    \* (per producer: each HTTP request has its own handler task)
+    /\ \A l \in Nodes, p \in Producers :
+           WF_vars(\E m \in req : m.p = p /\ HandlePublish(l, m, FALSE))
     \* SDK retry timer and response handling
     /\ \A p \in Producers : WF_vars(ProducerRetry(p))
                             /\ WF_vars(\E r \in rep : ProducerReceive(p, r))

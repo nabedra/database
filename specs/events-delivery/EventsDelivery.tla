@@ -354,7 +354,9 @@ Done ==
     /\ \A c \in Consumers : cst[c].ph = "retired"
     /\ UNCHANGED vars
 
-HandleAnyWrite == \E m \in req, keep \in BOOLEAN, t \in Stamps : HandleWrite(m, keep, t)
+From(x, m) == IF m.type = "publish" THEN m.p = x ELSE m.cl = x
+
+HandleAnyWrite ==\E m \in req, keep \in BOOLEAN, t \in Stamps : HandleWrite(m, keep, t)
 Failover == \E k \in 0..Len(pend), b \in Nodes : LeaderFails(k, b)
 Isolate == \E k \in 0..Len(pend), b \in Nodes : LeaderIsolated(k, b)
 
@@ -375,7 +377,10 @@ Fairness ==
     \* OpenRaft replication, commit and apply (EventsLog L_PublishCompletes)
     /\ WF_vars(CommitNext)
     \* HTTP handlers on the leader, reached through route refresh
-    /\ WF_vars(\E m \in req, t \in Stamps : HandleWrite(m, FALSE, t))
+    \* Per client: each HTTP request has its own handler task, so one client's
+    \* requests cannot starve another's (a single WF over every request could).
+    /\ \A x \in Producers \cup Consumers :
+           WF_vars(\E m \in req, t \in Stamps : From(x, m) /\ HandleWrite(m, FALSE, t))
     \* Control::retain loop and the 410 runbook
     /\ WF_vars(RetainTick) /\ WF_vars(OperatorReset)
     \* SDK retry timers and response handling
