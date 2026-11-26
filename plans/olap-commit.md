@@ -135,10 +135,15 @@ TLC v1.8.0, pinned image, Actions run 45800777105 at 0f075ab3 (check `olap-olap-
 | `OlapCommit.live.cfg` | not-run: stopped at 900 s, 776,145 states left on the queue | | |
 | reader control (`unpinned_read` control: one reader, no collection) | pass, exhaustive | 18,335,430 | |
 
-The T1 check fails on coverage because `GcDelete` and the reader steps run only in the unfinished collection baseline,
-and a stale-receipt step that only the mutant enabled (fixed in 333795de). The T2 check `olap-olap-commit-long` runs
-the same baselines with a 5-hour budget: pending. The collection and liveness baselines need an abstraction to fit
-T1; their bounds are not cut.
+The T1 check fails on coverage because `GcDelete` and the reader steps run only in the unfinished collection
+baseline (a stale-receipt step that only the mutant enabled was fixed in 333795de). Re-run at 41f8b577 (Actions run
+45811524492): the same baseline results (`OlapCommit.gc.cfg` 1,274,651 and `OlapCommit.live.cfg` 565,818 states left
+at 900 s); the history and collection mutants now run at smaller fault budgets with their own controls and are
+caught (`prefix_history_budget` 17 states, lasso, control 10,100 states; `gc_ignores_pins` and `gc_ignores_inflight`,
+control 122,140 states); the `unpinned_read` control (one reader at the L2 bounds) stopped at 902 s after passing in
+608 s on the earlier run, so the mutant was not counted there. The T2 check `olap-olap-commit-long` runs the same
+baselines with a 5-hour budget: pending. The collection and liveness baselines need an abstraction to fit T1; their
+bounds are not cut.
 
 ### Mutants
 
@@ -163,9 +168,10 @@ Counterexample lengths in states, from the same run.
 | `G05_OncePerRequest` | `skip_lookup` | 15 |
 | `G05_SameResult` | `skip_lookup_result` | 17 |
 | `G05_SameResult` | `prefix_local_unknown` (SCHED-12) | 12 |
-| `G05_Progress` | `prefix_retry_limit` (SCHED-3) | 14 (lasso) |
-| `G05_Progress` | `prefix_history_budget` (OLAP-1) | not counted: its control is the unfinished liveness baseline |
-| `GC_NeverDeletesReferenced` | `gc_ignores_pins`, `gc_ignores_inflight` | not counted: their control is the unfinished collection baseline |
+| `G05_Progress` | `prefix_retry_limit` (SCHED-3) | 14 (lasso); 17 in run 45811524492 |
+| `G05_Progress` | `prefix_history_budget` (OLAP-1) | 17 (lasso), run 45811524492, at reduced fault budgets with its own control |
+| `GC_NeverDeletesReferenced` | `gc_ignores_pins` | 15, run 45811524492, reduced fault budgets |
+| `GC_NeverDeletesReferenced` | `gc_ignores_inflight` | 7, run 45811524492, reduced fault budgets |
 
 ### Counterexamples
 
