@@ -122,6 +122,7 @@ impl Disk for UringDisk {
     fn read(&self, reqs: &mut [Req]) {
         let mut ops: Vec<Op<'_>> = reqs
             .iter_mut()
+            .filter(|r| !r.buf.is_empty())
             .map(|r| Op::Read {
                 buf: r.buf.bytes_mut(),
                 offset: r.offset,
@@ -129,7 +130,13 @@ impl Disk for UringDisk {
             .collect();
         let results = self.ring.run(&self.file, &mut ops);
         drop(ops);
-        for (r, res) in reqs.iter_mut().zip(results) {
+        let mut results = results.into_iter();
+        for r in reqs {
+            let res = if r.buf.is_empty() {
+                Ok(0)
+            } else {
+                results.next().unwrap_or_else(|| Err(io::Error::other("missing read completion")))
+            };
             r.result = match res {
                 Ok(n) if n == r.buf.len() => Ok(()),
                 Ok(n) => {
@@ -145,6 +152,9 @@ impl Disk for UringDisk {
     }
 
     fn write(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
         let mut ops = [Op::Write { buf, offset }];
         let n = self.ring.run(&self.file, &mut ops).pop().unwrap_or(Ok(0))?;
         self.rest(Op::Write { buf, offset }, n)

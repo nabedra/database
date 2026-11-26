@@ -173,6 +173,9 @@ impl Vectors for NvmeVectors {
         if vec.len() != self.dim {
             return Err(Error::Internal("a vector of other dimensions"));
         }
+        if vec.iter().any(|x| !x.is_finite()) {
+            return Err(Error::Internal("a vector is not finite"));
+        }
         let bytes: Vec<u8> = vec.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.file(key).put(key, &bytes)
     }

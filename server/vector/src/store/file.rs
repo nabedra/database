@@ -315,9 +315,13 @@ impl<K: Copy + Eq + Hash> RecordFile<K> {
                     out[k] = Some(Err(damaged(&self.name, first, "never written")));
                     continue;
                 }
-                let req = expect.iter().any(Option::is_some).then(|| {
-                    reqs.push(Req::new(first * PAGE64, expect.len()));
-                    (reqs.len() - 1, first, expect)
+                // Dirty pages were copied above. Trim them off either end so a request
+                // cannot extend into the dirty tail that has never reached the disk.
+                let req = expect.iter().position(Option::is_some).map(|begin| {
+                    let end = expect.iter().rposition(Option::is_some).unwrap_or(begin);
+                    let disk_first = first + begin as u64;
+                    reqs.push(Req::new(disk_first * PAGE64, end - begin + 1));
+                    (reqs.len() - 1, disk_first, expect[begin..=end].to_vec())
                 });
                 plans.push(Plan {
                     key: k,

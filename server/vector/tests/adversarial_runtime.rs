@@ -457,7 +457,6 @@ fn nr08_stopping_with_messages_in_flight_drops_every_job_once_and_runs_none_afte
 /// A caller that races `stop` does not wait for ever: its job is either run or dropped, and the
 /// call answers either way.
 #[test]
-#[ignore = "open bug VECTOR-cores-stop-strands-a-racing-job: a job queued as stop drains is never run nor dropped and its caller waits for ever"]
 fn nr09_a_call_racing_stop_always_gets_an_answer() {
     for iter in 0..400u64 {
         let cores: Arc<Cores<u64>> = Arc::new(Cores::start(1, big(), false, |_| 0).unwrap());
@@ -515,22 +514,16 @@ fn nr10_dropping_the_cores_drops_queued_jobs_once_and_settles_their_callers() {
 
 /// A core whose state cannot be made must not leave its callers waiting for ever.
 #[test]
-#[ignore = "open bug VECTOR-cores-dead-core-hangs-callers: a core whose make panicked queues work that nothing runs"]
 fn nr11_a_core_that_failed_to_start_does_not_hang_its_callers() {
-    let cores: Arc<Cores<usize>> = Arc::new(
+    let started = within(5, "startup with a failing core", || {
         Cores::start(2, Limits::default(), false, |c| {
             if c == 1 {
-                // A state that cannot be made, such as a file that will not open.
                 std::panic::panic_any("core 1 cannot open its file");
             }
             0
         })
-        .unwrap(),
-    );
-    assert_eq!(cores.call(0, Class::Interactive, 1, |s, _| *s + 1).unwrap(), 1);
-    let c2 = cores.clone();
-    let r = within(5, "a call to a core that never started", move || c2.call(1, Class::Interactive, 1, |s, _| *s));
-    assert!(r.is_err(), "{r:?}");
+    });
+    assert!(matches!(started, Err(Error::Io(message)) if message.contains("core 1")));
 }
 
 /// A job that panics is contained and counted, its caller learns, and the core serves on.
@@ -914,10 +907,8 @@ fn nr18_budgets_are_counted_deterministically_across_stores() {
     });
 }
 
-/// The I/O budget bounds the reads of a query. A scan charges the vectors it scores, and then
-/// `finish` reads the vector of every hit again, uncharged.
+/// The I/O budget includes every vector a query reads, including the returned hits.
 #[test]
-#[ignore = "open bug VECTOR-budget-finish-reads-uncharged: finish reads the vector of every hit from the store without charging the I/O budget"]
 fn nr19_the_io_budget_covers_every_vector_a_query_reads() {
     let f = files("iobudget", Backend::Pread, 3);
     let counting = Counting::new(Arc::new(NvmeVectors::on(f.disks.clone(), DIM).unwrap()));

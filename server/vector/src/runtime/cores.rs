@@ -35,10 +35,12 @@ impl<S> Inner<S> {
     }
 
     fn submit(&self, core: usize, class: Class, cost: u64, job: Job<S>) -> Result<()> {
+        let mut sched = self.sched(core)?;
         if self.stop.load(Ordering::Acquire) {
             return Err(Error::Overloaded);
         }
-        self.sched(core)?.submit(class, cost, job)?;
+        sched.submit(class, cost, job)?;
+        drop(sched);
         self.queues[core].wake.notify_one();
         Ok(())
     }
@@ -138,13 +140,17 @@ impl<S: 'static> Cores<S> {
             let (shared, make, tell) = (inner.clone(), make.clone(), tell.clone());
             let run = move || {
                 let cpu = want.filter(|c| task::pin_current_thread(*c).is_ok());
-                let _ = tell.send((core, cpu));
+                let Ok(mut state) = catch_unwind(AssertUnwindSafe(|| make(core))) else {
+                    let _ = tell.send(Err(Error::Io(format!("cannot initialize core {core}"))));
+                    return;
+                };
+                let _ = tell.send(Ok((core, cpu)));
+                drop(tell);
                 let ctx = Ctx {
                     core,
                     cpu,
                     inner: shared,
                 };
-                let mut state = make(core);
                 run_core(&mut state, &ctx);
             };
             match task::spawn_service(format!("vector-core-{core}"), run) {
@@ -161,15 +167,18 @@ impl<S: 'static> Cores<S> {
             }
         }
         drop(tell);
-        let mut cpus = vec![None; n];
-        for (core, cpu) in told.iter().take(n) {
-            cpus[core] = cpu;
-        }
-        Ok(Cores {
+        let mut cores = Cores {
             inner,
             threads,
-            cpus,
-        })
+            cpus: vec![None; n],
+        };
+        for _ in 0..n {
+            let (core, cpu) = told
+                .recv()
+                .map_err(|_| Error::Io("a core exited before initialization".into()))??;
+            cores.cpus[core] = cpu;
+        }
+        Ok(cores)
     }
 
     pub fn len(&self) -> usize {

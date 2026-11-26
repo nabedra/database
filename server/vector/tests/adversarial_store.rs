@@ -466,7 +466,6 @@ fn nt23_files_are_opened_with_o_direct() {
 /// only in RAM) reads exactly, with no flush in between. Each batch of dirty pages leaves such a
 /// record at its boundary, for every dimension that does not divide a page.
 #[test]
-#[ignore = "open bug VECTOR-nvme-straddling-record-reads-as-short-read: a record across a written page and the unwritten tail page reads as an error"]
 fn nt24_a_record_across_a_written_page_and_an_unwritten_one_reads_exactly() {
     for b in backends() {
         for (dim, churn) in [(3usize, false), (6, false), (768, false), (1025, false), (1500, false), (768, true), (1536, true), (1024, true), (4096, false), (100, true)] {
@@ -567,7 +566,6 @@ fn nt27_readers_of_stable_records_are_exact_while_neighbours_are_rewritten() {
 /// A healthy range over NVMe is never taken out of service: whatever the dimension, feeding rows
 /// and searching them give answers and no damage.
 #[test]
-#[ignore = "open bug VECTOR-nvme-straddling-record-reads-as-short-read: a healthy range fails with 'the vector store failed'"]
 fn nt26_a_healthy_index_over_nvme_is_never_taken_out_of_service() {
     for b in backends() {
         for dim in [6usize, 768, 1500] {
@@ -587,7 +585,6 @@ fn nt26_a_healthy_index_over_nvme_is_never_taken_out_of_service() {
 
 /// The same for code extensions on NVMe, whose sizes (96 bytes and the like) rarely divide a page.
 #[test]
-#[ignore = "open bug VECTOR-nvme-straddling-record-reads-as-short-read: an extension across a written page and the unwritten tail page reads as an error"]
 fn nt25_an_extension_across_a_written_page_and_an_unwritten_one_reads_exactly() {
     for b in backends() {
         for size in [96usize, 100, 4100] {
@@ -922,7 +919,6 @@ fn nt15_ram_and_nvme_agree_for_edge_dimensions_and_odd_batches() {
 /// A vector the store cannot give back must not be taken: whatever RAM would return, NVMe returns
 /// too, or refuses the put. NaN and infinities are not legal rows, but the store is the last line.
 #[test]
-#[ignore = "open bug VECTOR-nvme-put-accepts-non-finite: NvmeVectors::put stores NaN and infinities and get then refuses them"]
 fn nt16_a_put_that_can_never_be_read_back_is_refused() {
     for b in backends() {
         let f = files("nonfinite", b, 1);
@@ -1275,7 +1271,6 @@ fn nt22_damage_under_a_workload_gives_errors_and_never_wrong_rows() {
 
 /// An empty request is the same on both backends, also at an offset the kernel refuses.
 #[test]
-#[ignore = "open bug VECTOR-uring-empty-request-differs: an empty read or write at an invalid offset is Ok on positioned reads and EINVAL on io_uring"]
 fn nt28_empty_requests_fail_alike_on_both_backends() {
     let t = Tmp::new("empty");
     let mut outcomes = Vec::new();

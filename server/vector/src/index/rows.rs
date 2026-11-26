@@ -106,17 +106,17 @@ impl Rows {
         got.map(Some)
     }
 
-    /// The row of a version with its vector, as a hit returns it.
-    pub fn full_row(&self, slot: Slot, at: Pos) -> Result<Option<Arc<Row>>> {
-        let Some(row) = self.version(slot, at).and_then(|v| v.row.clone()) else {
-            return Ok(None);
-        };
-        if row.vec.is_some() || self.vectors.is_none() {
-            return Ok(Some(row));
+    /// The row of a version with the vector already read during scoring.
+    pub fn full_row(&self, slot: Slot, at: Pos, vector: Arc<[f32]>) -> Option<Arc<Row>> {
+        let row = self.version(slot, at)?.row.as_ref()?;
+        if row.vec.is_some() {
+            return Some(row.clone());
         }
-        let vec = self.vector(slot, at)?;
-        let (cols, image) = (row.cols.clone(), row.image.clone());
-        Ok(Some(Arc::new(Row { vec, cols, image })))
+        Some(Arc::new(Row {
+            vec: Some(vector),
+            cols: row.cols.clone(),
+            image: row.image.clone(),
+        }))
     }
 
     /// Whether reading a vector costs I/O.

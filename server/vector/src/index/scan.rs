@@ -77,6 +77,7 @@ struct Ranked {
     slot: Slot,
     at: Pos,
     unit: usize,
+    vector: Arc<[f32]>,
 }
 
 impl Ord for Ranked {
@@ -195,11 +196,11 @@ impl Scan {
     }
 
     /// Scores a visible row exactly. Returns whether it ranks at all.
-    fn offer(&mut self, key: &Key, e: &Entry, vec: &[f32]) -> bool {
+    fn offer(&mut self, key: &Key, e: &Entry, vec: Arc<[f32]>) -> bool {
         if !self.seen.insert(e.slot) && !mutant("no_slot_dedup") {
             return true;
         }
-        let Some(score) = exact(self.op, vec, &self.vec) else {
+        let Some(score) = exact(self.op, &vec, &self.vec) else {
             return false;
         };
         let good = goodness(self.op, score);
@@ -209,6 +210,7 @@ impl Scan {
             slot: e.slot,
             at: e.at,
             unit: self.units,
+            vector: vec,
         });
         if self.top.len() > self.limit {
             self.top.pop();
@@ -487,12 +489,24 @@ impl<C: Codec> Index<C> {
     fn offer_all<B>(&self, scan: &mut Scan, b: &Band<B>, bits: Option<Bits>) -> Result<bool> {
         let mut any = false;
         for (_, e) in self.shown(&scan.pin, b, bits) {
-            scan.charge(0, self.read_cost(), 0)?;
-            let (key, vec) = self.live(e)?;
-            scan.charge_score()?;
-            any |= scan.offer(key, e, &vec);
+            any |= self.score_entry(scan, e)?;
         }
         Ok(any)
+    }
+
+    fn score_entry(&self, scan: &mut Scan, e: &Entry) -> Result<bool> {
+        // Keep the winning vectors for the response. A replacement occupies the same
+        // space, but the incoming vector needs room while we score it.
+        let bytes = self.read_cost();
+        scan.charge(0, bytes, bytes)?;
+        scan.charge_score()?;
+        let (key, vec) = self.live(e)?;
+        let before = scan.top.len();
+        let offered = scan.offer(key, e, vec);
+        if scan.top.len() == before {
+            scan.release(bytes);
+        }
+        Ok(offered)
     }
 
     /// Coarse estimates first. A row whose best case is below the result's worst is not looked at
@@ -529,10 +543,7 @@ impl<C: Codec> Index<C> {
             if floor.is_some_and(|f| hope(self.codec.refine(q, &b.codes, i), i) < f) {
                 continue;
             }
-            scan.charge(0, self.read_cost(), 0)?;
-            let (key, vec) = self.live(e)?;
-            scan.charge_score()?;
-            scan.offer(key, e, &vec);
+            self.score_entry(scan, e)?;
         }
         scan.release(held);
         Ok(!order.is_empty())
@@ -548,7 +559,7 @@ impl<C: Codec> Index<C> {
         }
         let rows = &self.shared.rows;
         let hit = |r: Ranked| -> Result<Option<Hit>> {
-            let Some(row) = rows.full_row(r.slot, r.at)? else {
+            let Some(row) = rows.full_row(r.slot, r.at, r.vector) else {
                 return Ok(None);
             };
             let hit = || {
