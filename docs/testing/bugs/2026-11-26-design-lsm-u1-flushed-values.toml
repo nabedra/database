@@ -1,4 +1,4 @@
-# Design review rv-lsm (wave-rv), finding LSM-2. Open: the plan text is fixed, the code is not.
+# Design review rv-lsm (wave-rv), finding LSM-2.
 id = "RV-LSM-2"
 title = "Media damage of a record at or below flushed_seq re-epochs or frees a recorded journal segment, so flushed journal values are lost and the open refuses"
 class = "other"
@@ -7,12 +7,9 @@ guarantees = ["LSM-G01", "LSM-G03"]
 scenarios = ["NS07", "NS25", "LSM01"]
 found_by = "review"
 found_date = "2026-11-26"
-lowest_regression = "specs/lsm/Lsm.media.cfg"
+lowest_regression = "server/kv/tests/store_damage.rs::ns07_flushed_header_damage_preserves_live_journal_value"
 seed = "unknown"
-why_not_caught = "The campaign damages synced records only after a clean close, where a later close pad is evidence, and the spec accepted a Corrupt read after media damage as the U1 residual."
-invariant_added = "A non-valid journal position with seq(P) <= flushed_seq counts as certified, and recovery never re-epochs or frees a segment the manifest records, so a flushed journal value whose own bytes are intact stays readable."
-fix_commits = []
-revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-24"
+why_not_caught = "Clean-close damage cases had a later sync marker and never exercised a flushed locator sharing the damaged header block."
+invariant_added = "Recovery preserves live journal locators in the durable flush prefix, classifies certified gaps beyond that prefix independently, and validates recorded segment identities before any journal file mutation."
+fix_commits = ["a01ad16e6e347ca522ce30ff351e91ae0d9d7c53"]
+revert_patch_ok = true
