@@ -1,0 +1,17 @@
+id = "vector-sdk-parity"
+module = "vector"
+kinds = ["D"]
+guarantees = ["VEC-G12"]
+scenarios = ["VS18"]
+tiers = ["T1"]
+command = ["bash", "-ec", '''
+if [ ! -f node_modules/typescript/bin/tsc ]; then
+  npm ci --no-audit --no-fund
+fi
+npm run build
+NABEDRA_TEST_PYTHON=python3 node --test tests/vectorDifferential.test.mjs
+''']
+cwd = "orm/typescript"
+timeout_s = 180
+needs = ["node"]
+result_parser = "node-test"
