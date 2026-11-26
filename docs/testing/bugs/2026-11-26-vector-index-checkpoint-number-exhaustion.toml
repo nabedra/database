@@ -1,0 +1,14 @@
+id = "VECTOR-index-checkpoint-number-exhaustion"
+title = "A maximum-named stray segment makes checkpoint numbering overflow"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS17"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/index/tests/adversary_ck.rs::adv17_checkpoint_segment_number_exhaustion_is_an_error"
+seed = "unknown"
+why_not_caught = "Malformed frame and manifest tests did not exercise the largest legal hexadecimal segment filenames."
+invariant_added = "A checkpoint declines exhausted segment numbers without panicking or replacing the previous manifest."
+fix_commits = ["038e7a14cb269d2e8214fcd97db09f31c84d0a1a"]
+revert_patch_ok = true
