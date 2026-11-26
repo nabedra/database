@@ -1607,7 +1607,7 @@ fn decode_route_key(
         return Err(decode_capacity());
     }
     let scratch = shared.reserve_scratch(ByteClass::Data, working)?;
-    let request = protocol::parse_request(body)?;
+    let request = protocol::parse_oltp_request(body)?;
     if request.request_id != record.request_id
         || Digest::from_bytes(Sha256::digest(body).into()) != record.digest
     {

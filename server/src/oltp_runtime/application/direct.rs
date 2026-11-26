@@ -135,6 +135,9 @@ impl DirectRouting for crate::oltp_runtime::worker_runtime::direct_capability::D
     fn mode(&self) -> DirectMode {
         crate::oltp_runtime::worker_runtime::direct_capability::DirectSwitch::mode(self)
     }
+    fn vector(&self) -> bool {
+        self.vector_enabled()
+    }
 }
 
 /// Two flags, for tests: `active` is the capability, `direct_oltp` the

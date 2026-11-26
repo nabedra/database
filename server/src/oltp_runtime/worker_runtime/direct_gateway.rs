@@ -21,6 +21,12 @@ impl DirectRouting for WorkerRouting {
             .and_then(|runtime| runtime.direct_switch().map(|switch| switch.mode()))
             .unwrap_or(DirectMode::Off)
     }
+    fn vector(&self) -> bool {
+        self.runtime
+            .upgrade()
+            .and_then(|runtime| runtime.direct_switch().map(|switch| switch.vector_enabled()))
+            .unwrap_or(false)
+    }
 }
 
 struct WorkerTopology {

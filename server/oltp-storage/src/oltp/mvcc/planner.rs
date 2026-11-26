@@ -263,6 +263,7 @@ impl NativePlanner {
             Operation::List(_) => return self.list(pin, owner).await.map(PlannedOperation::Read),
             _ => {}
         }
+        operation.check_queued(true)?;
         let id = table_id(&operation).ok_or_else(not_found)?;
         let point = point.filter(|point| point.table.descriptor.id == id);
         let (version, table) = match point {
@@ -633,6 +634,7 @@ impl NativePlanner {
             schema: payload.schema,
             key: payload.key,
             format: payload.format,
+            search: payload.search,
         };
         descriptor.validate()?;
         let guard = self

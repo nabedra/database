@@ -50,6 +50,11 @@ pub const QUEUED_SNAPSHOT_RETRY_FEATURE: &str = "status.queued-snapshot-retry";
 #[doc(hidden)]
 pub const INDEX_RECLAIM_FEATURE: &str = "data.index.reclaim";
 
+/// Vector, list and full-text columns: Data and Catalog leaders may propose
+/// entries of tables that have them. An older build cannot decode them.
+#[doc(hidden)]
+pub const VECTOR_FEATURE: &str = "data.vector.v1";
+
 /// One registered cluster feature: its advertised name and the Control key
 /// of its sticky enablement (`ct/feature/<name>`, a `FeatureActivation`).
 #[derive(Clone, Copy, Debug)]
@@ -66,7 +71,7 @@ pub struct ClusterFeature {
 /// one (`machine::direct`). Entries are only ever appended: a name, once
 /// shipped, keeps its meaning and its key.
 #[doc(hidden)]
-pub const CLUSTER_FEATURES: [ClusterFeature; 3] = [
+pub const CLUSTER_FEATURES: [ClusterFeature; 4] = [
     ClusterFeature {
         name: DIRECT_BATCH_FEATURE,
         enabled_key: b"ct/feature/data.direct.batch",
@@ -78,6 +83,10 @@ pub const CLUSTER_FEATURES: [ClusterFeature; 3] = [
     ClusterFeature {
         name: INDEX_RECLAIM_FEATURE,
         enabled_key: b"ct/feature/data.index.reclaim",
+    },
+    ClusterFeature {
+        name: VECTOR_FEATURE,
+        enabled_key: b"ct/feature/data.vector.v1",
     },
 ];
 

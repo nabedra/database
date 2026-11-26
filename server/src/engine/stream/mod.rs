@@ -326,6 +326,9 @@ fn filter_columns<'a>(predicate: &'a Predicate, names: &mut BTreeSet<&'a str>) {
             }
         }
         Predicate::Logical(LogicalPredicate::Not { arg }) => filter_columns(arg, names),
+        Predicate::Text(text) => {
+            names.insert(text.column());
+        }
     }
 }
 

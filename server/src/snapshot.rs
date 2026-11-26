@@ -67,6 +67,7 @@ pub(crate) fn row_payload(row: &Row) -> usize {
                     Scalar::Utf8(s) => s.len(),
                     Scalar::Int64(_) | Scalar::Float64(_) => 8,
                     Scalar::Bool(_) => 1,
+                    _ => unreachable!("OLAP columns are scalar"),
                 }
         })
         .sum::<usize>()
@@ -153,6 +154,7 @@ fn schema(table: &TableDescriptor) -> Schema {
                         ColumnType::Int64 => DataType::Int64,
                         ColumnType::Float64 => DataType::Float64,
                         ColumnType::Bool => DataType::Boolean,
+                        _ => unreachable!("OLAP columns are scalar"),
                     },
                     false,
                 )
@@ -188,6 +190,7 @@ fn array(name: &str, ty: ColumnType, rows: &[Row]) -> ArrayRef {
                 })
                 .collect::<Vec<_>>(),
         )),
+        _ => unreachable!("OLAP columns are scalar"),
     }
 }
 
@@ -352,6 +355,7 @@ fn validated_reader(
             ColumnType::Int64 => Type::INT64,
             ColumnType::Float64 => Type::DOUBLE,
             ColumnType::Bool => Type::BOOLEAN,
+            _ => return Err(stored()),
         };
         if col.physical_type() != physical {
             return Err(stored());
@@ -398,6 +402,7 @@ fn scalar(arr: &ArrayRef, ty: ColumnType, i: usize) -> Result<Scalar, ProtocolEr
                 .ok_or_else(stored)?
                 .value(i),
         ),
+        _ => return Err(stored()),
     })
 }
 
@@ -527,6 +532,7 @@ fn plain_payload(mut buf: &[u8], ty: ColumnType, n: usize) -> Result<usize, Prot
             }
             Ok(n)
         }
+        _ => Err(stored()),
     }
 }
 
@@ -575,6 +581,7 @@ mod resource_tests {
                 ("text".into(), ColumnType::Utf8),
             ]
             .into(),
+            search: Default::default(),
         }
     }
     fn row(text: String) -> Row {

@@ -119,7 +119,7 @@ impl ScopedPlacement {
         if hash(body.as_ref()) != header.digest {
             return Err(QueueError::Conflict);
         }
-        let operation = protocol::parse_request(body.as_ref()).map_err(invalid)?;
+        let operation = protocol::parse_oltp_request(body.as_ref()).map_err(invalid)?;
         let (table, key) = match &operation.operation {
             Operation::Get(payload) => (payload.table_id, &payload.key),
             Operation::Update(payload) => (payload.table_id, &payload.key),

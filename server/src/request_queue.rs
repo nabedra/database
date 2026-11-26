@@ -2,6 +2,10 @@
 //! installation and must replicate each returned record before exposing its state.
 #[cfg(feature = "olap")]
 pub(crate) mod admission;
+#[cfg(feature = "oltp")]
+use crate::protocol::parse_oltp_request as parse_request;
+#[cfg(not(feature = "oltp"))]
+use crate::protocol::parse_request;
 use crate::protocol::{self, ProtocolError};
 use crate::storage::context::{RequestContext, StorageKey};
 use serde::{Deserialize, Serialize};
@@ -232,7 +236,7 @@ fn validate_record_contents(record: &RequestRecord) -> Result<(), QueueError> {
         || !record.digest.bytes().all(|b| b.is_ascii_hexdigit())
         || (!expired_identity
             && (record.digest != digest(&record.body)
-                || protocol::parse_request(&record.body)
+                || parse_request(&record.body)
                     .map_err(|_| QueueError::Invalid)?
                     .request_id
                     != record.request_id))
@@ -407,7 +411,7 @@ impl RequestQueue {
         if let Some(c) = &context {
             c.validate(now_ms / 1000).map_err(|_| QueueError::Invalid)?;
         }
-        let request = protocol::parse_request(&body).map_err(|_| QueueError::Invalid)?;
+        let request = parse_request(&body).map_err(|_| QueueError::Invalid)?;
         if let Some(record) = self.records.get(&RequestKey {
             storage: context
                 .as_ref()
@@ -717,7 +721,7 @@ impl RequestQueue {
         ) {
             return Err(QueueError::Conflict);
         }
-        let mutation = protocol::parse_request(&record.body)
+        let mutation = parse_request(&record.body)
             .map_err(|_| QueueError::Invalid)?
             .operation
             .is_mutation();

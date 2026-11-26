@@ -150,6 +150,7 @@ impl ArrowBatch {
                     Scalar::Utf8(value) => value.len() + 4,
                     Scalar::Int64(_) | Scalar::Float64(_) => 8,
                     Scalar::Bool(_) => usize::from(row_index.is_multiple_of(8)),
+                    _ => unreachable!("OLAP columns are scalar"),
                 };
                 sum.checked_add(bytes).filter(|sum| *sum <= limit)
             });
@@ -193,6 +194,7 @@ impl ArrowColumn {
             ColumnType::Int64 => Self::Int64(Int64Builder::with_capacity(0)),
             ColumnType::Float64 => Self::Float64(Float64Builder::with_capacity(0)),
             ColumnType::Bool => Self::Bool(BooleanBuilder::with_capacity(0)),
+            _ => unreachable!("OLAP columns are scalar"),
         }
     }
 
