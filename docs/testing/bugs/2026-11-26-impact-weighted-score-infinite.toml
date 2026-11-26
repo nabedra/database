@@ -1,0 +1,14 @@
+id = "VECTOR-impact-weighted-score-infinite"
+title = "A finite fusion weight can make the f32 _score infinite"
+class = "other"
+module = "vector"
+guarantees = ["unknown"]
+scenarios = ["VS04"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/src/impact/tests/adv_fuse.rs::vs04_adv_weighted_scores_stay_finite"
+seed = "unknown"
+why_not_caught = "fuse() checks that weights are finite, not that the sums are, and the tests use weights of 1 to 10."
+invariant_added = "Every fused _score is finite (it has no JSON form otherwise)."
+fix_commits = ["af6562ad51cbe49eaef46077be496ffcefb7cb1d"]
+revert_patch_ok = true
