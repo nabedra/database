@@ -1,0 +1,15 @@
+# Evidence: specs/olap-stream (design review, local TLC, unattested until the T check runs)
+id = "DESIGN-stream-join-seal-expiry"
+title = "A stream joiner can turn ready without the latest stream entry after its join seal expires"
+class = "membership-replacement-trust"
+module = "olap-stream"
+guarantees = ["OLAP-STR-G04", "OLAP-STR-G02", "OLAP-STR-G03"]
+scenarios = ["ST04", "R03"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "specs/olap-stream/join/mutants/prefix_join_seal_expiry.cfg"
+seed = "unknown"
+why_not_caught = "olap-stream-sim recovers from one harness-held entry and never changes membership, so no joiner exists; the scheduler join tests cover the ordinary queue, whose Unseal re-replicates records, and the seal deadline is never reached in them."
+invariant_added = "G04_ReplyImpliesReplicated: every live ready worker holds each replied stream handle at a checkpoint at or past the highest replied sequence."
+fix_commits = []
+revert_patch_ok = false

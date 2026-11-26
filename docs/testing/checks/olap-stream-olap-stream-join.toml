@@ -1,0 +1,15 @@
+# Design spec of stream joins and the join seal (specs/olap-stream/join/OlapStreamJoin.tla):
+# copy before readiness, publication under the seal, takeover and recovery at L2 bounds.
+# Its mutant prefix_join_seal_expiry restores the shipped publication (finding
+# docs/testing/bugs/2026-11-24-design-stream-join-seal-expiry.toml).
+id = "olap-stream-olap-stream-join"
+module = "olap-stream"
+kinds = ["T"]
+guarantees = ["OLAP-STR-G04"]
+scenarios = ["ST04"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/olap-stream/join", "OlapStreamJoin", "--module", "olap-stream"]
+cwd = "."
+timeout_s = 3600
+needs = ["tlc"]
+result_parser = "tlc"

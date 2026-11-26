@@ -1,0 +1,18 @@
+# Trace validation of the OLAP stream data protocol (specs/olap-stream/OlapStreamTrace.tla) against
+# two hand-written traces: one accepted, one rejected at the line its name gives. No simulation
+# workload emits traces yet, so this check shows that the trace spec works. It is not evidence
+# about the code.
+id = "olap-stream-olap-stream-trace"
+module = "olap-stream"
+kinds = ["T"]
+guarantees = ["OLAP-STR-G01", "OLAP-STR-G02", "OLAP-STR-G03", "OLAP-STR-G04", "OLAP-STR-G05", "OLAP-STR-G06"]
+scenarios = ["ST01", "ST04"]
+tiers = ["T0", "T1"]
+command = [
+  "python3", "scripts/testing/tla_trace.py", "check", "specs/olap-stream", "OlapStream",
+  "specs/olap-stream/traces/accepted", "--expect-rejected", "specs/olap-stream/traces/rejected",
+]
+cwd = "."
+timeout_s = 1800
+needs = ["tlc"]
+result_parser = "tlc"
