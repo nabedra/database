@@ -358,3 +358,59 @@ where
             .spawn(f)
     }
 }
+
+/// The CPUs this process may run on, ascending (`sched_getaffinity` on Linux). Elsewhere, and
+/// under `sim`, `0..available_parallelism`.
+pub fn allowed_cpus() -> std::io::Result<Vec<usize>> {
+    #[cfg(all(target_os = "linux", not(feature = "sim")))]
+    {
+        // SAFETY: `cpu_set_t` is plain data, and all zeroes is the empty set.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: the kernel writes at most `size_of::<cpu_set_t>()` bytes into `set`.
+        let rc = unsafe {
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set)
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let size = libc::CPU_SETSIZE as usize;
+        // SAFETY: every index is below CPU_SETSIZE, inside `set`.
+        Ok((0..size).filter(|&c| unsafe { libc::CPU_ISSET(c, &set) }).collect())
+    }
+    #[cfg(not(all(target_os = "linux", not(feature = "sim"))))]
+    {
+        Ok((0..std::thread::available_parallelism()?.get()).collect())
+    }
+}
+
+/// Pins the calling thread to one CPU (`sched_setaffinity` on Linux). Under `sim` it does
+/// nothing, so simulated services keep one schedule; elsewhere it is `Unsupported`.
+pub fn pin_current_thread(cpu: usize) -> std::io::Result<()> {
+    #[cfg(all(target_os = "linux", not(feature = "sim")))]
+    {
+        if cpu >= libc::CPU_SETSIZE as usize {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        // SAFETY: `cpu_set_t` is plain data, and all zeroes is the empty set.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `cpu` is below CPU_SETSIZE, inside `set`.
+        unsafe { libc::CPU_SET(cpu, &mut set) };
+        // SAFETY: the kernel reads `size_of::<cpu_set_t>()` bytes of `set`; 0 is this thread.
+        let rc =
+            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(feature = "sim")]
+    {
+        let _ = cpu;
+        Ok(())
+    }
+    #[cfg(all(not(target_os = "linux"), not(feature = "sim")))]
+    {
+        let _ = cpu;
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}

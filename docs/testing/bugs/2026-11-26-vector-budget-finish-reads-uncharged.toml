@@ -1,0 +1,18 @@
+# Found by the adversarial tests of task N (nabedra/oltp-vector-nvme-test). Index::finish builds each hit's row with Rows::full_row, which reads the vector from the store. The scan charged every vector it scored, and finish adds up to limit more reads (1,000 reads of 16 KiB at most) that no budget counts, so a query that ends Ok has read more than its I/O budget. The memory of those rows is not charged either.
+id = "VECTOR-budget-finish-reads-uncharged"
+title = "finish reads the vector of every hit from NVMe without charging the I/O budget"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS17"]
+found_by = "campaign"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/tests/adversarial_runtime.rs::nr19_the_io_budget_covers_every_vector_a_query_reads"
+seed = "unknown"
+why_not_caught = "The budget tests counted what the scan charged and never counted what the store served."
+invariant_added = "The vectors a query reads from the store, counted at the store, never exceed its I/O budget."
+fix_commits = ["8c074ad387f4bd94151129a45f9b5f691e157dfc"]
+revert_patch_ok = true
+status = "fixed"
+owner = "oltp-vector lead"
+expires = "2026-12-22"

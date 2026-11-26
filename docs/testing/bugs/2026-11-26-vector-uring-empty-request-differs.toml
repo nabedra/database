@@ -1,0 +1,18 @@
+# Found by the adversarial tests of task N (nabedra/oltp-vector-nvme-test). PreadDisk returns Ok for a request of no bytes without a system call, UringDisk submits it and the kernel validates the offset (above i64::MAX). RecordFile never makes an empty request, so only a direct caller of Disk sees the difference.
+id = "VECTOR-uring-empty-request-differs"
+title = "An empty read or write at an offset the kernel refuses is Ok with positioned reads and EINVAL with io_uring"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G10"]
+scenarios = ["VS16"]
+found_by = "campaign"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/tests/adversarial_store.rs::nt28_empty_requests_fail_alike_on_both_backends"
+seed = "unknown"
+why_not_caught = "The differential test of the backends used non-empty requests."
+invariant_added = "Both backends return the same result for every request, empty ones included."
+fix_commits = ["8c074ad387f4bd94151129a45f9b5f691e157dfc"]
+revert_patch_ok = true
+status = "fixed"
+owner = "oltp-vector lead"
+expires = "2026-12-22"

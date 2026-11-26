@@ -22,6 +22,9 @@ net = ["tokio/net"]
 # openraft 0.10's runtime on the simulated node context (`sim::openraft10`). Sim only; the
 # three crates are already in the product graph through openraft at these versions.
 sim-openraft = ["sim", "dep:openraft-rt", "dep:openraft-rt-tokio", "dep:rand"]
+# io_uring for the search worker's vector store (`fs::uring`). Linux only; elsewhere and
+# under `sim` the ring reports itself unavailable and callers use positioned reads.
+uring = ["dep:io-uring"]
 
 [dependencies]
 tokio = { version = "=1.54.1", default-features = false, features = ["rt", "time"] }
@@ -34,6 +37,10 @@ rand = { version = "=0.10.4", default-features = false, optional = true }
 # nabedra-kv already pins, so no crate enters the graph.
 [target.'cfg(unix)'.dependencies]
 libc = { version = "=0.2.191", default-features = false }
+
+# Published 2026-11-09. Its other dependencies (bitflags 2, cfg-if, libc) are in the graph.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "=0.7.16", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "=1.54.1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util", "net", "io-util"] }
