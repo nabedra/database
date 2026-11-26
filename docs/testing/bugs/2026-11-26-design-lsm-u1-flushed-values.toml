@@ -1,0 +1,18 @@
+# Design review rv-lsm (wave-rv), finding LSM-2. Open: the plan text is fixed, the code is not.
+id = "RV-LSM-2"
+title = "Media damage of a record at or below flushed_seq re-epochs or frees a recorded journal segment, so flushed journal values are lost and the open refuses"
+class = "other"
+module = "lsm"
+guarantees = ["LSM-G01", "LSM-G03"]
+scenarios = ["NS07", "NS25", "LSM01"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/lsm/Lsm.media.cfg"
+seed = "unknown"
+why_not_caught = "The campaign damages synced records only after a clean close, where a later close pad is evidence, and the spec accepted a Corrupt read after media damage as the U1 residual."
+invariant_added = "A non-valid journal position with seq(P) <= flushed_seq counts as certified, and recovery never re-epochs or frees a segment the manifest records, so a flushed journal value whose own bytes are intact stays readable."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"
