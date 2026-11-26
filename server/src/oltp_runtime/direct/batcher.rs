@@ -38,6 +38,7 @@ use crate::{
     oltp_replication::owned::OwnedCommand,
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
+use nabedra_oltp_types::types::CommitTs;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
@@ -311,13 +312,17 @@ impl Driver {
             .expect("a batch has a member");
         if batch.len() == 1 {
             let member = batch.into_iter().next().expect("one member");
+            let commit_ts = member.commit.commit_ts;
             let reply = lone(&self.resources, &handle, member.commit, deadline).await;
-            let _ = member.reply.send(reply);
+            finish_member(&handle, commit_ts, member.reply, reply);
             return;
         }
         let (commits, replies): (Vec<_>, Vec<_>) = batch
             .into_iter()
-            .map(|member| (member.commit, member.reply))
+            .map(|member| {
+                let commit_ts = member.commit.commit_ts;
+                (member.commit, (member.handle, commit_ts, member.reply))
+            })
             .unzip();
         let members = commits.len();
         self.stats.batch_entry(members);
@@ -334,26 +339,26 @@ impl Driver {
                 ParticipantReply::Direct(DirectReply::Batch(outcomes))
                     if outcomes.len() == members =>
                 {
-                    for (reply, outcome) in replies.into_iter().zip(outcomes) {
+                    for ((_, _, reply), outcome) in replies.into_iter().zip(outcomes) {
                         let _ = reply.send(Ok(Committed::member(outcome)));
                     }
                 }
                 // A whole-entry rejection wrote nothing for any member.
                 ParticipantReply::Direct(DirectReply::Rejected(fault))
                 | ParticipantReply::Rejected(fault) => {
-                    for reply in replies {
+                    for (_, _, reply) in replies {
                         let _ = reply.send(Ok(Committed::Rejected(fault)));
                     }
                 }
                 _ => {
-                    for reply in replies {
+                    for (_, _, reply) in replies {
                         let _ = reply.send(Ok(Committed::Corrupt));
                     }
                 }
             },
             Err(error) => {
-                for reply in replies {
-                    let _ = reply.send(Err(error.clone()));
+                for (handle, commit_ts, reply) in replies {
+                    finish_member(&handle, commit_ts, reply, Err(error.clone()));
                 }
             }
         }
@@ -380,6 +385,22 @@ impl Drop for Driver {
             )));
         }
     }
+}
+
+fn finish_member(
+    handle: &ParticipantHandle,
+    commit_ts: CommitTs,
+    sender: oneshot::Sender<Reply>,
+    reply: Reply,
+) {
+    if matches!(&reply, Err(error) if error.outcome == Outcome::NotApplied)
+        && let Ok(clock) = handle.direct_clock()
+    {
+        // Once a driver takes a member, the caller can no longer withdraw it.
+        // A definite pre-append error settles it even if the caller timed out.
+        clock.settle(commit_ts);
+    }
+    let _ = sender.send(reply);
 }
 
 fn unknown(message: &str) -> ProtocolError {
