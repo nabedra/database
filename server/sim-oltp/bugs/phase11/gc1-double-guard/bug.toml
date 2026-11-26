@@ -41,11 +41,14 @@ mode = "on"
 assertion = "counter"
 failure_contains = ["left: 2", "right: 1"]
 
-# The patch author's own runs.
+# The runs of the refreshed patch, by the agent that refreshed it (workflow `tests` runs in mode on, not attested
+# checks). The clean commit is the refresh commit; the patched commit is it plus revert.patch, on the scratch branch
+# scratch/close-out-gc1-double-guard-patched. Before the refresh, the patch author's runs were clean 45435450471
+# (b0a6d057, 3 of 3 passed) and patched 45435993866 (6186f447, 1 of 1 failed, `left: 2`, `right: 1`), over main c8426fe1.
 [regression.evidence]
 digest = "c9c22d769b2cddb4fc072d0efdfdb7c4370e5dd15493f119bbffbe5ce16c0b4a"
-clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435450471", sha = "b0a6d0573cba411b762e8c4e544431710003576b", result = "passed", note = "request p11-bugs-clean-b0a6d05-171752, c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_group_vote, 3 of 3 attempts, on mode, over main c8426fe1" }
-patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45435993866", sha = "6186f447238ae4caed3da5563a20ba1589b2fb55", result = "failed", note = "request p11-bugs-gc1-double-guard-6186f44-172038, c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_group_vote, 1 of 1 attempts, on mode, over main c8426fe1", output = """
+clean = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45741890078", sha = "551d71f11310bab1cbff63ed2674ed2c3441a17f", result = "passed", note = "request close-out-clean-551d71f-022152, c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_group_vote, 3 of 3 attempts, on mode, over main 1fb888a9" }
+patched = { run = "https://github.com/zPy52/nabedra-database/actions/runs/45741893093", sha = "3f8f5288b948562b4c2e9c5772fd1b20780cc822", result = "failed", note = "request close-out-gc1-patched-3f8f528-022152, c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_group_vote, 3 of 3 attempts failed, on mode, over main 1fb888a9", output = """
 assertion `left == right` failed
   left: 2
  right: 1
