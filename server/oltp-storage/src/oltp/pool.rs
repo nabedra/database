@@ -2061,9 +2061,14 @@ impl<'a> GroupTransaction<'a> {
     }
     /// The change record of log index `index`, in the same batch as the entry.
     /// Like the log it belongs to this replica: no generation, no snapshot.
-    #[doc(hidden)]
-    pub fn put_change(&mut self, index: u64, value: &[u8]) -> Result<(), ProtocolError> {
+    pub(crate) fn put_change(&mut self, index: u64, value: &[u8]) -> Result<(), ProtocolError> {
         self.put_meta(change_key(&self.read.prefix, index), value)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn put_change_for_test(&mut self, index: u64, value: &[u8]) -> Result<(), ProtocolError> {
+        self.put_change(index, value)
     }
     /// Deletes the change records of log indexes `from..=through`. The log's
     /// purge calls it in the transaction that deletes the same log entries.

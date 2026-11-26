@@ -607,7 +607,7 @@ async fn vs02_purge_deletes_the_change_records_of_the_purged_entries() {
         };
         group
             .transaction(meta, budget, move |tx| {
-                tx.put_change(index, b"change")?;
+                tx.put_change_for_test(index, b"change")?;
                 Ok(crate::oltp::pool::Transition::Commit(tx.copy_output(b"null")?))
             })
             .await
