@@ -787,12 +787,8 @@ fn adv_deep_json_in_vector_values_does_not_recurse() {
     handle.join().expect("deep values overflowed the stack");
 }
 
-/// Known to fail. `contains_any` has no bound on its list but the 8 MiB body,
-/// and each row compares every one of its tags with every value, so one
-/// request of 50,000 values costs 50 times that of 1,000 per scanned row
-/// (VEC-G11: CPU limits hold). A set lookup would make it linear in the tags.
+/// Membership against a long filter list stays bounded per row.
 #[test]
-#[ignore = "open bug 2026-11-26-contains-any-quadratic-cost"]
 fn adv_contains_any_evaluation_cost_is_not_quadratic_in_the_list() {
     let _g = lock();
     let rows = |tags: usize| -> Row {

@@ -1442,7 +1442,11 @@ fn vs17_rank_rejects_every_malformed_form() {
     for (why, payload) in cases {
         assert_eq!(
             code(parse_op("query.rank", payload.clone())),
-            ErrorCode::ValidationError,
+            if why == "many" {
+                ErrorCode::LimitExceeded
+            } else {
+                ErrorCode::ValidationError
+            },
             "{why} {payload}"
         );
     }
@@ -1460,9 +1464,12 @@ fn vs17_rank_rejects_every_malformed_form() {
         })
     };
     assert!(parse_op("query.rank_many", many(json!([]), 256)).is_ok());
+    assert_eq!(
+        code(parse_op("query.rank_many", many(json!([]), 257))),
+        ErrorCode::LimitExceeded
+    );
     for payload in [
         many(json!([]), 0),
-        many(json!([]), 257),
         many(json!([ranking(json!("x"))]), 1),
         rank(|_| ()),
     ] {

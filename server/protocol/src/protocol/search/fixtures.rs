@@ -3,6 +3,7 @@
 //! refuses every refused one that has a wire form.
 use super::*;
 use serde_json::{Map, json};
+use std::collections::BTreeSet;
 
 /// Refused in the client before anything is encoded.
 const CLIENT_ONLY: [&str; 10] = [
@@ -27,7 +28,107 @@ fn fixtures() -> Value {
         .into()
     });
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    serde_json::from_str(&text).unwrap()
+    #[derive(Deserialize)]
+    struct FixtureSource<'a> {
+        tables: Value,
+        #[serde(borrow)]
+        create: Vec<&'a RawValue>,
+        #[serde(borrow)]
+        describe: Vec<&'a RawValue>,
+        #[serde(borrow)]
+        calls: Vec<&'a RawValue>,
+    }
+    let source: FixtureSource<'_> = serde_json::from_str(&text).unwrap();
+    // Keep intentionally malformed Unicode as raw JSON. Test the server's
+    // refusal of that encoding separately below.
+    let mut malformed = BTreeSet::new();
+    let mut decode = |entries: Vec<&RawValue>| -> Vec<Value> {
+        entries
+            .into_iter()
+            .filter_map(|raw| match serde_json::from_str(raw.get()) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    let fields: BTreeMap<&str, &RawValue> =
+                        serde_json::from_str(raw.get()).unwrap();
+                    let name: String = serde_json::from_str(fields["name"].get()).unwrap();
+                    assert!(SDK_ONLY_UTF16.contains(&name.as_str()), "{name}: {error}");
+                    assert!(fields.contains_key("error") && !fields.contains_key("payload"));
+                    assert!(malformed.insert(name));
+                    None
+                }
+            })
+            .collect()
+    };
+    let fixtures = json!({
+        "tables": source.tables,
+        "create": decode(source.create),
+        "describe": decode(source.describe),
+        "calls": decode(source.calls)
+    });
+    assert_eq!(malformed.len(), SDK_ONLY_UTF16.len());
+    fixtures
+}
+
+const SDK_ONLY_UTF16: [&str; 10] = [
+    "a language with a lone surrogate",
+    "a model with a lone surrogate",
+    "tags with a lone surrogate",
+    "contains a lone surrogate",
+    "contains_any of a set with a lone surrogate",
+    "contains_any of a list with a lone low surrogate",
+    "starts_with a lone surrogate",
+    "match a lone surrogate",
+    "embed a lone surrogate",
+    "add full text in a language with a lone surrogate",
+];
+
+#[test]
+fn vs18_invalid_utf16_is_refused_on_the_wire() {
+    let schema = r#"{"id":"utf8","body":"utf8","vec":{"type":"vector","dim":2}}"#;
+    let table = Uuid::from_u128(11);
+    let request = Uuid::from_u128(1);
+    let cases = [
+        (
+            "table.create",
+            format!(
+                r#"{{"name":"made","schema":{schema},"key":"id","format":"parquet","full_text":{{"body":"en\ud800"}}}}"#
+            ),
+        ),
+        (
+            "table.create",
+            format!(
+                r#"{{"name":"made","schema":{schema},"key":"id","format":"parquet","embed":{{"vec":{{"source":"body","model":"m\udfff"}}}}}}"#
+            ),
+        ),
+        (
+            "table.upsert",
+            format!(r#"{{"table_id":"{table}","row":{{"id":"row","tags":["\ud800"]}}}}"#),
+        ),
+        (
+            "table.add_full_text",
+            format!(r#"{{"table_id":"{table}","column":"body","language":"\ud800"}}"#),
+        ),
+        (
+            "query.collect",
+            format!(
+                r#"{{"table_id":"{table}","query":{{"select":null,"filter":{{"op":"contains_any","column":"tags","values":["\udfff"]}},"order_by":null,"limit":null}}}}"#
+            ),
+        ),
+        (
+            "query.rank",
+            format!(
+                r#"{{"table_id":"{table}","query":{{"select":null,"filter":null,"limit":1}},"rank":{{"rankings":[{{"column":"body","op":"match","value":"\ud800"}}]}}}}"#
+            ),
+        ),
+    ];
+    for (operation, payload) in cases {
+        let body = format!(
+            r#"{{"request_id":"{request}","operation":"{operation}","payload":{payload}}}"#
+        );
+        let error = parse_oltp_request(body.as_bytes()).expect_err(operation);
+        assert_eq!(error.code, ErrorCode::ValidationError, "{operation}");
+        assert_eq!(error.outcome, Outcome::NotApplied, "{operation}");
+    }
 }
 fn text(value: &Value) -> &str {
     value.as_str().unwrap()
@@ -259,7 +360,12 @@ fn vs18_creates_and_descriptors_decode_as_the_sdks_expect() {
             }
             let table = descriptor(text(&fixtures["tables"]["users"])).unwrap();
             let error = request("table.create", &payload, &table).expect_err(name);
-            assert_eq!(error.code, ErrorCode::ValidationError, "{name}");
+            let expected = if case["error"]["type"] == "LimitExceededError" {
+                ErrorCode::LimitExceeded
+            } else {
+                ErrorCode::ValidationError
+            };
+            assert_eq!(error.code, expected, "{name}");
             rejected += 1;
         }
     }

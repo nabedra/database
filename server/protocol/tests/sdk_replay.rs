@@ -325,13 +325,13 @@ fn client_refusals_have_these_server_answers() {
         (
             "nine vector columns",
             wire(&docs, "table.create", create(vectors(9), json!({}))),
-            Err(ValidationError),
+            Err(LimitExceeded),
         ),
         // "misuse rank_many of 257": the SDKs raise LimitExceededError.
         (
             "rank_many of 257",
             wire(&chunks, "query.rank_many", many),
-            Err(ValidationError),
+            Err(LimitExceeded),
         ),
         // "create with 129 columns": the SDKs raise LimitExceededError.
         (
@@ -397,11 +397,8 @@ fn client_refusals_have_these_server_answers() {
     }
 }
 
-/// A value over a limit is `limit_exceeded` only in the last column of a row: elsewhere the row
-/// decoder stops early, serde_json then fails the unfinished object and the error becomes
-/// `validation_error` "malformed row". The SDKs raise LimitExceededError for this row.
+/// A row limit applies even when more fields follow the oversized value.
 #[test]
-#[ignore = "open bug 2026-11-26-server-row-limit-code"]
 fn a_limit_in_any_column_of_a_row_is_limit_exceeded() {
     let docs = named("docs");
     let row = docs_row(1, json!({"f32s": floats(&[0.0; 2050])["f32"], "n": 1025}));
@@ -415,4 +412,22 @@ fn a_limit_in_any_column_of_a_row_is_limit_exceeded() {
         Err(ErrorCode::LimitExceeded),
         "dense 4097 in vec"
     );
+}
+
+#[test]
+fn ranked_lists_report_the_typed_limit_error() {
+    let chunks = named("chunks");
+    let item = ranking("emb", "dot", floats(&[1.0, 2.0, 3.0]));
+    for count in [256, 257, 300] {
+        let want = if count == 256 {
+            Ok(())
+        } else {
+            Err(ErrorCode::LimitExceeded)
+        };
+        let list = json!(vec![item.clone(); count]);
+        assert_eq!(wire(&chunks, "query.rank", rank(list.clone(), 10)), want);
+        let mut many = rank(json!([]), 10);
+        many["batch"] = list;
+        assert_eq!(wire(&chunks, "query.rank_many", many), want);
+    }
 }

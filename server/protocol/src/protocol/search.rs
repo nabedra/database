@@ -367,17 +367,21 @@ fn decode_values(raw: &str, unique: bool) -> Result<Row, ProtocolError> {
             mut map: M,
         ) -> Result<Self::Value, M::Error> {
             let mut row = Row::new();
+            let mut first_error = None;
             while let Some((name, raw)) = map.next_entry::<String, &'de RawValue>()? {
+                if first_error.is_some() {
+                    continue;
+                }
                 match decode_value(raw) {
                     Ok(value) => {
                         if row.insert(name, value).is_some() && self.0 {
-                            return Ok(Err(invalid("a row names a column twice")));
+                            first_error = Some(invalid("a row names a column twice"));
                         }
                     }
-                    Err(error) => return Ok(Err(error)),
+                    Err(error) => first_error = Some(error),
                 }
             }
-            Ok(Ok(row))
+            Ok(first_error.map_or(Ok(row), Err))
         }
     }
     let mut decoder = serde_json::Deserializer::from_str(raw);
@@ -639,13 +643,32 @@ impl Embed {
         Ok(())
     }
 }
+/// Analyzers available to a full-text search column.
+pub const FULL_TEXT_LANGUAGES: &[&str] = &[
+    "arabic",
+    "danish",
+    "dutch",
+    "english",
+    "finnish",
+    "french",
+    "german",
+    "greek",
+    "hungarian",
+    "italian",
+    "norwegian",
+    "portuguese",
+    "romanian",
+    "russian",
+    "simple",
+    "spanish",
+    "swedish",
+    "tamil",
+    "turkish",
+];
+
 fn validate_language(language: &str) -> Result<(), ProtocolError> {
-    if !(1..=32).contains(&language.len())
-        || !language
-            .bytes()
-            .all(|c| c.is_ascii_lowercase() || c == b'_')
-    {
-        return Err(invalid("full-text language must match [a-z_]{1,32}"));
+    if !FULL_TEXT_LANGUAGES.contains(&language) {
+        return Err(invalid("unsupported full-text language"));
     }
     Ok(())
 }
@@ -656,7 +679,7 @@ impl SearchOptions {
     pub fn validate(&self, schema: &Schema) -> Result<(), ProtocolError> {
         let columns = search_columns(schema, self);
         if columns > MAX_SEARCH_COLUMNS {
-            return Err(invalid("a table has at most 8 search columns"));
+            return Err(limit("a table has at most 8 search columns"));
         }
         if columns != 0 && schema.contains_key(SCORE_COLUMN) {
             return Err(invalid("_score is reserved on tables with search columns"));
@@ -798,10 +821,48 @@ described!(CreateWire => CreatePayload {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum TextPredicate {
-    Contains { column: String, value: String },
-    ContainsAny { column: String, values: Vec<String> },
-    StartsWith { column: String, value: String },
+    Contains {
+        column: String,
+        value: String,
+    },
+    ContainsAny {
+        column: String,
+        values: ContainsAnyValues,
+    },
+    StartsWith {
+        column: String,
+        value: String,
+    },
 }
+/// Terms in wire order, with a lookup index built once for all rows.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ContainsAnyValues {
+    terms: Vec<String>,
+    #[serde(skip)]
+    sorted: Vec<usize>,
+}
+
+impl ContainsAnyValues {
+    pub fn as_slice(&self) -> &[String] {
+        &self.terms
+    }
+
+    pub(crate) fn contains(&self, term: &str) -> bool {
+        self.sorted
+            .binary_search_by(|&i| self.terms[i].as_str().cmp(term))
+            .is_ok()
+    }
+}
+
+impl From<Vec<String>> for ContainsAnyValues {
+    fn from(terms: Vec<String>) -> Self {
+        let mut sorted: Vec<_> = (0..terms.len()).collect();
+        sorted.sort_unstable_by(|&a, &b| terms[a].cmp(&terms[b]).then(a.cmp(&b)));
+        Self { terms, sorted }
+    }
+}
+
 impl TextPredicate {
     pub fn column(&self) -> &str {
         match self {
@@ -846,7 +907,10 @@ pub(super) fn decode_text_predicate(
     }
     if op == "contains_any" {
         let Any { column, values, .. } = payload(raw)?;
-        return Ok(TextPredicate::ContainsAny { column, values });
+        return Ok(TextPredicate::ContainsAny {
+            column,
+            values: values.into(),
+        });
     }
     let One { column, value, .. } = payload(raw)?;
     Ok(if op == "contains" {
@@ -855,12 +919,13 @@ pub(super) fn decode_text_predicate(
         TextPredicate::StartsWith { column, value }
     })
 }
-/// At most `max` elements; a longer list stops decoding at the first one over.
+/// Decode at most `max` elements. A longer list is refused or truncated for validation.
 fn bounded_list<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
     max: usize,
+    retain_extra: bool,
 ) -> Result<Vec<T>, D::Error> {
-    struct Visitor<T>(usize, std::marker::PhantomData<T>);
+    struct Visitor<T>(usize, bool, std::marker::PhantomData<T>);
     impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Visitor<T> {
         type Value = Vec<T>;
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -877,13 +942,19 @@ fn bounded_list<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
                     None => return Ok(out),
                 }
             }
+            if self.1 {
+                // Keep one extra item for a typed limit error. Consume the rest
+                // without allocating or decoding more rankings.
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                return Ok(out);
+            }
             match seq.next_element::<serde::de::IgnoredAny>()? {
                 None => Ok(out),
                 Some(_) => Err(serde::de::Error::custom("list exceeds its limit")),
             }
         }
     }
-    d.deserialize_seq(Visitor(max, std::marker::PhantomData))
+    d.deserialize_seq(Visitor(max, retain_extra, std::marker::PhantomData))
 }
 fn full_filter<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Predicate>, D::Error> {
     Option::<&'de RawValue>::deserialize(d)?
@@ -1169,7 +1240,7 @@ impl<'de> Deserialize<'de> for Fusion {
         let raw = <&RawValue>::deserialize(d)?.get();
         if raw.starts_with('[') {
             let mut decoder = serde_json::Deserializer::from_str(raw);
-            return bounded_list(&mut decoder, MAX_RANKINGS)
+            return bounded_list(&mut decoder, MAX_RANKINGS, false)
                 .map(Self::Weights)
                 .map_err(serde::de::Error::custom);
         }
@@ -1261,7 +1332,7 @@ impl<'de> Deserialize<'de> for RankOptions {
     }
 }
 fn rankings<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Ranking>, D::Error> {
-    bounded_list(d, MAX_RANKINGS)
+    bounded_list(d, MAX_RANKINGS + 1, true)
 }
 impl RankOptions {
     /// `fused` rankings share the fusion weights.
@@ -1475,7 +1546,7 @@ struct FullRows<'a> {
     rows: Vec<&'a RawValue>,
 }
 fn raw_rows<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<&'de RawValue>, D::Error> {
-    bounded_list(d, MAX_BATCH_ROWS + 1)
+    bounded_list(d, MAX_BATCH_ROWS + 1, false)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1493,7 +1564,7 @@ struct FullKeys {
     keys: Vec<Key>,
 }
 fn raw_keys<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Key>, D::Error> {
-    bounded_list(d, MAX_BATCH_ROWS + 1)
+    bounded_list(d, MAX_BATCH_ROWS + 1, false)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

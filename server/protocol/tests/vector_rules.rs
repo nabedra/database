@@ -478,7 +478,7 @@ fn rule_eight_search_columns_count_every_kind_and_only_those() {
             result.err()
         );
         if !ok {
-            assert_eq!(code(result), ErrorCode::ValidationError);
+            assert_eq!(code(result), ErrorCode::LimitExceeded);
         }
     }
     // An embedded column counts once.
@@ -540,9 +540,9 @@ fn rule_embedding_model_names_match_their_regex() {
     assert!(add("-docs").is_err() && add("docs v2").is_err() && add(&"a".repeat(65)).is_err());
 }
 
-/// Full-text languages are `[a-z_]{1,32}`, in `table.create` and in `add_full_text`.
+/// Create and add-full-text admit only languages with an analyzer.
 #[test]
-fn rule_full_text_languages_match_their_regex() {
+fn rule_full_text_languages_have_analyzers() {
     let _g = lock();
     let ok_create = |language: &str| {
         let extra = json!({"full_text": {"body": language}}).to_string();
@@ -563,16 +563,33 @@ fn rule_full_text_languages_match_their_regex() {
             .and_then(|r| r.operation.validate_for_table(&t))
             .is_ok()
     };
-    for c in (0u8..128).map(char::from) {
-        let expected = c.is_ascii_lowercase() || c == '_';
-        assert_eq!(ok_create(&format!("{c}")), expected, "{c:?}");
-        assert_eq!(ok_add(&format!("a{c}")), expected, "add a{c:?}");
+    for language in [
+        "arabic",
+        "danish",
+        "dutch",
+        "english",
+        "finnish",
+        "french",
+        "german",
+        "greek",
+        "hungarian",
+        "italian",
+        "norwegian",
+        "portuguese",
+        "romanian",
+        "russian",
+        "simple",
+        "spanish",
+        "swedish",
+        "tamil",
+        "turkish",
+    ] {
+        assert!(ok_create(language), "create {language}");
+        assert!(ok_add(language), "add {language}");
     }
-    let both: [&dyn Fn(&str) -> bool; 2] = [&ok_create, &ok_add];
-    for ok in both {
-        assert!(!ok("") && !ok("English") && !ok("en-us") && !ok("en1") && !ok("é"));
-        assert!(ok(&"a".repeat(32)) && !ok(&"a".repeat(33)));
-        assert!(ok("english") && ok("pt_br") && ok("_"));
+    for language in ["", "English", "en-us", "en1", "pt_br", "esperanto", "_"] {
+        assert!(!ok_create(language), "create {language}");
+        assert!(!ok_add(language), "add {language}");
     }
 }
 
