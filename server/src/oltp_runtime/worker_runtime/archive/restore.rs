@@ -339,6 +339,27 @@ impl VerifiedNativeRestore {
                         }
                         split = Some((scopes, 0usize));
                     }
+                    HistoryFrame::SplitSearch(schema) => {
+                        if let Some((scopes, child)) = &split {
+                            let scope = scopes.get(*child).ok_or_else(unknown)?;
+                            if let Some(active) = self.graph.active(&scope.group)? {
+                                let store = pool
+                                    .group(map_native_group(
+                                        &scope.group,
+                                        target.statement().target_pool.cluster_id,
+                                    ))
+                                    .await?;
+                                crate::oltp::mvcc::store::restore::install_search_schema(
+                                    &store,
+                                    target.clone(),
+                                    scope.clone(),
+                                    Some(active),
+                                    (**schema).clone(),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
                     HistoryFrame::SplitImage(_) => {
                         if let Some((scopes, child)) = &split {
                             let scope = scopes.get(*child).ok_or_else(unknown)?;
