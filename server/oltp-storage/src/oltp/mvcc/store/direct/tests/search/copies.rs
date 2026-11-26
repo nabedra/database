@@ -642,3 +642,29 @@ async fn vs16_the_first_search_fence_matches_the_restored_columns() {
     let rejected = restored.submit(s.fence_command(8, reused)).await;
     assert_eq!(search_reply(rejected), SearchReply::Rejected(Fault::InvalidBinding));
 }
+
+#[test]
+fn vs16_a_restore_refuses_malformed_search_metadata_before_reading_rows() {
+    let checked = SearchSchema {
+        epoch: 1,
+        columns: columns(),
+        high: MULTI,
+    };
+    assert!(restore::check_schema(Some(&checked), &[]).is_ok());
+    let mut no_dimension = checked.clone();
+    no_dimension.columns.last_mut().unwrap().dim = 0;
+    let mut unordered = checked.clone();
+    unordered.columns.swap(0, 1);
+    let mut repeated = checked.clone();
+    repeated.columns.insert(0, repeated.columns[0].clone());
+    let mut low = checked.clone();
+    low.high -= 1;
+    let mut inactive = checked;
+    inactive.epoch = 0;
+    for schema in [no_dimension, unordered, repeated, low, inactive] {
+        assert_eq!(
+            restore::check_schema(Some(&schema), &[]).unwrap_err().code,
+            ErrorCode::ValidationError
+        );
+    }
+}

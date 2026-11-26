@@ -199,7 +199,7 @@ impl SearchColumn {
             VectorKind::Dense => len == vector,
             // `n` u32 indices then `n` f32 weights (contract, "Values").
             VectorKind::Sparse => len.is_multiple_of(8),
-            VectorKind::Multi => len.is_multiple_of(vector) && len / vector <= MAX_MULTI,
+            VectorKind::Multi => vector != 0 && len.is_multiple_of(vector) && len / vector <= MAX_MULTI,
         }
     }
 }

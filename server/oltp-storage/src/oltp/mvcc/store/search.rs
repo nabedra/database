@@ -21,6 +21,14 @@ pub struct SearchSchema {
     pub high: ColumnId,
 }
 impl SearchSchema {
+    pub(crate) fn valid(&self) -> bool {
+        self.epoch != 0
+            && self.columns.len() <= MAX_SEARCH_COLUMNS
+            && self.columns.iter().all(SearchColumn::valid)
+            && self.columns.is_sorted_by(|a, b| a.id < b.id)
+            && self.columns.last().is_none_or(|column| column.id <= self.high)
+    }
+
     pub(super) fn column(&self, id: ColumnId) -> Option<&SearchColumn> {
         self.columns.iter().find(|column| column.id == id)
     }
