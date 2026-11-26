@@ -264,3 +264,96 @@ async fn d04_fixa_shutdown_refuses_a_batch_that_never_reached_raft() {
         "{response:?}"
     );
 }
+
+struct ApplyAfterTimeout {
+    inner: Arc<RaftConsensus<DataConfig, ParticipantMachine>>,
+    release: Arc<Notify>,
+    applied: Arc<Notify>,
+}
+
+impl Consensus<ParticipantCommand, ParticipantReply> for ApplyAfterTimeout {
+    fn propose(
+        &self,
+        command: OwnedCommand<ParticipantCommand>,
+    ) -> ConsensusFuture<'_, Applied<ParticipantReply>> {
+        let inner = self.inner.clone();
+        let release = self.release.clone();
+        let applied = self.applied.clone();
+        Box::pin(async move {
+            // Dropping the wait for a submitted proposal does not cancel Raft's work.
+            let submitted = tokio::spawn(async move {
+                release.notified().await;
+                let result = inner.propose(command).await;
+                applied.notify_one();
+                result
+            });
+            submitted.await.expect("submitted proposal task")
+        })
+    }
+
+    fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {
+        self.inner.ensure_linearizable()
+    }
+
+    fn lease_read_index(&self) -> ConsensusFuture<'_, u64> {
+        self.inner.lease_read_index()
+    }
+
+    fn current_leader(&self) -> Option<u64> {
+        self.inner.current_leader()
+    }
+
+    fn local_node(&self) -> Option<u64> {
+        self.inner.local_node()
+    }
+}
+
+#[tokio::test]
+async fn d05_unknown_proposal_keeps_range_clock_pending_until_apply() {
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    let voter = &cluster.voters[leader];
+    let clock = cluster.clock(leader);
+    let consensus = Arc::new(ApplyAfterTimeout {
+        inner: voter.consensus.clone(),
+        release: Arc::new(Notify::new()),
+        applied: Arc::new(Notify::new()),
+    });
+    let handle = Arc::new(ParticipantHandle::new(
+        ParticipantMachine::new(voter.store.clone()).unwrap(),
+        consensus.clone(),
+    ));
+    let request = timed_insert(&cluster, leader, 1);
+    let deadline = request.deadline;
+    let mut response = Box::pin(voter.executor.execute(&handle, request));
+    at_proposal(voter, response.as_mut(), 1).await;
+    assert_eq!(clock.pending_len(), 1);
+    let token = clock.leader_token().unwrap();
+
+    pause();
+    advance(deadline + Duration::from_millis(1)).await;
+    let response = response.await;
+    resume();
+    assert_eq!(
+        code(&response).map(|(_, outcome)| outcome),
+        Some(Outcome::Unknown)
+    );
+    assert_eq!(clock.leader_token(), Some(token));
+    assert_eq!(
+        clock.pending_len(),
+        1,
+        "an unknown proposal can still apply"
+    );
+
+    consensus.release.notify_one();
+    nabedra_rt::time::timeout(Duration::from_secs(5), consensus.applied.notified())
+        .await
+        .expect("submitted proposal finishes");
+    assert!(cluster.latest(leader, cluster.row_key(1)).await.0.is_some());
+    assert_eq!(
+        clock.pending_len(),
+        0,
+        "apply settled the pending timestamp"
+    );
+    cluster.shutdown().await;
+}
