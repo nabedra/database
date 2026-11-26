@@ -129,3 +129,161 @@ S2 and S3 can proceed independently after S1; S4 and S5 can proceed independentl
 Existing code to extend: [local dispatch](../server/src/engine/partition.rs), [remote coordination](../server/src/node/coordinator.rs), [worker runtime](../server/src/node/runtime.rs), [admission/settlement](../server/src/node/admission.rs), [payload ownership](../server/src/node/payload_owner.rs), [publication](../server/src/storage/publication.rs), [decision history](../server/src/storage/decision.rs), and [current process evidence](../server/notes/DN-runtime-integration.md). Managed-node slot equality currently appears in `cluster/state.rs`; enrollment, fingerprints, authorization and heartbeat schemas must evolve together.
 
 Verified dependency behavior: [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) provide ETag preconditions for the root update; they do not transact several object keys. [Tokio semaphore fairness](https://docs.rs/tokio/1.54.1/tokio/sync/struct.Semaphore.html) can block smaller acquisitions behind `acquire_many`, so it does not replace the CPU/byte scheduler. [Rust Result](https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html) handles expected failures; [panic containment](https://doc.rust-lang.org/std/panic/fn.catch_unwind.html) does not catch process aborts. No new dependency is selected by this plan.
+
+## Design review
+
+Reviewed 2026-11-26 against `main` `e6b4040b` (wave rv, task rv-oltp-direct). The spec models the OLTP registered queue
+on the queued path with the all-ready policy. It does not cover the OLAP cluster queue (`server/src/node/**`,
+`server/src/cluster/**`, olap feature only), the scoped RF3 queue (O30, O31), queries and their pinned read grants, or
+scheduling fairness.
+
+### Guarantees
+
+| Guarantee | Properties | Not modelled |
+| --- | --- | --- |
+| OLTP-G07 | `G07_ReadyHoldAccepted`, `G07_NoStaleRecord`, `G07_NoAbandonWhileHeld`, `Q03_ExecuteOnlyAccepted`, `QueueRetention`, `O14_RetryAttaches`, `L_AcceptedTerminates`, `L_CommittedFinishes`, deadlock freedom | Queue byte and count limits (Q02): resource accounting, SCHED-G01 |
+| OLTP-G08 | `G07_ReadyHoldAccepted` and `G07_NoStaleRecord` across `RemoveMember`, `Rejoin`, `JoinCopy`, `PublishJoin` and `AbortJoin`; deadlock freedom with a pending join | Voter changes: OltpRanges and OltpControl |
+| OLTP-G03 (queued path) | `G03_OnceExecution`, `R04_NoOldRunExecution` | The direct path: OltpDirect |
+| OLTP-G04 (queued path) | `G04_AbandonedNeverCommits`, `G04_NotAppliedHasProof`, `Receipt_Monotone` | The direct path: OltpDirect |
+| OLTP-G09 | `G09_SettleOnce`, `L_ReservationsSettle` | Byte budgets: SCHED-G01 |
+| SCHED-G04 | `R04_NoOldRunExecution`, `G04_AbandonedNeverCommits`, `G07_NoAbandonWhileHeld` | None |
+| SCHED-G01, G02, G03 | none | Capacity, fairness and aging are resource arithmetic and timing, checked by the C and M cases |
+
+### Topology
+
+```text
+client --HTTP--> API --> queue owner (fenced by Control) --copies--> every ready worker (RAM)
+                              |            \--attempts--> Status (identity, decision), Data
+                              \--ready view, join, removal, fence--> Control (Raft)
+```
+
+Faults modelled: worker crash, losing RAM (`MaxCrash`); partition of a live worker from Control and peers
+(`MaxPartition`), with heal; a full stop of every worker (`MaxStop`); a transient local lane refusal (`MaxLane`); a
+transient receipt lookup failure (`MaxReceiptFault`); a copy installed whose acknowledgement is lost (`MaxLostAck`). A
+total budget `MaxFaults` = 2 lets any two of them overlap. Message loss of a copy is the copy step not being taken. A
+lost client reply is `ReplyClient` not being taken. Out of scope: Byzantine workers, Control and Status unavailability
+(both are linearizable single steps, abstraction A1), clock drift (no lease is modelled; owner fencing is by view), and
+disk faults (the queue has no disk).
+
+### Spec
+
+`specs/oltp/queue/OltpQueue.tla`, `MCOltpQueue.tla`. The baseline is `OltpQueue.cfg`: 4 workers, 2 requests, every fault
+kind once, `MaxFaults` = 2, symmetry on workers and requests, safety and deadlock. The liveness baseline is
+`OltpQueue.live.cfg`: 3 workers, 1 request, no symmetry, `LiveSpec`, with the full stop and receipt faults off. That is
+below the L3 node bound, and the reason and approval are recorded under "Open gaps". The mutants are in
+`specs/oltp/queue/mutants/`, at 3 workers and 1 request, each with its control. There are no constraints and no limits.
+Fairness (each assumption names its mechanism): the owner's admission future and recovery loop (`InstallCopy`,
+`AcceptStaged`, `Start`, `ResolveCommitted`); the attempt task and Status progress (`SubmitDecision`,
+`CommitDecision`); the settlement guard (`Settle`, `CancelAttempt`); the membership actor's 250 ms poll (`ApplyView`,
+`JoinCopy`, `PublishJoin`); Control's heartbeat timeout (`RemoveMember`, `AbortJoin`); the cold-start procedure
+(`FenceGroups`); and the fault-stop assumption (`Heal`). The T check is `oltp-queue-spec`.
+
+Abstractions A1 to A6 are listed in the spec header. A3 folds the Running copy into the accepted version: every start
+and takeover consults the Status decision first, so a holder's Running copy changes no outcome.
+
+### Results
+
+| Run | Where | Distinct states | Depth | Verdict |
+| --- | --- | --- | --- | --- |
+| `OltpQueue.cfg` at 3 workers, 1 request (probe) | local, unattested | 38,221 | 30 | pass |
+| `OltpQueue.live.cfg` | local, unattested | 138,744 | 30 | pass, liveness checked |
+| `OltpQueue.cfg` (4 workers, 2 requests) | Actions: pending | | | not-run |
+
+Coverage: 29 actions, each with a nonzero count (minimum 97, local). Mutant counterexample lengths are local, at 3 workers
+and 1 request; the controls of the liveness mutants are `OltpQueue.live.cfg` with the lane fault off. Actions run
+https://github.com/zPy52/nabedra-database/actions/runs/45805091930 (on `fbb0b2e7`) is checking the L3 baseline.
+
+### Mutants
+
+| Mutant | Property | Counterexample (states, local) |
+| --- | --- | --- |
+| `ack_on_quorum` | `G07_ReadyHoldAccepted` | 6 |
+| `join_no_seal` | `G07_ReadyHoldAccepted` | 11 |
+| `ready_before_copy` | `G07_ReadyHoldAccepted` | 10 |
+| `rejoin_keeps_stale` | `G07_NoStaleRecord` | 8 |
+| `cold_on_missed_heartbeat` | `G07_NoAbandonWhileHeld` | 7 |
+| `dispatch_before_copies` | `Q03_ExecuteOnlyAccepted` | 8 |
+| `no_identity_dedup`, `retire_without_tombstone` | `G03_OnceExecution` | 15, 17 |
+| `no_durable_reservation` | `R04_NoOldRunExecution` | 11 |
+| `no_cold_fence`, `lookup_before_fence` | `G04_AbandonedNeverCommits` | 15, 14 |
+| `acc3_receipt_early` | `G04_NotAppliedHasProof` | 12 |
+| `gc1_double_guard`, `cancel_releases_put` | `G09_SettleOnce` | 8, 13 |
+| `o07_lane_fails` | `QueueRetention` | 9 |
+| `prefix_o14_ready_view` | `O14_RetryAttaches` | 8 |
+| `prefix_f1_receipt_regress` | `Receipt_Monotone` | 12 |
+| `prefix_join_never_aborted` | Deadlock | 7 |
+| `no_reconcile` | `L_CommittedFinishes` | 16 (lasso) |
+| `no_remove_crashed` | `L_AcceptedTerminates` | 12 (lasso) |
+| `no_settle_superseded` | `L_ReservationsSettle` | 16 (lasso) |
+
+### Counterexamples
+
+- **Interrupted join (OQ-2, record `2026-11-26-design-queue-join-never-aborted`).** Shipped Control refuses every
+  removal and owner fence while a join is pending, and only publication or a cold fence ends one. Trace
+  (`prefix_join_never_aborted`, 7 states): 1 submit r1; 2 partition w1; 3 remove w1; 4 heal; 5 w1 begins its rejoin;
+  6 the owner crashes; 7 no step is enabled. The plan now says an interrupted join never blocks recovery (plan fixed,
+  code pending). The spec's `AbortJoin`, and `RemoveMember` superseding a pending join, model the fix. The coverage
+  gap was that the draft spec let a crashed joiner release the join, which the code does not do.
+- **Receipt regression (OQ-1, record `2026-11-26-design-queue-receipt-regress`).** Trace (`prefix_f1_receipt_regress`,
+  12 states, no fault): r1 is accepted, copied, started and decided; a same-ID POST answers the durable terminal; a GET
+  then answers running. The plan now says a same-run mutation receipt answers from the durable decision (plan fixed,
+  code pending). The gap was that the client view had no monotonicity property.
+
+### Cost
+
+Per queued mutation in a cluster of N ready workers. The plan sets no numeric target; it requires the network and
+memory cost of all-ready replication to be measured.
+
+| Item | Spec actions | Code | Count |
+| --- | --- | --- | --- |
+| Status Raft writes besides the transaction | `SubmitRequest`, `AcceptStaged`, `Retire` | `reserve_identity`, `bind_staged`, `retire_terminal` (plus a Timestamp `release` at retirement) | 3 (+1) |
+| Decision | `CommitDecision` | the transaction's Status decision | 1 |
+| Queue copy RPCs | `InstallCopy` for the staged, accepted and terminal versions | the same, plus the Running version (A3), each a full `RecordFrame` with the body | 4(N-1) |
+| Sequential copy rounds | | batches of `MAX_PARALLEL_QUEUE_COPIES` = 4 | 4 ceil((N-1)/4), 2 of them before the 202 |
+| RAM copies of the body | | every ready worker, until `result_retention_ms` | N |
+| fsyncs | | the Raft writes above, on each Status or Timestamp voter; the queue itself has no disk | 4 Raft quorums plus the transaction |
+
+Finding OQ-5 proposes sending the body once and later phases as headers. Measure with `scripts/testing/ab.py`.
+
+### Independent read
+
+`wave-dr/reads/queue.md` (2026-11-24). The plan changed since then only by the removal of AGENTS.md references, so the
+read still applies. Its AGENTS.md rules are no longer a source.
+
+| Scenario | Encoding |
+| --- | --- |
+| R-queue-01 join during an install | `InstallCopy` only to current members; `JoinCopy` seals; `PublishJoin` resets the barrier; `join_no_seal`, `ready_before_copy` |
+| R-queue-02 stale joiner copy, then re-execution | `Rejoin` wipes the queue; `Start` checks the Status decision; `rejoin_keeps_stale`, `G03_OnceExecution` |
+| R-queue-03 joiner is the last survivor with a partial bootstrap | A joiner is not a holder: `AllReadyDown`, and a cold start needs every worker stopped (`G07_NoAbandonWhileHeld`). The interrupted-join wedge is OQ-2 |
+| R-queue-04 submitter crash after a partial install | `Crash` of the owner, then `RemoveMember` merges, and the new owner adopts with `AcceptStaged`; `Q03_ExecuteOnlyAccepted` |
+| R-queue-05 unaccepted copy leaks bytes or a slot | Adopted by the recovery loop (`AcceptStaged` under fairness). Byte accounting is not modelled. A staged record refused for good is an open candidate |
+| R-queue-06 stale replica rejoins after a partition | `Partition`, `RemoveMember`, `Heal`, `Rejoin`; `G07_NoStaleRecord` |
+| R-queue-07 stale replica after a cold start | `ColdStart`, `Bootstrap`, `Rejoin`; `R04_NoOldRunExecution`, `no_cold_fence` |
+| R-queue-08 cold start with a live holder | the `ColdStart` guard; `cold_on_missed_heartbeat` |
+| R-queue-09 same ID through two APIs | one owner under the UUID gate (A1); `G03_OnceExecution`, `no_identity_dedup` |
+| R-queue-10 two bodies for one ID | Not modelled: Status rejects a different digest at reservation (`admission.rs`, `DigestConflict`); each modelled identity has one body |
+| R-queue-11 deadline mid-install, then 429 | A failure with a local copy is uncertain, never `not_applied` (`worker_runtime.rs` `submit_original`); `G04_NotAppliedHasProof` |
+| R-queue-12 takeover with an old attempt running | `RemoveMember` supersedes attempts; `CancelAttempt`; `G09_SettleOnce` |
+| R-queue-13 duplicated settlement | `Settle` once per attempt; `gc1_double_guard` |
+| R-queue-14 wrongly suspected loss, then a late settlement | `Partition`, `RemoveMember`, `Settle`; `cancel_releases_put` |
+| R-queue-15 paused old owner writes a stale terminal | `OwnerOK` requires the current view; terms are abstract (A5); `G07_NoStaleRecord` |
+| R-queue-16 PUT across a full stop and a fence | `StopAll` keeps submitted decisions; `CommitDecision` checks `fenceRun`; `no_cold_fence`, `lookup_before_fence` |
+| R-queue-17 catalog and decision written apart | Not applicable to OLTP: the decision is one Status entry |
+| R-queue-18 multi-group fence and a decided transaction | Out of scope here: transaction finalization is OltpRanges. `FenceGroups` is one step (A1) |
+| R-queue-19 raw resubmit after a cold start | the abandoned branch of `SubmitRequest`; `no_durable_reservation` |
+| R-queue-20 delayed duplicate after retirement | the terminal branch of `SubmitRequest`; `retire_without_tombstone` |
+| R-queue-21 receipt of an unaccepted copy | `ReplyClient` answers accepted versions only |
+| R-queue-22 receipt from a lagging replica | Receipts come from the owner (`ReplyClient` needs `OwnerOK`); `Receipt_Monotone` (OQ-1) |
+| R-queue-23 query pin not replicated | Out of scope: queries (A6) |
+| R-queue-24 no bytes to re-establish copies | Not modelled: byte limits (SCHED-G01). Open gap |
+| R-queue-25 scale-down removes the last holder mid-transition | `RemoveMember` merges every survivor's copy. A drain of a live worker is not modelled. Open gap |
+| R-queue-26, R-queue-27 direct-to-queued forward races | the direct path: OltpDirect |
+| R-queue-28 cancellation races completion | `CancelAttempt` against `CommitDecision` and `Settle`; `cancel_releases_put` |
+
+### Open gaps
+
+- The liveness baseline runs at 3 workers and 1 request without symmetry, below the L3 node bound, because liveness
+  cannot use symmetry and the 4-worker, 2-request space does not fit the budget without it. It needs approval from a
+  reviewer who did not write it.
+- Byte and count limits, drains of live workers, queries and the scoped queue are not modelled.
+- The compute-charge owner behind `held` is unverified in the code (the old dr-queue note).
