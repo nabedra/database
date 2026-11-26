@@ -60,7 +60,7 @@ CONSTANTS
     Variant         \* a set of candidate design fixes, {} for the shipped design
 
 ASSUME D \in Nat /\ MaxDrift \in 0..D /\ L > 2 * D /\ RA > 2 * D /\ MaxEpoch >= 1
-ASSUME Variant \subseteq {"follow_retired", "observe_window"}
+ASSUME Variant \subseteq {"follow_retired", "observe_window", "last_verified_copy"}
 ASSUME Ops \subseteq {"set", "ttl", "del"}
 
 \* Candidate fixes.  Each prefix_* mutant reverts one of them (design bug loop).
@@ -69,9 +69,14 @@ ASSUME Ops \subseteq {"set", "ttl", "del"}
 \* the controller's lower bound reaches the source's latest expiry.
 FollowRetired == "follow_retired" \in Variant /\ Mutant # "prefix_retired_gate"
 LateStagedCommit == "follow_retired" \in Variant /\ Mutant # "prefix_early_staged_commit"
-\* observe_window: failover and replica replacement wait for the report
-\* window of the term, as the cold reset already does.
-ObserveWindow == "observe_window" \in Variant /\ Mutant # "prefix_no_observe_window"
+\* observe_window: a missing current-term report is unknown during the
+\* observation window, unless membership already proves retirement.
+ObserveWindow == "observe_window" \in Variant
+                 /\ Mutant \notin {"prefix_no_observe_window", "prefix_repair_lacks_report_window",
+                                "prefix_failover_lacks_report_window"}
+\* last_verified_copy: a recovery promotion preserves the only verified
+\* prefix, even when it trails the source progress by more than MaxLag.
+KeepLastVerified == "last_verified_copy" \in Variant /\ Mutant # "prefix_last_copy_lag_gate"
 
 -----------------------------------------------------------------------------
 (* Values *)
@@ -111,7 +116,7 @@ NoPkt == [kind |-> "none", src |-> NoW, gen |-> 0, ep |-> 0, seq |-> 0,
           eff |-> [k |-> CHOOSE k \in Keys : TRUE, v |-> 0, d |-> NoDl, c |-> Sys],
           val |-> EmptyVal, dl |-> EmptyDl]
 Unset == [set |-> FALSE, val |-> EmptyVal, dl |-> EmptyDl, cold |-> FALSE, fep |-> 0, fseq |-> 0]
-NoPromo == [on |-> FALSE, srcSeq |-> 0, retSeq |-> 0]
+NoPromo == [on |-> FALSE, srcSeq |-> 0, retSeq |-> 0, lastOnly |-> FALSE]
 
 -----------------------------------------------------------------------------
 VARIABLES
@@ -217,8 +222,10 @@ MemberIds == {<<w, member[w]>> : w \in {x \in Workers : member[x] > 0}}
 ReplicaChoices(p) ==
     LET c == {r \in LiveIds : r[1] # p[1]} IN IF c = {} THEN {NoW} ELSE c
 Expired(s) == CL >= lease[s].exp
-\* The candidate fix observe_window: the term's report window has passed.
-Observed == ~ObserveWindow \/ CL >= obsStart
+\* A live report or retirement proves the incarnation's status immediately.
+\* In their absence, wait for the controller's current-term report deadline.
+ObservationKnown(id) == id = NoW \/ Retired(id) \/ Live(id) \/ CL >= obsStart
+Observed(id) == ~ObserveWindow \/ ObservationKnown(id)
 
 -----------------------------------------------------------------------------
 (* Initial state: an initialized cluster.  Each slot is cold at epoch 1 with *)
@@ -400,7 +407,7 @@ NextEpoch(c, newPri) ==
 Failover(s) ==
     LET c == cs[s] IN
     /\ Expired(s)
-    /\ Observed
+    /\ Observed(c.pri)
     /\ ~Baseline(c.pri, s) \/ (c.mfrz /\ ~c.mfro.on)
     /\ IsMember(c.rep) /\ Baseline(c.rep, s)
     /\ c.ep < MaxEpoch
@@ -415,6 +422,7 @@ Failover(s) ==
 StagedCase(s) ==
     LET c == cs[s] IN
     /\ c.tgt # NoW /\ c.pri # NoW
+    /\ Observed(c.pri) /\ Observed(c.rep)
     /\ Retired(c.pri) \/ ~Baseline(c.pri, s) \/ Mutant = "staged_ignores_fence"
     /\ ~(IsMember(c.rep) /\ Baseline(c.rep, s))
 
@@ -429,8 +437,15 @@ StagedCopyOK(s) ==
     /\ IsMember(t) /\ Baseline(t, s)
     /\ Rpt(t, s).cur
 
+LastVerifiedCopy(s) ==
+    LET c == cs[s] IN
+    /\ StagedCopyOK(s)
+    /\ ~Baseline(c.pri, s) /\ ~Baseline(c.rep, s) /\ ~Baseline(c.mtgt, s)
+
 WithinLag(s) ==
-    Mutant = "staged_ignores_lag" \/ stg[s].seq - Rpt(cs[s].tgt, s).seq <= MaxLag
+    \/ Mutant = "staged_ignores_lag"
+    \/ stg[s].seq - Rpt(cs[s].tgt, s).seq <= MaxLag
+    \/ KeepLastVerified /\ LastVerifiedCopy(s)
 
 StagedCutoff(s) ==
     IF \/ Mutant = "staged_ignores_fence"
@@ -457,7 +472,8 @@ StagedPromote(s) ==
          Commit(s, SlotRec(NextEpoch(c, t), t, r, FALSE))
     /\ lease' = [lease EXCEPT ![s] = [exp |-> cutoff, nb |-> cutoff]]
     /\ promo' = [promo EXCEPT ![s][NextEpoch(c, t)] =
-                   [on |-> TRUE, srcSeq |-> stg[s].seq, retSeq |-> Rpt(t, s).seq]]
+                   [on |-> TRUE, srcSeq |-> stg[s].seq, retSeq |-> Rpt(t, s).seq,
+                    lastOnly |-> "last_verified_copy" \in Variant /\ LastVerifiedCopy(s)]]
     /\ ClearStg(s)
     /\ ReconcileUnchanged
 
@@ -484,7 +500,7 @@ StagedReset(s) ==
 StageStart(s) ==
     LET c == cs[s] IN
     /\ c.tgt = NoW /\ c.mtgt = NoW
-    /\ Observed
+    /\ Observed(c.rep)
     /\ Baseline(c.pri, s)
     /\ c.rep = NoW \/ ~IsMember(c.rep) \/ ~Live(c.rep)
     /\ \E t \in LiveIds :
@@ -502,7 +518,8 @@ StageComplete(s) ==
     /\ Baseline(c.pri, s)
     /\ StagedCopyOK(s)
     /\ Rpt(c.tgt, s).seq <= Rpt(c.pri, s).seq
-    /\ Rpt(c.pri, s).seq - Rpt(c.tgt, s).seq <= MaxLag
+    /\ \/ Mutant = "ordinary_transfer_ignores_lag"
+       \/ Rpt(c.pri, s).seq - Rpt(c.tgt, s).seq <= MaxLag
     /\ Commit(s, [c EXCEPT !.rep = c.tgt, !.tgt = NoW])
     /\ ClearStg(s)
     /\ UNCHANGED <<lease, promo>>
@@ -546,7 +563,8 @@ MoveFreeze(s) ==
     /\ c.mtgt # NoW /\ ~c.mfrz
     /\ Baseline(c.pri, s) /\ Baseline(c.mtgt, s)
     /\ Rpt(c.mtgt, s).seq <= Rpt(c.pri, s).seq
-    /\ Rpt(c.pri, s).seq - Rpt(c.mtgt, s).seq <= MaxLag
+    /\ \/ Mutant = "ordinary_transfer_ignores_lag"
+       \/ Rpt(c.pri, s).seq - Rpt(c.mtgt, s).seq <= MaxLag
     /\ Commit(s, [c EXCEPT !.mfrz = TRUE])
     /\ MoveUnchanged
 
@@ -1018,16 +1036,49 @@ G02_NoResurrection ==
 G09_ColdStartEmpty ==
     \A s \in Slots, e \in Epochs : (base[s][e].set /\ base[s][e].cold) => base[s][e].val = EmptyVal
 
-\* Decision 6: a staged promotion's retained prefix (as installed) trails the
-\* committed source watermark by at most MaxLag.
+\* Decision 6: the last verified copy is exempt from the cutover threshold.
+\* The exception is recorded at the transition, before the slot changes epoch.
 D6_LagBound ==
     \A s \in Slots, e \in Epochs :
-        (promo[s][e].on /\ base[s][e].set) => base[s][e].fseq >= promo[s][e].srcSeq - MaxLag
+        (promo[s][e].on /\ base[s][e].set /\ ~promo[s][e].lastOnly)
+            => base[s][e].fseq >= promo[s][e].srcSeq - MaxLag
+
+\* Ordinary transfers still enforce the threshold, whether installing a
+\* replacement replica or beginning a planned primary freeze.
+D6_OrdinaryTransferLag ==
+    [][\A s \in Slots :
+         LET c == cs[s]
+             n == cs'[s]
+         IN /\ (c.tgt # NoW /\ n.ep = c.ep /\ n.tgt = NoW /\ n.rep = c.tgt)
+                   => Rpt(c.pri, s).seq - Rpt(c.tgt, s).seq <= MaxLag
+            /\ (~c.mfrz /\ n.mfrz)
+                   => Rpt(c.pri, s).seq - Rpt(c.mtgt, s).seq <= MaxLag
+      ]_vars
+
+\* An automatic reset is a staged-recovery fallback for a slot without a
+\* verified copy. A scoped operator reset remains a separate action.
+D6_LastVerifiedCopyPreserved ==
+    [][\A s \in Slots :
+         LET c == cs[s]
+             n == cs'[s]
+         IN (n.ep > c.ep /\ n.cold /\ fb'.reset = fb.reset)
+                => (c.tgt # NoW /\ ~LastVerifiedCopy(s))
+      ]_vars
 
 \* CACHE-G05 and decision 5, the lag window ends at the handover: no write
 \* is acknowledged in an epoch after a later epoch took over its prefix.
 \* Such a write is lost however fast replication is.
 G05_NoAckAfterHandover == ~lateAck
+
+\* A staged promotion may not advance the epoch while its predecessor
+\* still has a valid committed grant, even after that source was retired.
+G05_NoEarlyStagedCommit ==
+    [][\A s \in Slots :
+         LET c == cs[s]
+             n == cs'[s]
+         IN (c.tgt # NoW /\ n.ep > c.ep /\ n.pri = c.tgt /\ ~n.cold)
+                => CL >= lease[s].exp
+      ]_vars
 
 \* CACHE-G05 and decision 5, loss comes only from replication lag: while a
 \* source can still acknowledge writes for an epoch, a promotable copy that
@@ -1047,6 +1098,18 @@ Follows(w, s) ==
 G05_LossOnlyFromLag ==
     \A w \in Workers, s \in Slots :
         Follows(w, s) => (CanFetch(w, s) /\ Recv(w, s, MkPkt(w, s)).seq = sh[w][s].seq + 1)
+
+\* A new controller may act on an enrolled incarnation with no report once
+\* its report deadline passes. Staged promotion considers both older copies.
+G05_ObservationWindow ==
+    [][\A s \in Slots :
+         LET c == cs[s]
+             n == cs'[s]
+         IN /\ (c.tgt = NoW /\ n.tgt # NoW /\ n.ep = c.ep) => ObservationKnown(c.rep)
+            /\ (n.ep > c.ep /\ n.pri # c.pri /\ ~n.cold /\ ~n.seed.on)
+                   => /\ ObservationKnown(c.pri)
+                      /\ (c.tgt # NoW /\ n.pri = c.tgt) => ObservationKnown(c.rep)
+      ]_vars
 
 \* CACHE-G05 ("A lost connection alone does not prove a slot's copies are
 \* gone"), K03: no failover or replica replacement drops a worker that has
@@ -1078,7 +1141,7 @@ D6_StagedRepair == \A s \in Slots : []<>(Available(s) \/ OperatorScope(s))
 
 \* Decision 6's invariant as written: no slot stays without an authorized
 \* primary (after faults stop, with surviving workers).  Not in a baseline:
-\* the shipped design fails it (finding CACHE-1 in the review).
+\* the approved policy keeps such unstaged slots in operator recovery (CACHE-3).
 D6_RepairBudget == \A s \in Slots : []<>Available(s)
 
 =============================================================================
