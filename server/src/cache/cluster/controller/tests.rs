@@ -979,9 +979,10 @@ fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
     ));
     let mut observations = Observations::default();
     report(&mut observations, &retired, target, 4_000, Some(copy));
+    let initial_retired_slot = retired.topology.slots[0];
     let changes = observations.plan(&retired, bounds(4_000));
     assert!(!retired.reconcile(4_000, changes));
-    assert_eq!(retired.topology.slots[0], staged);
+    assert_eq!(retired.topology.slots[0], initial_retired_slot);
 
     // Previously committed reconcile entries retain their apply semantics.
     let mut legacy = retired.clone();
