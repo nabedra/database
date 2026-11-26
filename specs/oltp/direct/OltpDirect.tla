@@ -100,10 +100,12 @@ InitRS == [row |-> [k \in Keys |-> [v |-> scn.rows[k], ver |-> 0]],
            recs |-> {}, w |-> {}, dup |-> FALSE, bad |-> FALSE]
 
 NoRec == [key |-> None, id |-> None, dg |-> <<>>, res |-> None, rk |-> None]
-\* The 'D' record of (key, id). Mutant dedup_ignored: none is ever found.
-RecOf(s, key, id) ==
+\* The 'D' record of (key, id). The properties read RecRaw.
+RecRaw(s, key, id) ==
     LET R == {x \in s.recs : x.key = key /\ x.id = id}
-    IN IF R = {} \/ Mutant = "dedup_ignored" THEN NoRec ELSE CHOOSE x \in R : TRUE
+    IN IF R = {} THEN NoRec ELSE CHOOSE x \in R : TRUE
+\* What the leader and apply find. Mutant dedup_ignored: none is ever found.
+RecOf(s, key, id) == IF Mutant = "dedup_ignored" THEN NoRec ELSE RecRaw(s, key, id)
 Has(rec) == rec.id # None
 
 Present(s, k) == s.row[k].v # None
@@ -450,23 +452,20 @@ MoveLeader(n, r) ==
     /\ UNCHANGED <<scn, st, up, iso, tso, qw, reads>>
 
 \* Rule 3: the new leader's first entry commits after the older entries its
-\* log holds. Mutant first_entry_needs_traffic: only a new proposal does it
-\* (no leader no-op).
+\* log holds, and only then does it serve. Mutant first_entry_needs_traffic:
+\* only a new proposal does it (no leader no-op). Mutant no_rule3: the leader
+\* serves at once, and the older entries commit later, one by one.
 RaftFirstEntry(r) ==
     LET a == ApplyAll(st[r], tso, prop[r], 1) IN
     /\ lst[r] = "elected" /\ Quorum(leader[r])
     /\ Mutant = "first_entry_needs_traffic" => \E x \in exec : x.r = r
-    /\ st' = [st EXCEPT ![r] = a.s]
-    /\ tso' = a.t
-    /\ prop' = [prop EXCEPT ![r] = <<>>]
+    /\ IF Mutant = "no_rule3"
+       THEN UNCHANGED <<st, tso, prop>>
+       ELSE /\ st' = [st EXCEPT ![r] = a.s]
+            /\ tso' = a.t
+            /\ prop' = [prop EXCEPT ![r] = <<>>]
     /\ lst' = [lst EXCEPT ![r] = "ready"]
     /\ UNCHANGED <<scn, leader, up, iso, pend, exec, gw, qw, answers, reads, used>>
-
-\* Mutant no_rule3: a new leader serves before its first entry applied.
-SkipRule3(r) ==
-    /\ Mutant = "no_rule3" /\ lst[r] = "elected" /\ Quorum(leader[r])
-    /\ lst' = [lst EXCEPT ![r] = "ready"]
-    /\ UNCHANGED <<scn, st, prop, leader, up, iso, pend, tso, exec, gw, qw, answers, reads, used>>
 
 -----------------------------------------------------------------------------
 (* A snapshot read at s on the range leader (rule 2, `observe_snapshot`):  *)
@@ -555,7 +554,7 @@ Next ==
     \/ \E c \in Clients : \/ ClientSend(c) \/ GwUnreachable(c) \/ GwResend(c)
                           \/ GwDeadline(c) \/ GwCrash(c)
     \/ \E x \in exec : RefuseRequest(x) \/ Execute(x) \/ ExecGiveUp(x) \/ ExecTimeout(x)
-    \/ \E r \in Ranges : RaftCommit(r) \/ RaftFirstEntry(r) \/ SkipRule3(r) \/ SnapshotRead(r)
+    \/ \E r \in Ranges : RaftCommit(r) \/ RaftFirstEntry(r) \/ SnapshotRead(r)
     \/ \E n \in Nodes, r \in Ranges : RaftElect(n, r) \/ MoveLeader(n, r)
     \/ \E n \in Nodes : CrashNode(n) \/ Restart(n) \/ Partition(n)
     \/ Heal \/ QueuedPropose
@@ -605,7 +604,7 @@ G03_SameResult ==
            /\ Dg(Req(a.c)) = Dg(Req(b.c)))
           => a.kind = b.kind /\ a.res = b.res
     /\ \A a \in answers :
-          LET q == Req(a.c)  rec == RecOf(StateFor(a.c), q.key, q.id) IN
+          LET q == Req(a.c)  rec == RecRaw(StateFor(a.c), q.key, q.id) IN
           (Def(a) /\ Has(rec) /\ rec.dg = Dg(q)) => a.kind = rec.rk /\ a.res = rec.res
 
 \* OLTP-G02 and OLTP-G03 (O08, independent read R-01): a recorded result is
