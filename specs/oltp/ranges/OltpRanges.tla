@@ -215,7 +215,7 @@ HandleElectionTimeout(n) ==
 \* configuration that are live, reachable and not of a higher term.
 Accepting(n) ==
     LET st == StateAt(mlen[n]) IN
-    {q \in Voters(st) \cup st.lrn \cup {n} :
+    {q \in Voters(st) \cup (IF Mutant = "learner_not_replicated" THEN {} ELSE st.lrn) \cup {n} :
         Live(q) /\ CanTalk(n, q) /\ term[q] <= term[n]}
 
 QuorumOK(n) == Quorum(StateAt(mlen[n]), Accepting(n))
@@ -253,6 +253,7 @@ CommitBlank(n) ==
 \* The leader commits client c's write and replies success.
 CommitWrite(n, c) ==
     /\ Live(n) /\ role[n] = "L" /\ QuorumOK(n)
+    /\ Mutant = "commit_needs_all" => Voters(StateAt(mlen[n])) \subseteq Accepting(n)
     /\ c \notin acked /\ c \notin StateAt(mlen[n]).w
     /\ DoCommit(n, [k |-> "w", c |-> c])
     /\ acked' = acked \cup {c}
@@ -269,10 +270,11 @@ CatchUp(n, q) ==
     /\ vblock' = IF LeaseOn THEN [vblock EXCEPT ![q] = Clock(q) + Lease] ELSE vblock
     /\ UNCHANGED <<hist, gone, up, lease, bkp, timeVars, iso, plan, ghostVars, bud>>
 
-\* A leader or candidate that reaches a node of a higher term adopts that
-\* term and steps down (a response carrying a higher vote).
+\* A node that hears from a node of a higher term (a request or a response
+\* carrying a higher vote) adopts that term without voting, and a leader or
+\* candidate steps down.
 StepDown(n, q) ==
-    /\ Live(n) /\ role[n] \in {"C", "L"} /\ Live(q) /\ CanTalk(n, q) /\ term[q] > term[n]
+    /\ Live(n) /\ Live(q) /\ CanTalk(n, q) /\ term[q] > term[n]
     /\ term' = [term EXCEPT ![n] = term[q]]
     /\ role' = [role EXCEPT ![n] = "F"]
     /\ lease' = [lease EXCEPT ![n] = MinClock]
@@ -494,7 +496,19 @@ Fairness ==
     /\ WF_vars(CatchUpAny) /\ WF_vars(StepDownAny)
     /\ WF_vars(MembershipAny) /\ WF_vars(RetireOld)
     /\ WF_vars(RestartAny) /\ WF_vars(Heal)
-LiveSpec == Spec /\ Fairness
+\* The liveness run takes an election only when no leader reaches the node.
+\* The model bounds terms, so spurious elections (which randomized election
+\* timeouts make rare) could otherwise use up every term and leave no
+\* leader: an artifact of the bound, not of the design. Safety runs keep
+\* every election.
+LiveNext ==
+    \/ NeedElection \/ BlankAny \/ WriteAny \/ CatchUpAny \/ StepDownAny \/ HeartbeatAny
+    \/ LeaseReadAny
+    \/ MoveBeginAny \/ MembershipAny \/ RetireOld
+    \/ CrashAny \/ RestartAny \/ WipeAny \/ BackupAny \/ StaleRestoreAny
+    \/ PartitionAny \/ Heal \/ Tick \/ DriftAny
+    \/ Terminal
+LiveSpec == Init /\ [][LiveNext]_vars /\ Fairness
 
 (***************************************************************************)
 (* Properties                                                              *)
