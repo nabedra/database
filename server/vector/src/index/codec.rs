@@ -17,6 +17,11 @@ pub trait Codec: Clone + Send + Sync + 'static {
     fn fits(&self, _dim: usize) -> bool {
         true
     }
+    /// CPU units and maximum held bytes to rotate and prepare one code query.
+    fn query_cost(&self, dim: usize) -> (u64, u64) {
+        let dim = dim as u64;
+        (dim, 2 * dim * size_of::<f32>() as u64)
+    }
     fn rotate(&self, dir: &[f32]) -> Vec<f32>;
     fn block(&self) -> Self::Block;
     fn push(&self, block: &mut Self::Block, dir: &[f32], centroid: &[f32], len: f32);
@@ -54,6 +59,13 @@ impl Codec for DirectionCodec {
 
     fn fits(&self, dim: usize) -> bool {
         dim == self.dim
+    }
+    fn query_cost(&self, _dim: usize) -> (u64, u64) {
+        let padded = self.rotation.padded() as u64;
+        // Float buffers for rotation, its interleaving scratch, the residual and
+        // rounding, plus signed levels and the four bit-slices.
+        let bytes = padded * (4 * size_of::<f32>() as u64 + 2) + 256;
+        (self.rotation.work() + 24 * padded, bytes)
     }
     fn rotate(&self, dir: &[f32]) -> Vec<f32> {
         let mut rotated = vec![0.0; self.rotation.padded()];

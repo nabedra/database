@@ -440,11 +440,14 @@ impl<C: Codec> Index<C> {
             return Ok(false);
         };
         let mut any = false;
-        let query = match (&p.centroid, codes) {
+        let (query, temporary) = match (&p.centroid, codes) {
             (Some(centroid), true) => {
-                Some(self.codec.query(&self.codec.rotate(&scan.dir), centroid))
+                let (work, bytes) = self.codec.query_cost(scan.dir.len());
+                scan.charge(work, 0, bytes)?;
+                let query = self.codec.query(&self.codec.rotate(&scan.dir), centroid);
+                (Some(query), bytes)
             }
-            _ => None,
+            _ => (None, 0),
         };
         for b in p
             .bands
@@ -460,6 +463,8 @@ impl<C: Codec> Index<C> {
                 Some(q) => any |= self.offer_best(scan, b, bits, q)?,
             }
         }
+        drop(query);
+        scan.release(temporary);
         Ok(any)
     }
 
