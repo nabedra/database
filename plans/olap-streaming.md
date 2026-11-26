@@ -413,3 +413,10 @@ Local TLC completed both safety and liveness over 570 distinct states at depth 1
 actions and minimum coverage 12. Mutant traces have 8 states for legacy fallback, 7 for a reused
 activation base, 4 for a legacy controller returning, and a 7-state lasso for missing coordinator
 upgrade. The `olap-join-rollout` check is pending attestation on this revision.
+**Runtime coverage boundary.** The focused regression exercises the worker's two local guards and
+both conditional write winners independently. Lost-reply end-to-end admission, deployed mixed
+binaries and simulator replay still require an integrated fixture. Delayed receiver-side copy RPCs
+are a separate candidate: a legacy-shaped Bootstrap or StreamReset may authenticate against its
+old root and wait before applying. Verify whether an old copy can erase newer data across a join
+retry, including on an already-ready target. A future fix should bind destructive copy steps to
+the copy generation at the receiver without adding control reads to successful ordinary operations.
