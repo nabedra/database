@@ -1,5 +1,6 @@
 //! VEC-G10: splits, backups, restore and replica snapshots (`specs/vector/blobs`).
 use super::*;
+use crate::oltp::mvcc::store::search::SearchSchema;
 use crate::oltp::{
     backup::history::{HistoryFrame, OwnedImage},
     mvcc::store::{
@@ -280,6 +281,16 @@ async fn vs16_a_split_page_without_every_vector_is_refused() {
 
 /// Installs images into a new group as an offline restore does.
 async fn restore(s: &S, images: &[CommittedImage], cut: u64, batch: usize) -> Replica {
+    restore_with_schema(s, images, cut, batch, None).await
+}
+
+async fn restore_with_schema(
+    s: &S,
+    images: &[CommittedImage],
+    cut: u64,
+    batch: usize,
+    schema: Option<SearchSchema>,
+) -> Replica {
     let mut target = s.f.group.clone();
     target.group_id = nabedra_rt::ids::uuid_v4();
     let store = s.f.pool.group(target.clone()).await.unwrap();
@@ -296,6 +307,7 @@ async fn restore(s: &S, images: &[CommittedImage], cut: u64, batch: usize) -> Re
     let mut index = 0;
     for batch in images.chunks(batch) {
         let (target, genesis, batch) = (target.clone(), genesis.clone(), batch.to_vec());
+        let schema = schema.clone();
         store
             .transaction(
                 ApplyMeta {
@@ -306,6 +318,9 @@ async fn restore(s: &S, images: &[CommittedImage], cut: u64, batch: usize) -> Re
                 BUDGET,
                 move |tx| {
                     tx.put_serialized(restore::RESTORE_GENESIS, &genesis)?;
+                    if let Some(schema) = schema {
+                        tx.put_serialized(restore::RESTORE_SEARCH, &schema)?;
+                    }
                     let mut sorted: Vec<_> = batch.iter().collect();
                     sorted.sort_by(|a, b| compare_keys(&a.key, &b.key).then(a.commit_ts.cmp(&b.commit_ts)));
                     restore::install_rows(tx, &target, &full_span(), ts(cut), &sorted)?;
@@ -602,4 +617,28 @@ async fn vs16_a_restore_refuses_vectors_that_do_not_fit_the_backups_columns() {
     // Rows without vectors need no columns.
     let plain: Vec<_> = backup.iter().filter(|image| image.search.is_none()).collect();
     restore::check_schema(None, &plain).unwrap();
+}
+
+
+#[tokio::test]
+async fn vs16_the_first_search_fence_matches_the_restored_columns() {
+    let mut s = S::new().await;
+    let write = s.write(1, None, Some(row(1, "a")), vec![s.set(PLAIN, s.dense(1))]);
+    s.direct(10, write).await;
+    let backed_up = images(&s, 10).await;
+    let schema = SearchSchema { epoch: 1, columns: columns(), high: 8 };
+    let mut restored = restore_with_schema(&s, &backed_up, 10, 1, Some(schema)).await;
+
+    let mut wrong = columns();
+    wrong[0].dim += 1;
+    let rejected = restored.submit(s.fence_command(7, wrong)).await;
+    assert_eq!(search_reply(rejected), SearchReply::Rejected(Fault::InvalidBinding));
+    let ready = restored.submit(s.fence_command(7, columns())).await;
+    assert!(matches!(search_reply(ready), SearchReply::Fenced { epoch: 7, .. }));
+    assert!(got(&restored.machine, s.f.key(1), 10).await.is_ok());
+
+    let mut reused = columns();
+    reused.push(column(8, VectorKind::Dense, 2));
+    let rejected = restored.submit(s.fence_command(8, reused)).await;
+    assert_eq!(search_reply(rejected), SearchReply::Rejected(Fault::InvalidBinding));
 }

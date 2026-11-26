@@ -169,6 +169,10 @@ pub(super) fn frozen(config: &Config) -> bool {
 pub(super) fn restored(
     tx: &mut GroupTransaction<'_>,
 ) -> Result<Option<SearchSchema>, ProtocolError> {
+    if let Some(mut schema) = load::<SearchSchema>(tx, restore::RESTORE_SEARCH)? {
+        schema.epoch = 0;
+        return Ok(Some(schema));
+    }
     for tag in [row::VECTOR, embed::EMBED] {
         if tx.first_from(&[tag], &[tag])?.is_some() {
             return Ok(Some(SearchSchema {
@@ -212,6 +216,14 @@ pub(super) fn fence(
     if command.epoch <= epoch {
         let direct = config.direct_schema;
         return reply(tx, SearchReply::Fenced { epoch, direct });
+    }
+    // At the first fence a restored range binds the same column incarnations
+    // that were used to validate its images, including full-text-only ranges.
+    if epoch == 0
+        && let Some(backup) = load::<SearchSchema>(tx, restore::RESTORE_SEARCH)?
+        && command.columns != backup.columns
+    {
+        return rejected(tx, Fault::InvalidBinding);
     }
     // An id names one incarnation: it keeps its definition and never returns.
     let reused = command.columns.iter().any(|column| {
