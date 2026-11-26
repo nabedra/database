@@ -13,3 +13,6 @@ why_not_caught = "olap-stream-sim recovers from one harness-held entry and never
 invariant_added = "G04_ReplyImpliesReplicated: every live ready worker holds each replied stream handle at a checkpoint at or past the highest replied sequence."
 fix_commits = []
 revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"
