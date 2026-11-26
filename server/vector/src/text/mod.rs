@@ -1,16 +1,19 @@
-//! Analyzers of `full_text` columns: Unicode word boundaries (UAX #29), lowercase, and a Snowball
+//! Analyzers of `full_text` columns. A text is first prepared: NFC (decision L10), then without
+//! format characters (L11). Then come Unicode word boundaries (UAX #29), lowercase, and a Snowball
 //! stemmer where the language has one. The same analyzer turns a row's text and a `match` query into
 //! terms, so both meet in the same dictionary.
 //!
-//! An analyzer is part of the index format: a checkpoint names [`Analyzer::identity`], and a
-//! checkpoint of another identity is not loaded.
+//! An analyzer is part of the index format: a checkpoint names [`Analyzer::format`], and a
+//! checkpoint of another one is not loaded.
 
 #[cfg(test)]
 mod tests;
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use rust_stemmers::{Algorithm, Stemmer};
+use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::types::{Error, Result};
@@ -42,8 +45,63 @@ pub const LANGUAGES: &[&str] = &[
 /// Longer words are left out, as no one searches for them and they would bloat the dictionary.
 pub const MAX_TERM_BYTES: usize = 64;
 
-/// Bumped whenever a text yields other terms than before.
+/// Bumped whenever a language's words yield other terms than before.
 const VERSION: u32 = 1;
+
+/// Bumped whenever the preparation of a text before its words changes. 1: none. 2: NFC, then
+/// without format characters.
+const PREPARATION: u32 = 2;
+
+/// Format characters, general category Cf of Unicode 16.0: soft hyphen, bidi controls, zero-width
+/// characters, joiners, the BOM, invisible operators, tags. They are not seen, so they must not make
+/// another word.
+const FORMAT: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+];
+
+fn is_format(c: char) -> bool {
+    let c = c as u32;
+    let i = FORMAT.partition_point(|&(_, hi)| hi < c);
+    FORMAT.get(i).is_some_and(|&(lo, _)| lo <= c)
+}
+
+/// NFC, then without format characters. Dropping one can leave marks that compose, so the rest is
+/// composed again.
+fn prepare(text: &str) -> Cow<'_, str> {
+    if text.is_ascii() {
+        return Cow::Borrowed(text);
+    }
+    let nfc = is_nfc_quick(text.chars()) == IsNormalized::Yes;
+    let formats = text.chars().any(is_format);
+    match (nfc, formats) {
+        (true, false) => Cow::Borrowed(text),
+        (_, false) => Cow::Owned(text.nfc().collect()),
+        (_, true) => {
+            let kept: String = text.nfc().filter(|c| !is_format(*c)).collect();
+            Cow::Owned(kept.nfc().collect())
+        }
+    }
+}
 
 fn algorithm(language: &str) -> Option<Option<Algorithm>> {
     Some(Some(match language {
@@ -119,13 +177,20 @@ impl Analyzer {
         self.language
     }
 
-    /// Names the analyzer and its version in checkpoints.
+    /// Names the language and the version of its words.
     pub fn identity(&self) -> String {
         format!("text/{}/{VERSION}", self.language)
     }
 
+    /// Names everything that decides the terms of a text: the identity and the preparation. A
+    /// checkpoint of another format is not loaded.
+    pub fn format(&self) -> String {
+        format!("{}+prepare/{PREPARATION}", self.identity())
+    }
+
     /// Calls `f` with every term of `text`, in text order.
     pub fn each(&self, text: &str, mut f: impl FnMut(&str)) {
+        let text = prepare(text);
         for word in text.unicode_words() {
             // Of the whole word, so that a final sigma becomes one.
             let lower = word.to_lowercase();

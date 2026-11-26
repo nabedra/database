@@ -318,8 +318,9 @@ fn vs17_adv_cjk_without_spaces_and_emoji_sequences_are_split_or_ignored_not_lost
     // UAX #29 puts each ideograph in a word of its own, and keeps a Katakana run whole.
     assert_eq!(names(&a, "中文搜索"), ["中", "文", "搜", "索"]);
     assert_eq!(names(&a, "カタカナ"), ["カタカナ"]);
-    // A combining mark stays in its word, a ZWJ emoji sequence has no word.
-    assert_eq!(names(&a, "Cafe\u{301}"), ["cafe\u{301}"]);
+    // A combining mark stays in its word, composed by NFC (decision L10), and a ZWJ emoji
+    // sequence has no word.
+    assert_eq!(names(&a, "Cafe\u{301}"), ["caf\u{e9}"]);
     assert!(names(&a, "👩\u{200d}👩\u{200d}👧").is_empty());
     assert_eq!(names(&a, "שלום עולם").len(), 2);
     let mut ix = one_doc_index("simple", &["搜索引擎", "引擎"]);
@@ -353,7 +354,7 @@ fn vs17_adv_words_at_the_byte_limit_in_every_language_and_stems_never_exceed_it(
             let mut w = String::new();
             let target = 50 + g.below(20) as usize;
             while w.len() < target {
-                w.push_str(*g.pick(FRAGMENTS));
+                w.push_str(g.pick::<&str>(FRAGMENTS));
                 if g.chance(1, 3) {
                     w.push(*g.pick(&['a', 'e', 'i', 'o', 'u', 'y', 'b', 'l', 'k', 'r', 's', 't']));
                 }
@@ -393,7 +394,7 @@ fn vs17_adv_very_long_words_and_texts_are_cheap_and_dropped_or_kept_by_the_limit
     let t = a.terms(&format!("{} short", "z".repeat(100)));
     assert_eq!((t.terms.len(), t.words), (1, 1));
     // Megabytes of one word, of one letter words, and a million bytes of marks.
-    let t = std::time::Instant::now();
+    let t = nabedra_rt::time::now_std();
     assert!(a.terms(&"a".repeat(4 << 20)).terms.is_empty());
     assert_eq!(a.terms(&"é ".repeat(1 << 20)).words, 1 << 20);
     assert!(
@@ -402,7 +403,8 @@ fn vs17_adv_very_long_words_and_texts_are_cheap_and_dropped_or_kept_by_the_limit
             .is_empty()
     );
     assert!(a.terms(&"\u{200d}".repeat(1 << 20)).terms.is_empty());
-    assert!(t.elapsed().as_secs() < 30, "{:?}", t.elapsed());
+    let took = nabedra_rt::time::elapsed(t);
+    assert!(took.as_secs() < 30, "{took:?}");
     // A document of a megabyte word and a query of the same word both match nothing, and a
     // document of the long word plus a short one still matches the short one.
     let mut ix = one_doc_index(
@@ -473,7 +475,6 @@ fn vs17_adv_identities_differ_per_language_and_hold_still() {
 // Decisions that G does not implement yet. These fail today, and name the decision.
 
 #[test]
-#[ignore = "L10: text is not NFC-normalized yet (decision L10, task G follow-up)"]
 fn vs17_adv_l10_composed_and_decomposed_text_yield_the_same_terms() {
     for lang in ["simple", "english", "french", "german"] {
         let a = Analyzer::new(lang).unwrap();
@@ -497,7 +498,6 @@ fn vs17_adv_l10_composed_and_decomposed_text_yield_the_same_terms() {
 }
 
 #[test]
-#[ignore = "gap: invisible format characters stay inside a term (RLM, bidi controls, soft hyphen), so the same visible word does not match"]
 fn vs17_adv_invisible_format_characters_do_not_make_a_different_word() {
     let a = Analyzer::new("simple").unwrap();
     for (visible, marked) in [

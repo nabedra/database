@@ -211,8 +211,8 @@ fn run(g: &mut Gen) -> std::result::Result<(), String> {
             9 if held.len() < 4 => {
                 let mut reads = Vec::new();
                 let mut points = Vec::new();
-                for r in 0..2 {
-                    let s = ix.status(ids[r]).unwrap();
+                for (r, &id) in ids.iter().enumerate() {
+                    let s = ix.status(id).unwrap();
                     let (read, p, c) = match g.below(3) {
                         0 => (
                             ReadAt::Latest { barrier: s.applied },
@@ -233,7 +233,7 @@ fn run(g: &mut Gen) -> std::result::Result<(), String> {
                             CommitTs::MAX,
                         ),
                     };
-                    reads.push((ids[r], read));
+                    reads.push((id, read));
                     points.push((r, p, c));
                 }
                 let pin = ix.pin(&reads).map_err(|e| format!("pin {reads:?}: {e}"))?;

@@ -92,7 +92,7 @@ fn vs04_adv_weights_scale_each_rankings_share() {
         );
     }
     assert!(matches!(
-        fuse(&[r1.clone()], &Fusion::Weights(vec![1.0, 1.0]), 5),
+        fuse(std::slice::from_ref(&r1), &Fusion::Weights(vec![1.0, 1.0]), 5),
         Err(Error::InvalidQuery(_))
     ));
     // Negative zero is a zero.
@@ -166,7 +166,6 @@ fn vs04_adv_mirrored_rankings_tie_and_go_by_key() {
 }
 
 #[test]
-#[ignore = "open bug VECTOR-impact-weighted-score-infinite"]
 fn vs04_adv_weighted_scores_stay_finite() {
     // A finite weight can make the f32 score infinite, which has no JSON form.
     for w in [1e39f64, 1e300, f64::MAX] {

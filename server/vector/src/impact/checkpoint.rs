@@ -82,7 +82,8 @@ pub(super) struct Running {
     _pin: Arc<PinInner>,
     heads: Vec<Head>,
     todo: Vec<u64>,
-    next: u64,
+    /// File numbers in the directory or written since. A new file takes one above them all.
+    taken: BTreeSet<u64>,
     file: Option<OpenFile>,
     files: Vec<FileInfo>,
 }
@@ -97,6 +98,16 @@ fn damaged(why: &str) -> io::Error {
 
 fn file_name(number: u64) -> String {
     format!("doc-{number:016x}")
+}
+
+/// A number above every one taken, or, past the last one, the lowest that is free.
+fn free_number(taken: &BTreeSet<u64>) -> Option<u64> {
+    match taken.last() {
+        None => Some(0),
+        Some(last) => last
+            .checked_add(1)
+            .or_else(|| (0..=u64::MAX).find(|n| !taken.contains(n))),
+    }
 }
 
 fn identity(analysis: &Analysis, columns: &[ColumnType]) -> Vec<u8> {
@@ -132,18 +143,16 @@ impl Checkpoints {
         self.dir.join(name)
     }
 
+    /// The numbers of the files named as [`file_name`] names them. Other names are ignored.
     fn numbers(&self) -> io::Result<Vec<u64>> {
         let names = self.fs.list(&self.dir)?;
         let number = |p: &PathBuf| {
-            p.file_name()?
-                .to_str()?
-                .strip_prefix("doc-")
-                .map(str::to_owned)
+            let hex = p.file_name()?.to_str()?.strip_prefix("doc-")?;
+            let exact =
+                hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+            exact.then(|| u64::from_str_radix(hex, 16).ok())?
         };
-        Ok(names
-            .iter()
-            .filter_map(|p| u64::from_str_radix(&number(p)?, 16).ok())
-            .collect())
+        Ok(names.iter().filter_map(number).collect())
     }
 
     fn load_manifest(&self) -> io::Result<Option<Manifest>> {
@@ -236,7 +245,7 @@ impl Checkpoints {
             let word =
                 |i: usize| u32::from_le_bytes([head[i], head[i + 1], head[i + 2], head[i + 3]]);
             let (len, crc) = (word(0) as usize, word(4));
-            let end = at + 8 + len as u64;
+            let end = at.saturating_add(8 + len as u64);
             if len > MAX_FRAME || end > info.len {
                 return Err(damaged("a frame's size is wrong"));
             }
@@ -293,12 +302,7 @@ impl<S: PostingStore> ImpactIndex<S> {
             return Err(Error::Busy);
         }
         store.prepare().map_err(io_error)?;
-        let next = store
-            .numbers()
-            .map_err(io_error)?
-            .into_iter()
-            .max()
-            .map_or(0, |n| n + 1);
+        let taken = store.numbers().map_err(io_error)?.into_iter().collect();
         let held = |s: &Service| matches!(s, Service::CatchingUp | Service::Serving);
         let heads: Vec<Head> = (self.ranges.iter().filter(|(_, r)| held(&r.service)))
             .map(|(id, r)| Head {
@@ -329,7 +333,7 @@ impl<S: PostingStore> ImpactIndex<S> {
             _pin: self.readers.begin(pin),
             todo: self.listed(),
             heads,
-            next,
+            taken,
             file: None,
             files: Vec::new(),
         });
@@ -700,8 +704,9 @@ impl Running {
         let open = match &mut self.file {
             Some(s) => s,
             none => {
-                let number = self.next;
-                self.next += 1;
+                let number =
+                    free_number(&self.taken).ok_or_else(|| damaged("no file number is free"))?;
+                self.taken.insert(number);
                 let path = store.path(&file_name(number));
                 let file = store.fs.open(&path, OpenMode::CreateNew)?;
                 file.write_all_at(FILE_MAGIC, 0)?;
@@ -722,7 +727,9 @@ impl Running {
         frame.extend(crc32c(rows).to_le_bytes());
         frame.extend(rows);
         open.file.write_all_at(&frame, open.info.len)?;
-        open.info.len += frame.len() as u64;
+        open.info.len = (open.info.len)
+            .checked_add(frame.len() as u64)
+            .ok_or_else(|| damaged("a file is too large"))?;
         open.info.ranges.append(ranges);
         Ok(())
     }

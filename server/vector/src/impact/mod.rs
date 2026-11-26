@@ -148,7 +148,7 @@ enum Analysis {
 impl Analysis {
     fn identity(&self) -> String {
         match self {
-            Analysis::Text(a) => a.identity(),
+            Analysis::Text(a) => a.format(),
             Analysis::Sparse => "sparse/1".to_owned(),
         }
     }

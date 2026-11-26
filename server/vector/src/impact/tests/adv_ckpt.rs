@@ -374,7 +374,6 @@ fn vs10_adv_truncated_extended_and_missing_files_are_detected() {
 }
 
 #[test]
-#[ignore = "open bug VECTOR-impact-checkpoint-number-overflow"]
 fn vs10_adv_stray_files_are_ignored_and_never_break_the_next_checkpoint() {
     let fs = disk();
     let (mut ix, m, _) = prepare(&fs, 5);
@@ -613,7 +612,7 @@ fn vs10_adv_hostile_files_with_valid_checksums_never_panic() {
                 b[start + 4..start + 8].copy_from_slice(&crc);
                 put(&image, &docs[i], &b);
             }
-            let t = std::time::Instant::now();
+            let t = nabedra_rt::time::now_std();
             let (mut back, _damage) =
                 ImpactIndex::recover(cfg(), RamStore::default(), store(&image))
                     .map_err(|e| e.to_string())?;
@@ -632,7 +631,7 @@ fn vs10_adv_hostile_files_with_valid_checksums_never_panic() {
                 settle(&mut back);
                 let _ = back.checkpoint();
             }
-            if t.elapsed().as_secs() > 5 {
+            if nabedra_rt::time::elapsed(t).as_secs() > 5 {
                 return Err("recovery took more than 5 s".into());
             }
             Ok(())

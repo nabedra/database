@@ -156,14 +156,16 @@ fn round(x: f64) -> f32 {
     (x as f32).clamp(f32::MIN, f32::MAX) + 0.0
 }
 
-/// Whether a bound surely stays below the result's worst score, with room for the rounding of
-/// sums in another order and of the score to f32.
+/// Whether a bound surely stays below the result's worst score. The slack covers sums in another
+/// order. The comparison is of scores as they are returned, rounded to f32, because rounding is
+/// monotone: a row whose bound rounds to the worst score may tie with it and win by key, also where
+/// f32 underflows to zero.
 fn below(bound: f64, worst: Option<f64>) -> bool {
     let Some(worst) = worst else {
         return false;
     };
-    let slack = (bound.abs() + worst.abs()) * 1e-6 + 1e-300;
-    bound + slack < worst
+    let slack = (bound.abs() + worst.abs()) * 1e-6;
+    f64::from(round(bound + slack)) < worst
 }
 
 struct Ranked {

@@ -5,6 +5,10 @@
 //! With one ranking `_score` is that ranking's value. With several, `"rrf"` gives a row
 //! `Σ 1 / (K + rank)` over the rankings that hold it, rank counted from 1, and a list of weights
 //! gives `Σ weight / (K + rank)`. Ties break by key.
+//!
+//! Every finite non-negative weight is accepted, and a fused `_score` is always finite: a sum is
+//! taken in f64 and rounded to the closest finite f32, so sums beyond f32 (from weights near 1e39 or
+//! above) tie at `f32::MAX`, like the scores of the operations themselves.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
@@ -89,7 +93,9 @@ pub fn fuse(rankings: &[Vec<Candidate>], fusion: &Fusion, limit: usize) -> Resul
                 .into_iter()
                 .map(|(key, s)| Candidate {
                     key: key.clone(),
-                    score: s as f32,
+                    // Rows whose sum is beyond f32, or beyond f64, tie at the largest f32 and go by
+                    // key.
+                    score: (s as f32).clamp(f32::MIN, f32::MAX),
                 })
                 .collect();
             fused.sort_by(|a, b| better(Order::HigherFirst, a, b));

@@ -952,7 +952,6 @@ fn vs07_adv_limit_zero_and_above_the_maximum_are_refused_and_nothing_else() {
 }
 
 #[test]
-#[ignore = "open bug VECTOR-impact-maxscore-drops-tied-underflow"]
 fn vs07_adv_scores_that_underflow_or_round_to_negative_zero_tie_as_zero() {
     let mut ix = serving(sparse_cfg());
     let mut m = Model::default();
