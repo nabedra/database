@@ -2,7 +2,7 @@
 id = "lsm-flushed-prefix"
 module = "lsm"
 kinds = ["T"]
-guarantees = ["LSM-G03"]
+guarantees = []
 scenarios = ["NS07"]
 tiers = ["T1"]
 command = ["python3", "scripts/testing/tla_check.py", "specs/lsm/flushed-prefix", "FlushedPrefixRecovery", "--module", "lsm"]
