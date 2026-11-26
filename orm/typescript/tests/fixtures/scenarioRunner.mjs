@@ -198,15 +198,21 @@ export function loadScenarios() {
 export async function runAll(only) {
   const scenarios = loadScenarios()
   const fake = await Fake.start()
-  // 8 MiB requests must not time out on a loaded machine.
+  // 8 MiB requests must not time out on a loaded machine. A scenario whose reply sleeps tests
+  // the timeout itself, so it gets a client that gives up after 2 s.
   const db = new Database({ url: fake.url, token: "fixture", timeout: 30 })
+  const short = new Database({ url: fake.url, token: "fixture", timeout: 2 })
+  const client = (scenario) => scenario.script.some((step) => "sleep" in step) ? short : db
   const transcript = {}
   try {
     for (const scenario of scenarios) {
-      if (only === undefined || only.has(scenario.name)) transcript[scenario.name] = await runOne(fake, db, scenario)
+      if (only === undefined || only.has(scenario.name)) {
+        transcript[scenario.name] = await runOne(fake, client(scenario), scenario)
+      }
     }
   } finally {
     db.close()
+    short.close()
     await fake.close()
   }
   return { scenarios, transcript }

@@ -207,13 +207,19 @@ def run_one(fake, db, scenario):
 def run_all(only=None):
     scenarios = json.loads(SCENARIOS.read_text(encoding="utf-8"))
     fake = Fake()
-    # 8 MiB requests must not time out on a loaded machine.
+    # 8 MiB requests must not time out on a loaded machine. A scenario whose reply sleeps tests
+    # the timeout itself, so it gets a client that gives up after 2 s.
     db = Database(fake.url, "fixture", timeout=30)
+    short = Database(fake.url, "fixture", timeout=2)
+
+    def client(item):
+        return short if any("sleep" in step for step in item["script"]) else db
     try:
-        return scenarios, {item["name"]: run_one(fake, db, item) for item in scenarios
+        return scenarios, {item["name"]: run_one(fake, client(item), item) for item in scenarios
                            if only is None or item["name"] in only}
     finally:
         db.close()
+        short.close()
         fake.close()
 
 

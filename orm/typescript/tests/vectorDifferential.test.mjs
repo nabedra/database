@@ -19,6 +19,8 @@ const wording = [
   [/requires finite float32 values/, "float32 vector"],
   [/Row must be a mapping|Rows must be iterable/, "rows"],
   [/Primary key must name a (?:str or int|string or bigint) column/, "primary key type"],
+  // An unknown option name is a TypeError in both. Python's interpreter words it, so only the class matters.
+  [/^\S+\(\) got an unexpected keyword argument '[^']*'$|^Unknown option '[^']*'$/, "unknown option"],
 ]
 const normalize = (text) => wording.reduce((result, [pattern, replacement]) => result.replace(pattern, replacement), text)
 
