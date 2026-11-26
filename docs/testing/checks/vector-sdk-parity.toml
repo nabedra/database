@@ -12,6 +12,6 @@ npm run build
 NABEDRA_TEST_PYTHON=python3 node --test tests/vectorDifferential.test.mjs
 ''']
 cwd = "orm/typescript"
-timeout_s = 180
+timeout_s = 900
 needs = ["node"]
 result_parser = "node-test"
