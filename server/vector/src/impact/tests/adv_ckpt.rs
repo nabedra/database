@@ -711,3 +711,20 @@ fn vs10_adv_a_checkpoint_without_rows_is_still_of_its_columns_only() {
         );
     }
 }
+
+#[test]
+fn vs14_adv_a_dropped_range_is_forgotten_on_disk_before_the_drop_returns() {
+    let fs = disk();
+    let (mut ix, m, _) = prepare(&fs, 11);
+    let other = RangeId(8);
+    bring_up(&mut ix, other, 0);
+    ix.checkpoint().unwrap();
+    ix.drop_range(other).unwrap();
+    for image in [fs.crash(), fs.kill()] {
+        let (mut back, damage) =
+            ImpactIndex::recover(cfg(), RamStore::default(), store(&image)).unwrap();
+        assert_eq!(damage, []);
+        assert!(back.status(other).is_err(), "a dropped range came back");
+        verify(&mut back, &m, true, "the other range").unwrap();
+    }
+}
