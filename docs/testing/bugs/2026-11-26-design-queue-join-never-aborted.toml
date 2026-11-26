@@ -1,0 +1,21 @@
+# Design review (rv-oltp-direct, queue). TLC counterexample, local and unattested: Deadlock in 7 states with
+# specs/oltp/queue/mutants/prefix_join_never_aborted.cfg (the shipped Control). The fixed design passes.
+# Code: Control machine.rs begin_ready and BeginOwnerFence answer Busy while a Ready transition is pending;
+# only publish_ready and PublishFence clear it; a restarted joiner adopts its ticket only in Building.
+id = "design-queue-join-never-aborted"
+title = "An owner or joiner crash during a pending queue join blocks every removal, owner fence and admission until a cold start"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G07", "OLTP-G08"]
+scenarios = ["R01", "R02", "R03", "O17"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/oltp/queue/mutants/prefix_join_never_aborted.cfg"
+seed = "unknown"
+why_not_caught = "The join fixtures and the draft spec let a crashed joiner release the join; no test crashes the owner or the joiner between BeginJoin and PublishReady."
+invariant_added = "A removal or owner fence supersedes a pending unpublished join, and the owner's join seal ends with that view change, so accepted work keeps progressing while a copy survives."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"
