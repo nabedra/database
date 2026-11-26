@@ -928,6 +928,14 @@ fn apply(
                 {
                     return reject(tx, Fault::InvalidBinding);
                 }
+                // A row put of a search range names its vectors (`PutRow`), even
+                // none, like a direct write: a plain `Put` is an older build's.
+                if config.search.is_some()
+                    && matches!(write.key, MvccKey::Row { .. })
+                    && matches!(write.change, Change::Put(_))
+                {
+                    return reject(tx, Fault::InvalidBinding);
+                }
                 let length = key_length(&write.key)?;
                 let fault = tx.with_scratch_buffer(length + 9, |tx, buffer| {
                     encode_key(&write.key, &mut buffer[1..1 + length]);

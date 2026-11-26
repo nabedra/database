@@ -331,16 +331,8 @@ async fn vs16_a_damaged_vector_is_never_null_and_quarantines_its_group() {
         let request = ImageRequestOf(&s).request();
         corrupt(s.f.machine().committed_image_page(request).await.err().unwrap());
         corrupt(got(s.f.machine(), s.f.key(1), 10).await.err().unwrap());
-        // The feed fails for a damaged value and reports a missing one.
-        let page = s.f.machine().change_page(after, 10, 1 << 20).await;
-        if missing {
-            assert!(matches!(
-                page.unwrap().payload().unwrap(),
-                ChangePage::Gone { .. }
-            ));
-        } else {
-            corrupt(page.err().unwrap());
-        }
+        // The feed fails for a damaged and for a missing value alike.
+        corrupt(s.f.machine().change_page(after, 10, 1 << 20).await.err().unwrap());
         let group = s.f.group.group_id;
         assert!(damage.borrow_and_update().contains(&group));
         assert!(s.f.pool.is_group_quarantined(group));
@@ -587,4 +579,84 @@ async fn vs16_a_snapshot_install_refuses_a_vector_that_does_not_fit_its_column()
         let refused = got(s.f.machine(), s.f.key(1), 10).await.err().unwrap();
         assert!(refused.message.starts_with("storage corrupt"), "{}", refused.message);
     }
+}
+
+type Rows = (Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>);
+async fn rows(s: &S) -> Rows {
+    (s.records(VALUE).await, s.records(VECTOR).await, s.records(STAGED).await)
+}
+/// A queued row put of a search range names its vectors, like a direct write:
+/// a plain `Put` (an older build's shape) is refused, on any page, and nothing
+/// of its transaction lands.
+#[tokio::test]
+async fn vs16_a_queued_plain_put_on_a_search_range_fails_closed() {
+    let mut s = S::new().await;
+    let write = s.write(1, None, Some(row(1, "a")), vec![s.set(PLAIN, s.dense(1))]);
+    s.direct(10, write).await;
+    let plain = |s: &S, key| PreparedWrite {
+        change: Change::Put(s.f.json(row(key, "plain"))),
+        ..s.f.queued_put(key, if key == 1 { Some(10) } else { None }, serde_json::Value::Null)
+    };
+    // One page.
+    let before = rows(&s).await;
+    let writes = vec![plain(&s, 1)];
+    let plan = s.f.queued_plan(20, &writes);
+    assert_eq!(s.f.prepare(&plan, writes).await, ParticipantReply::Rejected(Fault::InvalidBinding));
+    let after = rows(&s).await;
+    assert_eq!(after, before);
+    // Two pages: the first names its vector, the second is a plain put.
+    let pages = [
+        vec![s.put_row(1, Some(10), row(1, "b"), vec![s.set(PLAIN, s.dense(2))])],
+        vec![plain(&s, 2)],
+    ];
+    let txn = TxnId { request_id: nabedra_rt::ids::uuid_v4(), attempt: 0 };
+    let mut plan = s.f.queued_plan(20, &pages[0]);
+    plan.txn = txn;
+    plan.request.request_id = txn.request_id;
+    plan.plan.page_count = 2;
+    plan.plan.write_count = 2;
+    let roots = {
+        let first = initial_root(txn, &plan.plan).unwrap();
+        let second = page_root(first, 0, &pages[0]).unwrap();
+        [first, second]
+    };
+    plan.plan.write_root = page_root(roots[1], 1, &pages[1]).unwrap();
+    let mut replies = Vec::new();
+    for (index, writes) in pages.into_iter().enumerate() {
+        let guard = lifecycle::VerifiedLifecycleGuard::model_for_test(
+            lifecycle::LifecycleBinding {
+                guard_id: nabedra_rt::ids::uuid_v4(),
+                catalog_group_id: s.f.catalog_group_id,
+                table_id: s.f.table,
+                lifecycle_version: None,
+                schema_epoch: 1,
+                txn,
+                request: plan.request,
+                read_ts: plan.plan.read_ts,
+                authority: s.f.authority,
+            },
+            lifecycle::GuardMode::Shared,
+        )
+        .into_sealed();
+        replies.push(
+            s.f.submit(ParticipantCommand::PreparePage {
+                authority: s.f.authority,
+                txn,
+                request: plan.request,
+                manifest: plan.manifest,
+                plan: plan.plan.clone(),
+                page_index: index as u64,
+                previous_root: roots[index],
+                guards: Page::new(vec![guard]).unwrap(),
+                writes: Page::new(writes).unwrap(),
+            })
+            .await,
+        );
+    }
+    assert!(matches!(replies[0], ParticipantReply::PreparedPage { writes: 1, .. }), "{replies:?}");
+    assert_eq!(replies[1], ParticipantReply::Rejected(Fault::InvalidBinding));
+    s.abort(&plan).await;
+    let after = rows(&s).await;
+    assert_eq!(after, before, "the row, its vectors and nothing staged");
+    assert_eq!(s.get(1).await.vectors[&PLAIN], (10, vec![1; 8]));
 }

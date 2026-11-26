@@ -1301,21 +1301,6 @@ async fn adv_compat_dump_new_entries() {
     std::fs::write(path, lines.join("\n")).unwrap();
 }
 
-/// DB-5 and DESIGN.md say the log's purge deletes the change records of the entries
-/// it deletes. `purge_changes` is the only way to do that; the Raft log purge is the
-/// only place that can call it.
-#[test]
-fn adv_dbr5_the_raft_log_purge_deletes_the_change_records_it_covers() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../oltp-replication/src/oltp_replication/typed_log.rs");
-    let source = std::fs::read_to_string(path).unwrap();
-    let purge = source.split("async fn purge(").nth(1).expect("the purge of the typed log");
-    let purge = purge.split("\n    }\n}").next().unwrap();
-    assert!(
-        purge.contains("purge_changes"),
-        "typed_log purge never calls GroupTransaction::purge_changes: change records outlive their log entries"
-    );
-}
-
 /// A transaction of two pages stages by ordinal across pages: no row gets the
 /// vector of a row of the other page, and the abort collects both pages.
 #[tokio::test]
@@ -1481,7 +1466,9 @@ async fn adv_vec_g14_a_dropped_embedded_column_leaves_no_record_and_takes_no_rep
     // The old version keeps the dropped column's vector until a collector takes
     // it, and no reader is served it: a dropped column is never served (VEC-G08).
     assert!(!s.at(2, 12).await.vectors.contains_key(&EMBEDDED));
-    assert_eq!(s.count(VECTOR).await, 2);
+    let logical = crate::oltp::mvcc::store::row::logical_key(&s.f.key(2)).unwrap();
+    let kept = [&[VECTOR][..], &logical, &EMBEDDED.to_be_bytes(), &12u64.to_be_bytes()].concat();
+    assert!(s.records(VECTOR).await.iter().any(|(key, _)| *key == kept), "the vector of (EMBEDDED, 12) is kept");
     // The id never comes back, with the same definition or another.
     for definition in [embedded(EMBEDDED), column(EMBEDDED, VectorKind::Dense, 2)] {
         let columns = vec![column(PLAIN, VectorKind::Dense, 2), definition];

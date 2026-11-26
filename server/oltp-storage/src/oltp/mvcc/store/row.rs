@@ -864,13 +864,13 @@ fn read_row(
         .ok_or_else(damaged_value)?
         .checked_add(version.value.map_or(0, |value| value.get().len() + 256))
         .ok_or_else(invalid)?;
-    let search = image(view, &config, &logical, &version, true, owner)?;
     if bytes > max_bytes {
         return Err(failure(
             ErrorCode::LimitExceeded,
             "row exceeds its read budget",
         ));
     }
+    let search = image(view, &config, &logical, &version, true, owner)?;
     Ok(SearchRow::Row {
         version: Some(CommitTs::new(at).map_err(|_| recovery_unknown())?),
         search,

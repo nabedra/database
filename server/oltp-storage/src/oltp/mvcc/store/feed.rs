@@ -399,9 +399,10 @@ impl<'a> Entry<'a> {
                     let row = match version.value {
                         None => None,
                         Some(value) => {
-                            let Some(cost) = row::image_cost(view, bytes, &version, false)? else {
-                                return Ok(None);
-                            };
+                            // The reference rule keeps every vector a retained
+                            // version names, so a missing one is damage.
+                            let cost = row::image_cost(view, bytes, &version, false)?
+                                .ok_or_else(row::damaged_value)?;
                             let Some(cost) = value
                                 .get()
                                 .len()

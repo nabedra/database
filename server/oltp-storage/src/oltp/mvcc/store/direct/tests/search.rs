@@ -179,6 +179,7 @@ impl S {
             catalog_group_id,
             first_fence: first_fence.clone(),
             dir,
+            search: false,
         };
         assert!(matches!(f.submit(first_fence).await, ParticipantReply::Fenced(_)));
         let activation = f.activation();
@@ -207,6 +208,7 @@ impl S {
         let command = self.fence_command(self.search_epoch + 1, columns);
         let reply = search_reply(self.f.submit(command).await);
         if let SearchReply::Fenced { epoch, direct } = &reply {
+            self.f.search = true;
             self.search_epoch = *epoch;
             self.epoch = direct.unwrap().epoch;
         }

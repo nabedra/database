@@ -127,7 +127,8 @@ async fn vs02_purged_records_and_collected_values_answer_explicitly() {
     assert_eq!(seen(&s.changes(s.last() - 1, 8).await).len(), 1);
     assert!(matches!(page(&s, 5).await.payload().unwrap(), ChangePage::Gone { .. }));
 
-    // A row version or a vector that a collector removed is never skipped.
+    // A row version that a collector removed is never skipped, and a vector that
+    // a retained version names is damage (the reference rule keeps it).
     for tag in [VALUE, VECTOR] {
         let mut s = S::new().await;
         let write = s.write(1, None, Some(row(1, 1)), vec![s.set(PLAIN, s.dense(1))]);
@@ -138,6 +139,12 @@ async fn vs02_purged_records_and_collected_values_answer_explicitly() {
         let records = s.records(tag).await;
         let key = records[if tag == VALUE { 1 } else { 0 }].0.clone();
         s.tamper(move |tx| tx.delete(&key)).await;
+        if tag == VECTOR {
+            let error = s.f.machine().change_page(START, 1024, 8 << 20).await.err().unwrap();
+            assert!(error.message.starts_with("storage corrupt"), "{}", error.message);
+            assert!(s.f.pool.is_group_quarantined(s.f.group.group_id));
+            continue;
+        }
         assert!(matches!(page(&s, START).await.payload().unwrap(), ChangePage::Gone { .. }));
         assert_eq!(seen(&s.changes(3, 8).await).len(), 1);
     }

@@ -198,9 +198,11 @@ pub enum HistoryFrame {
         root: Digest,
     },
 }
-/// Metadata of a cloned image, its vector list and column maps included. The
-/// values themselves keep the owner of their frame.
-const IMAGE_CLONE_BYTES: usize = 8 << 10;
+/// Metadata of a cloned image: 1 KiB, and 8 KiB with a vector list and column
+/// maps. The values themselves keep the owner of their frame.
+fn clone_bytes(search: bool) -> usize {
+    if search { 8 << 10 } else { 1024 }
+}
 pub struct OwnedImage {
     image: CommittedImage,
     _source: OwnedCommand<HistoryFrame>,
@@ -220,7 +222,7 @@ impl OwnedImage {
             image
                 .key
                 .heap_bytes()
-                .checked_add(IMAGE_CLONE_BYTES)
+                .checked_add(clone_bytes(image.search.is_some()))
                 .ok_or_else(invalid)?,
         )?;
         let image = image.clone();
@@ -244,7 +246,7 @@ impl OwnedImage {
             effect
                 .key
                 .heap_bytes()
-                .checked_add(IMAGE_CLONE_BYTES)
+                .checked_add(clone_bytes(effect.search.is_some()))
                 .ok_or_else(invalid)?,
         )?;
         let image = CommittedImage {

@@ -197,7 +197,8 @@ impl SearchColumn {
         let vector = self.dim as usize * 4;
         match self.kind {
             VectorKind::Dense => len == vector,
-            VectorKind::Sparse => true,
+            // `n` u32 indices then `n` f32 weights (contract, "Values").
+            VectorKind::Sparse => len.is_multiple_of(8),
             VectorKind::Multi => len.is_multiple_of(vector) && len / vector <= MAX_MULTI,
         }
     }
