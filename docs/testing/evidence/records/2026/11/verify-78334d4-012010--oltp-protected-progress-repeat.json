@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "verify-78334d4-012010--oltp-protected-progress-repeat.log",
+      "sha256": "63c1d3393d7fb2cf65e9319c68a33c4aa8b715ac8da2b28c54f5f25f2fce6e3b"
+    }
+  ],
+  "assertions": {
+    "executed": 600,
+    "failed": 1,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-protected-progress-repeat",
+  "duration_s": 2429.727,
+  "guarantees": [],
+  "kind": "R",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-26T00:40:03.435681+00:00",
+    "request_id": "verify-78334d4-012010",
+    "runner": "GitHub Actions 1000014583",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45727968538"
+  },
+  "scenarios": [
+    "O22"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "78334d4eb3b5d05ae7c72eb39bcf3eca0b792ee5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

@@ -1,0 +1,135 @@
+{
+  "artifacts": [
+    {
+      "name": "verify-78334d4-012010--specs-selftest.log",
+      "sha256": "f9878703907da7c55b5ff01a6e2391e175979ec5bb73be6a8396833a38f6f0ad"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "7d2fd46ffe2f8a7159767aabac5b35c6ff2ca9482c8d2ea332cb32060e0e6610"
+    },
+    {
+      "name": "tla/TwoPhase.log",
+      "sha256": "cdf9a3904b38fc7c6791bc8076a827993c75ac2480306f2b9c69e60924656c12"
+    },
+    {
+      "name": "tla/control-commit_one_prepared.cfg",
+      "sha256": "b32ad805cd473ae2fbffe4d4eede46c8b2eb6b6583e3715ed3f86020e0941ba9"
+    },
+    {
+      "name": "tla/control-commit_one_prepared.log",
+      "sha256": "d0b4e6c4326a3fc5b116fd2712871ca201372bd1c4bcad1d5cf66fb0a84af738"
+    },
+    {
+      "name": "tla/mutant-commit_one_prepared.cex.json",
+      "sha256": "2b5b7828bcf92c4e0512510a5b8285cd56e7eb7353271089ed1f92b67ea9f768"
+    },
+    {
+      "name": "tla/mutant-commit_one_prepared.log",
+      "sha256": "4f37716546e62be92c3f6f2e600b6b6294bd5ff233362d525cd19dbe0718cdc0"
+    },
+    {
+      "name": "tla/mutant-no_resend.cex.json",
+      "sha256": "f58c6d27e32b2ffc09cbf4513726d03f5aa29c5628e56c286878630faab8e157"
+    },
+    {
+      "name": "tla/mutant-no_resend.log",
+      "sha256": "34edde43cf1d4f1a44966dc5545e08fb1905db0630c72a389cfc612f473154c0"
+    }
+  ],
+  "assertions": {
+    "executed": 9,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "specs-selftest",
+  "duration_s": 7.838,
+  "guarantees": [],
+  "kind": "T",
+  "mode": {
+    "tla": "exhaustive"
+  },
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-26T01:48:11.879958+00:00",
+    "request_id": "verify-78334d4-012010",
+    "runner": "GitHub Actions 1000014622",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45727968538"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "78334d4eb3b5d05ae7c72eb39bcf3eca0b792ee5",
+  "sim_core_hours": null,
+  "tla": {
+    "actions": 11,
+    "budget_s": 900,
+    "controls": [
+      {
+        "cfg": "control-commit_one_prepared.cfg",
+        "depth": 13,
+        "detail": "",
+        "distinct_states": 683,
+        "duration_s": 0.9,
+        "states_left": 0,
+        "verdict": "pass"
+      }
+    ],
+    "depth": 15,
+    "distinct_states": 2750,
+    "min_action_coverage": 8,
+    "mode": "exhaustive",
+    "mutants": [
+      {
+        "cex_length": 6,
+        "control": "control-commit_one_prepared.cfg",
+        "detail": "invariant Consistent violated, counterexample of 6 states",
+        "expect": "Consistent",
+        "name": "commit_one_prepared",
+        "observed": "Consistent",
+        "ok": true
+      },
+      {
+        "cex_length": 8,
+        "control": "TwoPhase.cfg",
+        "detail": "liveness property Termination violated, counterexample of 8 states (lasso)",
+        "expect": "Termination",
+        "name": "no_resend",
+        "observed": "Termination",
+        "ok": true
+      }
+    ],
+    "runs": [
+      {
+        "cfg": "TwoPhase.cfg",
+        "depth": 15,
+        "detail": "",
+        "distinct_states": 2750,
+        "duration_s": 5.0,
+        "states_left": 0,
+        "verdict": "pass"
+      }
+    ],
+    "settings": [
+      "TwoPhase.cfg: SPECIFICATION Spec, MaxCrashes = 1, MaxDrops = 1, Mutant = \"none\", RM <- MCRM",
+      "mutant commit_one_prepared of TwoPhase.cfg: MaxDrops = 0, Mutant = \"commit_one_prepared\" instead of MaxDrops = 1, Mutant = \"none\"",
+      "mutant no_resend of TwoPhase.cfg: Mutant = \"no_resend\" instead of Mutant = \"none\""
+    ],
+    "settings_sha256": "da00f8b4e4ea5f2b3bf20316b2489ae721c2cd57703f771ba77b80f65baedf30",
+    "spec": "specs/selftest/TwoPhase",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "uncovered": [],
+    "unmutated": [
+      "TypeOK"
+    ]
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}

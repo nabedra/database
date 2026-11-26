@@ -1,0 +1,47 @@
+{
+  "artifacts": [
+    {
+      "name": "verify-78334d4-012010--cache-sim-product.log",
+      "sha256": "3e5fb0573b73207e2de55e74bebc88086d5ef6ffa7701bec092f37cb1a9e94fc"
+    }
+  ],
+  "assertions": {
+    "executed": 57,
+    "failed": 0,
+    "not_run": [
+      {
+        "id": "ignored",
+        "reason": "1 tests marked #[ignore]"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "cache-sim-product",
+  "duration_s": 103.689,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-26T00:20:22.237820+00:00",
+    "request_id": "verify-78334d4-012010",
+    "runner": "GitHub Actions 1000014518",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45727968538"
+  },
+  "scenarios": [
+    "K01",
+    "K02",
+    "K03"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "78334d4eb3b5d05ae7c72eb39bcf3eca0b792ee5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "verify-78334d4-012010--oltp-sim-topology-splits.log",
+      "sha256": "6c263efd7b5a97a655ff2370b20ae281d810c3e70b1b7a87fb8e2a8e4262c430"
+    }
+  ],
+  "assertions": {
+    "executed": 2,
+    "failed": 2,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim-topology-splits",
+  "duration_s": 1403.873,
+  "guarantees": [
+    "OLTP-G06"
+  ],
+  "kind": "S H",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-26T01:21:17.592976+00:00",
+    "request_id": "verify-78334d4-012010",
+    "runner": "GitHub Actions 1000014598",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45727968538"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "78334d4eb3b5d05ae7c72eb39bcf3eca0b792ee5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
