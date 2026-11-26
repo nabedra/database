@@ -563,16 +563,20 @@ impl InstallCheck {
     }
 }
 impl RowImage {
-    /// Every vector names a column of `schema` and has its type.
+    /// Every vector and source version belongs to a column of the right kind.
     pub(super) fn fits(&self, schema: &SearchSchema) -> bool {
-        self.vectors.iter().all(|image| {
-            schema.column(image.column).is_some_and(|column| {
-                image
-                    .value
-                    .checked_len()
-                    .is_some_and(|len| column.fits(image.value.kind, len))
+        self.source
+            .0
+            .keys()
+            .all(|id| schema.column(*id).is_some_and(|column| column.source.is_some()))
+            && self.vectors.iter().all(|image| {
+                schema.column(image.column).is_some_and(|column| {
+                    image
+                        .value
+                        .checked_len()
+                        .is_some_and(|len| column.fits(image.value.kind, len))
+                })
             })
-        })
     }
 }
 /// A Resolve whose commit timestamp is at or below the closed floor. It cannot be

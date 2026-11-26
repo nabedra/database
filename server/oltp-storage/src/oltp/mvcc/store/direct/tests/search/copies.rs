@@ -668,3 +668,41 @@ fn vs16_a_restore_refuses_malformed_search_metadata_before_reading_rows() {
         );
     }
 }
+
+#[tokio::test]
+async fn vs16_archive_of_a_split_keeps_the_root_without_embedding_attempts() {
+    use crate::oltp::mvcc::store::split_closure::{fold_image, image_seed};
+
+    let mut s = S::new().await;
+    fill(&mut s).await;
+    let _split = freeze(&mut s, 41).await;
+    let source = images(&s, 41).await;
+    let split_image = source.iter().find(|image| {
+        image.search.as_ref().is_some_and(|search| !search.records.is_empty())
+    }).unwrap();
+    let mut archived_image = split_image.clone();
+    archived_image.search.as_mut().unwrap().records.clear();
+    let root = image_seed().unwrap();
+    let published = fold_image(root, split_image).unwrap();
+    assert_eq!(published, fold_image(root, &archived_image).unwrap());
+    archived_image.search.as_mut().unwrap().source.0.clear();
+    assert_ne!(published, fold_image(root, &archived_image).unwrap());
+}
+
+#[tokio::test]
+async fn vs16_a_restore_refuses_an_undeclared_embedding_source() {
+    let mut s = S::new().await;
+    fill(&mut s).await;
+    let backup = images(&s, 41).await;
+    let image = backup.iter().find(|image| {
+        image.search.as_ref().is_some_and(|search| {
+            search.source.0.contains_key(&EMBEDDED)
+                && !search.blobs.0.contains_key(&EMBEDDED)
+        })
+    }).unwrap();
+    let mut schema = SearchSchema { epoch: 1, columns: columns(), high: MULTI };
+    assert!(restore::check_schema(Some(&schema), &[image]).is_ok());
+    schema.columns.retain(|column| column.id != EMBEDDED);
+    let error = restore::check_schema(Some(&schema), &[image]).unwrap_err();
+    assert_eq!(error.code, ErrorCode::ValidationError);
+}
