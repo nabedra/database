@@ -1,0 +1,11 @@
+id = "events-ack-gap"
+module = "events"
+kinds = ["T"]
+guarantees = []
+scenarios = ["EV03"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/events-delivery/ack", "EventsAckGap", "--module", "events"]
+cwd = "."
+timeout_s = 900
+needs = ["tlc"]
+result_parser = "tlc"

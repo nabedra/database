@@ -156,7 +156,8 @@ ApplyAck(S, cmd) ==
        ELSE IF m.after >= m.th \/ m.th > m.last \/ m.last > TailOff(S) \/ m.after > S.ckpt
        THEN [s |-> S1, r |-> Res("invalid")]
        ELSE IF m.th > S.ckpt
-       THEN IF S.ckpt < FirstCkpt(S) /\ Mutant # "ack_across_gap"
+       THEN IF S.ckpt < FirstCkpt(S)
+                   /\ ((m.after # S.ckpt /\ Mutant # "gap_accepts_old_token") \/ Mutant = "prefix_ack_gap_fails")
             THEN [s |-> S1, r |-> Res("expired")]
             ELSE LET ck == IF Mutant = "ack_to_tail" THEN TailOff(S) ELSE m.th
                  IN [s |-> okS(ck), r |-> [Res("ckpt") EXCEPT !.off = ck]]

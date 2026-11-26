@@ -1,0 +1,11 @@
+id = "events-time"
+module = "events"
+kinds = ["T"]
+guarantees = []
+scenarios = ["EV03", "EV07"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/events-time", "EventsTime", "--module", "events"]
+cwd = "."
+timeout_s = 900
+needs = ["tlc"]
+result_parser = "tlc"

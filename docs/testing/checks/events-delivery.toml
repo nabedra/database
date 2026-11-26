@@ -2,7 +2,7 @@
 id = "events-delivery"
 module = "events"
 kinds = ["T"]
-guarantees = ["EVT-G02", "EVT-G03", "EVT-G05", "EVT-G06", "EVT-G08"]
+guarantees = ["EVT-G02", "EVT-G03", "EVT-G05", "EVT-G06"]
 scenarios = ["EV01", "EV02", "EV03", "EV07"]
 tiers = ["T1"]
 command = ["python3", "scripts/testing/tla_check.py", "specs/events-delivery", "EventsDelivery", "--module", "events"]
