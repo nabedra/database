@@ -677,10 +677,11 @@ impl<'a> Placement<'a> {
                 prior_lease: slot.lease,
                 fence,
             };
-            if proof.within_lag() {
-                // Retirement prevents further renewals. An isolated old
-                // incarnation can still spend a grant it already received.
-                let cutoff = proof.cutoff(self.now.lower_ms);
+            // A retired source can acknowledge more writes until its last
+            // committed grant expires. Defer the plan without changing how
+            // the state machine applies previously committed reconcile entries.
+            let cutoff = proof.cutoff(self.now.lower_ms);
+            if proof.within_lag() && self.now.fenced(cutoff) {
                 let next = self.switch_owner(slot, moving.target, cutoff, None)?;
                 return Some(Change::Slot {
                     index,

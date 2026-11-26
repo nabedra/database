@@ -15,7 +15,12 @@ use super::super::protocol::{
 };
 use super::super::transport::Endpoint;
 use super::state::{Command, State};
-use super::{RaftConfig, log::Log, machine::Machine, placement::{Change, Observations, SourceFence}};
+use super::{
+    RaftConfig,
+    log::Log,
+    machine::Machine,
+    placement::{Observations, SourceFence},
+};
 use uuid::Uuid;
 
 struct Directory(PathBuf);

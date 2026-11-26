@@ -478,7 +478,7 @@ async fn retired_source_schedule(
     );
 
     // Let the target report its verified copy and the leader plan.
-    let deadline = cluster.now() + 2 * RENEW_MS;
+    let deadline = expiry + 2 * RENEW_MS;
     let promoted = loop {
         let _ = cluster.renew_once(target.node).await;
         cluster.reconcile_once().await;
@@ -494,8 +494,8 @@ async fn retired_source_schedule(
     assert_eq!(promoted.primary, Some(target));
     assert!(!promoted.cold);
     if !enabled {
-        // The transition committed on the retirement proof, before the
-        // source's grant ended, and carries that grant as its start.
+        // The retirement proof prevents renewals. Publication still waits
+        // for the last committed grant to expire.
         let (at, _, proof) = cluster
             .observed
             .lock()
@@ -509,7 +509,7 @@ async fn retired_source_schedule(
         assert_eq!(proof.source, old);
         assert_eq!(proof.prior_lease, Some(grant));
         assert!(
-            at < expiry,
+            at >= expiry,
             "promotion committed at {at}, grant ends {expiry}"
         );
         assert_eq!(promoted.lease.unwrap().not_before_ms, grant.expires_ms);

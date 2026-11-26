@@ -226,13 +226,25 @@ The directed schedules restrict the interleavings independently of the broad `ca
 | Ordinary replica transfer at 33 | Leave the copy staged. | 47 |
 
 The initial recovery-policy run passed on [Actions 45846984253](https://github.com/zPy52/nabedra-database/actions/runs/45846984253).
-The extended local run completed each clean schedule with an empty queue. The clock-bound mutant exposed overlap in
+The extended run passed on [Actions 45851163238](https://github.com/zPy52/nabedra-database/actions/runs/45851163238). Each clean schedule completed with an empty queue. The clock-bound mutant exposed overlap in
 12 states (`G06_LeaseExclusive`) and a stale acknowledgement in 14 (`G06_ServedEpochOrder`). The freeze mutant exposed
 overlap in 17 states. The early-commit mutant exposed an unsafe transition in 48 states (`G05_NoEarlyStagedCommit`)
 and a stale acknowledgement in 50 (`G05_NoAckAfterHandover`). The retirement replication mutant exposed lost tail
 replication in 10 states (`G05_LossOnlyFromLag`). Observation-window mutants failed in 11 and 6 states. The last-copy reset and
 ordinary transfer lag mutants failed in 57 and 47 states. The broad baselines retain their original properties and
 bounds. These schedules provide evidence for the listed cases only.
+
+### Retired-source rollout
+
+New controllers wait for grant expiry when planning a retired-source promotion. The state machine retains its original
+validation of previously committed reconciliation entries so log replay produces the same topology after upgrading.
+Finish upgrading controller leadership before relying on this planner rule throughout a cluster. Apply-time enforcement
+across mixed binaries requires a separately versioned command and rollout model.
+
+A replica in the same generation keeps the exact authenticated endpoint from its previous view while its slots still
+name that incarnation as their source. It continues pulling the retiring source's acknowledged tail. Replica apply
+checks the generation, exact source incarnation and slot epoch. The replica drops the saved endpoint once no assigned
+copy needs it or the cluster generation changes. A worker commissioned after retirement may have no endpoint to retain.
 
 The model batches planning and commitment into one action. K03 must exercise reports and an outstanding recovery
 proposal crossing a controller term change, as well as the measured age of a late first report and the time needed

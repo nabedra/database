@@ -286,6 +286,7 @@ struct Lane {
 
 pub(super) async fn replicate(worker: Worker, tls: PeerTls) -> io::Result<()> {
     let mut lanes: BTreeMap<WorkerId, Lane> = BTreeMap::new();
+    let mut retired_peers = BTreeMap::new();
     let mut topology = worker.topology();
     let mut groups = groups(&topology, worker.shared.id);
     let mut polls = interval(REPLICATION_POLL);
@@ -294,12 +295,33 @@ pub(super) async fn replicate(worker: Worker, tls: PeerTls) -> io::Result<()> {
         polls.tick().await;
         let current = worker.topology();
         if !Arc::ptr_eq(&current, &topology) {
-            topology = current;
-            groups = self::groups(&topology, worker.shared.id);
+            groups = self::groups(&current, worker.shared.id);
             lanes.retain(|source, _| groups.contains_key(source));
+            if current.generation == topology.generation {
+                retired_peers.retain(|source, _| {
+                    groups.contains_key(source) && current.member(*source).is_none()
+                });
+                for source in groups.keys().copied() {
+                    if current.member(source).is_none()
+                        && let Some(previous) = topology.member(source)
+                    {
+                        // A retired worker may still acknowledge under its
+                        // last grant. Keep its authenticated endpoint only
+                        // while this generation still names it as a source.
+                        retired_peers.insert(source, previous.peer.clone());
+                    }
+                }
+            } else {
+                retired_peers.clear();
+            }
+            topology = current;
         }
         for (&source, group) in &groups {
-            let Some(member) = topology.member(source) else {
+            let Some(endpoint) = topology
+                .member(source)
+                .map(|member| &member.peer)
+                .or_else(|| retired_peers.get(&source))
+            else {
                 continue;
             };
             if lanes
@@ -324,7 +346,7 @@ pub(super) async fn replicate(worker: Worker, tls: PeerTls) -> io::Result<()> {
                 source: worker.shared.id,
                 destination: source,
             };
-            match copy(&worker, &tls, &member.peer, identity, &probes, lane).await {
+            match copy(&worker, &tls, endpoint, identity, &probes, lane).await {
                 Ok(()) => {
                     lane.last_used = Some(time::now_std());
                     lane.failures = 0;

@@ -873,8 +873,9 @@ impl State {
                 packet,
                 reply,
             } => {
-                if generation == self.topology.generation && self.topology.member(source).is_some()
-                {
+                if generation == self.topology.generation {
+                    // The copy still follows its exact source incarnation
+                    // and epoch while a retirement fences future grants.
                     self.apply(source, packet);
                 }
                 let _ = reply.send(());
