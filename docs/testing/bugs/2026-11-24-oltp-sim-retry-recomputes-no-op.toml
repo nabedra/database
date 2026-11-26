@@ -1,0 +1,17 @@
+id = "OLTP-sim-retry-recomputes-no-op"
+title = "A retry of a direct-path no-op or refused insert is recomputed, so the same request ID and body later applies"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G03"]
+scenarios = ["O08", "D02"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "server/sim-oltp/src/scripted/oltp_direct.rs scripted::oltp_direct::dr1_sequential_retry"
+seed = 1
+why_not_caught = "The history checker accepted a recomputed no-op or row conflict as a fresh answer until its default followed lead decision 11."
+invariant_added = "DR-1. Fault model, scripted schedules with production direct limits, seed 1, run with --ignored: a retry of a mutation with the same request ID and body returns the first definite result of that identity (O08, oltp-contract.md Direct-path retry results). dr1_sequential_retry, no fault: an update of a missing row answers false, another client inserts the row, and the same ID and body then answers true and applies (trace 389ba38e121e19e1). dr1_update and dr1_insert_refused: a first attempt held on a link applies after a retry through the other gateway answered false, or 409 not_applied (traces 7197b0a3958f674d, ae0ebd96f7aaf4df); their lost and not-sent controls stay clean. The history checker reports unstable-result on all three."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

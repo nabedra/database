@@ -9,6 +9,23 @@
 //!
 //! Each case runs the delayed attempt (`Delivered`) and two controls without it: `Lost` breaks
 //! the connection that carries it, and `NotSent` never sends it.
+//!
+//! Every case is ignored: it records an open finding, and no check runs it. A reproduction
+//! fails while its finding is open. A pass does not show a fix, because no assertion checks
+//! that the delayed attempt reached the leader (there is no per-attempt probe here), and a
+//! control passes by design. DR-1 is the known gap in "Direct-path retry results" of
+//! `docs/testing/oltp-contract.md`, open record `OLTP-sim-retry-recomputes-no-op`. DR-2 is open
+//! record `OLTP-sim-retry-not-applied-after-commit`. The histories of the first run, at
+//! `9b810d96`, are the fixtures in `server/check/tests/fixtures/unreviewed_dr1_dr2/`.
+//!
+//! Run one case from `server/`. `NABEDRA_SEED` and `NABEDRA_SEEDS` pick the seeds (default 1
+//! and 1), and `NABEDRA_SIM_ARTIFACTS` keeps the histories:
+//!
+//! ```text
+//! RUST_MIN_STACK=16777216 RUSTFLAGS="--cfg tokio_unstable" CARGO_TARGET_DIR=target/sim \
+//!   cargo test --locked --release -p nabedra-sim-oltp --lib scripted::oltp_direct::dr1_update \
+//!   -- --exact --ignored --nocapture --test-threads=1
+//! ```
 
 use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
 
@@ -312,10 +329,10 @@ fn check(name: &str, case: impl Fn(u64) -> SeedRun + Sync) {
 }
 
 macro_rules! cases {
-    ($($(#[$doc:meta])* $name:ident: $schedule:expr;)*) => {$(
+    ($($(#[$doc:meta])* $name:ident ($why:literal): $schedule:expr;)*) => {$(
         $(#[$doc])*
         #[test]
-        #[ignore = "open design finding; not part of any gate"]
+        #[ignore = $why]
         fn $name() {
             check(stringify!($name), |seed| run_schedule(seed, $schedule));
         }
@@ -323,19 +340,50 @@ macro_rules! cases {
 }
 
 cases! {
-    dr1_update: |driver| dr1(driver, false, Delayed::Delivered);
-    dr1_update_control_lost: |driver| dr1(driver, false, Delayed::Lost);
-    dr1_update_control_not_sent: |driver| dr1(driver, false, Delayed::NotSent);
-    dr1_insert_refused: |driver| dr1(driver, true, Delayed::Delivered);
-    dr1_insert_refused_control_lost: |driver| dr1(driver, true, Delayed::Lost);
-    dr1_insert_refused_control_not_sent: |driver| dr1(driver, true, Delayed::NotSent);
-    dr1_sequential_retry: dr1_sequential;
-    dr2_leader_link: |driver| dr2(driver, Outage::Leader, Delayed::Delivered);
-    dr2_leader_and_first_link: |driver| dr2(driver, Outage::LeaderAnd(0), Delayed::Delivered);
-    dr2_leader_and_second_link: |driver| dr2(driver, Outage::LeaderAnd(1), Delayed::Delivered);
-    dr2_all_links: |driver| dr2(driver, Outage::All, Delayed::Delivered);
-    dr2_admission_full: |driver| dr2(driver, Outage::LeaderWithLoad, Delayed::Delivered);
-    dr2_admission_full_control_lost: |driver| dr2(driver, Outage::LeaderWithLoad, Delayed::Lost);
-    dr2_admission_full_control_not_sent:
+    dr1_update ("DR-1, open record OLTP-sim-retry-recomputes-no-op: fails while open; \
+        run with --ignored, see the module docs"):
+        |driver| dr1(driver, false, Delayed::Delivered);
+    dr1_update_control_lost ("control for DR-1 (OLTP-sim-retry-recomputes-no-op): passes \
+        by design; run with --ignored, see the module docs"):
+        |driver| dr1(driver, false, Delayed::Lost);
+    dr1_update_control_not_sent ("control for DR-1 (OLTP-sim-retry-recomputes-no-op): passes \
+        by design; run with --ignored, see the module docs"):
+        |driver| dr1(driver, false, Delayed::NotSent);
+    dr1_insert_refused ("DR-1, open record OLTP-sim-retry-recomputes-no-op: fails while open; \
+        run with --ignored, see the module docs"):
+        |driver| dr1(driver, true, Delayed::Delivered);
+    dr1_insert_refused_control_lost ("control for DR-1 (OLTP-sim-retry-recomputes-no-op): \
+        passes by design; run with --ignored, see the module docs"):
+        |driver| dr1(driver, true, Delayed::Lost);
+    dr1_insert_refused_control_not_sent ("control for DR-1 (OLTP-sim-retry-recomputes-no-op): \
+        passes by design; run with --ignored, see the module docs"):
+        |driver| dr1(driver, true, Delayed::NotSent);
+    dr1_sequential_retry ("DR-1, open record OLTP-sim-retry-recomputes-no-op: fails while \
+        open; run with --ignored, see the module docs"):
+        dr1_sequential;
+    dr2_leader_link ("DR-2, open record OLTP-sim-retry-not-applied-after-commit: fails while \
+        open; run with --ignored, see the module docs"):
+        |driver| dr2(driver, Outage::Leader, Delayed::Delivered);
+    dr2_leader_and_first_link ("DR-2, open record OLTP-sim-retry-not-applied-after-commit: \
+        fails while open; run with --ignored, see the module docs"):
+        |driver| dr2(driver, Outage::LeaderAnd(0), Delayed::Delivered);
+    dr2_leader_and_second_link ("DR-2, open record OLTP-sim-retry-not-applied-after-commit: \
+        fails while open; run with --ignored, see the module docs"):
+        |driver| dr2(driver, Outage::LeaderAnd(1), Delayed::Delivered);
+    dr2_all_links ("DR-2 (OLTP-sim-retry-not-applied-after-commit) not reproduced by this \
+        shape: every retry stays unknown, so it fails with ScheduleStep; run with --ignored, \
+        see the module docs"):
+        |driver| dr2(driver, Outage::All, Delayed::Delivered);
+    dr2_admission_full ("DR-2, open record OLTP-sim-retry-not-applied-after-commit: fails \
+        while open, by the route refusal and not the intended 429; run with --ignored, see the \
+        module docs"):
+        |driver| dr2(driver, Outage::LeaderWithLoad, Delayed::Delivered);
+    dr2_admission_full_control_lost ("control for DR-2 \
+        (OLTP-sim-retry-not-applied-after-commit): passes by design; run with --ignored, see \
+        the module docs"):
+        |driver| dr2(driver, Outage::LeaderWithLoad, Delayed::Lost);
+    dr2_admission_full_control_not_sent ("not a valid control for DR-2 \
+        (OLTP-sim-retry-not-applied-after-commit): its own first retry becomes the delayed \
+        attempt; run with --ignored, see the module docs"):
         |driver| dr2(driver, Outage::LeaderWithLoad, Delayed::NotSent);
 }
