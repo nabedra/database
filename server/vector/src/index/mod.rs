@@ -133,6 +133,8 @@ struct Meta {
     /// The bisection's target for each entry that was present when the split began.
     split_targets: BTreeMap<u64, PartId>,
     drained_into: usize,
+    /// Appends assigned to this partition that a core has not consumed yet.
+    appending: usize,
     /// Copies in flight from it and to it.
     leaving: usize,
     arriving: usize,
@@ -383,6 +385,7 @@ impl Shared {
             targets: Vec::new(),
             split_targets: BTreeMap::new(),
             drained_into: 0,
+            appending: 0,
             leaving: 0,
             arriving: 0,
             landed: Vec::new(),
@@ -412,10 +415,16 @@ impl Shared {
             None => root.and_then(|r| r.undirected),
             Some((dir, _)) => root.and_then(|r| r.tree.nearest(dir, None)).map(|(p, _)| p),
         };
-        match (part, direction) {
-            (Some(part), _) => Some(part),
-            (None, Some((dir, _))) => self.new_part(group, dir.into(), false),
-            (None, None) => self.new_part(group, Arc::new([]), true),
+        if part.is_some() {
+            return part;
+        }
+        let owner = self.next_part as usize % self.shards;
+        if self.queues[owner].len() >= self.queue_len {
+            return None;
+        }
+        match direction {
+            Some((dir, _)) => self.new_part(group, dir.into(), false),
+            None => self.new_part(group, Arc::new([]), true),
         }
     }
 
@@ -927,6 +936,9 @@ impl<C: Codec> Index<C> {
                 if sh.queues[owner].len() >= sh.queue_len {
                     return moved;
                 }
+                if let Some(meta) = sh.dir.get_mut(&part) {
+                    meta.appending += 1;
+                }
                 sh.queues[owner].push_back(Msg::Append(a, part));
             } else {
                 sh.forget(a.generation, a.slot, a.at);
@@ -1124,7 +1136,11 @@ impl<C: Codec> Index<C> {
                 let removed = self.remove_moved(part) + self.collect(part) > 0;
                 let meta = &self.shared.dir[&part];
                 let entries = meta.entries;
-                if entries == 0 && meta.drained_into == 0 && meta.arriving == 0 && meta.leaving == 0
+                if entries == 0
+                    && meta.appending == 0
+                    && meta.drained_into == 0
+                    && meta.arriving == 0
+                    && meta.leaving == 0
                 {
                     self.shared.retire(part);
                     return true;

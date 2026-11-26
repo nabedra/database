@@ -582,3 +582,74 @@ fn adv17_checkpoints_with_right_checksums_and_wrong_contents_never_panic() {
     }
     assert!(panics.is_empty(), "{} of 600 forged checkpoints panic, for example {:?}", panics.len(), &panics[..panics.len().min(4)]);
 }
+
+/// The old and new snapshots have a different row at the same segment number and byte length.
+#[test]
+fn adv10_interrupted_peer_copy_preserves_the_old_manifest_segments() {
+    let snapshot = |pos| {
+        let fs = disk();
+        let mut ix = Index::new(cfg(), ExactCodec, Some(store(&fs))).unwrap();
+        ix.begin_load(RANGE, pos, pos).unwrap();
+        let tags = Value::Tags(Arc::new([Arc::from("t")]));
+        ix.load_rows(RANGE, &[(key(1), pos, row(&[1.0, 0.0], vec![tags], pos))])
+            .unwrap();
+        ix.run();
+        ix.finish_load(RANGE).unwrap();
+        ix.caught_up(RANGE, pos).unwrap();
+        ix.checkpoint().unwrap();
+        fs
+    };
+    let local = snapshot(1);
+    let peer = snapshot(2);
+    let segment = Path::new(DIR).join("seg-0000000000000000");
+    assert_eq!(local.contents(&segment).unwrap().len(), peer.contents(&segment).unwrap().len());
+    let completed = local.kill();
+    copy_checkpoint(&store(&peer), &store(&completed)).unwrap();
+
+    let mut unavailable = Vec::new();
+    let mut wrong = Vec::new();
+    for step in 0..=completed.mutating_ops() {
+        let target = local.kill();
+        target.crash_after(step);
+        let _ = copy_checkpoint(&store(&peer), &store(&target));
+        for restored in [target.crash(), target.power_loss(step)] {
+            let (mut ix, damage) = Index::recover(cfg(), ExactCodec, store(&restored)).unwrap();
+            if !damage.is_empty() {
+                unavailable.push((step, damage));
+                continue;
+            }
+            let pos = ix.status(RANGE).unwrap().applied;
+            assert!(matches!(pos, 1 | 2));
+            ix.caught_up(RANGE, pos).unwrap();
+            let pin = ix.pin(&[(RANGE, ReadAt::Position(pos))], None).unwrap();
+            let hits = ix.search(&pin, &query(Op::Dot, &[1.0, 0.0], 1)).unwrap();
+            let got = images(&hits);
+            if got != vec![pos] {
+                wrong.push((step, pos, got));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "an interrupted copy returned the wrong row: {wrong:?}");
+    assert!(unavailable.is_empty(), "an interrupted copy damaged the old checkpoint: {unavailable:?}");
+
+    let missing = local.kill();
+    missing.remove(&segment).unwrap();
+    copy_checkpoint(&store(&peer), &store(&missing)).unwrap();
+    assert!(!missing.exists(&segment).unwrap(), "a missing segment is still reserved by the old manifest");
+}
+
+#[test]
+fn adv17_checkpoint_segment_number_exhaustion_is_an_error() {
+    let fs = disk();
+    fs.create_dir_all_durable(Path::new(DIR));
+    let mut ix = serving(cfg(), ExactCodec, Some(store(&fs)));
+    advance(&mut ix, RANGE, 1);
+
+    for number in [u64::MAX - 1, u64::MAX] {
+        let path = Path::new(DIR).join(format!("seg-{number:016x}"));
+        fs.open(&path, OpenMode::CreateNew).unwrap();
+        assert!(matches!(ix.checkpoint(), Err(Error::Io(_))), "segment number {number}");
+        fs.remove(&path).unwrap();
+    }
+    ix.checkpoint().unwrap();
+}

@@ -208,6 +208,9 @@ impl<C: Codec> Shard<C> {
 
     /// `AppendEntry`. A partition that drains by now gets nothing: the entry is assigned again.
     fn append_entry(&mut self, sh: &mut Shared, codec: &C, a: Append, part: PartId) {
+        if let Some(meta) = sh.dir.get_mut(&part) {
+            meta.appending = meta.appending.saturating_sub(1);
+        }
         if !sh.gens.contains_key(&a.generation) {
             sh.forget(a.generation, a.slot, a.at);
         } else if sh.dir.get(&part).is_some_and(|m| m.state == State::Ready) {

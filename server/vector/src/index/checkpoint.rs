@@ -101,6 +101,12 @@ fn segment_name(number: u64) -> String {
     format!("seg-{number:016x}")
 }
 
+fn segment_after(number: u64) -> io::Result<u64> {
+    number
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("checkpoint segment numbers exhausted"))
+}
+
 impl Store {
     pub fn new(fs: Arc<dyn Fs>, dir: impl Into<PathBuf>) -> Store {
         Store {
@@ -139,6 +145,22 @@ impl Store {
             .iter()
             .filter_map(|p| u64::from_str_radix(&number(p)?, 16).ok())
             .collect())
+    }
+
+    /// A file named by the installed manifest remains reserved even if it is missing.
+    fn next_segment(&self) -> io::Result<u64> {
+        let existing = self.segments()?.into_iter().max();
+        let installed = match self.load_manifest() {
+            Ok(Some(manifest)) => manifest.files.into_iter().map(|file| file.number).max(),
+            Ok(None) => None,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => None,
+            Err(error) => return Err(error),
+        };
+        existing
+            .into_iter()
+            .chain(installed)
+            .max()
+            .map_or(Ok(0), segment_after)
     }
 
     fn load_manifest(&self) -> io::Result<Option<Manifest>> {
@@ -250,17 +272,21 @@ impl Store {
 /// Copies the installed checkpoint of another search replica. The manifest goes last.
 pub fn copy_checkpoint(from: &Store, to: &Store) -> Result<()> {
     let copy = || -> io::Result<()> {
-        let manifest = from
+        let mut manifest = from
             .load_manifest()?
             .ok_or_else(|| damaged("the peer has no checkpoint"))?;
         to.prepare()?;
-        for info in &manifest.files {
-            let name = segment_name(info.number);
-            if to.fs.exists(&to.path(&name))? {
-                to.fs.remove(&to.path(&name))?;
+        let mut next = to.next_segment()?;
+        for info in &mut manifest.files {
+            let source_name = segment_name(info.number);
+            let source = from.fs.open(&from.path(&source_name), OpenMode::Read)?;
+            if source.len()? != info.len {
+                return Err(damaged("a peer file's size is wrong"));
             }
-            let source = from.fs.open(&from.path(&name), OpenMode::Read)?;
-            let target = to.fs.open(&to.path(&name), OpenMode::CreateNew)?;
+            info.number = next;
+            next = segment_after(next)?;
+            let target_name = segment_name(info.number);
+            let target = to.fs.open(&to.path(&target_name), OpenMode::CreateNew)?;
             let mut at = 0;
             while at < info.len {
                 let mut chunk = vec![0; COPY_BYTES.min((info.len - at) as usize)];
@@ -271,7 +297,9 @@ pub fn copy_checkpoint(from: &Store, to: &Store) -> Result<()> {
             target.sync_data()?;
         }
         to.fs.sync_dir(&to.dir)?;
-        to.install(&manifest)
+        to.install(&manifest)?;
+        to.clean(&manifest);
+        Ok(())
     };
     copy().map_err(io_error)
 }
@@ -288,12 +316,7 @@ impl<C: Codec> Index<C> {
             return Err(Error::Busy);
         }
         store.prepare().map_err(io_error)?;
-        let next = store
-            .segments()
-            .map_err(io_error)?
-            .into_iter()
-            .max()
-            .map_or(0, |n| n + 1);
+        let next = store.next_segment().map_err(io_error)?;
         let held = |r: &Range| matches!(r.service, Service::CatchingUp | Service::Serving);
         let heads: Vec<Head> = (self.shared.ranges.iter().filter(|(_, r)| held(r)))
             .map(|(id, r)| Head {
@@ -623,7 +646,7 @@ impl Running {
             Some(s) => s,
             none => {
                 let number = self.next;
-                self.next += 1;
+                self.next = segment_after(number)?;
                 let path = store.path(&segment_name(number));
                 let file = store.fs.open(&path, OpenMode::CreateNew)?;
                 file.write_all_at(SEGMENT_MAGIC, 0)?;

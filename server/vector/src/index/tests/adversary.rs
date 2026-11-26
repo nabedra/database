@@ -756,3 +756,60 @@ fn adv07_a_merge_never_makes_a_partition_larger_than_part_max() {
         }
     }
 }
+
+/// Maintenance cannot reclaim the empty destination of an append that is already queued.
+#[test]
+fn adv07_queued_appends_keep_their_empty_destinations() {
+    let cfg = Config {
+        queue: 1,
+        ..Config::new(schema(2, &[ColumnType::Int], Some(0)), 1)
+    };
+    let mut ix = serving(cfg, ExactCodec, None);
+    let changes = (0..2)
+        .map(|key| (key, Some(row(&[1.0, 0.0], vec![Value::Int(key as i64)], key))))
+        .collect();
+    assert_eq!(ix.apply(RANGE, &page(0, changes)), Ok(2));
+    assert!(ix.pump());
+    ix.maintain(8);
+    assert!(ix.step(0));
+    ix.advance();
+    assert_eq!(ix.status(RANGE).unwrap().applied, 1);
+    assert_eq!(ix.shared.next_part, 1, "a full queue must not allocate another tenant's partition");
+
+    assert!(ix.pump());
+    ix.maintain(8);
+    assert!(ix.step(0));
+    ix.advance();
+    assert_eq!(ix.status(RANGE).unwrap().applied, 2);
+}
+
+/// Dropping a generation releases its queued destinations when the core consumes the old message.
+#[test]
+fn adv07_a_stale_append_releases_its_destination() {
+    let mut ix = serving(Config::new(schema(2, &[], None), 1), ExactCodec, None);
+    assert_eq!(ix.apply(RANGE, &page(0, vec![(1, Some(row(&[0.0, 0.0], vec![], 1)))])), Ok(1));
+    assert!(ix.pump());
+    ix.drop_range(RANGE).unwrap();
+    assert!(ix.step(0));
+    settle(&mut ix);
+    assert!(ix.shared.dir.is_empty());
+    assert!(ix.shared.roots.is_empty());
+}
+
+/// An append assigned before a split releases the source reservation when retargeted.
+#[test]
+fn adv07_a_retargeted_append_releases_the_source_partition() {
+    let mut ix = serving(Config::new(schema(2, &[], None), 1), ExactCodec, None);
+    feed(&mut ix, RANGE, &page(0, vec![(1, Some(row(&[1.0, 0.0], vec![], 1)))]));
+    assert_eq!(ix.apply(RANGE, &page(1, vec![(2, Some(row(&[0.0, 1.0], vec![], 2)))])), Ok(2));
+    assert!(ix.pump());
+    let source = PartId(0);
+    assert!(ix.split(source));
+    assert!(ix.step(0));
+    assert_eq!(ix.shared.dir[&source].appending, 0);
+    settle(&mut ix);
+    assert_eq!(ix.status(RANGE).unwrap().applied, 2);
+    let pin = latest(&mut ix, None);
+    let hits = ix.search(&pin, &query(Op::Dot, &[1.0, 0.0], 2)).unwrap();
+    assert_eq!(images(&hits), vec![1, 2]);
+}
