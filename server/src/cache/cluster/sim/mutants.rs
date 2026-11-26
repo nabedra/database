@@ -858,6 +858,67 @@ fn staged_promotion_after_live_source_retirement_waits_for_grant() {
     }
 }
 
+/// K03: after installing the retirement view, an existing replica must
+/// still pull an acknowledgement from the exact incarnation it follows.
+#[test]
+fn assigned_replica_keeps_pulling_the_retired_source_tail() {
+    runtime::run(1, |world| async move {
+        let key = (0..)
+            .map(|i| format!("{{retired-tail-{i}}}"))
+            .find(|key| key_slot(key.as_bytes()) < 63)
+            .unwrap();
+        let slot = key_slot(key.as_bytes());
+        let config = Case::RetiredStaged.config(false);
+        let mut cluster = Cluster::boot(world, vec![key.clone()], config).await;
+        let initial = cluster.slot(slot);
+        let old = initial.primary.unwrap();
+        let replica = initial.replica.unwrap();
+        assert!(write_ok(
+            cluster
+                .send(&key, Op::Set("before".into(), None), Some(old.node))
+                .await
+        ));
+        let deadline = cluster.now() + LEASE_MS;
+        let copied = loop {
+            if let Some(sample) = cluster.sample(Some(replica), slot).await
+                && sample.baseline
+                && sample.sequence > 0
+            {
+                break sample.sequence;
+            }
+            assert!(cluster.now() < deadline, "assigned copy did not catch up");
+            cluster.step(25).await;
+        };
+        cluster.immediate_delivery();
+        cluster.renew_once(old.node).await.unwrap();
+        cluster.isolate_controller_links(old.node);
+        assert!(matches!(
+            cluster.enroll_replacement(old.node).await,
+            Reply::Applied { .. }
+        ));
+        cluster.renew_once(replica.node).await.unwrap();
+        assert!(
+            cluster.workers[&replica.node]
+                .topology()
+                .member(old)
+                .is_none()
+        );
+        assert!(write_ok(
+            cluster
+                .send(&key, Op::Set("after".into(), None), Some(old.node))
+                .await
+        ));
+        cluster.step(250).await;
+        let sample = cluster.sample(Some(replica), slot).await.unwrap();
+        assert_eq!(sample.epoch, initial.epoch);
+        assert_eq!(
+            sample.sequence,
+            copied + 1,
+            "replica stopped pulling the retired tail"
+        );
+    });
+}
+
 #[test]
 fn planted_staged_promotion_beyond_lag_scripted_and_search() {
     scripted(Case::LaggedStaged);

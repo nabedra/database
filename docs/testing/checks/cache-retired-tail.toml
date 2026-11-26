@@ -1,0 +1,12 @@
+id = "cache-retired-tail"
+module = "cache"
+kinds = ["S"]
+guarantees = []
+scenarios = ["K03"]
+tiers = ["T1"]
+command = ["cargo", "test", "--locked", "-j", "4", "--no-default-features", "--features", "cache,sim", "--lib", "cache::cluster::sim::tests::mutants::assigned_replica_keeps_pulling_the_retired_source_tail", "--", "--exact", "--test-threads=1"]
+cwd = "server"
+timeout_s = 1200
+needs = []
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim-cache" }
+result_parser = "cargo-test"
