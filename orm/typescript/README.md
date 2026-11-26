@@ -96,7 +96,7 @@ vectors as raw float32 bytes.
 | --- | --- |
 | `col(name).cosine(query)`, `.dot(query)`, `.l2(query)` | A ranking. A string is embedded with the column's model. `cosine` rejects a zero query vector. |
 | `col(name).match(text)` | A ranking by BM25 |
-| `col(name).contains(value)`, `.containsAny(values)` | Filters on `list(String)` columns. `containsAny` of nothing matches nothing. It sends an array in its order and a `Set` sorted by UTF-8 bytes, as Python sorts a set. |
+| `col(name).contains(value)`, `.containsAny(values)` | Filters on `list(String)` columns. `containsAny` of nothing matches nothing. It sends a `Set` sorted by UTF-8 bytes, as Python sorts a `set`, and any other iterable, `Map` keys included, in its order. |
 | `col(name).startsWith(prefix)` | Filter on `String` columns |
 | `query.rank(...rankings, { fusion = "rrf", candidates = 100, recall = 0.95, exact = false, consistency = "latest" })` | New query ordered by one ranking, or by several fused. `fusion` is `"rrf"` or one nonnegative weight per ranking. |
 | `query.rerank(ranking, { candidates = 200 })` | New query that scores the best candidates of `rank` again |
@@ -130,6 +130,8 @@ The call stops at the first request that fails and throws `BatchError`:
 | --- | --- |
 | `applied` | Rows known to be applied, in the whole call |
 | `outcomes` | One `{ key, outcome, error }` per row of the failed request, in order. `outcome` is `"applied"`, `"not_applied"` or `"outcome_unknown"`. `error` is `null` for an applied row. |
+| `requestId` | ID of the failed request |
+| `outcome` | `"not_applied"`, `"partial"`, `"unknown"`, or `"applied"` when only the wait for embeddings failed |
 
 The class of a row's `error` follows its outcome, then its code: `"outcome_unknown"`
 gives `UnknownOutcomeError`. A `"not_applied"` row maps `validation_error`,
@@ -138,14 +140,12 @@ gives `UnknownOutcomeError`. A `"not_applied"` row maps `validation_error`,
 `AuthenticationError`, `NotFoundError`, `ConflictError`, `LimitExceededError`,
 `OverloadedError`, `StorageError` and `SearchUnavailableError`, and any other code to
 `NabedraError`.
-| `requestId` | ID of the failed request |
-| `outcome` | `"not_applied"`, `"partial"`, `"unknown"`, or `"applied"` when only the wait for embeddings failed |
 
 A lost response makes every row of its request `"outcome_unknown"`. The client never
 sends a request again. Writing the same rows again is safe while no other writer
 changes them. Rows after the failed request were not sent. An invalid row throws
 `ValidationError` if nothing was sent yet. After that, it or an error from the
-iterable throws `BatchError` with the applied count and no `outcomes`.
+iterable, whatever it throws, throws `BatchError` with the applied count and no `outcomes`.
 
 `{ waitForEmbedding: true }` polls `searchStatus()` after the last request until no
 embedding of the table is pending, for at most the client's `timeout`. Other writers'

@@ -121,6 +121,7 @@ export class Expr {
     }
     const checked = Array.from(values, (value) => stringValue(value, column))
     // A Set keeps insertion order, but Python's set has none. Sort by UTF-8 bytes in both SDKs.
+    // Other iterables, Map keys included, keep their order, as in Python.
     if (values instanceof Set) checked.sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)))
     return fromNode({ op: "contains_any", column, values: checked })
   }

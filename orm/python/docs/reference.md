@@ -214,14 +214,14 @@ The call stops at the first request that fails and raises `BatchError`:
 | --- | --- |
 | `applied` | Rows known to be applied, in the whole call |
 | `outcomes` | One dictionary per row of the failed request, in order, with `key`, `outcome` and `error`. `outcome` is `"applied"`, `"not_applied"` or `"outcome_unknown"`. `error` is `None` for an applied row. |
+| `request_id` | ID of the failed request |
+| `outcome` | `"not_applied"`, `"partial"`, `"unknown"`, or `"applied"` when only the wait for embeddings failed |
 
 The class of a row's `error` follows its outcome, then its code: `"outcome_unknown"`
 gives `UnknownOutcomeError`. A `"not_applied"` row maps `validation_error`,
 `unauthorized`, `not_found`, `conflict`, `limit_exceeded`, `overloaded`,
 `storage_unavailable` and `search_unavailable` to their classes in the
 [error table](#errors-and-uncertain-writes), and any other code to `NabedraError`.
-| `request_id` | ID of the failed request |
-| `outcome` | `"not_applied"`, `"partial"`, `"unknown"`, or `"applied"` when only the wait for embeddings failed |
 
 A lost response makes every row of its request `"outcome_unknown"`. The client
 never sends a request again. Writing the same rows again is safe while no other
@@ -313,7 +313,7 @@ hits = mine.rank(col("embedding").cosine("reset my password")).select("id", "bod
 
 | Column type | Values | Operations |
 | --- | --- | --- |
-| `Vector(n)` | `n` float32 values, as a list, a tuple or any contiguous float32 buffer such as `array("f")` or a NumPy array. Read as `array("f")`. | `cosine`, `dot`, `l2` |
+| `Vector(n)` | `n` float32 values, as a list, a tuple or any contiguous float32 buffer such as `array("f")` or a float32 NumPy array. Read as `array("f")`. | `cosine`, `dot`, `l2` |
 | `Vector(sparse=True)` | `{index: weight}` with unsigned 32-bit indices. Read as a dictionary in index order. | `cosine`, `dot` |
 | `list[Vector(n)]` | A list or tuple of up to 1,024 vectors, for example `list(matrix)`. Read as a list of `array("f")`. | `cosine`, `dot`: for every query vector, its best row vector, summed |
 | `list[str]` | A list of strings | `contains`, `contains_any` filters |
@@ -337,7 +337,7 @@ vectors as raw float32 bytes.
 | --- | --- |
 | `col(name).cosine(query)`, `.dot(query)`, `.l2(query)` | A ranking. A string is embedded with the column's model. `cosine` rejects a zero query vector. |
 | `col(name).match(text)` | A ranking by BM25 |
-| `col(name).contains(value)`, `.contains_any(values)` | Filters on `list[str]` columns. `contains_any` of nothing matches nothing. It sends a sequence in its order and a set sorted by UTF-8 bytes. |
+| `col(name).contains(value)`, `.contains_any(values)` | Filters on `list[str]` columns. `contains_any` of nothing matches nothing. It sends a `set` or `frozenset` sorted by UTF-8 bytes and any other iterable, `dict` keys included, in its order. |
 | `col(name).starts_with(prefix)` | Filter on `str` columns |
 | `rank(*rankings, fusion="rrf", candidates=100, recall=0.95, exact=False, consistency="latest")` | New query ordered by one ranking, or by several fused. `fusion` is `"rrf"` or one nonnegative weight per ranking. |
 | `rerank(ranking, *, candidates=200)` | New query that scores the best candidates of `rank` again |

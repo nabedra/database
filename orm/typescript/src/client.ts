@@ -206,7 +206,8 @@ export class Database {
     keyOrOptions: K | CreateTableOptions<S, K, E>,
     { format: positionalFormat }: { format?: "parquet" } = {},
   ): Promise<Table<S, K, E>> {
-    const options = typeof keyOrOptions === "object"
+    // A null key stays a ValidationError, as before options objects and as in Python.
+    const options = typeof keyOrOptions === "object" && keyOrOptions !== null
       ? checkOptions(keyOrOptions, ["key", "format", "partitionBy", "fullText", "embed"])
       : { key: keyOrOptions, format: positionalFormat }
     const { partitionBy, fullText, embed } = options as CreateTableOptions<S, K, E>

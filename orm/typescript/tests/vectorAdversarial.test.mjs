@@ -11,9 +11,7 @@ import { record } from "./fixtures/plainCorpus.mjs"
 const row = (over = {}) => ({ id: "a", n: 1n, f: 1, b: true, vec: [1, 2], sp: {}, mu: [], tags: [], ...over })
 
 // Scenarios that fail on the current code, each with its own named test below.
-const defects = new Set([
-  "misuse an unknown option",
-])
+const defects = new Set([])
 
 test("every scenario meets its expectations", { timeout: 300_000 }, async (t) => {
   const { scenarios, transcript } = await runAll()
@@ -30,7 +28,8 @@ test("a row is never applied without proof", { timeout: 300_000 }, async (t) => 
     const run = transcript[scenario.name]
     const { error } = run.result
     if (error?.type !== "BatchError" || error.outcomes.length === 0) continue
-    const reply = scenario.script[Math.min(run.requests.length, scenario.script.length) - 1]
+    // With no request recorded there is no reply, so nothing can have been applied.
+    const reply = run.requests.length === 0 ? {} : scenario.script[Math.min(run.requests.length, scenario.script.length) - 1]
     const wellFormed = reply.applied !== undefined
       || (reply.data !== undefined && reply.data.includes('"outcomes":[') && !reply.data.includes('"outcomes":{'))
     if (!wellFormed) {
@@ -223,9 +222,9 @@ test("errors are Nabedra errors, never raw", async (t) => {
   for (const call of calls) await assert.rejects(call, (error) => error.constructor.name.endsWith("Error") && error.code !== undefined)
 })
 
-// Known defects. Each test fails until the code is fixed.
+// Former defects, fixed in b0cab01b. Each test failed before the fix.
 
-test("DEFECT rank ignores an option it does not know, where Python raises TypeError", async (t) => {
+test("rank, rerank, rankMany and upsertMany refuse an option they do not know, as Python does", async (t) => {
   const { fake, chunks } = await harness(t)
   const ranking = col("emb").cosine([1, 0, 0])
   fake.reset(ok("[]"), ok("[]"), ok("[[]]"), { applied: 0 })
@@ -241,7 +240,7 @@ test("DEFECT rank ignores an option it does not know, where Python raises TypeEr
   assert.equal(fake.requests.length, 0, "a request with a misspelled option was sent")
 })
 
-test("DEFECT a not_applied row whose error code is outcome_unknown becomes an UnknownOutcomeError", async (t) => {
+test("a not_applied row whose error code is outcome_unknown is not an UnknownOutcomeError", async (t) => {
   // Python maps the unknown code to NabedraError. The row says not_applied, so its class must not say unknown.
   const { fake, db } = await harness(t)
   const scenario = loadScenarios().find((item) => item.name === "not_applied with the unknown code")

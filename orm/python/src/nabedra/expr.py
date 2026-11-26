@@ -1,7 +1,7 @@
 """Immutable predicates. Schema validation happens when attached to a query."""
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Set
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from ._vector import check_query, column_kind, has_zero_vector, query_value, to_wire
@@ -70,8 +70,9 @@ class Expr:
         if isinstance(values, str) or not isinstance(values, Iterable):
             raise ValidationError(f"Column {column!r} requires a list of strings")
         checked = tuple(_string(value, column) for value in values)
-        if isinstance(values, Set):
+        if isinstance(values, (set, frozenset)):
             # A set has no order. Sort by UTF-8 bytes so the request is the same in every process and SDK.
+            # Other iterables, dict keys included, keep their order, as in TypeScript.
             checked = tuple(sorted(checked, key=lambda value: value.encode("utf-8", "surrogatepass")))
         return Expr._from_node(("contains_any", column, checked))
 

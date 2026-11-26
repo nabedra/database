@@ -53,7 +53,9 @@ class Scenarios(unittest.TestCase):
             error = run["result"].get("error")
             if error is None or error["type"] != "BatchError" or not error["outcomes"]:
                 continue
-            reply = scenario["script"][min(len(run["requests"]), len(scenario["script"])) - 1]
+            # With no request recorded there is no reply, so nothing can have been applied.
+            reply = (scenario["script"][min(len(run["requests"]), len(scenario["script"])) - 1]
+                     if run["requests"] else {})
             well_formed = "applied" in reply or ("data" in reply and '"outcomes":[' in reply["data"]
                                                  and "outcomes\":{" not in reply["data"])
             with self.subTest(scenario["name"]):
@@ -273,10 +275,10 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class KnownDefects(unittest.TestCase):
-    """Each test fails until the code is fixed."""
+class FormerDefects(unittest.TestCase):
+    """Fixed in b0cab01b. Each test failed before the fix."""
 
-    def test_defect_contains_any_of_a_set_sends_a_hash_seed_dependent_order(self):
+    def test_contains_any_of_a_set_sends_one_order_for_every_hash_seed(self):
         # A set has no order. The request must not depend on PYTHONHASHSEED, or two processes and the
         # TypeScript SDK send different bytes for one query.
         import os

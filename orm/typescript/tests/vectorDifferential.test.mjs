@@ -10,10 +10,7 @@ const python = process.env.NABEDRA_TEST_PYTHON
 const root = fileURLToPath(new URL("../../python/", import.meta.url))
 
 // Scenarios whose outcome differs by the language's own types, with the reason.
-const language = new Map([
-  ["misuse an unknown option", "Python raises TypeError for an unknown keyword; see the DEFECT test in vectorAdversarial"],
-  ["not_applied with the unknown code", "see the DEFECT test in vectorAdversarial"],
-])
+const language = new Map([])
 
 // Messages that name a language's own types.
 const wording = [

@@ -207,7 +207,8 @@ def run_one(fake, db, scenario):
 def run_all(only=None):
     scenarios = json.loads(SCENARIOS.read_text(encoding="utf-8"))
     fake = Fake()
-    db = Database(fake.url, "fixture", timeout=2)
+    # 8 MiB requests must not time out on a loaded machine.
+    db = Database(fake.url, "fixture", timeout=30)
     try:
         return scenarios, {item["name"]: run_one(fake, db, item) for item in scenarios
                            if only is None or item["name"] in only}

@@ -55,9 +55,8 @@ test("options objects refuse unknown names and null like Python keyword argument
   }
   assert.doesNotThrow(() => query.rank(ranking, { recall: 0.5 }).rerank(ranking, { candidates: 3 }))
   const db = new Database({ url: "http://127.0.0.1:9", token: "test" })
-  for (const options of [{ key: "id", partition: "id" }, null]) {
-    await assert.rejects(db.createTable("t", { id: String }, options), TypeError)
-  }
+  await assert.rejects(db.createTable("t", { id: String }, { key: "id", partition: "id" }), TypeError)
+  await assert.rejects(db.createTable("t", { id: String }, null), ValidationError)
 })
 
 test("rows detach every value", () => {

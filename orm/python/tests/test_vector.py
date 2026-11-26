@@ -108,7 +108,7 @@ class VectorTests(unittest.TestCase):
     def test_contains_any_orders_sets_by_utf8_bytes_and_keeps_sequence_order(self):
         query = Query(TableContext())
         for values, expected in (({'é', 'Z', '\U0001f600', '\uffff'}, ['Z', 'é', '\uffff', '\U0001f600']),
-                                 (frozenset({'b', 'a'}), ['a', 'b']), ({'b': 1, 'a': 2}.keys(), ['a', 'b']),
+                                 (frozenset({'b', 'a'}), ['a', 'b']), ({'b': 1, 'a': 2}.keys(), ['b', 'a']),
                                  (['b', 'a'], ['b', 'a']), (('b', 'a'), ('b', 'a')), (iter(['b', 'a']), ['b', 'a'])):
             wire = query.where(col('tags').contains_any(values))._to_wire()['filter']['values']
             self.assertEqual(wire, list(expected))

@@ -196,8 +196,9 @@ async function writeMany(
     try {
       chunk = (await chunks.next()).value
     } catch (error) {
-      if (applied === 0 || !(error instanceof Error)) throw error
-      throw new BatchError(`Batch stopped after ${applied} applied rows: ${error.message}`,
+      if (applied === 0) throw error
+      const detail = error instanceof Error ? error.message : String(error)
+      throw new BatchError(`Batch stopped after ${applied} applied rows: ${detail}`,
         { applied, outcome: "partial", cause: error })
     }
     if (chunk === undefined) return applied
@@ -217,7 +218,7 @@ function knownColumn(table: object, column: string): ColumnType {
   return schema[column]
 }
 
-/** A handle to one table ID and its original schema. */
+/** A handle to one table ID and its schema. Only its own column changes update that schema. */
 export class Table<
   S extends Schema = Schema, K extends Column<S> = Column<S>, E extends Column<S> = never,
 > {

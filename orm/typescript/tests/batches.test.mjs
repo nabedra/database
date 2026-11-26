@@ -181,6 +181,14 @@ test("VS15 later input errors keep the applied count", async (t) => {
     assert.deepEqual([error.applied, error.outcomes, error.outcome], [10_000, [], "partial"])
     assert.ok(error.cause instanceof cause)
   }
+  // A throwable that is not an Error keeps the applied count too.
+  async function* strings() {
+    yield* rows(10_001)
+    throw "source" // eslint-disable-line no-throw-literal
+  }
+  server.chunks = []
+  const thrown = await batchError(table.upsertMany(strings()))
+  assert.deepEqual([thrown.applied, thrown.cause, thrown.message], [10_000, "source", "Batch stopped after 10000 applied rows: source"])
   server.chunks = []
   // Nothing was sent, so the original error is the whole story.
   await assert.rejects(table.upsertMany(input(1, { id: "x", note: "" })), ValidationError)

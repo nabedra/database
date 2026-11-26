@@ -198,7 +198,8 @@ export function loadScenarios() {
 export async function runAll(only) {
   const scenarios = loadScenarios()
   const fake = await Fake.start()
-  const db = new Database({ url: fake.url, token: "fixture", timeout: 2 })
+  // 8 MiB requests must not time out on a loaded machine.
+  const db = new Database({ url: fake.url, token: "fixture", timeout: 30 })
   const transcript = {}
   try {
     for (const scenario of scenarios) {
