@@ -26,7 +26,7 @@ use std::{
 
 use nabedra_check::history::{Event, EventType};
 use nabedra_oltp_types::{
-    sim_probe::{Probe, emit},
+    sim_probe::{GuardKind, Probe, emit, next_guard},
     types::{AppliedPosition, Digest, GroupKind},
 };
 use nabedra_protocol::protocol::Key;
@@ -91,19 +91,33 @@ fn subscriptions_see_accepted_probes_with_their_origin() {
     });
 }
 
+/// Native leases held by the live process of `node`.
+fn native_leases(probes: &Probes, node: u64) -> u64 {
+    probes
+        .lock()
+        .protocol
+        .guards()
+        .held(node, GuardKind::NativeLease)
+}
+
 /// A lease that reports its release when it drops, as `NativeSettlement` does.
-struct Lease;
+struct Lease(u64);
 
 impl Lease {
     fn acquire() -> Self {
-        emit(|| Probe::GuardAcquired { class: "query" });
-        Self
+        let guard = next_guard();
+        emit(|| Probe::GuardAcquired {
+            guard,
+            kind: GuardKind::NativeLease,
+            class: "query",
+        });
+        Self(guard)
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        emit(|| Probe::GuardReleased);
+        emit(|| Probe::GuardReleased { guard: self.0 });
     }
 }
 
@@ -114,14 +128,14 @@ fn a_retired_task_that_drops_its_lease_after_the_restart_is_dead() {
     sim::run(1, |world| async move {
         world.add_node(1, NodeClock::default());
         let (checks, probes) = installed(&world);
-        let mut releases =
-            probes.subscribe(|event: &ProbeEvent| matches!(event.probe, Probe::GuardReleased));
+        let mut releases = probes
+            .subscribe(|event: &ProbeEvent| matches!(event.probe, Probe::GuardReleased { .. }));
         let retired = world.spawn_node(1, async {
             let _lease = Lease::acquire();
             std::future::pending::<()>().await;
         });
         tokio::task::yield_now().await;
-        assert_eq!(probes.native_outstanding(1), 1);
+        assert_eq!(native_leases(&probes, 1), 1);
 
         world.crash(1);
         world.restart(1);
@@ -138,16 +152,18 @@ fn a_retired_task_that_drops_its_lease_after_the_restart_is_dead() {
         let running = world.spawn_node(1, async {
             drop(Lease::acquire());
             let held = Lease::acquire();
+            let guard = held.0;
             std::mem::forget(held);
+            guard
         });
-        running.await.unwrap();
+        let held = running.await.unwrap();
         assert!(releases.try_recv().expect("a counted release").live);
-        assert_eq!(probes.native_outstanding(1), 1);
+        assert_eq!(native_leases(&probes, 1), 1);
         assert!(checks.violations().is_empty(), "{:?}", checks.violations());
         world
-            .spawn_node(1, async {
-                drop(Lease);
-                drop(Lease);
+            .spawn_node(1, async move {
+                drop(Lease(held));
+                drop(Lease(held));
             })
             .await
             .unwrap();

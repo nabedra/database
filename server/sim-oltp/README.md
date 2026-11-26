@@ -48,6 +48,43 @@ and excludes the injected deletion from the client history. For the seeded stale
 records a previously observed row in place of the latest HTTP response. Both controls are
 part of the development-only harness.
 
+## Resources overlay
+
+`NABEDRA_SIM_WORKLOAD=resources` runs `direct`, `cold` and `move` with the phase 11 `resources`
+overlay, and `direct,resources` runs it on `direct` alone. Without `resources` in the list the
+overlay draws nothing and changes nothing. With it, the run lowers some limits, cuts client
+requests at a drawn poll, fills the admission limits, stalls and drains processes during work, and
+ends with a quiet stage that must leave every resource ledger where it was.
+
+```sh
+NABEDRA_SIM_WORKLOAD=direct,resources NABEDRA_SEED=1 NABEDRA_SEEDS=1 NABEDRA_SIM_VERIFY_REPLAY=1 \
+  cargo run --locked --release -p nabedra-sim-oltp --bin nabedra-sim -- run
+```
+
+Every run installs the probes, so their rules run too. `ExactlyOnceRelease` and
+`ReleaseAfterWork` follow every native lease and Raft log write by name. A request that a client cuts still runs on the servers,
+as the product intends. Only a deadline or a stop cancels work there, so the seeds with a short
+deadline and many stalls are the ones that abandon native work.
+
+## Topology workload
+
+`NABEDRA_SIM_WORKLOAD=topology` runs splits, replica moves, leader transfers, index publication, a
+table drop and gateways with old routes next to the phase 10 nemesis and clients. The rules and the
+text each one quotes are in `src/invariants/topology.rs`. Rules that no public answer can judge have
+fixtures there and are `not_run` in the sweep record until probes feed them.
+
+A seed's summary says how often each rule was judged. A rule with a count of 0 did not run in that
+seed, and the sweep record lists it as `not_run` with the seed. A seed in which no client write
+committed, no client read was answered or no auditor scan was answered under load is red (`Progress`).
+
+`NABEDRA_SIM_TOPOLOGY` forces parts of the drawn plan, as a comma list: `split-under-load` or
+`split-before-load`, `move` or `no-move`, and `drop-race` or `no-drop-race`. A requested split that
+does not publish within its bound after the heal is red. `NABEDRA_SIM_TOPOLOGY_DEFECT` seeds one
+defect (`lose-row`, `duplicate-row`, `choose-building`, `fake-drop`, `refresh-twice`,
+`lie-about-refusal`, `stuck-fence`, `lose-range`). `scripts/testing/sim_planted.py` runs each with its
+clean twin. They test the rules and their wiring. Only `lose-row` and `fake-drop` change what the
+cluster does.
+
 ## Evidence scope
 
 The sweep report stores seed and configuration hashes, trace hashes, replay counts, virtual

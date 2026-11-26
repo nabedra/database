@@ -20,6 +20,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::{Arc, Mutex, Weak},
     thread::{self, ThreadId},
+    time::Duration,
 };
 
 use nabedra_check::history::{Event, EventType};
@@ -37,7 +38,8 @@ use crate::{
     history::Bodies,
     invariants::{
         Invariants,
-        protocol::{Ledgers, NOT_APPLIED_NEVER_COMMITTED, Origin, Protocol},
+        protocol::{EXACTLY_ONCE_RELEASE, Ledgers, NOT_APPLIED_NEVER_COMMITTED, Origin, Protocol},
+        resources::GuardCounts,
     },
     trace::TraceFile,
 };
@@ -165,15 +167,32 @@ impl Probes {
             hub.snapshot = Some(node);
         }
         sim_probe::snapshot_ledgers(node);
-        let mut hub = self.lock();
-        hub.snapshot = None;
-        hub.protocol.ledgers(node)
+        let (ledgers, violations) = {
+            let mut hub = self.lock();
+            hub.snapshot = None;
+            (hub.protocol.ledgers(node), hub.protocol.count_guards(node))
+        };
+        if let Some(world) = sim::world() {
+            for (kind, detail) in violations {
+                self.report(&world, kind, detail);
+            }
+        }
+        ledgers
     }
 
-    /// Native leases the probes saw acquired and not released on `node` in its current
-    /// incarnation.
-    pub fn native_outstanding(&self, node: u64) -> u64 {
-        self.lock().protocol.native_outstanding(node)
+    /// What happened to the guards of live processes so far.
+    pub fn guard_counts(&self) -> GuardCounts {
+        self.lock().protocol.guards().counts()
+    }
+
+    /// ExactlyOnceRelease at a quiescent point of `node` that began at `since`.
+    pub(crate) fn check_lost_guards(&self, world: &World, node: u64, since: Duration) {
+        let since = u64::try_from(since.as_nanos()).unwrap_or(u64::MAX);
+        self.ran(EXACTLY_ONCE_RELEASE, 1);
+        let lost = self.lock().protocol.guards().lost(node, since);
+        for (kind, detail) in lost {
+            self.report(world, kind, detail);
+        }
     }
 
     /// NotAppliedNeverCommitted: after a definite `not_applied` answer, no replica ever

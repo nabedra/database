@@ -3,6 +3,11 @@
 //! checked synchronously as each probe arrives.
 
 pub mod protocol;
+pub mod resources;
+
+pub(crate) mod membership;
+#[cfg(test)]
+mod membership_tests;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -10,6 +15,9 @@ use std::{
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
+
+pub(crate) mod queued;
+pub(crate) mod topology;
 
 use nabedra_check::{checker::Verdict, history::Event};
 use nabedra_rt::{
@@ -491,7 +499,7 @@ impl Invariants {
     }
 
     /// A probe snapshot of `worker`'s ledgers, without holding the checks lock.
-    fn ledgers(&self, worker: u64) -> Option<Ledgers> {
+    pub(crate) fn ledgers(&self, worker: u64) -> Option<Ledgers> {
         self.probes().map(|probes| probes.snapshot(worker))
     }
 

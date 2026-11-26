@@ -45,6 +45,10 @@ pub enum Ledger {
     ComputeGuards,
     /// Native leases prepared and not yet settled.
     NativeLeases,
+    /// Free physical slots of one native executor.
+    FreeNativeSlots(&'static str),
+    /// Raft log writes started and not yet finished.
+    PendingWrites,
     /// Bytes held by scratch leases.
     ScratchBytes,
     /// Disk reservations held on one device, and their bytes.
@@ -56,6 +60,18 @@ pub enum Ledger {
     },
     /// `RangeClock` commits registered and not yet settled, per group.
     RangeClockPending,
+}
+
+/// What a guard that [`Probe::GuardAcquired`] reports holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardKind {
+    /// A native lease of `WorkerSharedResources`. Counted by [`Ledger::NativeLeases`].
+    NativeLease,
+    /// The permit of a native executor's slot. No ledger counts it: the free slots are one.
+    NativeSlot,
+    /// A pending Raft log write. Counted by [`Ledger::PendingWrites`].
+    PendingWrite,
 }
 
 /// A route: a half-open key span, unbounded where it is `None`, and the group that owns it.
@@ -205,12 +221,18 @@ pub enum Probe {
     QueueCopy { request_id: Uuid },
     /// Reserved for phase 11: a receipt reached a terminal state.
     Receipt { request_id: Uuid },
-    /// `WorkerSharedResources` granted a native lease.
-    GuardAcquired { class: &'static str },
-    /// A native lease settled.
-    GuardReleased,
-    /// A native job's work returned, before its lease settles.
-    WorkDone { class: &'static str },
+    /// A guard was granted. `guard` names it within the world, from [`next_guard`].
+    GuardAcquired {
+        guard: u64,
+        kind: GuardKind,
+        class: &'static str,
+    },
+    /// A guard was released: its ledger no longer counts it.
+    GuardReleased { guard: u64 },
+    /// The work that `guard` covers started.
+    WorkStarted { guard: u64 },
+    /// That work returned. `abandoned` means that its caller had already been cancelled.
+    WorkDone { guard: u64, abandoned: bool },
 }
 
 impl Probe {
@@ -235,7 +257,8 @@ impl Probe {
             Self::QueueCopy { .. } => "QueueCopy",
             Self::Receipt { .. } => "Receipt",
             Self::GuardAcquired { .. } => "GuardAcquired",
-            Self::GuardReleased => "GuardReleased",
+            Self::GuardReleased { .. } => "GuardReleased",
+            Self::WorkStarted { .. } => "WorkStarted",
             Self::WorkDone { .. } => "WorkDone",
         }
     }
@@ -273,6 +296,28 @@ pub fn emit(probe: impl FnOnce() -> Probe) {
 /// True when a sink is installed, for a probe that needs work before it can be built.
 pub fn active() -> bool {
     nabedra_rt::sim::world().is_some_and(|world| world.with_ext::<ProbeSink, _>(|_| ()).is_some())
+}
+
+/// How many guards the world has named.
+struct Guards(u64);
+
+/// The next guard's name in this world, from 1. Zero, which names no guard, outside a
+/// simulation world or without a sink.
+pub fn next_guard() -> u64 {
+    let Some(world) = nabedra_rt::sim::world() else {
+        return 0;
+    };
+    if world.with_ext::<ProbeSink, _>(|_| ()).is_none() {
+        return 0;
+    }
+    let next = world.with_ext::<Guards, _>(|guards| {
+        guards.0 += 1;
+        guards.0
+    });
+    next.unwrap_or_else(|| {
+        world.insert_ext(Guards(1));
+        1
+    })
 }
 
 type LedgerSource = Box<dyn Fn() -> bool + Send>;
@@ -341,6 +386,18 @@ mod tests {
             });
         });
         assert_eq!(*seen.lock().unwrap(), ["SnapshotServed", "SnapshotServed"]);
+    }
+
+    #[test]
+    fn guards_are_named_in_order_within_a_world() {
+        assert_eq!(next_guard(), 0);
+        for _ in 0..2 {
+            nabedra_rt::sim::run(1, |world| async move {
+                assert_eq!(next_guard(), 0);
+                ProbeSink::new(|_| ()).install(&world);
+                assert_eq!([next_guard(), next_guard()], [1, 2]);
+            });
+        }
     }
 
     #[test]

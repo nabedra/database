@@ -518,15 +518,17 @@ impl WorkerSharedResources {
                 return Err(capacity());
             }
             state.count += 1;
-            #[cfg(feature = "sim")]
-            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GuardAcquired {
-                class: class_name(class),
-            });
         }
+        #[cfg(feature = "sim")]
+        let guard = probe_acquired(class);
         let mut lease = NativeLease {
             permit: None,
             owner: self.clone(),
-            settlement: NativeSettlement(self.leases.clone()),
+            settlement: NativeSettlement(
+                self.leases.clone(),
+                #[cfg(feature = "sim")]
+                guard,
+            ),
         };
         #[cfg(any(test, feature = "test-hooks"))]
         self.native_jobs[class as usize].fetch_add(1, Ordering::Relaxed);
@@ -540,6 +542,8 @@ impl WorkerSharedResources {
             .acquire_owned()
             .await
             .map_err(|_| capacity())?;
+        #[cfg(feature = "sim")]
+        let permit = SlotPermit::new(permit, class);
         lease.permit = Some(permit);
         Ok(PreparedNative { class, lease })
     }
@@ -617,17 +621,27 @@ struct LeaseState {
     count: usize,
 }
 struct NativeLease {
+    #[cfg(not(feature = "sim"))]
     permit: Option<OwnedSemaphorePermit>,
+    #[cfg(feature = "sim")]
+    permit: Option<SlotPermit>,
     owner: Arc<WorkerSharedResources>,
     settlement: NativeSettlement,
 }
 /// Tracks job settlement without keeping the worker or its executor alive.
-struct NativeSettlement(Arc<NativeLeases>);
+struct NativeSettlement(
+    Arc<NativeLeases>,
+    /// The guard's name in the probe stream.
+    #[cfg(feature = "sim")]
+    u64,
+);
 impl Drop for NativeSettlement {
     fn drop(&mut self) {
         self.0.state.lock().expect("native lease state").count -= 1;
         #[cfg(feature = "sim")]
-        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GuardReleased);
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GuardReleased {
+            guard: self.1,
+        });
         self.0.settled.notify_waiters();
     }
 }
@@ -713,16 +727,19 @@ impl PreparedNative {
         };
         let (tx, rx) = oneshot::channel();
         #[cfg(feature = "sim")]
-        let class = self.class;
+        let (probed, slot) = (
+            self.lease.settlement.1,
+            self.lease.permit.as_ref().map_or(0, |permit| permit.guard),
+        );
         let job = (guard, work, self.lease);
         executor.send(Box::new(move || {
             let (guard, work, lease) = job;
+            #[cfg(feature = "sim")]
+            probe_work(&[probed, slot], None);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
                 .unwrap_or_else(|_| Err(super::super::recovery_unknown()));
             #[cfg(feature = "sim")]
-            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::WorkDone {
-                class: class_name(class),
-            });
+            probe_work(&[probed, slot], Some(tx.is_closed()));
             // Release the slot and the worker owner before the caller can see
             // the result: a caller that then drops its last owner must find the
             // worker unbound, or a reopen is refused (C02, CIfix1).
@@ -782,12 +799,81 @@ impl WorkerSharedResources {
         }
         let leases = self.leases.state.lock().expect("native lease state").count;
         snapshot(Ledger::NativeLeases, leases as u64);
+        for (class, executor) in [
+            (ExecutionClass::Query, &self.query),
+            (ExecutionClass::Control, &self.control),
+        ] {
+            let free = executor.slots.available_permits() as u64;
+            snapshot(Ledger::FreeNativeSlots(class_name(class)), free);
+        }
         snapshot(Ledger::ScratchBytes, self.working_decode_bytes() as u64);
         for disk in self.storage_reservations() {
             let (device, reservations, bytes) = disk.ledger();
             snapshot(Ledger::DiskReservations { device }, reservations);
             snapshot(Ledger::DiskReservedBytes { device }, bytes);
         }
+    }
+}
+
+/// Reports a new native lease, and returns its name in the probe stream.
+#[cfg(feature = "sim")]
+fn probe_acquired(class: ExecutionClass) -> u64 {
+    probe_guard(nabedra_oltp_types::sim_probe::GuardKind::NativeLease, class)
+}
+
+#[cfg(feature = "sim")]
+fn probe_guard(kind: nabedra_oltp_types::sim_probe::GuardKind, class: ExecutionClass) -> u64 {
+    use nabedra_oltp_types::sim_probe::{Probe, emit, next_guard};
+    let guard = next_guard();
+    emit(|| Probe::GuardAcquired {
+        guard,
+        kind,
+        class: class_name(class),
+    });
+    guard
+}
+
+/// Reports that the work under a lease and its slot started, or returned. `done` says whether its
+/// caller had been cancelled. The lease is the first guard, and the one that work is counted by.
+#[cfg(feature = "sim")]
+fn probe_work(guards: &[u64], done: Option<bool>) {
+    use nabedra_oltp_types::sim_probe::{Probe, emit};
+    for (index, &guard) in guards.iter().enumerate() {
+        emit(|| match done {
+            None => Probe::WorkStarted { guard },
+            Some(abandoned) => Probe::WorkDone {
+                guard,
+                abandoned: abandoned && index == 0,
+            },
+        });
+    }
+}
+
+/// A slot's permit with its name in the probe stream (simulation only).
+#[cfg(feature = "sim")]
+struct SlotPermit {
+    _permit: OwnedSemaphorePermit,
+    guard: u64,
+}
+
+#[cfg(feature = "sim")]
+impl SlotPermit {
+    fn new(permit: OwnedSemaphorePermit, class: ExecutionClass) -> Self {
+        let kind = nabedra_oltp_types::sim_probe::GuardKind::NativeSlot;
+        Self {
+            _permit: permit,
+            guard: probe_guard(kind, class),
+        }
+    }
+}
+
+#[cfg(feature = "sim")]
+impl Drop for SlotPermit {
+    fn drop(&mut self) {
+        let guard = self.guard;
+        nabedra_oltp_types::sim_probe::emit(|| {
+            nabedra_oltp_types::sim_probe::Probe::GuardReleased { guard }
+        });
     }
 }
 

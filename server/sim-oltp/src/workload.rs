@@ -31,6 +31,8 @@ use crate::{
 };
 
 const OPERATIONS: &str = "/v1/operations";
+/// The assertion that the `resources` overlay's stage was judged.
+pub(crate) const STAGE_JUDGED: &str = "resources stage judged";
 const SETUP_DEADLINE: Duration = Duration::from_secs(20);
 const SETTLE_LIMIT: Duration = Duration::from_secs(2);
 
@@ -57,6 +59,13 @@ fn run(
     }
     if setup.selection.focus.batch {
         config.force("data.direct.batch", json!(true));
+    }
+    if setup.workloads.overlay() {
+        let d05 = workloads::paused::samples(seed, workload) || setup.selection.focus.d05;
+        workloads::resources::limits(seed, &mut config, !d05);
+    }
+    if workload == Workload::Queued {
+        config.force("direct_oltp", json!(workloads::queued::direct(seed)));
     }
     let program = (workload == Workload::Smoke).then(|| Program::generate(generator));
     let (mut result, world, panics) = nabedra_sim::runtime::run(seed, |world| async move {
@@ -210,6 +219,10 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         let trace = trace.clone();
         move |ms, conn, line: &str| trace.lock().unwrap().record(ms, conn, line)
     };
+    if workload == Workload::Membership {
+        // A lost volume that is formatted again repeats its inode numbers, as `mkfs` does.
+        world.set_mkfs_inodes(true);
+    }
     match Cluster::new(
         world.clone(),
         checks.clone(),
@@ -221,7 +234,19 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     {
         Ok(mut cluster) => {
             let body = panics::caught(async {
-                let startup = cluster.start().await;
+                let configured = match workload {
+                    Workload::Queued => workloads::queued::configure(&mut cluster.config, seed),
+                    _ => Ok(()),
+                };
+                let mut membership = (workload == Workload::Membership)
+                    .then(|| workloads::membership::Membership::draw(generator));
+                let startup = match configured {
+                    Ok(()) => match membership.as_mut() {
+                        Some(membership) => membership.start(&mut cluster).await,
+                        None => cluster.start().await,
+                    },
+                    Err(error) => Err(error),
+                };
                 assertions.insert("cluster readiness", startup.is_ok());
                 // Only then: a sweep is a test build too, and extra tasks change its schedule.
                 #[cfg(test)]
@@ -230,17 +255,63 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
                 }
                 match startup {
                     Ok(()) if workload != Workload::Smoke => {
-                        let report = workloads::direct::run(
-                            &mut cluster,
-                            &config,
-                            history.clone(),
-                            generator,
-                            seed,
-                            workload,
-                            &setup.selection,
-                            setup.quiet,
-                        )
-                        .await;
+                        let report = if let Some(membership) = membership {
+                            membership
+                                .run(
+                                    &mut cluster,
+                                    &config,
+                                    history.clone(),
+                                    generator,
+                                    seed,
+                                    &setup.selection,
+                                    setup.quiet,
+                                )
+                                .await
+                        } else if workload == Workload::Queued {
+                            workloads::queued::run(
+                                &mut cluster,
+                                &config,
+                                history.clone(),
+                                generator,
+                                seed,
+                                &setup.selection,
+                                setup.quiet,
+                            )
+                            .await
+                        } else if workload == Workload::Topology {
+                            workloads::topology::run(
+                                &mut cluster,
+                                &config,
+                                history.clone(),
+                                generator,
+                                seed,
+                                &setup.selection,
+                                setup.quiet,
+                            )
+                            .await
+                        } else {
+                            workloads::direct::run(
+                                &mut cluster,
+                                &config,
+                                history.clone(),
+                                generator,
+                                seed,
+                                workload,
+                                &setup.selection,
+                                setup.quiet,
+                                setup.workloads.overlay(),
+                            )
+                            .await
+                        };
+                        if setup.workloads.overlay() {
+                            let judged = report.as_ref().is_ok_and(|report| report.stage_judged);
+                            assertions.insert(STAGE_JUDGED, judged);
+                            if !judged && !has_violation(&checks, workloads::resources::NOT_JUDGED)
+                            {
+                                let why = "the run ended before it";
+                                workloads::resources::not_judged(&checks, &world, why);
+                            }
+                        }
                         match report {
                             Ok(report) => {
                                 for (name, passed) in report.assertions {
@@ -325,13 +396,17 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
     let mut unclassified_conflicts = 0;
     let mut not_judged = BTreeMap::new();
     if history.events().iter().any(|event| event.key.is_some()) {
-        let verdict = history.check_direct();
+        let (assertion, verdict) = if workload == Workload::Queued {
+            (
+                "transactions, per-key linearizability and outcomes",
+                workloads::queued::check(history.events()),
+            )
+        } else {
+            ("linearizability and keyed dedup", history.check_direct())
+        };
         unclassified_conflicts = verdict.unclassified_conflicts;
         not_judged = verdict.not_judged.clone();
-        assertions.insert(
-            "linearizability and keyed dedup",
-            verdict.anomalies.is_empty(),
-        );
+        assertions.insert(assertion, verdict.anomalies.is_empty());
         checks.check_history(&world, &verdict);
     }
     checks.check_outcomes(&world, history.events(), history.bodies());

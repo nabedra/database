@@ -15,6 +15,7 @@ use crate::{
     bootstrap::{DATABASE, http_addr},
     history::Completion,
     net::HttpConnection,
+    workloads::resources,
 };
 
 pub(crate) struct Reply {
@@ -64,7 +65,8 @@ pub(crate) async fn request(
     deadline: Duration,
 ) -> Result<Reply, String> {
     let addr = http_addr(gateway);
-    in_node(client, async move {
+    let cut = resources::cut(client);
+    let call = in_node(client, async move {
         timeout(deadline, async {
             let mut connection = HttpConnection::connect(Target::Addr(addr))
                 .await
@@ -96,8 +98,14 @@ pub(crate) async fn request(
         })
         .await
         .map_err(|_| format!("HTTP n{gateway} {path} deadline"))?
-    })
-    .await
+    });
+    match cut {
+        None => call.await,
+        Some(cut) => cut
+            .run(call)
+            .await
+            .unwrap_or_else(|| Err(resources::CANCELLED.into())),
+    }
 }
 
 /// The bytes of a request body, as they go on the wire.

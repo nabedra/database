@@ -25,7 +25,7 @@ const CLOCKS: &[(u64, &str, &str)] = &[
 
 /// The largest fixed Data apply reply budget, `META.output_bytes` in
 /// `oltp-replication`'s `hosted.rs`.
-const MIN_APPLY_REPLY_BYTES: i64 = 128 << 10;
+pub(crate) const MIN_APPLY_REPLY_BYTES: i64 = 128 << 10;
 
 pub(crate) struct Config {
     knobs: BTreeMap<String, Value>,
@@ -53,7 +53,8 @@ impl Config {
         Self { knobs }
     }
 
-    /// Override one sampled knob, as a seed-search focus token asks (`batch`).
+    /// Override one sampled knob, as a seed-search focus token (`batch`) or the `resources`
+    /// overlay asks.
     pub fn force(&mut self, knob: &str, value: Value) {
         assert!(self.knobs.contains_key(knob), "unknown knob {knob}");
         self.knobs.insert(knob.into(), value);
