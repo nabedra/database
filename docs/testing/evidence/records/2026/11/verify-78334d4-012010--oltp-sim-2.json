@@ -1,0 +1,46 @@
+{
+  "artifacts": [
+    {
+      "name": "verify-78334d4-012010--oltp-sim-2.log",
+      "sha256": "3a1798f435274d645e26eb131cd1d1f959d43ee4905d9b175b7847fcaa0b1e0d"
+    }
+  ],
+  "assertions": {
+    "executed": 89,
+    "failed": 1,
+    "not_run": [
+      {
+        "id": "ignored",
+        "reason": "2 tests marked #[ignore]"
+      }
+    ]
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim-2",
+  "duration_s": 1352.294,
+  "guarantees": [
+    "OLTP-G02",
+    "OLTP-G03"
+  ],
+  "kind": "S H",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-26T00:51:57.941159+00:00",
+    "request_id": "verify-78334d4-012010",
+    "runner": "GitHub Actions 1000014587",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45727968538"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "78334d4eb3b5d05ae7c72eb39bcf3eca0b792ee5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

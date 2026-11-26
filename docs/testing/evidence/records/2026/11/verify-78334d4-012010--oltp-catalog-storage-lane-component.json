@@ -1,0 +1,41 @@
+{
+  "artifacts": [
+    {
+      "name": "verify-78334d4-012010--oltp-catalog-storage-lane-component.log",
+      "sha256": "1b5b2eec1dbd51739a1c16d5be2d241f48c6b29d21fb08a2200162830ffcf0b8"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-catalog-storage-lane-component",
+  "duration_s": 226.108,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-26T00:29:34.041220+00:00",
+    "request_id": "verify-78334d4-012010",
+    "runner": "GitHub Actions 1000014555",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45727968538"
+  },
+  "scenarios": [
+    "O07",
+    "Q01"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "78334d4eb3b5d05ae7c72eb39bcf3eca0b792ee5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

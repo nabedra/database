@@ -1,0 +1,46 @@
+{
+  "artifacts": [
+    {
+      "name": "verify-78334d4-012010--check-history.log",
+      "sha256": "35e725bf733a076fdd159f6e4cff82809bf522f67a8bfda5e77b669f8e286550"
+    }
+  ],
+  "assertions": {
+    "executed": 26,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "check-history",
+  "duration_s": 19.609,
+  "guarantees": [
+    "OLTP-G02",
+    "OLTP-G03",
+    "OLTP-G04",
+    "EVT-G01",
+    "EVT-G02",
+    "EVT-G03",
+    "CACHE-G05"
+  ],
+  "kind": "H",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-26T00:22:40.580805+00:00",
+    "request_id": "verify-78334d4-012010",
+    "runner": "GitHub Actions 1000014527",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45727968538"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "78334d4eb3b5d05ae7c72eb39bcf3eca0b792ee5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

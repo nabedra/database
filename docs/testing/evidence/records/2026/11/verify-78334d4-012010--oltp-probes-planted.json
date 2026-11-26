@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "verify-78334d4-012010--oltp-probes-planted.log",
+      "sha256": "463619b609cbd15c8d367da303ef05cf3bc34612d0cd2986ae39776a17f38f0f"
+    }
+  ],
+  "assertions": {
+    "executed": 2,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-probes-planted",
+  "duration_s": 1244.235,
+  "guarantees": [],
+  "kind": "S H",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-26T00:36:28.541191+00:00",
+    "request_id": "verify-78334d4-012010",
+    "runner": "GitHub Actions 1000014579",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45727968538"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "78334d4eb3b5d05ae7c72eb39bcf3eca0b792ee5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

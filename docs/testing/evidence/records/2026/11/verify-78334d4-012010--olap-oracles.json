@@ -1,0 +1,44 @@
+{
+  "artifacts": [
+    {
+      "name": "verify-78334d4-012010--olap-oracles.log",
+      "sha256": "dc20a95fab9618d2c7b3025b04b7414b854bc2f8601cd54454149255222a71dd"
+    }
+  ],
+  "assertions": {
+    "executed": 3,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "olap-oracles",
+  "duration_s": 126.968,
+  "guarantees": [
+    "OLAP-G06",
+    "OLAP-G08"
+  ],
+  "kind": "D U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-26T00:29:08.073397+00:00",
+    "request_id": "verify-78334d4-012010",
+    "runner": "GitHub Actions 1000014551",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45727968538"
+  },
+  "scenarios": [
+    "U01",
+    "U02"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "78334d4eb3b5d05ae7c72eb39bcf3eca0b792ee5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

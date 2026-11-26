@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "name": "verify-78334d4-012010--oltp-snapshot-atomicity-repeat.log",
+      "sha256": "03ae46a7ef650150f3d41bf159cce2a463bb061b7f9391582d426c76d27c6d71"
+    }
+  ],
+  "assertions": {
+    "executed": 40,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-snapshot-atomicity-repeat",
+  "duration_s": 1421.894,
+  "guarantees": [],
+  "kind": "R",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-26T01:32:10.710657+00:00",
+    "request_id": "verify-78334d4-012010",
+    "runner": "GitHub Actions 1000014602",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45727968538"
+  },
+  "scenarios": [
+    "O07"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "78334d4eb3b5d05ae7c72eb39bcf3eca0b792ee5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

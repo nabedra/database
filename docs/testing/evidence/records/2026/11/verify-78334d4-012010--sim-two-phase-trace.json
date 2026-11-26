@@ -1,0 +1,254 @@
+{
+  "artifacts": [
+    {
+      "name": "verify-78334d4-012010--sim-two-phase-trace.log",
+      "sha256": "e4ea5433a6e6845c946bb9b457f06e2cd41c1d4351132403b80b7cc426c47a71"
+    },
+    {
+      "name": "tla/summary.json",
+      "sha256": "8f58fedaeacc2af3bfaa1b4ac8ed457598d639bf8f950881d2dc5118a44d77c8"
+    },
+    {
+      "name": "tla/control.log",
+      "sha256": "28b6893243ce057ea9a5fc1690a126b24e61cac7bdaf55b9b4eec6b64324a8d2"
+    },
+    {
+      "name": "tla/control.ndjson",
+      "sha256": "ce8506758e12c4b49f3de57fb371291ce87ef7b4277cc133bd886ce86ed85a37"
+    },
+    {
+      "name": "tla/mutant-changed_var_missing.log",
+      "sha256": "bd1409ad1c3704213c529864739911679abc937973f41af4c2676feb676d5cee"
+    },
+    {
+      "name": "tla/mutant-choice.log",
+      "sha256": "1d8dd6e25c203f940572e5103827ff1d2aacac21795b47f1257bd0c19e659427"
+    },
+    {
+      "name": "tla/mutant-optional_set_missing.log",
+      "sha256": "99ea17339f1eb6038f41c91f902317507086344a980c4816fed7cdd95934fdab"
+    },
+    {
+      "name": "tla/mutant-optional_set_wrong.log",
+      "sha256": "48983ec1ba64d6646cf427730b3ed6da530896fea56ac4e7531ab15722ffc775"
+    },
+    {
+      "name": "tla/mutant-optional_var_missing.log",
+      "sha256": "7c82a85856b8b378e6b49fea071991c15988b9d70396db0ce5645b4ad4a965cf"
+    },
+    {
+      "name": "tla/mutant-optional_var_wrong.log",
+      "sha256": "5c4cc5196a1ad311c6baabf1dba7a80717b9bfddcb6304393c900d8634804332"
+    },
+    {
+      "name": "tla/mutant-reads_seed.log",
+      "sha256": "a9a1b276c421c9c66e56662fbf8b7e22796a1ba7aa816e278d70fb9a57bcf652"
+    },
+    {
+      "name": "tla/mutant-reads_t.log",
+      "sha256": "ea23f38f3fe397350e07384ad280c295f1ee49e872c7930af27414857e0cef80"
+    },
+    {
+      "name": "tla/mutant-set_as_object.log",
+      "sha256": "0512b3a22c751e55e7879b689a50e82bb61c640e79dcbe4f418dbed6174b2a82"
+    },
+    {
+      "name": "tla/mutant-silent_step.log",
+      "sha256": "0f9fdcb8c1b1391c5c44589a5eae230ccb603b963c3fb8410871c2d7aee5bc4b"
+    },
+    {
+      "name": "tla/mutant-silent_step_unchecked.log",
+      "sha256": "701bc970ab75bdeb2b37a856318033996a98650393de1c96afa7399de0b801ec"
+    },
+    {
+      "name": "tla/mutant-skip_line.log",
+      "sha256": "408af1a6132054aa49dad99f8184a9a49131c80bb1e7e03d43500abed49ab551"
+    },
+    {
+      "name": "tla/mutant-skip_line_unassigned.log",
+      "sha256": "710feaf33a5f4c4516adafaf32e8476beaaf31995b5e4d885de6610bbe026915"
+    },
+    {
+      "name": "tla/mutant-skip_line_unchecked.log",
+      "sha256": "ac9c8875c6af92bfacc4ad6299097e14ab5300403f2f78594cd5fcc3fb2ad997"
+    },
+    {
+      "name": "tla/mutant-trailing_condition.log",
+      "sha256": "86836b782a1a017e8d4f61e7d8e4c003f746e0d7528e7413f8d0347f2cdc418a"
+    },
+    {
+      "name": "tla/mutant-wide_msg_field.log",
+      "sha256": "6a7eea3760cf70933d6eaba55c592aa03ebd3375f3cceb7b235c6527f22f05c9"
+    },
+    {
+      "name": "tla/mutant-wide_msg_order.log",
+      "sha256": "ee666aebf45b7d775b3155bdf577be00b9247a7aee3766cad469e94075fd1690"
+    },
+    {
+      "name": "tla/mutant-wide_msg_record.log",
+      "sha256": "e124a52d037e7e56612ba66aef6b159c40e33ff63c6df129d32dd4d79ba037df"
+    },
+    {
+      "name": "tla/trace-000.log",
+      "sha256": "6c4d53e3e4ea4e0510196f1c1027d8eed9c70ba51bdc4e37f22aed9386f555af"
+    },
+    {
+      "name": "tla/trace-001.log",
+      "sha256": "3421f874f3d6990e9b5ba049f637547657c068cabab4c2e63750336ddc42d66c"
+    },
+    {
+      "name": "tla/trace-002.log",
+      "sha256": "3fc759a802b7fd20820277a3e6c1e13881c1ff503012831e660d2f492a20bb40"
+    },
+    {
+      "name": "tla/trace-003.log",
+      "sha256": "2ca408d22fa689f95b8a140de59f8ad53208f4807c5af82f04da0cc5f29eef86"
+    },
+    {
+      "name": "tla/trace-004.log",
+      "sha256": "40376c3cac3ff54af6a0179b2dae732758a0c8c6ccba0c90439f2c714f32277e"
+    },
+    {
+      "name": "tla/trace-005.log",
+      "sha256": "0d616b739744843a52c7222fa0cc25bca5e452fc29110c85aed54be5d7e2df21"
+    },
+    {
+      "name": "tla/trace-006.log",
+      "sha256": "051fe4200316c0cc91290ca39367c510bec4efc843f803d5830a6799c31a45ed"
+    },
+    {
+      "name": "tla/trace-007.log",
+      "sha256": "90c5cf5cac411130545ed3c32fabb2be465e5398059f12e5384cd82d4fa6ea1c"
+    },
+    {
+      "name": "tla/trace-008.log",
+      "sha256": "395f241f8eb5fab95c732261525422facf25bfec2142d360239cf79d0c2ffaf6"
+    },
+    {
+      "name": "tla/trace-009.log",
+      "sha256": "bb0b27738fb315a9fe12d93cf7ac9a864bedc9b1493e1483dffe9b0efeb47a0f"
+    },
+    {
+      "name": "tla/trace-010.log",
+      "sha256": "cdc1b706b232b79d08e7384756b18f4bbf115dfe1b968ad377afe13c49a0be15"
+    },
+    {
+      "name": "tla/trace-011.log",
+      "sha256": "4fec5afe35b1e4f9fc27ec3a964854edf123f69fe13dbb8e64aaaaf22c8e94d6"
+    },
+    {
+      "name": "tla/trace-012.log",
+      "sha256": "54a1bf7d8a862d81a18560c570d864c2d950f5077878eb2451974245bfd755a3"
+    },
+    {
+      "name": "tla/trace-013.log",
+      "sha256": "1b875a76b59f6e9009eef3e160d47e76455bb2c8763f8667f95122dfbfc00bda"
+    },
+    {
+      "name": "tla/trace-014.log",
+      "sha256": "82c13b3517f0360c9a02b100275b83925341749d35e362acbdd4ad0741e6f649"
+    },
+    {
+      "name": "tla/trace-015.log",
+      "sha256": "8b6260ec15ceecb4a62c32e36d37aed494f2bc9e2d359fb8f3fe77eda54cc577"
+    },
+    {
+      "name": "tla/trace-016.log",
+      "sha256": "675beea5e8a4e231cf59a7af8095256a26f225131b456056fcb735534b3ea4db"
+    },
+    {
+      "name": "tla/trace-017.log",
+      "sha256": "73b821ed3e1f0f5a44b4e12fc70dc22bc473dd047d608131f38b86bc09a2a8df"
+    },
+    {
+      "name": "tla/trace-018.log",
+      "sha256": "a51a6351d3b73c8b7a6bb08a87e0bdeb5322ae8ad93d6b93ec2df44fd0515fe4"
+    },
+    {
+      "name": "tla/trace-019.log",
+      "sha256": "2b4ebe82f8f7a84c3abc3843ea2fa7abceb43cfe9b2211c977a68f27e7a911f3"
+    },
+    {
+      "name": "tla/trace-020.log",
+      "sha256": "643d47db9216078c0ada4f464e1133a084a7b8c41c40e792cf9eec3a5005da91"
+    },
+    {
+      "name": "tla/trace-021.log",
+      "sha256": "a0a3d793e6a6f750ad1a9f3def577e9c7d701e4f9b2928dd1ae04d6ea1d3b833"
+    },
+    {
+      "name": "tla/trace-022.log",
+      "sha256": "89c57cfeb84ba1fe9d0823638b7b74be61c846dd669fdcf0379192763c5f1c5e"
+    },
+    {
+      "name": "tla/trace-023.log",
+      "sha256": "d753c9b32c846c6278758e30f54cbdbf9c029b9febe0b9311151b1f0ac845c77"
+    },
+    {
+      "name": "tla/trace-024.log",
+      "sha256": "36e4e5b9775f7f27bbbdc62dd692e5f8a1515599028b614284a6238ca8f3b250"
+    },
+    {
+      "name": "tla/trace-025.log",
+      "sha256": "33f39b82b751bacde265a13731d5ead668708b216445ecccb2a9810400045ac9"
+    },
+    {
+      "name": "tla/trace-026.log",
+      "sha256": "1e6fa39176233f9247ab86d709c4290ca073c1868e2bd34551be04b7ed258cb0"
+    },
+    {
+      "name": "tla/trace-027.log",
+      "sha256": "184674236777b549e26ff971c1bfa765b582f83d3b9fdcbd87602f4aadefee2e"
+    }
+  ],
+  "assertions": {
+    "executed": 64,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "sim-two-phase-trace",
+  "duration_s": 72.566,
+  "guarantees": [],
+  "kind": "T",
+  "mode": {
+    "tla": "trace"
+  },
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-26T01:47:13.227954+00:00",
+    "request_id": "verify-78334d4-012010",
+    "runner": "GitHub Actions 1000014620",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45727968538"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "78334d4eb3b5d05ae7c72eb39bcf3eca0b792ee5",
+  "sim_core_hours": null,
+  "tla": {
+    "budget_s": 900,
+    "dropped": {
+      "artifacts": 18
+    },
+    "mode": "trace",
+    "spec": "specs/selftest/TwoPhase",
+    "tier": "T1",
+    "tools": "tlc 1.8.0; community-modules 202611060952",
+    "traces": {
+      "accepted": 26,
+      "checked": 46,
+      "expected_rejections": 20,
+      "failing": [],
+      "rejected": 20
+    },
+    "truncated": true
+  },
+  "tree_clean": true,
+  "virtual_hours": null
+}
