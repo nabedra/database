@@ -12,6 +12,7 @@ use super::rows::Slot;
 use super::shard::{Band, Entry, band_span};
 use super::tree::{SCAN_BEAM, Walk};
 use super::{Index, Meta, Pin, parts_of};
+use crate::runtime::{Budget, Meter, Usage};
 use crate::types::{CommitTs, Error, Key, MAX_LIMIT, Op, PartId, Pos, RangeId, Result, Row};
 
 #[derive(Clone, PartialEq, Debug)]
@@ -76,6 +77,7 @@ struct Ranked {
     slot: Slot,
     at: Pos,
     unit: usize,
+    vector: Arc<[f32]>,
 }
 
 impl Ord for Ranked {
@@ -133,9 +135,41 @@ pub struct Scan {
     units: usize,
     /// Units read so far, or skipped because nothing in them could enter the result.
     pub visited: usize,
+    /// The budget it runs within, if any.
+    meter: Option<Meter>,
 }
 
+/// Memory a scored row may add: its place in the result and in the set of rows seen.
+const ROW_BYTES: u64 = (std::mem::size_of::<Ranked>() + 2 * std::mem::size_of::<Slot>()) as u64;
+
 impl Scan {
+    /// What it spent so far, when it runs within a budget.
+    pub fn usage(&self) -> Option<Usage> {
+        self.meter.as_ref().map(Meter::used)
+    }
+
+    /// Charges work before it happens. Running out ends the scan.
+    fn charge(&mut self, cpu: u64, io: u64, memory: u64) -> Result<()> {
+        let Some(m) = &mut self.meter else {
+            return Ok(());
+        };
+        m.cpu(cpu)?;
+        m.io(io)?;
+        m.grow(memory)
+    }
+
+    fn release(&mut self, memory: u64) {
+        if let Some(m) = &mut self.meter {
+            m.shrink(memory);
+        }
+    }
+
+    /// An exact score of `dim` units, and the memory a new row may hold.
+    fn charge_score(&mut self) -> Result<()> {
+        let fresh = if self.top.len() < self.limit { ROW_BYTES } else { 8 };
+        self.charge(self.vec.len() as u64, 0, fresh)
+    }
+
     /// The least goodness that still enters the result.
     fn floor(&self) -> Option<f32> {
         (self.top.len() >= self.limit).then(|| self.top.peek().map_or(f32::INFINITY, |r| r.good))
@@ -162,11 +196,11 @@ impl Scan {
     }
 
     /// Scores a visible row exactly. Returns whether it ranks at all.
-    fn offer(&mut self, key: &Key, e: &Entry, vec: &[f32]) -> bool {
+    fn offer(&mut self, key: &Key, e: &Entry, vec: Arc<[f32]>) -> bool {
         if !self.seen.insert(e.slot) && !mutant("no_slot_dedup") {
             return true;
         }
-        let Some(score) = exact(self.op, vec, &self.vec) else {
+        let Some(score) = exact(self.op, &vec, &self.vec) else {
             return false;
         };
         let good = goodness(self.op, score);
@@ -176,6 +210,7 @@ impl Scan {
             slot: e.slot,
             at: e.at,
             unit: self.units,
+            vector: vec,
         });
         if self.top.len() > self.limit {
             self.top.pop();
@@ -253,7 +288,38 @@ impl<C: Codec> Index<C> {
             seen: HashSet::new(),
             units: 0,
             visited: 0,
+            meter: None,
         })
+    }
+
+    /// [`Index::scan`] within a budget. Running out ends it with `OverBudget`, and nothing of it
+    /// is returned.
+    pub fn scan_within(
+        &self,
+        pin: &Pin,
+        query: &Query,
+        stop: Box<dyn StopRule>,
+        budget: Budget,
+    ) -> Result<Scan> {
+        let mut scan = self.scan(pin, query, stop)?;
+        scan.meter = Some(Meter::new(budget));
+        Ok(scan)
+    }
+
+    /// [`Index::search`] within a budget.
+    pub fn search_within(&self, pin: &Pin, query: &Query, budget: Budget) -> Result<Vec<Hit>> {
+        let mut scan = self.scan_within(pin, query, Box::new(RecallEstimate), budget)?;
+        while self.visit(&mut scan)? {}
+        self.finish(scan)
+    }
+
+    /// The bytes that reading one raw vector costs.
+    fn read_cost(&self) -> u64 {
+        if self.shared.rows.on_disk() {
+            (self.cfg.schema.dim * 4) as u64
+        } else {
+            0
+        }
     }
 
     fn plan(&self, pin: &Pin, query: &Query, dir: &[f32], len: f64) -> Plan {
@@ -417,21 +483,30 @@ impl<C: Codec> Index<C> {
     fn live(&self, e: &Entry) -> Result<(&Key, Arc<[f32]>)> {
         const GONE: Error = Error::Internal("an entry without its row");
         let key = self.shared.rows.key(e.slot).ok_or(GONE)?;
-        let row = self
-            .shared
-            .rows
-            .version(e.slot, e.at)
-            .and_then(|v| v.row.as_ref());
-        Ok((key, row.and_then(|r| r.vec.clone()).ok_or(GONE)?))
+        Ok((key, self.shared.rows.vector(e.slot, e.at)?.ok_or(GONE)?))
     }
 
     fn offer_all<B>(&self, scan: &mut Scan, b: &Band<B>, bits: Option<Bits>) -> Result<bool> {
         let mut any = false;
         for (_, e) in self.shown(&scan.pin, b, bits) {
-            let (key, vec) = self.live(e)?;
-            any |= scan.offer(key, e, &vec);
+            any |= self.score_entry(scan, e)?;
         }
         Ok(any)
+    }
+
+    fn score_entry(&self, scan: &mut Scan, e: &Entry) -> Result<bool> {
+        // Keep the winning vectors for the response. A replacement occupies the same
+        // space, but the incoming vector needs room while we score it.
+        let bytes = (self.cfg.schema.dim * size_of::<f32>()) as u64;
+        scan.charge(0, self.read_cost(), bytes)?;
+        scan.charge_score()?;
+        let (key, vec) = self.live(e)?;
+        let before = scan.top.len();
+        let offered = scan.offer(key, e, vec);
+        if scan.top.len() == before {
+            scan.release(bytes);
+        }
+        Ok(offered)
     }
 
     /// Coarse estimates first. A row whose best case is below the result's worst is not looked at
@@ -444,6 +519,10 @@ impl<C: Codec> Index<C> {
         q: &C::Query,
     ) -> Result<bool> {
         let shown = self.shown(&scan.pin, b, bits);
+        let dim = scan.vec.len() as u64;
+        let n = b.entries.len() as u64;
+        let held = n * (std::mem::size_of::<super::codec::Estimate>() + 24) as u64;
+        scan.charge(n * (dim / 8 + 1), 0, held)?;
         let mut coarse = Vec::with_capacity(b.entries.len());
         self.codec.scan(q, &b.codes, &mut coarse);
         let (op, len) = (scan.op, scan.len);
@@ -458,12 +537,15 @@ impl<C: Codec> Index<C> {
             if floor.is_some_and(|f| good < f) {
                 break;
             }
+            if floor.is_some() {
+                scan.charge(dim / 2 + 1, 0, 0)?;
+            }
             if floor.is_some_and(|f| hope(self.codec.refine(q, &b.codes, i), i) < f) {
                 continue;
             }
-            let (key, vec) = self.live(e)?;
-            scan.offer(key, e, &vec);
+            self.score_entry(scan, e)?;
         }
+        scan.release(held);
         Ok(!order.is_empty())
     }
 
@@ -472,20 +554,36 @@ impl<C: Codec> Index<C> {
         if scan.pin.0.failed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::PinFailed);
         }
-        let hit = |r: Ranked| {
-            let generation = self.shared.rows.generation(r.slot)?;
-            let version = self.shared.rows.version(r.slot, r.at)?;
-            Some(Hit {
-                range: *self.shared.gens.get(&generation)?,
-                key: r.key,
-                at: r.at,
-                commit_ts: version.ts,
-                score: goodness(scan.op, r.good),
-                row: version.row.clone()?,
-            })
+        if let Some(what) = scan.meter.as_ref().and_then(Meter::over) {
+            return Err(Error::OverBudget(what));
+        }
+        let rows = &self.shared.rows;
+        let hit = |r: Ranked| -> Result<Option<Hit>> {
+            let Some(row) = rows.full_row(r.slot, r.at, r.vector) else {
+                return Ok(None);
+            };
+            let hit = || {
+                let generation = rows.generation(r.slot)?;
+                let version = rows.version(r.slot, r.at)?;
+                Some(Hit {
+                    range: *self.shared.gens.get(&generation)?,
+                    key: r.key,
+                    at: r.at,
+                    commit_ts: version.ts,
+                    score: goodness(scan.op, r.good),
+                    row,
+                })
+            };
+            Ok(hit())
         };
-        let hits: Option<Vec<Hit>> = scan.top.into_sorted_vec().into_iter().map(hit).collect();
-        hits.ok_or(Error::Internal("a pinned row is gone"))
+        let hits: Result<Option<Vec<Hit>>> = scan
+            .top
+            .into_sorted_vec()
+            .into_iter()
+            .map(hit)
+            .collect::<Result<Vec<_>>>()
+            .map(|h| h.into_iter().collect());
+        hits?.ok_or(Error::Internal("a pinned row is gone"))
     }
 
     /// A whole scan.

@@ -437,7 +437,8 @@ impl<C: Codec> Index<C> {
         let (next_at, next_ts) = next.map_or((0, 0), |s| (s.at, s.ts));
         o.u64(next_at);
         o.u64(next_ts);
-        o.bytes(&floats(row.vec.as_deref().unwrap_or(&[])))?;
+        let vec = rows.vector(e.slot, e.at).map_err(|e| damaged(&e.to_string()))?;
+        o.bytes(&floats(vec.as_deref().unwrap_or(&[])))?;
         o.u32(u32::try_from(row.cols.len()).map_err(|_| damaged("too many columns"))?);
         for v in &row.cols {
             o.value(v)?;
@@ -551,6 +552,7 @@ impl<C: Codec> Index<C> {
             touches.sort_unstable();
             r.touches = touches.into();
         }
+        index.fail_damaged();
         Ok((index, found))
     }
 
@@ -590,6 +592,9 @@ impl<C: Codec> Index<C> {
                 .rows
                 .restore(keys, generation, &key, version)
                 .ok_or_else(full)?;
+            sh.rows
+                .store_vector(slot, at)
+                .map_err(|e| damaged(&e.to_string()))?;
             if next_at > 0 {
                 sh.rows
                     .restore(keys, generation, &key, (next_at, next_ts, None));

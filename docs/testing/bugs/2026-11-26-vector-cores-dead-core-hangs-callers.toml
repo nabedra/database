@@ -1,0 +1,15 @@
+# Found by the adversarial tests of task N (nabedra/oltp-vector-nvme-test). Cores::start takes the state from a closure that returns the value, so a state that cannot be made (a file that does not open) can only panic. The thread dies after it reported its CPU, start returns Ok, panics() stays 0, and every call to that core waits for ever; submit keeps accepting work until the queue limit and then refuses it as overload.
+id = "VECTOR-cores-dead-core-hangs-callers"
+title = "A core whose state could not be made accepts work that nothing runs"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS17"]
+found_by = "campaign"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/tests/adversarial_runtime.rs::nr11_a_core_that_failed_to_start_does_not_hang_its_callers"
+seed = "unknown"
+why_not_caught = "Only panics inside tasks were tested."
+invariant_added = "A core that failed to start answers its callers with an error."
+fix_commits = ["8c074ad387f4bd94151129a45f9b5f691e157dfc"]
+revert_patch_ok = true

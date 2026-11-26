@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
+use crate::store::Vectors;
 use crate::types::{
     Change, ColumnType, CommitTs, Error, Key, MAX_DIM, Page, PartId, Pos, RangeId, Result, Row,
     Schema,
@@ -64,6 +65,8 @@ pub struct Config {
     pub reassigns: usize,
     /// (value, partition) pairs that the summary of one filter column may use.
     pub summary_pairs: usize,
+    /// Where raw vectors live. `None` keeps them in the rows, in RAM.
+    pub vectors: Option<Arc<dyn Vectors>>,
 }
 
 impl Config {
@@ -80,6 +83,7 @@ impl Config {
             copies: 64,
             reassigns: 8,
             summary_pairs: 1 << 22,
+            vectors: None,
         }
     }
 
@@ -409,7 +413,8 @@ impl Shared {
     fn assign(&mut self, a: &Append) -> Option<PartId> {
         let row = self.rows.version(a.slot, a.at)?.row.clone()?;
         let group = group_of(self.partition_by, &row);
-        let direction = codec::direction(row.vec.as_deref()?);
+        // A vector the store cannot read is logged, and its range fails after this step.
+        let direction = codec::direction(&self.rows.vector(a.slot, a.at).ok()??);
         let root = self.roots.get(&group);
         let part = match &direction {
             None => root.and_then(|r| r.undirected),
@@ -513,7 +518,7 @@ impl<C: Codec> Index<C> {
         let shared = Shared {
             ranges: BTreeMap::new(),
             gens: BTreeMap::new(),
-            rows: Rows::default(),
+            rows: Rows::new(cfg.vectors.clone()),
             dir: BTreeMap::new(),
             roots: BTreeMap::new(),
             summary: Summary::new(cfg.schema.columns.len(), cfg.summary_pairs),
@@ -615,7 +620,15 @@ impl<C: Codec> Index<C> {
         }
         for (key, ts, row) in rows {
             let known = self.range(id)?.keys.contains_key(key);
-            if known || self.put_version(id, key, at, *ts, Some(row)).is_err() {
+            let put = match known {
+                true => Err(Error::InvalidFeed("invalid snapshot")),
+                false => self.put_version(id, key, at, *ts, Some(row)),
+            };
+            if let Err(error) = put {
+                if matches!(error, Error::Store(_)) {
+                    self.fail_range(id, "the vector store failed");
+                    return Err(error);
+                }
                 self.fail_range(id, "the snapshot repeats a key or holds an invalid row");
                 return Err(Error::InvalidFeed("invalid snapshot"));
             }
@@ -676,6 +689,7 @@ impl<C: Codec> Index<C> {
             r.touches.push_back((at, ts, slot));
         }
         if has_entry {
+            sh.rows.store_vector(slot, at)?;
             sh.rows.name(slot, at);
             *r.outstanding.entry(at).or_default() += 1;
             sh.inbox.push_back(Append {
@@ -746,7 +760,9 @@ impl<C: Codec> Index<C> {
                     } => self.put_version(id, key, at, *commit_ts, row.as_ref()),
                 };
                 if let Err(error) = put {
-                    self.fail_range(id, "the feed is invalid");
+                    let store = matches!(error, Error::Store(_));
+                    let why = if store { "the vector store failed" } else { "the feed is invalid" };
+                    self.fail_range(id, why);
                     return Err(error);
                 }
             }
@@ -806,6 +822,15 @@ impl<C: Codec> Index<C> {
         self.discard(id);
         self.shared.ranges.remove(&id);
         Ok(())
+    }
+
+    /// Takes the ranges whose vectors the store could not read out of service.
+    fn fail_damaged(&mut self) {
+        for generation in self.shared.rows.take_damage() {
+            if let Some(id) = self.shared.gens.get(&generation).copied() {
+                self.fail_range(id, "the vector store failed");
+            }
+        }
     }
 
     /// Takes the range out of service. Only another install brings it back.
@@ -955,13 +980,15 @@ impl<C: Codec> Index<C> {
         let Some(msg) = sh.queues.get_mut(shard).and_then(VecDeque::pop_front) else {
             return false;
         };
-        match self.shards[shard].handle(sh, &self.codec, msg) {
+        let handled = match self.shards[shard].handle(sh, &self.codec, msg) {
             None => true,
             Some(wait) => {
                 sh.queues[shard].push_back(wait);
                 false
             }
-        }
+        };
+        self.fail_damaged();
+        handled
     }
 
     /// Handles every message and advances the positions.
@@ -973,6 +1000,7 @@ impl<C: Codec> Index<C> {
                 break;
             }
         }
+        self.fail_damaged();
         self.advance();
     }
 
@@ -1120,6 +1148,7 @@ impl<C: Codec> Index<C> {
             self.cursor = part;
             done |= self.maintain_part(part);
         }
+        self.fail_damaged();
         done
     }
 

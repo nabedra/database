@@ -1,0 +1,15 @@
+# Found by the adversarial tests of task N (nabedra/oltp-vector-nvme-test). NvmeVectors::get treats a non-finite float as damage, but put does not check for one, so the store accepts a vector that it can never return, and RAM would return it. The index checks finiteness first (a row that does not fit the schema is refused), so only a direct caller of the store sees it.
+id = "VECTOR-nvme-put-accepts-non-finite"
+title = "NvmeVectors::put stores NaN and infinities and get then refuses them"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G10"]
+scenarios = ["VS16"]
+found_by = "campaign"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/tests/adversarial_store.rs::nt16_a_put_that_can_never_be_read_back_is_refused"
+seed = "unknown"
+why_not_caught = "No test put a value the index would have refused."
+invariant_added = "A put either fails or reads back bit for bit."
+fix_commits = ["8c074ad387f4bd94151129a45f9b5f691e157dfc"]
+revert_patch_ok = true

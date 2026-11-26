@@ -1,0 +1,15 @@
+# Found by the adversarial tests of task N (nabedra/oltp-vector-nvme-test). RecordFile::read_round asks the disk for every page of a record, also for the pages that are only in RAM and not in the file yet, so the request ends beyond the file and fails as a short read, although the record is whole in memory. The first auto flush leaves one such record per batch for every record size that does not divide 61,440 bytes (dimension 100, 1,000, 2,048, 4,096), and any size after reuse of released places. In an index the failed read is logged as damage and takes a healthy range out of service (nt26); extensions on NVMe share the code (nt25).
+id = "VECTOR-nvme-straddling-record-reads-as-short-read"
+title = "A record that spans a written page and the unwritten tail page reads as a damaged page"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G10", "VEC-G11"]
+scenarios = ["VS16", "VS10"]
+found_by = "campaign"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/tests/adversarial_store.rs::nt24_a_record_across_a_written_page_and_an_unwritten_one_reads_exactly"
+seed = "unknown"
+why_not_caught = "Every test of the store flushed before it read, and its dimensions (6, 768, 1,024, 1,536) divide the 15 pages of a flush batch, so no record straddled the page that stays in RAM."
+invariant_added = "Reads between flushes: a record that is whole in the file and in RAM reads exactly, for generated record sizes and with reuse of places."
+fix_commits = ["8c074ad387f4bd94151129a45f9b5f691e157dfc"]
+revert_patch_ok = true

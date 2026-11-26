@@ -1,0 +1,15 @@
+# Found by the adversarial tests of task N (nabedra/oltp-vector-nvme-test). Inner::submit checks the stop flag before it takes the queue lock, so a job can be queued after stop drained that queue. The core thread then sees the flag and returns without running it, the job stays in the queue until the Cores value is dropped, and Cores::call, which waits for the answer, never returns. Found with three callers against stop in a loop: a hang in about one iteration in a hundred.
+id = "VECTOR-cores-stop-strands-a-racing-job"
+title = "A job submitted while stop drains the queues is never run and never dropped, and its caller waits for ever"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS17"]
+found_by = "campaign"
+found_date = "2026-11-26"
+lowest_regression = "server/vector/tests/adversarial_runtime.rs::nr09_a_call_racing_stop_always_gets_an_answer"
+seed = "unknown"
+why_not_caught = "The unit test of shutdown submits before it stops, one thread, so submit and stop never overlap."
+invariant_added = "A call that races stop always answers, run or refused: the test runs 400 iterations of three callers against stop and fails on a hang."
+fix_commits = ["8c074ad387f4bd94151129a45f9b5f691e157dfc"]
+revert_patch_ok = true

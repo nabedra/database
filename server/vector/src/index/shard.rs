@@ -95,7 +95,8 @@ impl<B> Partition<B> {
 /// What a step needs of a live version.
 fn row_of(sh: &Shared, slot: Slot, at: Pos) -> Option<(Arc<Row>, Vec<f32>, f64)> {
     let row = sh.rows.version(slot, at)?.row.clone()?;
-    let vec = row.vec.clone()?;
+    // A vector the store cannot read is logged, and its range fails after this step.
+    let vec = sh.rows.vector(slot, at).ok()??;
     let (dir, len) = direction(&vec).unwrap_or_else(|| (vec.to_vec(), 0.0));
     Some((row, dir, len))
 }
