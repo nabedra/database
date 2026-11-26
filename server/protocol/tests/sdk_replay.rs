@@ -47,17 +47,15 @@ const LANGUAGE: &[&str] = &[
     "extra add_full_text with language 'English'",
 ];
 const RANKINGS: &[&str] = &["extra rank of 257 rankings"];
-/// The sparse case is not in the committed capture: 1.4 MB that does not compress.
 const QUERY_SIZE: &[&str] = &[
     "extra multi query of 65 vectors of 4096",
     "extra sparse query of 262145 entries",
 ];
-/// Sent by the SDK and refused by the server, each with its open bug.
-const OPEN: [&[&str]; 4] = [MODEL, LANGUAGE, RANKINGS, QUERY_SIZE];
 
 struct Case {
     name: String,
     table: Result<TableDescriptor, String>,
+    outcome: String,
     bodies: Vec<String>,
 }
 
@@ -102,29 +100,34 @@ fn descriptor(data: &str) -> Result<TableDescriptor, String> {
 fn named(name: &str) -> TableDescriptor {
     descriptor(TABLES.iter().find(|(n, _)| *n == name).unwrap().1).unwrap()
 }
-fn cases() -> Vec<Case> {
+fn cases(wanted: impl Fn(&str) -> bool) -> Vec<Case> {
     let capture = match std::env::var("NABEDRA_SDK_REPLAY") {
         Ok(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}")),
         Err(_) => CAPTURE.to_owned(),
     };
     capture
         .lines()
-        .map(|line| {
+        .filter_map(|line| {
             let case: Value = serde_json::from_str(line).unwrap();
+            let name = case["name"].as_str().unwrap();
+            if !wanted(name) {
+                return None;
+            }
             let table = match case["table"].as_str().unwrap() {
                 "custom" => descriptor(&text(&case["descriptor"])),
                 name => Ok(named(name)),
             };
-            Case {
-                name: case["name"].as_str().unwrap().to_owned(),
+            Some(Case {
+                name: name.to_owned(),
                 table,
+                outcome: case["sdk_outcome"].as_str().unwrap().to_owned(),
                 bodies: case["requests"]
                     .as_array()
                     .unwrap()
                     .iter()
                     .map(|r| text(&r["raw"]))
                     .collect(),
-            }
+            })
         })
         .collect()
 }
@@ -139,45 +142,29 @@ fn accept(table: &Result<TableDescriptor, String>, body: &str) -> Result<(), Str
         .validate_for_table(table)
         .map_err(|e| format!("{:?}: {e}", e.code))
 }
-/// The refusals of the sent requests of these cases, and how many requests there were.
-fn refusals(names: &[&str]) -> (Vec<String>, usize) {
-    let (mut found, mut requests) = (Vec::new(), 0);
-    for case in cases()
-        .iter()
-        .filter(|case| names.contains(&case.name.as_str()))
-    {
-        for (index, body) in case.bodies.iter().enumerate() {
-            requests += 1;
-            if let Err(error) = accept(&case.table, body) {
-                found.push(format!("{} #{index}: {error}", case.name));
-            }
-        }
+/// The SDK must refuse each captured case without reaching the transport.
+fn assert_local_refusals(names: &[&str], error: &str) {
+    let cases = cases(|name| names.contains(&name));
+    let expected = format!("refused:{error}");
+    for name in names {
+        let case = cases
+            .iter()
+            .find(|case| case.name == *name)
+            .unwrap_or_else(|| panic!("no captured SDK case named {name}"));
+        assert!(case.bodies.is_empty(), "{name} was sent");
+        assert_eq!(case.outcome, expected, "{name}");
     }
-    (found, requests)
-}
-fn open_bug(names: &[&str]) {
-    let (refused, requests) = refusals(names);
-    assert!(requests > 0, "no captured request of {names:?}");
-    assert!(
-        refused.is_empty(),
-        "{} refused:\n{}",
-        refused.len(),
-        refused.join("\n")
-    );
 }
 
 #[test]
 fn every_request_the_python_sdk_sends_is_accepted() {
     let (mut total, mut sent, mut requests, mut refused) = (0, 0, 0, Vec::new());
-    for case in cases() {
+    for case in cases(|_| true) {
         total += 1;
         if case.bodies.is_empty() {
             continue;
         }
         sent += 1;
-        if OPEN.iter().any(|names| names.contains(&case.name.as_str())) {
-            continue;
-        }
         for (index, body) in case.bodies.iter().enumerate() {
             requests += 1;
             if let Err(error) = accept(&case.table, body) {
@@ -197,45 +184,38 @@ fn every_request_the_python_sdk_sends_is_accepted() {
     );
 }
 
-/// The SDKs take any nonempty model name; the server wants [A-Za-z0-9][A-Za-z0-9_.-]{0,63}.
 #[test]
-#[ignore = "open bug 2026-11-26-sdk-server-model-name"]
 fn sdk_model_names_are_server_model_names() {
-    open_bug(MODEL);
+    assert_local_refusals(MODEL, "ValidationError");
 }
 
-/// The SDKs take any nonempty language; the server wants [a-z_]{1,32}.
 #[test]
-#[ignore = "open bug 2026-11-26-sdk-server-language"]
 fn sdk_languages_are_server_languages() {
-    open_bug(LANGUAGE);
+    assert_local_refusals(LANGUAGE, "ValidationError");
 }
 
-/// `rank()` has no client bound on its rankings; the server decodes at most 256.
 #[test]
-#[ignore = "open bug 2026-11-26-sdk-server-rank-257"]
 fn sdk_rank_sends_at_most_256_rankings() {
-    open_bug(RANKINGS);
+    assert_local_refusals(RANKINGS, "LimitExceededError");
 }
 
-/// A query vector is bounded by the 8 MiB body only in the SDKs, by 2^18 words on the server.
 #[test]
-#[ignore = "open bug 2026-11-26-sdk-server-query-vector-size"]
 fn sdk_query_vectors_fit_the_server_bound() {
-    // The value the SDK sends for 262,145 entries, rebuilt: the full capture has it byte for byte.
+    assert_local_refusals(QUERY_SIZE, "LimitExceededError");
+}
+
+#[test]
+fn server_refuses_sparse_queries_above_the_word_budget() {
     let indices: Vec<u8> = (0..262_145u32).flat_map(u32::to_le_bytes).collect();
     let weights: Vec<u8> = (0..262_145).flat_map(|_| 1f32.to_le_bytes()).collect();
     let value = json!({"sparse": {"i": b64(&indices), "f32": b64(&weights)}});
-    let sparse = wire(
-        &named("chunks"),
-        "query.rank",
-        rank(json!([ranking("sp", "dot", value)]), 3),
-    );
-    let (refused, requests) = refusals(&QUERY_SIZE[..1]);
-    assert!(requests > 0, "no captured multi query");
     assert!(
-        refused.is_empty() && sparse.is_ok(),
-        "{refused:?}, sparse: {sparse:?}"
+        wire(
+            &named("chunks"),
+            "query.rank",
+            rank(json!([ranking("sp", "dot", value)]), 3),
+        )
+        .is_err()
     );
 }
 
@@ -339,7 +319,7 @@ fn client_refusals_have_these_server_answers() {
             wire(&docs, "table.create", create(wide, json!({}))),
             Err(ValidationError),
         ),
-        // "extra float row at the server's 1 MiB": the SDKs count 1.2345678901234567 as 18 bytes, the server as 1.
+        // The server and SDKs count a float64 as one byte in the 1 MiB row limit.
         (
             "float row at 1 MiB",
             wire(
