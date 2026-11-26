@@ -237,23 +237,22 @@ PauseApplies(a) ==
     /\ frozen = 0 /\ pause = 0
     /\ PauseChecksReceipt => a \notin receipts
 
+\* The barrier applies, or another attempt's barrier or freeze answers
+\* Conflict (direct.rs:950), which ends the attempt like a refused freeze.
+\* The fixed design never reaches the Conflict branch.
 ProposeDirectPause ==
     /\ Barrier /\ coord /\ phase = "open" /\ dec = None /\ ~pausedOk /\ Can("src")
-    /\ pause = att \/ PauseApplies(att)
-    /\ pause' = att
-    /\ \/ pausedOk' = TRUE /\ UNCHANGED <<latePause, bud>>
-       \/ /\ bud.dup < MaxDup /\ bud' = [bud EXCEPT !.dup = @ + 1]
-          /\ latePause' = latePause \cup {att} /\ pausedOk' = TRUE
-    /\ UNCHANGED <<hostV, ldr, auth, frozen, pub, receipts, hi, above, attV, coord, route,
-                   cliV, lateReq, ghostV>>
-
-\* Another attempt's barrier or freeze answers Conflict (direct.rs:950).
-PauseConflict ==
-    /\ Barrier /\ coord /\ phase = "open" /\ dec = None /\ ~pausedOk /\ Can("src")
-    /\ ~refused /\ pause # att /\ ~PauseApplies(att)
-    /\ refused' = TRUE
-    /\ UNCHANGED <<hostV, ldr, srcV, att, kind, phase, attAuth, dec, coV, route, cliV,
-                   lateV, ghostV, bud>>
+    /\ ~refused
+    /\ IF pause = att \/ PauseApplies(att)
+       THEN /\ pause' = att
+            /\ \/ pausedOk' = TRUE /\ UNCHANGED <<latePause, bud>>
+               \/ /\ bud.dup < MaxDup /\ bud' = [bud EXCEPT !.dup = @ + 1]
+                  /\ latePause' = latePause \cup {att} /\ pausedOk' = TRUE
+            /\ UNCHANGED refused
+       ELSE /\ refused' = TRUE
+            /\ UNCHANGED <<pause, pausedOk, latePause, bud>>
+    /\ UNCHANGED <<hostV, ldr, auth, frozen, pub, receipts, hi, above, att, kind, phase,
+                   attAuth, dec, coord, route, cliV, lateReq, ghostV>>
 
 \* A duplicated or delayed DirectPause of attempt a reaches the source.
 LatePause(a) ==
@@ -398,13 +397,18 @@ LatePauseAny == \E a \in Attempts : LatePause(a)
 OpenAny == \E k \in {"auto", "manual"} : OpenSplit(k)
 
 \* The split is published and settled and no write is left at the source.
+\* Or the writers wait: the source is held, or a gateway holds a route the
+\* published source no longer serves. The liveness properties decide
+\* whether such a wait ends.
 Terminal ==
-    /\ route = "kids" /\ pub /\ phase = "none"
-    /\ \A c \in Client : w[c] = "idle" /\ gw[c] = "kids"
+    /\ \/ /\ route = "kids" /\ pub /\ phase = "none"
+          /\ \A c \in Client : w[c] = "idle" /\ gw[c] = "kids"
+       \/ pause # 0 \/ frozen # 0
+       \/ pub /\ \E c \in Client : gw[c] = "src"
     /\ UNCHANGED vars
 
 CoordStep ==
-    \/ ProposeDirectPause \/ PauseConflict \/ TakeCut \/ BindChildren \/ ProposeSplitFreeze
+    \/ ProposeDirectPause \/ TakeCut \/ BindChildren \/ ProposeSplitFreeze
     \/ StageChildren \/ PublishSplit \/ FinishSource \/ CloseSplit
 
 Next ==
