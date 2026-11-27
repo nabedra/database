@@ -1083,3 +1083,55 @@ fn vs10_a_stable_record_reads_back_while_its_page_changes_under_every_read() {
     assert_eq!(got.map(|v| v == [7; 2048]).map_err(|e| e.to_string()), Ok(true));
     assert!(disk.next.load(Ordering::SeqCst) >= 2, "the page changed under the reads");
 }
+
+// ----- Review rv-dense suspicions (task fix-dense, 2026-11-27).
+
+/// A file whose reads panic, as a buggy filesystem layer might.
+struct PanickyFile;
+
+impl nabedra_rt::fs::FsFile for PanickyFile {
+    fn write_all_at(&self, _: &[u8], _: u64) -> io::Result<()> {
+        Ok(())
+    }
+    fn read_exact_at(&self, _: &mut [u8], offset: u64) -> io::Result<()> {
+        std::panic::panic_any(format!("a read at {offset} panics"))
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn preallocate(&self, _: u64) -> io::Result<()> {
+        Ok(())
+    }
+    fn set_len(&self, _: u64) -> io::Result<()> {
+        Ok(())
+    }
+    fn len(&self) -> io::Result<u64> {
+        Ok(0)
+    }
+}
+
+/// A read whose pool threads all panicked answers, with an error for every request, and so does
+/// every later read: a panicking read must not take its pool thread with it, or a batch queued
+/// behind dead threads waits for ever.
+#[test]
+fn vs10_a_pool_whose_reads_all_panic_still_answers_every_read() {
+    let disk = Arc::new(PreadDisk::new(Arc::new(PanickyFile), 2).unwrap());
+    let (tell, told) = std::sync::mpsc::channel();
+    let reader = disk.clone();
+    let reads = move || {
+        for _ in 0..4 {
+            let mut reqs: Vec<Req> = (0..3).map(|i| Req::new(i * PAGE as u64, 1)).collect();
+            reader.read(&mut reqs);
+            let _ = tell.send(reqs.iter().all(|r| r.result.is_err()));
+        }
+    };
+    let thread = nabedra_rt::task::spawn_service("vs10-panicky-reads", reads).unwrap();
+    for round in 0..4 {
+        let answer = told.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(answer, Ok(true), "read {round} of a pool whose reads panicked");
+    }
+    thread.join().unwrap();
+}

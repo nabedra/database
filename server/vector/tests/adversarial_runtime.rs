@@ -526,6 +526,35 @@ fn nr11_a_core_that_failed_to_start_does_not_hang_its_callers() {
     assert!(matches!(started, Err(Error::Io(message)) if message.contains("core 1")));
 }
 
+/// A panic payload whose drop panics again.
+struct PanicsWhenDropped;
+
+impl Drop for PanicsWhenDropped {
+    fn drop(&mut self) {
+        std::panic::panic_any("the payload of a contained panic panics when dropped");
+    }
+}
+
+/// A core that started must not die under its callers either. Dropping the payload of a contained
+/// panic runs code of the task outside its `catch_unwind`; if that drop panics, the core's thread
+/// unwinds and every later call to it waits for ever. It has to be contained and counted like any
+/// panic, and the core serves on.
+#[test]
+fn nr22_a_started_core_survives_a_job_whose_panic_panics_again() {
+    let cores = Arc::new(Cores::start(1, Limits::default(), false, |_| 7u32).unwrap());
+    let c = cores.clone();
+    let bad = within(5, "the bad job", move || {
+        c.call(0, Class::Interactive, 1, |_, _| -> u8 { std::panic::panic_any(PanicsWhenDropped) })
+    });
+    assert!(bad.is_err(), "{bad:?}");
+    for i in 0..3 {
+        let c = cores.clone();
+        let after = within(5, "a call after the bad job", move || c.call(0, Class::Batch, 1, |s, _| *s));
+        assert_eq!(after, Ok(7), "call {i} after the bad job");
+    }
+    assert_eq!(cores.panics(), 1);
+}
+
 /// A job that panics is contained and counted, its caller learns, and the core serves on.
 #[test]
 fn nr12_a_panicking_job_is_contained_and_counted() {

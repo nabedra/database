@@ -211,7 +211,9 @@ fn work(inner: &PoolInner) {
             return;
         };
         drop(jobs);
-        job();
+        // A read that panics leaves its request failed; the thread serves on, so that a pool
+        // whose reads all panicked still answers every later read.
+        crate::runtime::contained(job);
     }
 }
 

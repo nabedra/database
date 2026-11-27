@@ -283,8 +283,21 @@ fn run_core<S>(state: &mut S, ctx: &Ctx<S>) {
         };
         drop(guard);
         // A task that panics is contained: the core and the other tasks go on (scenario F02).
-        if catch_unwind(AssertUnwindSafe(|| job(state, ctx))).is_err() {
+        if !contained(|| job(state, ctx)) {
             ctx.inner.panics.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Runs `f` and contains a panic in it. Returns whether it finished. Dropping the payload of a
+/// panic runs code of the task too, so a payload whose drop panics is contained as well, and one
+/// that panics again is leaked rather than unwinding the caller's thread.
+pub(crate) fn contained(f: impl FnOnce()) -> bool {
+    let Err(payload) = catch_unwind(AssertUnwindSafe(f)) else {
+        return true;
+    };
+    if let Err(again) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        std::mem::forget(again);
+    }
+    false
 }
