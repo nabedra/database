@@ -4,7 +4,7 @@ use crate::{
         mvcc::store::direct::{DirectMemberReply, DirectReply},
         pool::ByteClass,
     },
-    oltp_replication::owned::OwnedCommand,
+    oltp_replication::{owned::OwnedCommand, types::ReadTs},
 };
 use std::{pin::Pin, sync::OnceLock, task::Poll};
 use tokio::{
@@ -308,9 +308,21 @@ impl Consensus<ParticipantCommand, ParticipantReply> for ApplyAfterTimeout {
     }
 }
 
-#[tokio::test]
+/// OD-1 (G02): a proposal the executor's deadline cut can still apply, so its
+/// timestamp stays pending and a snapshot read above it waits instead of
+/// reading the row as absent. Real time throughout: a paused clock advanced
+/// past the deadline also expires the leader lease, and the held proposal
+/// would then be refused before append instead of applying.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d05_unknown_proposal_keeps_range_clock_pending_until_apply() {
-    let cluster = Cluster::new(Options::default()).await;
+    let counter = Arc::new(Counter(AtomicU64::new(1_000)));
+    let cluster = Arc::new(
+        Cluster::new(Options {
+            timestamps: Some(counter.clone()),
+            ..Default::default()
+        })
+        .await,
+    );
     let leader = cluster.leader().await;
     let voter = &cluster.voters[leader];
     let clock = cluster.clock(leader);
@@ -323,39 +335,70 @@ async fn d05_unknown_proposal_keeps_range_clock_pending_until_apply() {
         ParticipantMachine::new(voter.store.clone()).unwrap(),
         consensus.clone(),
     ));
-    let request = timed_insert(&cluster, leader, 1);
-    let deadline = request.deadline;
-    let mut response = Box::pin(voter.executor.execute(&handle, request));
-    at_proposal(voter, response.as_mut(), 1).await;
-    assert_eq!(clock.pending_len(), 1);
-    let token = clock.leader_token().unwrap();
-
-    pause();
-    advance(deadline + Duration::from_millis(1)).await;
-    let response = response.await;
-    resume();
+    // What a snapshot of the absent row returns. Every snapshot waits for
+    // every pending commit at or below it (rule 2), so take it first.
+    let before = ReadTs::new(counter.0.fetch_add(1, Ordering::SeqCst)).unwrap();
+    let absent = voter
+        .handle
+        .read_at(before, cluster.row_key(1))
+        .await
+        .unwrap();
+    let id = nabedra_rt::ids::uuid_v4();
+    let request = cluster.request_at(
+        leader,
+        &insert(&cluster, id, 1),
+        id,
+        1,
+        Duration::from_millis(400),
+    );
+    let response = voter.executor.execute(&handle, request).await;
     assert_eq!(
         code(&response).map(|(_, outcome)| outcome),
-        Some(Outcome::Unknown)
+        Some(Outcome::Unknown),
+        "{response:?}"
     );
-    assert_eq!(clock.leader_token(), Some(token));
     assert_eq!(
         clock.pending_len(),
         1,
         "an unknown proposal can still apply"
     );
 
+    // A snapshot above the pending timestamp, from the same authority.
+    let read_ts = ReadTs::new(counter.0.fetch_add(1, Ordering::SeqCst)).unwrap();
+    let reader = {
+        let cluster = cluster.clone();
+        nabedra_rt::task::spawn(async move {
+            cluster.voters[leader]
+                .handle
+                .read_at(read_ts, cluster.row_key(1))
+                .await
+        })
+    };
+    nabedra_rt::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !reader.is_finished(),
+        "a snapshot above an unresolved commit waits for it"
+    );
+
     consensus.release.notify_one();
     nabedra_rt::time::timeout(Duration::from_secs(5), consensus.applied.notified())
         .await
         .expect("submitted proposal finishes");
+    let seen = reader.await.unwrap().unwrap();
+    assert_ne!(
+        seen.as_slice(),
+        absent.as_slice(),
+        "the snapshot includes the commit below it"
+    );
     assert!(cluster.latest(leader, cluster.row_key(1)).await.0.is_some());
     assert_eq!(
         clock.pending_len(),
         0,
         "apply settled the pending timestamp"
     );
-    cluster.shutdown().await;
+    drop(handle);
+    drop(consensus);
+    Arc::try_unwrap(cluster).ok().unwrap().shutdown().await;
 }
 
 #[tokio::test]
