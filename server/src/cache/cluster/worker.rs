@@ -3,7 +3,7 @@ mod actor;
 #[cfg(all(test, feature = "sim"))]
 pub(in crate::cache::cluster) use actor::LeaseActorFixture;
 #[cfg(feature = "sim")]
-pub(in crate::cache::cluster) use actor::{SlotSample, lease_authorizes};
+pub(in crate::cache::cluster) use actor::SlotSample;
 mod peer;
 #[cfg(all(test, feature = "sim"))]
 pub(super) use peer::PROBES;

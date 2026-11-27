@@ -1,0 +1,14 @@
+# The simulator's disk fault model (FaultFs and simulated volumes): specs/sim/disk/SimDisk.tla.
+# Four exhaustive baselines (SimDisk.cfg, .p4k, .wipe, .full) with coverage, then every configuration in
+# specs/sim/disk/mutants (mutants, reverted fixes, gaps). Witnesses run by hand. See specs/sim/README.md.
+id = "sim-sim-disk"
+module = "sim"
+kinds = ["T"]
+guarantees = []
+scenarios = ["NS04", "NS05", "NS15", "O11", "O17"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/sim/disk", "SimDisk", "--module", "sim"]
+cwd = "."
+timeout_s = 7200
+needs = ["tlc"]
+result_parser = "tlc"

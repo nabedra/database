@@ -7,8 +7,9 @@ tiers = ["T1"]
 # Fault model. The cluster uses the simulated runtime, network and ClockBound.
 # Only the Cache library is compiled with sim. The sweep's partitions deliver
 # late, as TCP does. cache-sim-loss runs the same seeds with lost messages.
-# The history checker has no lag window here, so a pass says nothing about how
-# many acknowledged writes above the promoted copy's prefix a failover loses.
+# The history checker allows a failover to lose only writes above the promoted
+# copy's prefix acknowledged within the fault model's lag window (a lease and
+# two renewal intervals) before the old grant ended, and a planned handover none.
 command = ["bash", "-euc", '''
 cargo test --locked -j 4 --release -p nabedra-check --test history_cache_sim
 sim=(cargo test --locked -j 4 --release --no-default-features --features cache,sim --lib)

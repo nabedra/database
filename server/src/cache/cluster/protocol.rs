@@ -8,7 +8,11 @@ use uuid::Uuid;
 use super::transport::{Endpoint, Fingerprint};
 use crate::cache::command::SLOT_COUNT;
 
-pub(super) const VERSION: u16 = 1;
+// Every controller, worker and peer message checks it. 2: staged promotions
+// carry `last_copy` and are fenced at apply by the source's last grant, and the
+// controller state bounds its receipts and retired incarnations. A peer or
+// controller log of version 1 is refused, not read.
+pub(super) const VERSION: u16 = 2;
 pub(super) const LEASE_MS: u64 = 3_000;
 pub(super) const RENEW_MS: u64 = 1_000;
 pub(super) const CONTROL_FRAME: usize = 12 << 20;

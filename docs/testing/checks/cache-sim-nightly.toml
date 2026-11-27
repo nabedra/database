@@ -7,7 +7,7 @@ tiers = ["T2", "T3"]
 # Fault-model repetition gate. Run five times the PR seeds in a single sweep
 # so the evidence contains the result and range of the entire campaign. The
 # first sweep delivers late across partitions and the second loses messages.
-# No lag window, as in cache-sim. It replays no seed unless one fails, so it is
+# The same lag window as cache-sim. It replays no seed unless one fails, so it is
 # not determinism evidence.
 command = ["bash", "-euc", '''
 build=(cargo test --locked -j 4 --release --no-default-features --features cache,sim --lib)

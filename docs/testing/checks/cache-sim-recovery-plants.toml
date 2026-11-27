@@ -1,0 +1,30 @@
+# Fault model. Directed K03 recovery schedules, each run clean and with one planted defect: the last live grant of a
+# retired source, a stale source report, the last verified copy, a planned handover, a scoped cold reset, the assigned
+# replica of a retired source, a pause between a clock sample and its use (SIM-7, the fx-sim fault API), and the
+# closed-form lease checks on P1 and the staged plants. A clean twin must pass and
+# its planted twin must break the named check. See plans/cache.md, "Design review".
+id = "cache-sim-recovery-plants"
+module = "cache"
+kinds = ["S"]
+guarantees = []
+scenarios = ["K03"]
+tiers = ["T1"]
+command = ["cargo", "test", "--locked", "-j", "4", "--no-default-features", "--features", "cache,sim", "--lib", "--", "--exact", "--test-threads=1",
+  "cache::cluster::sim::tests::mutants::planted_retired_promotion_commits_early_scripted",
+  "cache::cluster::sim::tests::mutants::planted_older_source_report_scripted",
+  "cache::cluster::sim::tests::mutants::planted_last_copy_lag_gate_scripted",
+  "cache::cluster::sim::tests::mutants::planted_handover_short_prefix_scripted",
+  "cache::cluster::sim::tests::mutants::planted_cold_reset_retains_data_scripted",
+  "cache::cluster::sim::tests::mutants::planted_publish_reuses_first_sample_scripted",
+  "cache::cluster::sim::tests::mutants::assigned_replica_keeps_pulling_the_retired_source_tail",
+  "cache::cluster::sim::tests::mutants::planted_lease_ignores_error_bound_scripted",
+  "cache::cluster::sim::tests::mutants::planted_staged_promotion_on_retirement_scripted_and_search",
+  "cache::cluster::sim::tests::mutants::planted_staged_promotion_before_fence_scripted_and_search",
+  "cache::cluster::sim::tests::mutants::staged_promotion_after_live_source_retirement_waits_for_grant",
+  "cache::cluster::sim::tests::mutants::planted_cases_under_late_partitions",
+]
+cwd = "server"
+timeout_s = 3600
+needs = []
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim-cache", NABEDRA_PLANTED_SEEDS = "500" }
+result_parser = "cargo-test"

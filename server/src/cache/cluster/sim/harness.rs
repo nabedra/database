@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use nabedra_rt::sim::net::{Dial, Envelope, Fate, Planner, SimListener, node_ip};
-use nabedra_rt::sim::{self, NodeClock, World};
+use nabedra_rt::sim::{self, ClockRead, Fidelity, NodeClock, World};
 use nabedra_rt::time;
 use nabedra_sim::{Filters, NetPlan, Plan, RaftObserver, runtime};
 use uuid::Uuid;
@@ -18,8 +18,8 @@ use super::super::{
     clock::{Clock, ClockMode},
     controller::{self, MAX_MOVES_PER_WORKER, RECONCILE_MS, SimConfig, SimRaftMetrics},
     protocol::{
-        Admin, CONTROL_FRAME, LEASE_MS, Member, Progress, RENEW_MS, Reply, Request, Slot, Topology,
-        VERSION, WorkerId,
+        Admin, CONTROL_FRAME, Heartbeat, LEASE_MS, Member, Progress, RENEW_MS, Reply, Request,
+        Slot, Topology, VERSION, WorkerId,
     },
     transport::{Endpoint, PeerConnection, PeerTls},
     worker::{self, SlotSample, Worker},
@@ -198,10 +198,14 @@ impl Cluster {
             watched,
             expiry_readings: Default::default(),
             observe: Box::new(move |node, event| {
-                let now = runtime::virtual_ms(&observe_world.upgrade().unwrap());
-                observer.lock().unwrap().observe(node, event, now);
+                let world = observe_world.upgrade().unwrap();
+                let now = runtime::virtual_ms(&world);
+                let truth = u128::from(sim::EPOCH_MS) * 1_000_000
+                    + runtime::virtual_elapsed(&world).as_nanos();
+                let now_ns = u64::try_from(truth).unwrap_or(u64::MAX);
+                observer.lock().unwrap().observe(node, event, now, now_ns);
             }),
-            committed: Box::new(move |node, index, term, leader, topology, staged| {
+            committed: Box::new(move |node, index, term, leader, topology, applied| {
                 let now = runtime::virtual_ms(&commit_world.upgrade().unwrap());
                 commits.lock().unwrap().committed(
                     node,
@@ -211,7 +215,7 @@ impl Cluster {
                     now,
                     topology,
                     &commit_keys,
-                    staged,
+                    applied,
                 );
             }),
         });
@@ -241,6 +245,12 @@ impl Cluster {
             );
         }
         world.insert_ext(bounds);
+        if config.gradual_drift {
+            // The sweeps drift every clock within the declared bound. Declare
+            // it, so no in-bound drift change fires a timer early (SIM-13).
+            // The beyond-bound twins drift past it on purpose and declare none.
+            world.set_drift_bound_ppm(Some(i64::from(config.declared_ppm)));
+        }
         for node in nodes {
             let residual = if config.skew && (11..OPERATOR).contains(&node) {
                 (config.base_error_ns as i64) * if node == 11 { -1 } else { 1 }
@@ -481,6 +491,23 @@ impl Cluster {
         self.world.heal_all();
     }
 
+    /// Freezes `node` right after its next ClockBound sample returns, with the
+    /// sampling code suspended between the sample and its use (SIM-7), until
+    /// [`Cluster::thaw`].
+    pub fn freeze_after_next_clock_sample(&self, node: u64) {
+        self.trace(format_args!("freeze {node} after its next clock sample"));
+        let mut fidelity = Fidelity::default();
+        fidelity.freeze_after_ext_reads = true;
+        self.world.set_fidelity(fidelity);
+        self.world
+            .freeze_after_clock_read(node, ClockRead::nth(1).in_file("clock_bound.rs"));
+    }
+
+    pub fn thaw(&self, node: u64) {
+        self.trace(format_args!("thaw {node}"));
+        self.world.thaw(node);
+    }
+
     pub fn drift(&self, node: u64, ppm: i64) {
         self.trace(format_args!("drift {node} {ppm} ppm"));
         self.world
@@ -511,6 +538,46 @@ impl Cluster {
             ),
         )
         .await
+    }
+
+    /// The heartbeat `node` would send now: its installed topology stamp and
+    /// its actors' progress. A schedule keeps it to deliver late.
+    pub async fn capture_heartbeat(&self, node: u64) -> Heartbeat {
+        let worker = &self.workers[&node];
+        let topology = worker.topology();
+        let progress = sim::in_node(node, worker.sim_progress()).await;
+        Heartbeat {
+            version: VERSION,
+            generation: topology.generation,
+            revision: topology.revision,
+            worker: worker.id(),
+            progress,
+        }
+    }
+
+    /// Delivers `heartbeat` to the leader from `node`'s address and
+    /// certificate, as a heartbeat held in the network arrives after newer
+    /// ones. `node` must be cut from the controllers: the request opens its
+    /// links to the leader for its own round trip and closes them again.
+    pub async fn deliver_heartbeat(&self, node: u64, heartbeat: Heartbeat) -> Option<Reply> {
+        let leader = self.leader()?;
+        self.trace(format_args!(
+            "deliver an older heartbeat of {node} to {leader}"
+        ));
+        self.link(node, leader, false);
+        self.link(leader, node, false);
+        let request = Request::Heartbeat(heartbeat);
+        let result = sim::in_node(node, async move {
+            PeerTls::sim(fingerprint(node))
+                .connect(&endpoint(leader, CONTROL))
+                .await?
+                .json::<_, Reply>(&request, CONTROL_FRAME)
+                .await
+        })
+        .await;
+        self.link(node, leader, true);
+        self.link(leader, node, true);
+        result.ok()
     }
 
     pub fn now(&self) -> u64 {
@@ -683,8 +750,12 @@ impl Cluster {
         }
         let mut writable = BTreeMap::new();
         for ((slot, owner), lease) in views {
+            // The plan's rule (Leases), written out here rather than calling
+            // the product's lease function: the lower bound has reached
+            // `not_before` and the upper bound is still before the expiry.
             if let Some(now) = bounds.get(&owner.node)
-                && sim::in_node(owner.node, async { worker::lease_authorizes(lease, *now) }).await
+                && now.lower_ms >= lease.not_before_ms
+                && now.upper_ms < lease.expires_ms
                 && let Some(previous) = writable.insert(slot, owner)
             {
                 self.violate(

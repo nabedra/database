@@ -1,0 +1,17 @@
+# Candidate from fx-lsm's search for the LSM-10 pattern, confirmed in phase 2 with FaultFs: the shipped open
+# (create_dir_all, then sync of the directory itself only) loses topology.wal after a crash to durable state;
+# durable_dir keeps it across a crash and 64 seeded power losses. The regression runs both forms.
+id = "RV-CACHE-controller-dir-sync"
+title = "A power loss after the Cache controller created its metadata directory could drop the WAL with acknowledged decisions"
+class = "other"
+module = "cache"
+guarantees = ["CACHE-G06", "CACHE-G07"]
+scenarios = ["K03"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/src/cache/cluster/controller/disk.rs::k03_controller_directory_survives_a_power_loss_after_open"
+seed = "unknown"
+why_not_caught = "The controller uses std::fs directly, so no FaultFs power loss reaches it, and controller disk loss is outside the Cache spec and simulator (plan decision 4)."
+invariant_added = "Opening the controller syncs its metadata directory and each ancestor's entry, so a synced WAL survives a power loss at any point after open."
+fix_commits = ["2fca91271360eeaa2973cfd0499daa2c4acce095"]
+revert_patch_ok = false

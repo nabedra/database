@@ -55,7 +55,14 @@ pub(in crate::cache::cluster) struct StagedPromotion {
     pub source: WorkerId,
     pub source_sequence: u64,
     pub prior_lease: Option<Lease>,
+    /// Why the source cannot serve: retired, or its report and lease expired.
+    /// Either way the promotion commits only once the controller's lower
+    /// bound reaches the source's latest committed expiry (CACHE-1).
     pub fence: SourceFence,
+    /// The target holds the last verified copy of the slot, so it is promoted
+    /// whatever its lag behind the source watermark (CACHE-4). Ordinary
+    /// transfers still use the cutover limit.
+    pub last_copy: bool,
 }
 
 impl StagedPromotion {
@@ -73,12 +80,21 @@ impl StagedPromotion {
         self.prior_lease.map_or(0, |lease| lease.expires_ms)
     }
 
-    fn within_lag(self) -> bool {
+    /// The source's last grant has ended at `lower_ms`, so it can acknowledge
+    /// nothing more in this epoch.
+    fn grant_ended(self, lower_ms: u64) -> bool {
         #[cfg(feature = "sim")]
-        if super::super::sim::hooks::knobs().staged_ignores_lag {
+        if self.fence == SourceFence::Retired
+            && super::super::sim::hooks::knobs().retired_promotion_commits_early
+        {
             return true;
         }
-        self.source_sequence.saturating_sub(self.retained_sequence) <= MAX_CUTOVER_LAG
+        lower_ms >= self.cutoff(lower_ms)
+    }
+
+    fn within_lag(self) -> bool {
+        self.last_copy
+            || self.source_sequence.saturating_sub(self.retained_sequence) <= MAX_CUTOVER_LAG
     }
 }
 
@@ -126,6 +142,7 @@ impl Observations {
                 && received_ms < report.received_ms.saturating_add(REPORT_AGE_MS)
         });
         let worker = heartbeat.worker;
+        let previous = self.reports.remove(&worker);
         let mut staged_progress = Vec::new();
         let slots = heartbeat
             .progress
@@ -136,6 +153,30 @@ impl Observations {
                     return None;
                 }
                 if slot.primary == Some(worker) {
+                    // A heartbeat carries no order, and a primary's sequence
+                    // never decreases within its epoch. A lower report from
+                    // the same incarnation is an older heartbeat delivered
+                    // late. Keep the newest progress, so a transfer is never
+                    // measured against a stale source watermark.
+                    #[cfg(feature = "sim")]
+                    let keep_older =
+                        super::super::sim::hooks::knobs().controller_keeps_older_report;
+                    #[cfg(not(feature = "sim"))]
+                    let keep_older = false;
+                    if !keep_older
+                        && let Some(newer) = previous
+                            .as_ref()
+                            .and_then(|old| old.slots.get(&report.slot))
+                            .filter(|old| {
+                                old.epoch == report.epoch
+                                    && (old.sequence > report.sequence
+                                        || (old.sequence == report.sequence
+                                            && old.frozen.is_some()
+                                            && report.frozen.is_none()))
+                            })
+                    {
+                        return Some((report.slot, *newer));
+                    }
                     if report.baseline && slot.moving.is_some_and(|moving| moving.replica_only) {
                         staged_progress.push(report);
                     }
@@ -228,8 +269,11 @@ impl Observations {
         let mut staged_recovery = Vec::new();
         for (index, slot) in topo.slots.iter().copied().enumerate() {
             let index = index as u16;
-            if let Some(change) = placement.recover_staged(index, slot, state) {
-                staged_recovery.push(change);
+            if let Some(recovery) = placement.recover_staged(index, slot, state) {
+                if staged_recovery.len() + recovery.len() > MAX_CHANGES {
+                    return staged_recovery;
+                }
+                staged_recovery.extend(recovery);
                 if staged_recovery.len() == MAX_CHANGES {
                     return staged_recovery;
                 }
@@ -366,8 +410,13 @@ impl State {
                         }
                     }
                     #[cfg(feature = "sim")]
-                    if let Some(proof) = staged {
-                        self.applied_staged.push((index, proof));
+                    {
+                        if let Some(proof) = staged {
+                            self.applied.staged.push((index, proof));
+                        }
+                        if next.cold && next.epoch != old.epoch {
+                            self.applied.resets.push(index);
+                        }
                     }
                     self.topology.slots[usize::from(index)] = next;
                     changed = true;
@@ -424,6 +473,7 @@ impl State {
             && proof.target != proof.source
             && old.lease == proof.prior_lease
             && source_fenced(self, proof.source, old.lease, lower_ms, proof.fence)
+            && proof.grant_ended(lower_ms)
             && self.staging.get(&index).is_some_and(|staging| {
                 staging.source_sequence == Some(proof.source_sequence)
                     && (staging.revision..=topo.revision).contains(&proof.target_revision)
@@ -550,7 +600,7 @@ fn valid_change(
     let Some(frozen) = moving.frozen else {
         return false;
     };
-    if proof.sequence != frozen.sequence || moving.replica_only {
+    if !holds_frozen_prefix(proof.sequence, frozen.sequence) || moving.replica_only {
         return false;
     }
     if next.primary == old.primary {
@@ -638,7 +688,9 @@ impl<'a> Placement<'a> {
         Some((copy, revision))
     }
 
-    fn recover_staged(&mut self, index: u16, slot: Slot, state: &State) -> Option<Change> {
+    /// Staged recovery for one slot: a promotion, the two changes of a
+    /// last-copy promotion, or a scoped cold reset.
+    fn recover_staged(&mut self, index: u16, slot: Slot, state: &State) -> Option<Vec<Change>> {
         let source = slot.primary?;
         let moving = slot.moving.filter(|moving| moving.replica_only)?;
         if self
@@ -674,11 +726,24 @@ impl<'a> Placement<'a> {
             return None;
         }
 
+        // Retirement stops renewals, but the retired process can still spend
+        // its last committed grant (CACHE-1). Retirement only skips the wait
+        // for its report to age out: the promotion commits once the
+        // controller's lower bound reaches that grant's expiry, which the
+        // state machine checks again at apply.
         let fence = if retired {
             SourceFence::Retired
         } else {
             SourceFence::LeaseExpired
         };
+        // At this point the source cannot serve and the assigned replica has
+        // no usable copy, so a verified staged copy is the last one. It is
+        // promoted whatever its lag (CACHE-4). Only the planted lag gate of
+        // the simulator applies the ordinary cutover limit here.
+        #[cfg(feature = "sim")]
+        let last_copy = !super::super::sim::hooks::knobs().last_copy_lag_gate;
+        #[cfg(not(feature = "sim"))]
+        let last_copy = true;
         if source_fenced(state, source, slot.lease, self.now.lower_ms, fence)
             && self.topo.member(moving.target).is_some()
             && let Some((copy, target_revision)) =
@@ -697,20 +762,18 @@ impl<'a> Placement<'a> {
                 source_sequence,
                 prior_lease: slot.lease,
                 fence,
+                last_copy,
             };
-            // A retired source can acknowledge more writes until its last
-            // committed grant expires. Defer the plan without changing how
-            // the state machine applies previously committed reconcile entries.
-            let cutoff = proof.cutoff(self.now.lower_ms);
-            if proof.within_lag() && self.now.fenced(cutoff) {
+            if proof.within_lag() && proof.grant_ended(self.now.lower_ms) {
+                let cutoff = proof.cutoff(self.now.lower_ms);
                 let next = self.switch_owner(slot, moving.target, cutoff, None)?;
-                return Some(Change::Slot {
+                return Some(vec![Change::Slot {
                     index,
                     expected: slot,
                     next,
                     evidence: Some(copy),
                     staged: Some(proof),
-                });
+                }]);
             }
         }
 
@@ -733,13 +796,13 @@ impl<'a> Placement<'a> {
             })?;
         let replica = self.replica_for(primary, None);
         slot.epoch.checked_add(1)?;
-        Some(Change::Slot {
+        Some(vec![Change::Slot {
             index,
             expected: slot,
             next: slot.cold_reset(primary, replica),
             evidence: None,
             staged: None,
-        })
+        }])
     }
 
     fn plan_slot(&mut self, index: u16, slot: Slot, state: &State) -> Option<Slot> {
@@ -914,7 +977,7 @@ impl<'a> Placement<'a> {
         if let Some(frozen) = moving.frozen {
             let exact = frozen.lease_expires_ms == deadline;
             let cutoff = if exact { frozen.upper_ms } else { deadline };
-            if target.sequence == frozen.sequence && self.now.fenced(cutoff) {
+            if holds_frozen_prefix(target.sequence, frozen.sequence) && self.now.fenced(cutoff) {
                 let prior = slot
                     .primary
                     .filter(|&source| {
@@ -1037,6 +1100,16 @@ impl<'a> Placement<'a> {
         *self.moves.entry(source).or_default() += 1;
         *self.moves.entry(target).or_default() += 1;
     }
+}
+
+/// A planned cutover needs the target at exactly the frozen sequence: every
+/// write the source acknowledged is at or below it.
+fn holds_frozen_prefix(sequence: u64, frozen: u64) -> bool {
+    #[cfg(feature = "sim")]
+    if super::super::sim::hooks::knobs().handover_short_prefix {
+        return sequence <= frozen;
+    }
+    sequence == frozen
 }
 
 fn close_enough(source: Progress, target: Progress) -> bool {

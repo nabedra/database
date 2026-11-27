@@ -153,13 +153,13 @@ impl RaftStateMachine<RaftConfig> for Machine {
             };
             #[cfg(feature = "sim")]
             {
-                let staged = std::mem::take(&mut current.state.applied_staged);
+                let applied = std::mem::take(&mut current.state.applied);
                 super::super::sim::hooks::committed(
                     id.index,
                     id.leader_id.term,
                     id.leader_id.node_id,
                     &current.state.topology,
-                    &staged,
+                    &applied,
                 );
             }
             drop(current);
@@ -206,7 +206,7 @@ impl RaftStateMachine<RaftConfig> for Machine {
                 id.leader_id.term,
                 id.leader_id.node_id,
                 &current.state.topology,
-                &[],
+                &Default::default(),
             );
         }
         Ok(())

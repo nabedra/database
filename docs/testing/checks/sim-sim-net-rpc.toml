@@ -1,0 +1,13 @@
+# The Events simulator's message router over NetPlan: specs/sim/net-rpc/SimNetRpc.tla.
+# See specs/sim/README.md.
+id = "sim-sim-net-rpc"
+module = "sim"
+kinds = ["T"]
+guarantees = []
+scenarios = ["EV01", "EV02", "EV07"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/sim/net-rpc", "SimNetRpc", "--module", "sim"]
+cwd = "."
+timeout_s = 3600
+needs = ["tlc"]
+result_parser = "tlc"

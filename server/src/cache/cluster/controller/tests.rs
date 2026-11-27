@@ -919,7 +919,9 @@ fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
     assert!(!state.reconcile(4_999, vec![promotion.clone()]));
 
     // The prior deadline has passed, but a new leader needs time to hear
-    // from the still-verified target before it can discard this epoch.
+    // from the still-verified target before it can discard this epoch. It
+    // also waits out its observation window for the source's first report
+    // (CACHE-2): a connected source could still renew the slot.
     let mut new_leader = Observations::default();
     new_leader.reset_if_changed(2, state.topology.generation, bounds(8_000));
     report(&mut new_leader, &state, make_member(3, 1).id, 8_001, None);
@@ -927,8 +929,13 @@ fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
     assert!(!state.clone().reconcile(8_001, changes));
     report(&mut new_leader, &state, target, 8_002, Some(copy));
     let changes = new_leader.plan(&state, bounds(8_002));
+    assert!(
+        !state.clone().reconcile(8_002, changes),
+        "a new leader promoted before the source's first report window elapsed"
+    );
+    let changes = new_leader.plan(&state, bounds(11_000));
     let mut recovered = state.clone();
-    assert!(recovered.reconcile(8_002, changes));
+    assert!(recovered.reconcile(11_000, changes));
     assert_eq!(recovered.topology.slots[0].primary, Some(target));
     assert!(!recovered.topology.slots[0].cold);
 
@@ -954,15 +961,24 @@ fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
             ..copy
         }),
     );
+    // CACHE-4: a copy one mutation past the cutover limit is still the last
+    // verified copy. It is promoted instead of reset.
     let changes = late.plan(&lagged, bounds(7_999));
-    assert!(!lagged.reconcile(7_999, changes));
-    let changes = late.plan(&lagged, bounds(8_000));
-    assert!(lagged.reconcile(8_000, changes));
-    let reset = lagged.topology.slots[0];
-    assert!(reset.cold);
-    assert_eq!(reset.epoch, 2);
-    assert!(reset.lease.is_none());
-    assert!(reset.moving.is_none());
+    assert!(changes.iter().any(|change| matches!(
+        change,
+        Change::Slot {
+            index: 0,
+            staged: Some(proof),
+            ..
+        } if proof.last_copy
+    )));
+    assert!(lagged.reconcile(7_999, changes));
+    let promoted = lagged.topology.slots[0];
+    assert_eq!(promoted.primary, Some(target));
+    assert!(!promoted.cold);
+    assert_eq!(promoted.epoch, 2);
+    assert_eq!(promoted.lease.unwrap().not_before_ms, 5_000);
+    assert!(promoted.moving.is_none());
 
     // A new leader must defer staging promotion while the retired source
     // can still acknowledge writes under its existing lease.
@@ -984,21 +1000,32 @@ fn k03_staged_promotion_checks_fence_lag_and_copy_at_apply() {
     assert!(!retired.reconcile(4_000, changes));
     assert_eq!(retired.topology.slots[0], initial_retired_slot);
 
-    // Previously committed reconcile entries retain their apply semantics.
-    let mut legacy = retired.clone();
-    let mut legacy_promotion = promotion.clone();
+    // Apply refuses a retirement proof while the source's grant is live
+    // (CACHE-1): retirement alone is no fence.
+    let mut early = retired.clone();
+    let mut early_promotion = promotion.clone();
     let Change::Slot {
         staged: Some(proof),
         ..
-    } = &mut legacy_promotion
+    } = &mut early_promotion
     else {
         panic!("expected staged promotion");
     };
     proof.fence = SourceFence::Retired;
-    assert!(legacy.reconcile(4_000, vec![legacy_promotion]));
-    assert_eq!(legacy.topology.slots[0].primary, Some(target));
+    assert!(!early.reconcile(4_000, vec![early_promotion.clone()]));
+    assert!(!early.reconcile(4_999, vec![early_promotion]));
+    assert_eq!(early.topology.slots[0], initial_retired_slot);
 
+    // Once the grant has expired, the retired source's promotion commits.
     let changes = observations.plan(&retired, bounds(5_000));
+    assert!(changes.iter().any(|change| matches!(
+        change,
+        Change::Slot {
+            index: 0,
+            staged: Some(proof),
+            ..
+        } if proof.fence == SourceFence::Retired
+    )));
     assert!(retired.reconcile(5_000, changes));
     let next = retired.topology.slots[0];
     assert_eq!(next.primary, Some(target));
@@ -1121,10 +1148,10 @@ fn k03_staged_completion_requires_a_report_from_this_transfer() {
     }
 }
 
-/// Known to fail. A heartbeat carries no order, so a late older one replaces
-/// the source's newer report, and a copy far beyond the lag bound completes.
+/// Record cache-older-source-heartbeat. A heartbeat carries no order, so a
+/// late older one used to replace the source's newer report, and a copy far
+/// beyond the lag bound completed. The controller keeps the newest progress.
 #[test]
-#[ignore = "open bug 2026-11-24-cache-older-source-heartbeat"]
 fn k03_older_source_heartbeat_does_not_complete_a_lagging_copy() {
     let (mut state, source, target, _, copy) = staging_fixture();
     let staged = state.topology.slots[0];
@@ -1159,6 +1186,125 @@ fn k03_older_source_heartbeat_does_not_complete_a_lagging_copy() {
         state.topology.slots[0], staged,
         "lag 900 hidden by an older source heartbeat"
     );
+}
+
+/// CACHE-4: a staged target holding the last verified copy is promoted even
+/// beyond the cutover limit, whether its source crashed or retired.
+#[test]
+fn k03_last_verified_copy_is_promoted_beyond_the_cutover_limit() {
+    use super::placement::{Change, MAX_CUTOVER_LAG};
+
+    let (mut state, source, target, _, copy) = staging_fixture();
+    // The source commits a watermark 40 mutations past the copy.
+    state.apply(
+        Command::Renew {
+            generation: state.topology.generation,
+            revision: state.topology.revision,
+            worker: source,
+            expires_ms: 4_000,
+            staged_progress: vec![Progress {
+                sequence: copy.sequence + MAX_CUTOVER_LAG + 8,
+                serving_primary: true,
+                ..copy
+            }],
+        },
+        false,
+    );
+    let staged = state.topology.slots[0];
+    let mut retired = state.clone();
+    assert!(matches!(
+        retired.apply(
+            Command::Enroll {
+                member: make_member(source.node, 2),
+                certificate: [source.node as u8; 32],
+            },
+            true
+        ),
+        Some(Reply::Applied { .. })
+    ));
+    for mut state in [state, retired] {
+        let mut observations = Observations::default();
+        report(&mut observations, &state, target, 3_900, Some(copy));
+        assert!(observations.plan(&state, bounds(3_999)).is_empty());
+        let changes = observations.plan(&state, bounds(4_000));
+        assert!(
+            changes.iter().any(|change| matches!(
+                change,
+                Change::Slot {
+                    index: 0,
+                    staged: Some(proof),
+                    ..
+                } if proof.last_copy
+            )),
+            "{changes:?}"
+        );
+        // Apply still refuses it before the source's grant ends.
+        assert!(!state.clone().reconcile(3_999, changes.clone()));
+        assert!(state.reconcile(4_000, changes));
+        let next = state.topology.slots[0];
+        assert_eq!(next.primary, Some(target));
+        assert_eq!(next.epoch, staged.epoch + 1);
+        assert!(!next.cold);
+        assert!(next.moving.is_none());
+        assert_eq!(next.lease.unwrap().not_before_ms, 4_000);
+    }
+}
+
+/// CACHE-8: operator receipts and retired incarnations are bounded. Neither a
+/// long-lived fleet's restarts nor its admin operations stop the controller.
+#[test]
+fn k03_restarts_and_operations_never_fill_the_controller_history() {
+    let mut state = fixture();
+    let node = 4;
+    let mut last = make_member(node, 1).id;
+    for boot in 2..=8_300u128 {
+        let member = make_member(node, boot);
+        assert!(
+            matches!(
+                state.apply(
+                    Command::Enroll {
+                        member: member.clone(),
+                        certificate: [node as u8; 32],
+                    },
+                    true
+                ),
+                Some(Reply::Applied { .. })
+            ),
+            "restart {boot} was refused"
+        );
+        assert!(state.is_retired(last));
+        last = member.id;
+    }
+    // The newest retirements are still refused at enrollment.
+    let stale = make_member(node, 8_299);
+    assert!(matches!(
+        state.apply(
+            Command::Enroll {
+                member: stale,
+                certificate: [node as u8; 32],
+            },
+            true
+        ),
+        Some(Reply::Refused(_))
+    ));
+    // Admin operations that apply: receipts keep a bounded, recent window.
+    for id in 0..8_300u128 {
+        let reply = admin(
+            &mut state,
+            3_000_000 + id,
+            Admin::Enroll {
+                member: make_member(5 + (id % 2) as u64, 0),
+            },
+            0,
+        );
+        assert!(
+            matches!(reply, Reply::Applied { .. }),
+            "operation {id}: {reply:?}"
+        );
+    }
+    assert!(state.valid_snapshot());
+    let snapshot: State = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    assert!(snapshot.valid_snapshot());
 }
 
 /// The existing controller fixture and placement decisions, without the Raft transport.

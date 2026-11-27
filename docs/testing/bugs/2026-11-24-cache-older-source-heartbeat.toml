@@ -1,3 +1,6 @@
+# Fixed in phase 2 (fx-cache): Observations::record keeps the newest progress of a primary's slot for the same
+# incarnation and epoch. The regression, no longer ignored, failed on 6417c4dd (run 45975845424) and passes from
+# 7ed7f21b (run 45979686152). Sim twin: mutants::planted_older_source_report_scripted (TransferLag).
 # A controller unit schedule only, local and unattested. No cluster schedule that delivers a source's
 # older heartbeat after a newer one is known, and the author's 151 instrumented sweep seeds (local) did not
 # produce one. This record is neither a pass nor a fail of the guarantee it names.
@@ -12,9 +15,6 @@ found_date = "2026-11-24"
 lowest_regression = "server/src/cache/cluster/controller/tests.rs::k03_older_source_heartbeat_does_not_complete_a_lagging_copy"
 seed = "unknown"
 why_not_caught = "A worker in the sweeps never has two heartbeats in flight at once, so no heartbeat arrives after a newer one, and no unit test reordered them."
-invariant_added = "Completing a staged replica compares the target with the newest source progress the controller has seen. The regression is ignored and fails today."
-fix_commits = []
+invariant_added = "Completing a staged replica compares the target with the newest source progress the controller has seen; the sim checks the actual lag at the commit (TransferLag)."
+fix_commits = ["7ed7f21bdc4ceb62253ebbe40f22c6ac6d40171a"]
 revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-22"

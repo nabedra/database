@@ -1,0 +1,18 @@
+# Finding CACHE-8 of the review wave (rv-cache, 2026-11-26). The old state machine refused enrollment with "worker
+# incarnation history is full" after 8,192 restarts and every admin operation with "operator receipt history is full"
+# after 8,192 operations (state.rs on caeb6272, lines 170 and 287). The regression passes from f1b392f7. It was not
+# run on the old state machine, which it cannot pass: its loops go past both caps.
+id = "cache-controller-history-full"
+title = "After 8,192 worker restarts or admin operations the Cache controller refused every enrollment or operation"
+class = "resource-release-order"
+module = "cache"
+guarantees = ["CACHE-G05", "CACHE-G11"]
+scenarios = ["K05"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/src/cache/cluster/controller/tests.rs::k03_restarts_and_operations_never_fill_the_controller_history"
+seed = "unknown"
+why_not_caught = "No test ran a fleet's lifetime of restarts or operations against the state machine."
+invariant_added = "Receipts keep the latest 8,192 operations and each node its last 8 retired incarnations; enrollment and admin operations never fail for history size."
+fix_commits = ["f1b392f7b35c7dfae6bab001dbaa1d4d7a3c2bd8"]
+revert_patch_ok = false

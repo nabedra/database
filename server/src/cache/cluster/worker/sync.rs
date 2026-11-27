@@ -278,6 +278,10 @@ fn rss_bytes() -> Option<u64> {
 #[derive(Default)]
 struct Lane {
     cursor: usize,
+    // Slots whose last reply carried a full batch of deltas, so the source
+    // likely holds more. They are probed again on the next poll instead of
+    // waiting for the cursor to come round the whole lane (CACHE-6).
+    behind: Vec<(u16, u64)>,
     session: Option<PeerConnection>,
     next_attempt: Option<Instant>,
     last_used: Option<Instant>,
@@ -316,11 +320,15 @@ pub(super) async fn replicate(worker: Worker, tls: PeerTls) -> io::Result<()> {
             }
             topology = current;
         }
+        #[cfg(feature = "sim")]
+        let member_gate = super::super::sim::hooks::knobs().copy_drops_retired_source;
+        #[cfg(not(feature = "sim"))]
+        let member_gate = false;
         for (&source, group) in &groups {
             let Some(endpoint) = topology
                 .member(source)
                 .map(|member| &member.peer)
-                .or_else(|| retired_peers.get(&source))
+                .or_else(|| retired_peers.get(&source).filter(|_| !member_gate))
             else {
                 continue;
             };
@@ -333,11 +341,21 @@ pub(super) async fn replicate(worker: Worker, tls: PeerTls) -> io::Result<()> {
             }
             cap_connections(&mut lanes, source);
             let lane = lanes.entry(source).or_default();
-            let count = group.len().min(PROBES);
+            let mut selected: Vec<(u16, u64)> = std::mem::take(&mut lane.behind)
+                .into_iter()
+                .filter(|point| group.binary_search(point).is_ok())
+                .take(PROBES)
+                .collect();
+            let count = group.len().min(PROBES - selected.len());
             let cursor = lane.cursor;
-            let selected = (0..count).map(|index| group[(index + cursor) % group.len()]);
+            for index in 0..count {
+                let point = group[(index + cursor) % group.len()];
+                if !selected.contains(&point) {
+                    selected.push(point);
+                }
+            }
             lane.cursor = (cursor + count) % group.len();
-            let probes = sample(&worker, source, topology.generation, selected).await;
+            let probes = sample(&worker, source, topology.generation, selected.into_iter()).await;
             if probes.is_empty() {
                 continue;
             }
@@ -347,7 +365,8 @@ pub(super) async fn replicate(worker: Worker, tls: PeerTls) -> io::Result<()> {
                 destination: source,
             };
             match copy(&worker, &tls, endpoint, identity, &probes, lane).await {
-                Ok(()) => {
+                Ok(behind) => {
+                    lane.behind = behind;
                     lane.last_used = Some(time::now_std());
                     lane.failures = 0;
                     lane.next_attempt = None;
@@ -452,7 +471,7 @@ async fn copy(
     identity: Identity,
     probes: &[Probe],
     lane: &mut Lane,
-) -> io::Result<()> {
+) -> io::Result<Vec<(u16, u64)>> {
     let mut connection = match lane.session.take() {
         Some(connection) => connection,
         None => tls.connect(endpoint).await?,
@@ -514,5 +533,17 @@ async fn copy(
             let _ = timeout(LOCAL_DEADLINE, result).await;
         }
     }
-    Ok(())
+    // A full batch of deltas means the source likely has more for that slot.
+    Ok(probes
+        .iter()
+        .zip(responded)
+        .filter_map(|(probe, received)| match received {
+            Received::Sequenced(last)
+                if last.saturating_sub(probe.sequence) >= peer::DELTAS_PER_PROBE as u64 =>
+            {
+                Some((probe.slot, probe.epoch))
+            }
+            _ => None,
+        })
+        .collect())
 }

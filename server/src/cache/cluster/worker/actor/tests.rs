@@ -537,6 +537,92 @@ fn k02_promoted_then_refilled_roles_stay_within_total_data_capacity() {
     );
 }
 
+/// CACHE-5 and CACHE-G03: under sampled LRU, a write that fits its slot but
+/// not the actor's remaining primary budget evicts older keys of its slot
+/// instead of returning OOM.
+#[test]
+fn k02_sampled_lru_evicts_against_the_actor_budget() {
+    let id = node(1);
+    let mut config = config(id);
+    config.primary_bytes = MIB;
+    config.replica_bytes = MIB;
+    config.eviction = EvictionPolicy::SampledLru;
+    let mut actor = State::new(0, config).unwrap();
+    let first = Bytes::from_static(b"{actor-budget-a}");
+    let second = Bytes::from_static(b"{actor-budget-b}");
+    let (slot_a, slot_b) = (key_slot(&first), key_slot(&second));
+    assert_ne!(slot_a, slot_b);
+    let mut topology = Topology {
+        revision: 1,
+        ..Topology::default()
+    };
+    let owned = Slot {
+        epoch: 1,
+        primary: Some(id),
+        cold: true,
+        ..Default::default()
+    };
+    topology.slots[usize::from(slot_a)] = owned;
+    topology.slots[usize::from(slot_b)] = owned;
+    let mut grants = vec![None; topology.slots.len()];
+    for slot in [slot_a, slot_b] {
+        grants[usize::from(slot)] = Some(Lease {
+            expires_ms: u64::MAX,
+            not_before_ms: 0,
+        });
+    }
+    actor.install(Arc::new(topology), &grants);
+    let write = |actor: &mut State, slot, key: &Bytes, size: usize| {
+        let op = Operation::Set {
+            key: key.clone(),
+            value: Bytes::from(vec![7; size]),
+            ttl_ms: None,
+            when: SetWhen::Always,
+        };
+        actor.execute(slot, 1, 1, nabedra_rt::time::now_std(), &op)
+    };
+    // Each slot is far below its own 4 MiB limit. Together they fill most of
+    // the actor's 1 MiB primary budget.
+    assert!(matches!(
+        write(&mut actor, slot_a, &first, 600_000),
+        Response::Simple(_)
+    ));
+    assert!(matches!(
+        write(&mut actor, slot_b, &second, 300_000),
+        Response::Simple(_)
+    ));
+    let older = Bytes::from_static(b"{actor-budget-b}:newer");
+    assert_eq!(key_slot(&older), slot_b);
+    let reply = write(&mut actor, slot_b, &older, 300_000);
+    assert!(
+        matches!(reply, Response::Simple(_)),
+        "sampled LRU returned {reply:?} instead of evicting"
+    );
+    let shard = &actor.slots[&slot_b];
+    assert_eq!(shard.evicted, 1);
+    assert!(actor.storage.primary <= config.primary_bytes);
+    assert!(matches!(
+        actor.execute(
+            slot_b,
+            1,
+            1,
+            nabedra_rt::time::now_std(),
+            &Operation::Get(second)
+        ),
+        Response::Bulk(None)
+    ));
+    assert!(matches!(
+        actor.execute(
+            slot_a,
+            1,
+            1,
+            nabedra_rt::time::now_std(),
+            &Operation::Get(first)
+        ),
+        Response::Bulk(Some(_))
+    ));
+}
+
 #[test]
 fn k03_replica_requests_a_snapshot_when_delta_cannot_fit() {
     let origin = node(1);

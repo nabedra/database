@@ -1,0 +1,21 @@
+# Finding CACHE-5 of the review wave (rv-cache, 2026-11-26), confirmed in phase 2 by the regression below:
+# it returned OOM on 6417c4dd (run 45975845424, Cache library tests) and evicts on the fix.
+# The store evicted only against its own slot limit (store.rs fit_layout), while publish refused any turn whose
+# charge exceeded the actor's remaining primary budget (actor.rs publish, StoreBytes::ceiling). With 8 MiB per
+# actor and 683 slots of 8 MiB, a full actor returned OOM under sampled_lru, which CACHE-G03 forbids.
+# Residual: eviction stays within the written slot, so a write to a slot that holds too little to evict still
+# returns OOM when the actor is full. Choosing victims across slots needs a multi-slot journal turn.
+id = "cache-actor-budget-oom"
+title = "Sampled LRU returned OOM instead of evicting once the actor's primary budget was full"
+class = "other"
+module = "cache"
+guarantees = ["CACHE-G03"]
+scenarios = ["K02"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/src/cache/cluster/worker/actor/tests.rs::k02_sampled_lru_evicts_against_the_actor_budget"
+seed = "unknown"
+why_not_caught = "Store tests check eviction against the slot limit alone, and no actor test filled several slots past the actor budget."
+invariant_added = "A sampled_lru write that fits its slot but not the actor's remaining primary budget evicts older keys of the slot and is admitted."
+fix_commits = ["7ed7f21bdc4ceb62253ebbe40f22c6ac6d40171a"]
+revert_patch_ok = false
