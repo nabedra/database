@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Seek};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
@@ -37,7 +37,7 @@ pub(super) struct Log(Arc<Mutex<Wal>>);
 
 impl Log {
     pub fn open(dir: &Path) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
+        disk::durable_dir(&*nabedra_rt::fs::real(), dir)?;
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
