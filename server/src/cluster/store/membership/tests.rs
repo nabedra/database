@@ -471,3 +471,55 @@ async fn expired_before_submission_is_definite_and_performs_no_write() {
     );
     assert_eq!(counts(&s), (0, 1));
 }
+
+#[tokio::test]
+async fn st04_r03_readiness_and_abort_match_the_same_captured_root() {
+    for readiness_wins in [false, true] {
+        let root = registered();
+        let storage = store(&root);
+        let base = storage.load_control(deadline()).await.unwrap();
+        let readiness = PreparedMembership::prepare(base.clone(), ready(&root)).unwrap();
+        let abort = PreparedMembership::prepare(
+            base.clone(),
+            crate::cluster::membership::fence_readiness(&root, owner(), id(30)).unwrap(),
+        )
+        .unwrap();
+        let gate = Arc::new(ReadGate::default());
+        *storage.backend().pending_gate.lock().unwrap() = Some(gate.clone());
+        let unknown = readiness.submit(&storage, deadline()).await.unwrap();
+        assert!(matches!(
+            unknown,
+            OwnershipOutcome::Unknown { current: Some(current) } if current == base
+        ));
+        assert!(entered(&gate).await);
+
+        let provider = storage
+            .backend()
+            .pending_task
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+        let (applied, renewal) = if readiness_wins {
+            gate.release.add_permits(1);
+            let applied = finish(provider).await;
+            (applied, abort.submit(&storage, deadline()).await.unwrap())
+        } else {
+            let renewal = abort.submit(&storage, deadline()).await.unwrap();
+            gate.release.add_permits(1);
+            (finish(provider).await, renewal)
+        };
+
+        let observed = storage.load_control(deadline()).await.unwrap();
+        assert_eq!(observed.root().revision, root.revision + 1);
+        if readiness_wins {
+            assert!(applied.is_ok());
+            assert!(matches!(renewal, OwnershipOutcome::Conflict { .. }));
+            assert_eq!(observed.root().nodes[0].state, NodeState::Ready);
+        } else {
+            assert_eq!(applied, Err(StorageError::Conflict));
+            assert!(matches!(renewal, OwnershipOutcome::Acknowledged(_)));
+            assert_eq!(observed.root().nodes[0].state, NodeState::Starting);
+        }
+    }
+}

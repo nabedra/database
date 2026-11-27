@@ -1,0 +1,18 @@
+# Design review rv-lsm (wave-rv), finding LSM-5. Open: a residual, written into the plan; the code is not changed.
+id = "RV-LSM-5"
+title = "A run-time quarantine whose manifest edit fails is kept only in memory; after a crash the damaged group's Raft node starts and votes again"
+class = "membership-replacement-trust"
+module = "lsm"
+guarantees = ["LSM-G03"]
+scenarios = ["NS07", "NS23"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/lsm/quarantine/Quarantine.cfg"
+seed = "unknown"
+why_not_caught = "No test fails the manifest sync right after a run-time damage report, and open checks run footers only, so block and journal-value damage is not found again before the group starts."
+invariant_added = "A group quarantined at run time never starts again under its old identity: G03_QuarantineSticky without its lostQ exception."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

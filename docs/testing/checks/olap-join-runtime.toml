@@ -1,0 +1,11 @@
+id = "olap-join-runtime"
+module = "olap-stream"
+kinds = ["U"]
+guarantees = []
+scenarios = ["ST04", "R03"]
+tiers = ["T1"]
+command = ["cargo", "test", "--locked", "--lib", "st04_r03_", "--", "--test-threads=1"]
+cwd = "server"
+timeout_s = 2400
+needs = []
+result_parser = "cargo-test"
