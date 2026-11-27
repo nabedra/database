@@ -58,10 +58,7 @@ enum Operation {
     Publication,
     Finish,
     /// RANGES-1: the direct-write barrier in the source before the cut.
-    /// Appended last; an older worker cannot decode it (see `pause`).
     Pause,
-    /// RANGES-1: the owner's sweep releases the barrier of a settled split.
-    Release,
 }
 impl Operation {
     fn routes_data(self) -> bool {
@@ -76,7 +73,6 @@ impl Operation {
                 | Self::Imported
                 | Self::Finish
                 | Self::Pause
-                | Self::Release
         )
     }
     fn purpose(self) -> Purpose {
@@ -378,14 +374,6 @@ impl SplitClient {
     #[doc(hidden)]
     pub async fn pause(&self, attempt: &SplitAttempt) -> Result<(), ProtocolError> {
         self.typed(&attempt.intent.source, Operation::Pause, &source(attempt))
-            .await
-    }
-    /// RANGES-1: release the barrier a late copy of a settled split's pause
-    /// left in the source. The release applies the same rule on every
-    /// release of the store, so replicas of mixed releases stay equal.
-    #[doc(hidden)]
-    pub async fn release(&self, attempt: &SplitAttempt) -> Result<(), ProtocolError> {
-        self.typed(&attempt.intent.source, Operation::Release, &source(attempt))
             .await
     }
     #[doc(hidden)]

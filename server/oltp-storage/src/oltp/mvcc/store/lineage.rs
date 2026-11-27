@@ -594,7 +594,7 @@ pub(super) fn finish_source(
     commit(tx, &ParticipantReply::SplitSourceFinished(decision))
 }
 
-fn source_receipt(split_id: Uuid) -> [u8; 17] {
+pub(super) fn source_receipt(split_id: Uuid) -> [u8; 17] {
     let mut key = [b'S'; 17];
     key[1..].copy_from_slice(split_id.as_bytes());
     key

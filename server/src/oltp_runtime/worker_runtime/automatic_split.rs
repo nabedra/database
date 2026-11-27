@@ -364,22 +364,7 @@ impl OwnerLoop {
                 runtime.clear_split_deficit(source.group_id);
                 let automatic = (1..=AUTOMATIC_ATTEMPTS)
                     .any(|slot| AutomaticSplitOrigin { epoch, slot }.id(source) == split_id);
-                let attempt = client.job(split_id).await?;
-                if let Some(attempt) = &attempt
-                    && attempt.closed.is_some()
-                    && attempt.intent.source == *source
-                {
-                    // RANGES-1: a late copy of a settled attempt's pause holds
-                    // the source with nobody to release it; release it here.
-                    if let Err(error) = client.release(attempt).await {
-                        runtime.split_observation(
-                            source.group_id,
-                            Some(split_id),
-                            "release_pending",
-                            Some(error.code),
-                        );
-                    }
-                } else if let Some(attempt) = attempt
+                if let Some(attempt) = client.job(split_id).await?
                     && attempt.closed.is_none()
                     && attempt.intent.source == *source
                     && attempt.intent.automatic.is_some() == automatic
