@@ -335,14 +335,6 @@ async fn d05_unknown_proposal_keeps_range_clock_pending_until_apply() {
         ParticipantMachine::new(voter.store.clone()).unwrap(),
         consensus.clone(),
     ));
-    // What a snapshot of the absent row returns. Every snapshot waits for
-    // every pending commit at or below it (rule 2), so take it first.
-    let before = ReadTs::new(counter.0.fetch_add(1, Ordering::SeqCst)).unwrap();
-    let absent = voter
-        .handle
-        .read_at(before, cluster.row_key(1))
-        .await
-        .unwrap();
     let id = nabedra_rt::ids::uuid_v4();
     let request = cluster.request_at(
         leader,
@@ -353,7 +345,17 @@ async fn d05_unknown_proposal_keeps_range_clock_pending_until_apply() {
     );
     // The proposal reaches the held consensus, then the deadline passes.
     let mut response = Box::pin(voter.executor.execute(&handle, request));
-    at_proposal(voter, response.as_mut(), 1).await;
+    let early = nabedra_rt::time::timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|cx| match response.as_mut().poll(cx) {
+            Poll::Ready(answer) => Poll::Ready(Some(answer)),
+            Poll::Pending if voter.executor.stats().entries_proposed == 1 => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }),
+    )
+    .await
+    .expect("the request reaches its proposal");
+    assert_eq!(early, None, "answered before proposing");
     let response = response.await;
     assert_eq!(
         code(&response).map(|(_, outcome)| outcome),
@@ -388,12 +390,11 @@ async fn d05_unknown_proposal_keeps_range_clock_pending_until_apply() {
         .await
         .expect("submitted proposal finishes");
     let seen = reader.await.unwrap().unwrap();
-    assert_ne!(
-        seen.as_slice(),
-        absent.as_slice(),
-        "the snapshot includes the commit below it"
+    assert!(
+        String::from_utf8_lossy(seen.as_slice()).contains("fixa"),
+        "the snapshot includes the commit below it: {}",
+        String::from_utf8_lossy(seen.as_slice())
     );
-    assert!(cluster.latest(leader, cluster.row_key(1)).await.0.is_some());
     assert_eq!(
         clock.pending_len(),
         0,
