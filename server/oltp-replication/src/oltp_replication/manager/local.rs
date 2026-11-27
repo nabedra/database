@@ -4,6 +4,8 @@
 pub(crate) use super::super::authority::control::LocalOperatorPermit;
 mod registered;
 mod restore;
+#[cfg(all(test, feature = "sim", target_os = "linux"))]
+mod sim_tests;
 use super::super::{
     TlsMaterial,
     multiplex::{PeerDirectory, TransportConfig, TransportTrust, WorkerTransport},
@@ -267,7 +269,9 @@ fn topology(owner: &DirectoryOwner, database: &Text<128>) -> Result<LocalTopolog
 }
 #[cfg(unix)]
 fn lock_directory(path: &Path) -> Result<DirectoryOwner, ProtocolError> {
-    fs::create_dir_all(path).map_err(storage)?;
+    // Every open makes the data directory durable in its parent, also when a crashed
+    // earlier open created it and stopped before the sync (DUR-5).
+    fs::create_dir_all_synced(path).map_err(storage)?;
     let meta = fs::symlink_metadata(path).map_err(storage)?;
     if !meta.is_dir()
         || meta.file_type().is_symlink()
