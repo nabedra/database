@@ -93,9 +93,10 @@ checks the register requires. Follow the [evidence rules](references/evidence.md
   below the 14-day rate on `main`. A panic, abort or OOM kill blocks without
   retry. Replay a failing simulation seed to diagnose the bug. The failure
   stays recorded.
-- Use `scripts/testing/ab.py` for performance claims. It alternates base and
-  head on one runner and flags a regression of 5% or more that exceeds the
-  bootstrap threshold. Use dedicated hardware for absolute latency targets.
+- Use `scripts/testing/ab.py` for Nabedra base/head performance claims.
+  It alternates base and head on one runner and flags regressions of 5% or
+  more that exceed the bootstrap threshold. Use dedicated hardware for absolute latency targets.
+  For comparisons with other systems, use [performance review](../performance-review/SKILL.md).
 
 ## Pull request body
 
