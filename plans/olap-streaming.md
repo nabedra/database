@@ -433,7 +433,10 @@ version is refused as stale. The field is serialized only for a fenced join; a l
 it, so a fenced join to a legacy joiner pauses, as the rollout above already requires. Successful
 ordinary operations read nothing extra. Regression tests:
 `st04_r03_delayed_reset_from_an_earlier_join_attempt_is_refused` and
-`st04_r03_failed_reset_does_not_consume_its_base`.
+`st04_r03_failed_reset_does_not_consume_its_base`. `OlapJoinFence` models it: a failed attempt leaves its
+reset in flight (`JoinFail`), the reset lands later (`LateReset`), and the mutant `unbound_reset`, the
+receiver before the fix, breaks `G07_ReadyHoldsAccepted` in 7 states. Local TLC: both baselines pass
+with 53,937 distinct states at depth 19, 16 actions covered, all five mutants caught.
 
 A coordinator that still holds an unresolved fenced seal refuses a new fenced join at once instead
 of waiting behind its own seal for the 30 s exchange deadline, during which the controller would hold
