@@ -380,12 +380,16 @@ impl Fidelity {
 
 type Observer = Arc<dyn Fn(&SimEvent<'_>) + Send + Sync>;
 
+/// A product registry tracked by [`World::track_registry`]: its name, and whether its
+/// owner is still alive.
+type Registry = (&'static str, Box<dyn Fn() -> bool + Send>);
+
 /// The run's observers and type-keyed extension slots.
 #[derive(Default)]
 struct Hooks {
     observers: Mutex<Vec<Observer>>,
     ext: Mutex<BTreeMap<TypeId, Box<dyn Any + Send>>>,
-    registries: Mutex<Vec<(&'static str, Box<dyn Fn() -> bool + Send>)>>,
+    registries: Mutex<Vec<Registry>>,
 }
 
 impl std::fmt::Debug for Hooks {
