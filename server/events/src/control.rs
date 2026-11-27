@@ -9,7 +9,7 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use crate::{
         PartitionRoute,
     },
     partition,
-    raft::{Broker, BrokerConfig, Group, GroupError},
+    raft::{Broker, BrokerConfig, ClockPolicy, Group, GroupError},
 };
 
 use catalog::{Bootstrap, BrokerSpec, Header, Topic};
@@ -63,6 +63,10 @@ pub struct Config {
     http_limits: HttpLimits,
     #[serde(default = "default_disk_reserve")]
     min_free_disk_bytes: u64,
+    /// The stated broker clock bound (EVENTS-2, EVT-G08). Older configs omit it and get
+    /// the defaults.
+    #[serde(default)]
+    clock: ClockPolicy,
 }
 
 #[derive(Deserialize)]
@@ -111,6 +115,13 @@ impl Config {
         ensure!(
             self.allow_plaintext || self.public_tls.is_some(),
             "public TLS is required"
+        );
+        ensure!(
+            (0..=60_000).contains(&self.clock.max_clock_error_ms)
+                && self.clock.max_uncertainty_ms >= 2 * self.clock.max_clock_error_ms
+                && (1..=60_000).contains(&self.clock.sample_max_age_ms),
+            "the clock bound needs 0 to 60000 ms of error, an uncertainty budget of at least \
+             twice the error and a sample age of 1 to 60000 ms"
         );
         ensure!(
             self.allow_plaintext
@@ -299,6 +310,11 @@ pub(super) struct Control {
     peer_control: Semaphore,
     publish_metrics: Calls,
     poll_metrics: Calls,
+    /// The metadata group still waits for the empty-volume rule (EVENTS-1). It holds
+    /// `true` on the broker that initializes a new cluster.
+    metadata_join: Mutex<Option<bool>>,
+    /// The rule found this volume's metadata replica lost: an operator re-adds it.
+    metadata_lost: AtomicBool,
 }
 
 const LATENCY_BOUNDS_MS: [u64; 11] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000];
@@ -332,6 +348,7 @@ impl Control {
     fn new(mut config: Config, broker: Arc<Broker>) -> Result<Arc<Self>> {
         let bootstrap = config.bootstrap.broker_map(config.allow_plaintext)?;
         let keyring = Arc::new(config.take_keyring()?);
+        broker.set_clock_policy(config.clock);
         let disk_available = AtomicU64::new(broker.disk_available_bytes()?);
         Ok(Arc::new(Self {
             config,
@@ -348,6 +365,8 @@ impl Control {
             peer_control: Semaphore::new(24),
             publish_metrics: Calls::default(),
             poll_metrics: Calls::default(),
+            metadata_join: Mutex::new(None),
+            metadata_lost: AtomicBool::new(false),
         }))
     }
 

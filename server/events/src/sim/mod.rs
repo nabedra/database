@@ -14,7 +14,7 @@ pub mod runtime;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -34,6 +34,12 @@ pub(crate) struct State {
     pub history: history::History,
     /// The broker each running node serves.
     pub brokers: BTreeMap<u64, Arc<Broker>>,
+    /// Nodes whose volume lost the group: the empty-volume rule (EVENTS-1) keeps them out
+    /// of it, so they neither vote nor acknowledge.
+    pub lost: BTreeSet<u64>,
+    /// Clients stamp commands from `Group::time_bounds`, as a product leader does after
+    /// EVENTS-2. Off in the default sweep, whose commands carry the target's raw clock.
+    pub guarded_time: bool,
 }
 
 /// The Events part of one simulated run: the `nabedra_rt` world plus the network plan,
@@ -56,6 +62,8 @@ impl Harness {
                 observer: RaftObserver::new(voters),
                 history: history::History::default(),
                 brokers: BTreeMap::new(),
+                lost: BTreeSet::new(),
+                guarded_time: false,
             }),
         })
     }

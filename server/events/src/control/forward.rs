@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::{CACHE_LEADERS, CONTROL_WORK_TIMEOUT, Control, Error, METADATA, catalog};
 use crate::{
-    http, partition,
+    partition,
     raft::{GroupError, GroupStatus},
 };
 
@@ -59,6 +59,11 @@ pub(super) enum Rpc {
     Group {
         group: String,
         call: GroupCall,
+    },
+    /// What the target's volume holds for `group` (EVENTS-1). Brokers released before
+    /// this request answer 400, which the caller treats as no answer.
+    DiskState {
+        group: String,
     },
 }
 
@@ -170,7 +175,7 @@ impl Rpc {
 
     fn budget(&self) -> Duration {
         match self {
-            Self::Inspect { .. } => PROBE_TIMEOUT,
+            Self::Inspect { .. } | Self::DiskState { .. } => PROBE_TIMEOUT,
             Self::Open { .. }
             | Self::Initialize { .. }
             | Self::Retire { .. }
@@ -265,6 +270,9 @@ impl Control {
                 encode(())
             }
             Rpc::Group { group, call } => self.execute_group(&group, call).await,
+            Rpc::DiskState { group } => {
+                encode(self.broker.disk_state(&group).map_err(|_| Error::Invalid)?)
+            }
         }
     }
 
@@ -280,16 +288,17 @@ impl Control {
             GroupCall::MetaWrite { command } if group_id == METADATA => {
                 group.write(encode(command)?).await.map_err(Into::into)
             }
+            // EVENTS-2: the leader stamps time from the guarded interval of its voters'
+            // clocks (`Group::time_bounds`), not from its own clock alone.
             GroupCall::PartitionRead { mut query } if group_id != METADATA => {
-                if let partition::Query::Poll { now_ms, .. } = &mut query {
-                    *now_ms = http::now_ms();
+                if matches!(query, partition::Query::Poll { .. }) {
+                    partition::stamp_query(&mut query, group.time_bounds().await?);
                 }
                 encode(group.read(move |tx| partition::query(tx, query)).await?)
             }
             GroupCall::PartitionWrite { mut command } if group_id != METADATA => {
                 match &mut command {
-                    partition::Command::Publish { now_ms, .. }
-                    | partition::Command::PublishMany { now_ms, .. } => {
+                    partition::Command::Publish { .. } | partition::Command::PublishMany { .. } => {
                         if self
                             .disk_available
                             .load(std::sync::atomic::Ordering::Relaxed)
@@ -297,16 +306,18 @@ impl Control {
                         {
                             return Err(Error::Disk.into());
                         }
-                        *now_ms = http::now_ms();
+                        partition::stamp(&mut command, group.time_bounds().await?);
                         return group
                             .write_coalesced(encode(command)?)
                             .await
                             .map_err(Into::into);
                     }
-                    partition::Command::Claim { now_ms, .. }
-                    | partition::Command::Renew { now_ms, .. }
-                    | partition::Command::Release { now_ms, .. }
-                    | partition::Command::Ack { now_ms, .. } => *now_ms = http::now_ms(),
+                    partition::Command::Claim { .. }
+                    | partition::Command::Renew { .. }
+                    | partition::Command::Release { .. }
+                    | partition::Command::Ack { .. } => {
+                        partition::stamp(&mut command, group.time_bounds().await?);
+                    }
                     // Retention may run on a local preferred leader even while
                     // metadata quorum is temporarily unavailable.
                     partition::Command::Retain { .. } => {}

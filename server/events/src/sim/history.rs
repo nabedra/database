@@ -138,8 +138,15 @@ fn uuid_of(value: &Value) -> Option<Uuid> {
     value.as_str()?.parse().ok()
 }
 
-/// Checks the history against the final log. Returns one line per anomaly.
-pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<String> {
+/// Checks the history against the final log. Returns one line per anomaly. `earliest` is
+/// the first offset retention kept (1 without retention): an event below it was removed by
+/// retention, which the retention workload checks against EVT-G08 when it happens.
+pub fn check(
+    history: &History,
+    log: &FinalLog,
+    final_checkpoint: u64,
+    earliest: u64,
+) -> Vec<String> {
     let mut anomalies = Vec::new();
     let mut offset_of: BTreeMap<Uuid, u64> = BTreeMap::new();
     let mut event_at: BTreeMap<u64, Uuid> = BTreeMap::new();
@@ -175,9 +182,10 @@ pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<St
                     .collect();
                 invoked.extend(ids.iter().copied());
                 // This workload retries whole batches, so even an unknown outcome can
-                // leave only the entire batch or none of it in the final log.
+                // leave only the entire batch or none of it in the final log. Retention
+                // can remove the front of a batch, so the check needs it all retained.
                 let present = ids.iter().filter(|id| retained.contains(id)).count();
-                if present != 0 && present != ids.len() {
+                if earliest == 1 && present != 0 && present != ids.len() {
                     anomalies.push(format!(
                         "EVT-G04 partial-batch: {present} of {} invoked events survived (history index {})",
                         ids.len(), event.index,
@@ -199,7 +207,7 @@ pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<St
                 }
                 for (id, offset) in &pairs {
                     claim(*id, *offset, "publish ok", event.index, &mut anomalies);
-                    if log.get(offset) != Some(id) {
+                    if *offset >= earliest && log.get(offset) != Some(id) {
                         anomalies.push(format!(
                             "EVT-G01 lost-write: acknowledged event {id} at offset {offset} is not in the final log (history index {})",
                             event.index
@@ -239,7 +247,7 @@ pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<St
                     expected = offset + 1;
                     delivered.insert(offset);
                     claim(id, offset, "poll", event.index, &mut anomalies);
-                    if log.get(&offset) != Some(&id) {
+                    if offset >= earliest && log.get(&offset) != Some(&id) {
                         anomalies.push(format!(
                             "EVT-G02 phantom-read: poll delivered {id} at offset {offset}, the final log holds {:?} (history index {})",
                             log.get(&offset),
@@ -254,7 +262,7 @@ pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<St
 
     // The final log: offsets 1..=tail with no gaps, only invoked events, no event twice.
     let mut seen = BTreeSet::new();
-    for (expected, (offset, id)) in (1u64..).zip(log) {
+    for (expected, (offset, id)) in (earliest..).zip(log) {
         if *offset != expected {
             anomalies.push(format!(
                 "EVT-G02 gap: the final log has offset {offset} where {expected} was expected"
@@ -273,7 +281,8 @@ pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<St
         }
     }
     for (event_id, offset) in &offset_of {
-        if log.get(offset).is_some_and(|held| held != event_id)
+        if *offset >= earliest
+            && log.get(offset).is_some_and(|held| held != event_id)
             && !log.values().any(|id| id == event_id)
         {
             anomalies.push(format!(
@@ -290,7 +299,11 @@ pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<St
             ));
         }
     }
-    let tail = log.keys().next_back().copied().unwrap_or(0);
+    let tail = log
+        .keys()
+        .next_back()
+        .copied()
+        .unwrap_or(earliest.saturating_sub(1));
     if final_checkpoint != tail {
         anomalies.push(format!(
             "EVT-G05 drain-incomplete: the final checkpoint is {final_checkpoint}, the tail {tail}"

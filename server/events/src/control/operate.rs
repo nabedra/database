@@ -20,13 +20,16 @@ use super::{Control, Error, METADATA, RESTORE_REBIND, catalog, parse_partition_i
 use crate::{
     http::{self, ApiError},
     partition,
-    raft::{GroupError, GroupStatus, MAX_HOSTED_GROUPS, Membership},
+    raft::{
+        DiskState, Group, GroupError, GroupStatus, MAX_HOSTED_GROUPS, Membership, Rejoin, rejoin,
+    },
 };
 
 const ADMIN_MAX_BYTES: usize = 16 * 1024;
 const HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 const CONTROLLER_INTERVAL: Duration = Duration::from_millis(200);
-const RETENTION_PAGE: usize = 8;
+/// The time one retention tick may spend trimming the groups this broker leads (EVENTS-3).
+const RETENTION_BUDGET: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct BackupLayout {
@@ -187,6 +190,12 @@ impl Control {
             "store_recovery_required": storage.recovery_required,
             // A full device: Raft writes retry until space frees up.
             "no_space": storage.no_space,
+            // EVENTS-1: this volume lost its metadata replica; the broker does not vote in
+            // the metadata group until an operator re-adds it.
+            "metadata_replica_lost": self.metadata_lost.load(Ordering::Acquire)
+                && self.broker.group(METADATA).is_none(),
+            // The empty-volume rule still waits for every bootstrap peer to answer.
+            "metadata_join_pending": self.metadata_join.lock().expect("metadata join lock").is_some(),
             "storage": storage,
             "publish": self.publish_metrics.report(),
             "poll": self.poll_metrics.report(),
@@ -389,6 +398,9 @@ impl Control {
         let mut cursor = 0usize;
         loop {
             timer.tick().await;
+            if let Err(error) = self.join_metadata().await {
+                tracing::warn!(%error, "could not open the metadata group yet");
+            }
             let available = self.broker.disk_available_bytes().unwrap_or_default();
             self.disk_available.store(available, Ordering::Relaxed);
             if let Ok(header) = self.read_header().await {
@@ -447,48 +459,75 @@ impl Control {
         let mut anchor = None;
         loop {
             timer.tick().await;
-            let ids = self.broker.group_ids();
-            if ids.is_empty() {
-                continue;
-            }
-            for group_id in ids
-                .iter()
-                .cycle()
-                .skip(cursor % ids.len())
-                .take(RETENTION_PAGE.min(ids.len()))
-            {
-                let Some((topic, _)) = parse_partition_id(group_id) else {
-                    continue;
-                };
-                let Some(group) = self.broker.group(group_id) else {
-                    continue;
-                };
-                if group.leader() != Some(self.config.broker_id) {
-                    continue;
-                }
-                let Some(definition) = self.read_cached_by_id(topic, &mut anchor).await else {
-                    continue;
-                };
-                let retain_ms = i64::try_from(definition.retention_seconds.saturating_mul(1000))
-                    .unwrap_or(i64::MAX);
-                let cutoff_ms = http::now_ms().saturating_sub(retain_ms);
-                let status = group
-                    .read(|tx| partition::query(tx, partition::Query::Status))
-                    .await;
-                if let Ok(Ok(partition::QueryReply::Status(status))) = status
-                    && status
-                        .oldest_published_ms
-                        .is_some_and(|time| time < cutoff_ms)
-                    && let Ok(command) = serde_json::to_value(partition::Command::Retain {
-                        cutoff_ms,
-                        limit: partition::MAX_RETAIN_EVENTS,
-                    })
-                {
-                    let _ = group.write(command).await;
-                }
-            }
-            cursor = cursor.wrapping_add(RETENTION_PAGE);
+            cursor = self
+                .retain_pass(cursor, &mut anchor, RETENTION_BUDGET)
+                .await;
         }
+    }
+
+    /// One retention tick (EVENTS-3). It visits only the partition groups this broker
+    /// leads, round robin from `cursor`, and trims each one until its expired backlog is
+    /// gone or the tick's `budget` is spent, so retention keeps up with a busy partition
+    /// instead of removing at most 128 events per visit. Returns the next tick's cursor.
+    pub(super) async fn retain_pass(
+        &self,
+        cursor: usize,
+        anchor: &mut Option<catalog::Topic>,
+        budget: Duration,
+    ) -> usize {
+        let deadline = crate::rt::now() + budget;
+        let led: Vec<(String, Uuid)> = self
+            .broker
+            .group_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let (topic, _) = parse_partition_id(&id)?;
+                let group = self.broker.group(&id)?;
+                (group.leader() == Some(self.config.broker_id)).then_some((id, topic))
+            })
+            .collect();
+        if led.is_empty() {
+            return 0;
+        }
+        let start = cursor % led.len();
+        for step in 0..led.len() {
+            if crate::rt::now() >= deadline {
+                return start + step;
+            }
+            let (group_id, topic) = &led[(start + step) % led.len()];
+            let Some(group) = self.broker.group(group_id) else {
+                continue;
+            };
+            let Some(definition) = self.read_cached_by_id(*topic, anchor).await else {
+                continue;
+            };
+            let retain_ms =
+                i64::try_from(definition.retention_seconds.saturating_mul(1000)).unwrap_or(i64::MAX);
+            self.retain_group(&group, retain_ms, deadline).await;
+        }
+        start + 1
+    }
+
+    /// Trims one partition group (`partition::trim`) from the guarded cutoff. Returns
+    /// the events removed.
+    pub(super) async fn retain_group(
+        &self,
+        group: &Group,
+        retain_ms: i64,
+        deadline: crate::rt::Instant,
+    ) -> usize {
+        let Some(cutoff_ms) = self.retention_cutoff(group, retain_ms).await else {
+            return 0;
+        };
+        partition::trim(group, cutoff_ms, deadline).await.0
+    }
+
+    /// The retention cutoff for one group (EVENTS-2): the lower bound of the guarded
+    /// interval minus the retention period, so one fast clock cannot remove an event
+    /// early. Without a fresh interval retention waits for the next tick.
+    async fn retention_cutoff(&self, group: &Group, retain_ms: i64) -> Option<i64> {
+        let bounds = group.time_bounds().await.ok()?;
+        Some(bounds.lower_ms.saturating_sub(retain_ms))
     }
 
     async fn read_cached_by_id(
@@ -793,30 +832,124 @@ impl Control {
                  until an operator re-adds this replica"
             );
         } else if initial.contains(&self.config.broker_id) && !self.broker.was_retired(METADATA)? {
-            let group = match self.open_group(METADATA).await {
-                Ok(group) => group,
-                Err(error) if self.broker.is_quarantined(METADATA) => {
-                    tracing::error!(%error, "the damaged metadata group stays stopped");
-                    return Ok(());
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if initial.first() == Some(&self.config.broker_id)
-                && !group.is_initialized()
+            let initializer = initial.first() == Some(&self.config.broker_id)
                 && (restoring
                     || self
                         .config
                         .initialize_new_cluster
-                        .unwrap_or(self.config.allow_plaintext))
-            {
-                let addresses = initial
-                    .iter()
-                    .map(|id| (*id, self.bootstrap[id].peer_url.clone()))
-                    .collect();
-                group.initialize(addresses).await?;
+                        .unwrap_or(self.config.allow_plaintext));
+            let stored = self.broker.group(METADATA);
+            match stored {
+                // The restore CLI seeded every initial voter from one backup cut.
+                Some(group) if restoring => {
+                    if initializer && !group.is_initialized() {
+                        group.initialize(self.initial_addresses()).await?;
+                    }
+                }
+                // The volume holds the group, and nothing is left to initialize.
+                Some(group) if !initializer || group.is_initialized() => {}
+                // EVENTS-1: this volume does not hold the group, or holds it without the
+                // initial membership. A broker cannot tell a new volume from one that lost
+                // its replica, so the peers decide. Probing them waits for their listeners,
+                // so the decision runs after `serve` starts them, on the monitor loop.
+                _ => {
+                    *self.metadata_join.lock().expect("metadata join lock") = Some(initializer);
+                    if self.metadata_peers().is_empty() {
+                        self.join_metadata().await?;
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    fn initial_addresses(&self) -> BTreeMap<u64, String> {
+        self.config
+            .bootstrap
+            .metadata_voters
+            .iter()
+            .map(|id| (*id, self.bootstrap[id].peer_url.clone()))
+            .collect()
+    }
+
+    /// The bootstrap brokers other than this one: the peers of the empty-volume rule.
+    fn metadata_peers(&self) -> BTreeSet<u64> {
+        self.bootstrap
+            .keys()
+            .copied()
+            .filter(|id| *id != self.config.broker_id)
+            .collect()
+    }
+
+    /// Applies the empty-volume rule to the metadata group (EVENTS-1; plan, "Brokers and
+    /// storage"): open it as a voter only in a new cluster, and never under the old
+    /// membership of a volume that lost its replica. Runs again on every monitor tick
+    /// while a peer has not answered.
+    pub(super) async fn join_metadata(&self) -> Result<()> {
+        let Some(initializer) = *self.metadata_join.lock().expect("metadata join lock") else {
+            return Ok(());
+        };
+        let done = || *self.metadata_join.lock().expect("metadata join lock") = None;
+        let open = self.broker.group(METADATA);
+        if open
+            .as_ref()
+            .is_some_and(|group| !initializer || group.is_initialized())
+        {
+            // An operator's re-add opened the group behind an election floor meanwhile.
+            done();
+            return Ok(());
+        }
+        let probe = Rpc::DiskState {
+            group: METADATA.into(),
+        };
+        let peers = self.metadata_peers();
+        let answers = futures_util::future::join_all(peers.iter().map(|id| {
+            let probe = &probe;
+            async move {
+                (
+                    *id,
+                    self.peer_operation::<DiskState>(*id, probe).await.ok(),
+                )
+            }
+        }))
+        .await
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        match rejoin(
+            initializer,
+            &self.config.bootstrap.metadata_voters,
+            &answers,
+        ) {
+            Rejoin::Wait => Ok(()),
+            Rejoin::Lost => {
+                done();
+                if open.is_none() {
+                    self.metadata_lost.store(true, Ordering::Release);
+                    tracing::error!(
+                        "this volume lost its metadata replica: the broker stays out of the \
+                         metadata group and never votes under its old membership. Re-add it \
+                         with move_metadata (remove it, then add it back), or start the \
+                         replacement under a new broker ID"
+                    );
+                } else {
+                    tracing::warn!(
+                        "the metadata group already formed on the peers; not initializing it"
+                    );
+                }
+                Ok(())
+            }
+            Rejoin::Genesis => {
+                let group = match open {
+                    Some(group) => group,
+                    None => self.open_group(METADATA).await?,
+                };
+                if initializer && !group.is_initialized() {
+                    group.initialize(self.initial_addresses()).await?;
+                }
+                done();
+                Ok(())
+            }
+        }
     }
 
     pub(super) async fn recover_seeded(self: Arc<Self>) -> Result<()> {

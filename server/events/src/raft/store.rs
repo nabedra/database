@@ -645,6 +645,16 @@ impl Database {
             .collect()
     }
 
+    /// Groups this volume retired: it once hosted them and keeps only the retirement record.
+    pub fn retired_group_ids(&self) -> Result<Vec<String>> {
+        entries(&self.snapshot(), RETIRED, &prefix_end(RETIRED), true)
+            .map(|entry| {
+                let (key, _) = entry?;
+                Ok(std::str::from_utf8(&key[RETIRED.len()..])?.to_owned())
+            })
+            .collect()
+    }
+
     pub fn hosted_key(id: &str) -> Vec<u8> {
         [HOSTED, id.as_bytes()].concat()
     }

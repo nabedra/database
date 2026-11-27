@@ -18,6 +18,38 @@ pub const MAX_SUBSCRIPTIONS_PER_PARTITION: u32 = 4096;
 const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
 const HEAD_KEY: &[u8] = b"partition/v1/head";
 
+/// Stamps a command the leader is about to propose with guarded time (EVENTS-2; plan,
+/// "Brokers and storage"). A publish gets the upper bound, so an event's age never runs
+/// ahead of true time. Lease commands get the lower bound, against which the replicated
+/// lease clock tests expiry, and a TTL widened by the interval's width, so a new lease's
+/// deadline is the upper bound plus the requested TTL. The entry format is the one an
+/// unguarded leader writes; with `TimeBounds::local` the stamps are unchanged.
+pub fn stamp(command: &mut Command, bounds: crate::raft::TimeBounds) {
+    match command {
+        Command::Publish { now_ms, .. } | Command::PublishMany { now_ms, .. } => {
+            *now_ms = bounds.upper_ms;
+        }
+        Command::Claim { now_ms, ttl_ms, .. } | Command::Renew { now_ms, ttl_ms, .. } => {
+            *now_ms = bounds.lower_ms;
+            if (1..=MAX_LEASE_MS).contains(ttl_ms) {
+                let width = bounds.upper_ms.saturating_sub(bounds.lower_ms).max(0);
+                *ttl_ms = ttl_ms.saturating_add(width).min(MAX_LEASE_MS);
+            }
+        }
+        Command::Release { now_ms, .. } | Command::Ack { now_ms, .. } => {
+            *now_ms = bounds.lower_ms;
+        }
+        _ => {}
+    }
+}
+
+/// Stamps a poll with the lower bound, the time its lease check uses (EVENTS-2).
+pub fn stamp_query(query: &mut Query, bounds: crate::raft::TimeBounds) {
+    if let Query::Poll { now_ms, .. } = query {
+        *now_ms = bounds.lower_ms;
+    }
+}
+
 pub fn valid_name(name: &str) -> bool {
     (1..=63).contains(&name.len())
         && name
@@ -248,6 +280,48 @@ impl StateMachine for Machine {
     }
 }
 
+/// Trims one partition group's expired events (EVENTS-3): one `Retain` entry per
+/// [`MAX_RETAIN_EVENTS`] events older than `cutoff_ms`, repeated while a full page was
+/// removed and `deadline` (on [`crate::rt::now`]) allows. Returns the events removed and
+/// the earliest offset the last entry left.
+pub async fn trim(
+    group: &crate::raft::Group,
+    cutoff_ms: i64,
+    deadline: crate::rt::Instant,
+) -> (usize, Option<u64>) {
+    let status = group.read(|tx| query(tx, Query::Status)).await;
+    let expired = matches!(
+        status,
+        Ok(Ok(QueryReply::Status(status)))
+            if status.oldest_published_ms.is_some_and(|time| time < cutoff_ms)
+    );
+    let (mut total, mut earliest) = (0, None);
+    while expired {
+        let Ok(command) = serde_json::to_value(Command::Retain {
+            cutoff_ms,
+            limit: MAX_RETAIN_EVENTS,
+        }) else {
+            break;
+        };
+        let Ok(reply) = group.write(command).await else {
+            break;
+        };
+        let Ok(Ok(Reply::Retained {
+            removed,
+            earliest_offset,
+        })) = serde_json::from_value::<Mutation>(reply)
+        else {
+            break;
+        };
+        total += removed;
+        earliest = Some(earliest_offset);
+        if removed < MAX_RETAIN_EVENTS || crate::rt::now() >= deadline {
+            break;
+        }
+    }
+    (total, earliest)
+}
+
 /// Execute on a read snapshot acquired through the group's quorum-confirmed read.
 pub fn query(tx: &Transaction<'_>, query: Query) -> StorageResult<Result<QueryReply, Error>> {
     as_outcome(read(tx, query))
@@ -257,6 +331,7 @@ pub fn query(tx: &Transaction<'_>, query: Query) -> StorageResult<Result<QueryRe
 #[derive(PartialEq)]
 pub(crate) struct SimState {
     pub tail: u64,
+    pub earliest: u64,
     pub checkpoint: u64,
     pub events: Vec<Event>,
 }
@@ -287,6 +362,7 @@ pub(crate) fn sim_state(
         }
         Ok(SimState {
             tail: head.tail(),
+            earliest: head.earliest_offset,
             checkpoint: status.checkpoint,
             events: out,
         })
