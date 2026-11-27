@@ -1084,3 +1084,86 @@ async fn consumer(sim: Arc<Harness>, stop: Arc<AtomicBool>, seed: u64, nodes: u6
         sleep(Duration::from_millis(pause)).await;
     }
 }
+
+#[cfg(test)]
+mod rpc_delivery_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use nabedra_sim::Filters;
+
+    #[test]
+    fn duplicate_respects_a_partition_opened_by_the_first_delivery() {
+        nabedra_rt::sim::run(1, |world| async move {
+            let config = SimConfig::new(1);
+            let sim = Harness::new(world.clone(), config.knobs, config.nodes);
+            let _installed = Installed::new(sim.clone());
+            for id in [1, 2] {
+                world.add_node(id, NodeClock::default());
+                world.crash(id);
+            }
+            let mut cluster = Cluster::new(sim.clone(), config);
+            cluster.start(1).await.unwrap();
+            cluster.start(2).await.unwrap();
+            sim.lock().net.set_filters(Filters {
+                dup_per_mille: 1000,
+                ..Filters::default()
+            });
+            let calls = Arc::new(AtomicUsize::new(0));
+            let reply = in_node(
+                1,
+                super::super::net::call(2, "test", Duration::from_millis(100), {
+                    let calls = calls.clone();
+                    let sim = sim.clone();
+                    move |_| {
+                        if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                            sim.lock().net.block(1, 2);
+                        }
+                        async { Some(()) }
+                    }
+                }),
+            )
+            .await;
+            assert_eq!(reply, Some(()));
+            nabedra_rt::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            cluster.stop_all();
+        });
+    }
+
+    #[test]
+    fn reply_respects_a_partition_before_the_receiver_resumes() {
+        nabedra_rt::sim::run(1, |world| async move {
+            let config = SimConfig::new(1);
+            let sim = Harness::new(world.clone(), config.knobs, config.nodes);
+            let _installed = Installed::new(sim.clone());
+            for id in [1, 2] {
+                world.add_node(id, NodeClock::default());
+                world.crash(id);
+            }
+            let mut cluster = Cluster::new(sim.clone(), config);
+            cluster.start(1).await.unwrap();
+            cluster.start(2).await.unwrap();
+            let reply = in_node(
+                1,
+                super::super::net::call(2, "test", Duration::from_millis(100), {
+                    let sim = sim.clone();
+                    move |_| {
+                        sim.lock().net.pause(1);
+                        let sim = sim.clone();
+                        sim.world().clone().spawn_node(2, async move {
+                            nabedra_rt::time::sleep(Duration::from_millis(10)).await;
+                            let mut state = sim.lock();
+                            state.net.block(2, 1);
+                            state.net.resume(1);
+                        });
+                        async { Some(()) }
+                    }
+                }),
+            )
+            .await;
+            assert_eq!(reply, None);
+            cluster.stop_all();
+        });
+    }
+}
