@@ -79,7 +79,19 @@ impl ReplicaPlacement {
         request.validate()?;
         let local = self.factory.manager.client().local_identity();
         let mut plan = match self.factory.control.replica_move(id).await? {
-            Some(plan) if plan.request == request && plan.owner == local => plan,
+            Some(plan) if plan.request == request => {
+                // CONTROL-1: after an owner fence, the new owner is the
+                // steward of a published move's retirement.
+                let steward = if plan.owner == local {
+                    None
+                } else {
+                    self.factory.control.replica_move_steward(id).await?
+                };
+                if !drives_move(&plan, local, steward) {
+                    return Err(conflict());
+                }
+                plan
+            }
             Some(_) => return Err(conflict()),
             None => self.start(permit, catalog, id, request).await?,
         };
@@ -783,4 +795,73 @@ fn elect_move_source(request: uuid::Uuid) -> bool {
         let trigger = std::path::PathBuf::from(directory).join(format!("move-elect-source-{request}"));
         std::fs::remove_file(trigger).is_ok()
     })
+}
+
+/// CONTROL-1: the worker that may advance `plan`: its own owner, or, once an
+/// owner fence released a published move's slot, the steward Control
+/// recorded for its retirement (`ControlHandle::replica_move_steward`).
+fn drives_move(plan: &ReplicaMove, local: WorkerIdentity, steward: Option<WorkerIdentity>) -> bool {
+    plan.owner == local
+        || steward == Some(local) && matches!(plan.phase, ReplicaMovePhase::Published { .. })
+}
+
+#[cfg(test)]
+mod control1_tests {
+    use super::*;
+    use crate::oltp_replication::authority::control::GroupRecord;
+
+    fn worker(n: u8) -> WorkerIdentity {
+        WorkerIdentity {
+            worker_id: Uuid::from_u128(n as u128),
+            incarnation: Uuid::from_u128(1000 + n as u128),
+            certificate_sha256: Digest::from_bytes([n; 32]),
+            enrollment_revision: 1,
+        }
+    }
+
+    /// CONTROL-1: the new owner re-drives the retirement of a published move
+    /// that an owner fence re-owned. The lost owner's plan still names it, so
+    /// the shipped check (`plan.owner == local`) refused the new owner.
+    #[test]
+    fn r05_control1_the_steward_re_drives_a_re_owned_published_retirement() {
+        let (lost, steward, other) = (worker(1), worker(2), worker(3));
+        let mut plan: ReplicaMove = serde_json::from_value(serde_json::json!({
+            "id": Uuid::from_u128(7), "request": {
+                "group": {"cluster_id": Uuid::from_u128(8), "database": "default", "group_id": Uuid::from_u128(9),
+                          "kind": {"data": {"table_id": Uuid::from_u128(10), "shard_id": Uuid::from_u128(11)}},
+                          "group_format_version": GROUP_FORMAT_VERSION},
+                "expected_generation": Uuid::from_u128(12), "remove_node": 1,
+                "target": {"node_id": 4, "worker_id": lost.worker_id, "pool_id": Uuid::from_u128(13)},
+                "worker": lost, "pool_generation": 1},
+            "owner": lost, "authority": {"run_id": Uuid::from_u128(14), "owner_term": 1},
+            "expected": {"identity": {"cluster_id": Uuid::from_u128(8), "database": "default", "group_id": Uuid::from_u128(9),
+                          "kind": {"data": {"table_id": Uuid::from_u128(10), "shard_id": Uuid::from_u128(11)}},
+                          "group_format_version": GROUP_FORMAT_VERSION},
+                         "generation": Uuid::from_u128(12), "replica_count": 3, "replica_root": Digest::from_bytes([5; 32]),
+                         "membership_position": {"term": 1, "node_id": 1, "index": 5}},
+            "old": [{"node_id": 1, "worker_id": lost.worker_id, "pool_id": Uuid::from_u128(15)},
+                    {"node_id": 2, "worker_id": steward.worker_id, "pool_id": Uuid::from_u128(16)},
+                    {"node_id": 3, "worker_id": other.worker_id, "pool_id": Uuid::from_u128(17)}],
+            "next": [{"node_id": 4, "worker_id": lost.worker_id, "pool_id": Uuid::from_u128(13)},
+                     {"node_id": 2, "worker_id": steward.worker_id, "pool_id": Uuid::from_u128(16)},
+                     {"node_id": 3, "worker_id": other.worker_id, "pool_id": Uuid::from_u128(17)}],
+            "lineage": {"catalog": Uuid::from_u128(18), "table": Uuid::from_u128(10), "table_version": 1,
+                        "schema_epoch": 1, "route_digest": Digest::from_bytes([6; 32])},
+            "guard": null, "phase": serde_json::to_value(ReplicaMovePhase::Moving).unwrap()
+        }))
+        .unwrap();
+        let placement: GroupRecord = plan.expected.clone();
+        // A moving move is never re-owned (it refuses the owner fence).
+        assert!(!drives_move(&plan, steward, Some(steward)));
+        plan.phase = ReplicaMovePhase::Published {
+            placement,
+            activated_generation: 1,
+            activated_at: AppliedPosition { term: 1, node_id: 4, index: 9 },
+            activation_lineage: Digest::from_bytes([7; 32]),
+        };
+        assert!(drives_move(&plan, lost, None), "the plan's own owner");
+        assert!(drives_move(&plan, steward, Some(steward)), "the steward re-drives the retirement");
+        assert!(!drives_move(&plan, other, Some(steward)), "another worker does not");
+        assert!(!drives_move(&plan, steward, None), "no steward before an owner fence");
+    }
 }
