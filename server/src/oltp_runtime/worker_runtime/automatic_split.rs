@@ -867,3 +867,163 @@ async fn settle(
     .await
     .map_err(|_| unknown())?
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oltp::mvcc::store::{
+        KeySpan,
+        lifecycle::{GuardMode, LifecycleBinding, VerifiedLifecycleGuard},
+        lineage::SplitBinding,
+    };
+    use crate::oltp_replication::authority::timestamp::split::ImageCut;
+
+    const EPOCH: ShardEpoch = ShardEpoch {
+        schema: 7,
+        routing: 11,
+    };
+
+    fn source() -> GroupIdentity {
+        GroupIdentity {
+            cluster_id: Uuid::from_u128(1),
+            database: Text::new("split".to_owned()).unwrap(),
+            kind: GroupKind::Data {
+                table_id: Uuid::from_u128(2),
+                shard_id: Uuid::from_u128(3),
+            },
+            group_id: Uuid::from_u128(4),
+            group_format_version: 1,
+        }
+    }
+
+    fn authority(owner_term: u64) -> Authority {
+        Authority {
+            run_id: Uuid::from_u128(5),
+            owner_term,
+        }
+    }
+
+    /// An open attempt on `source()` opened under `opened_by`: automatic in
+    /// `slot` of `EPOCH`, or manual for `None`, with its children bound or not.
+    fn attempt(opened_by: Authority, slot: Option<u8>, bound: bool) -> SplitAttempt {
+        let source = source();
+        let automatic = slot.map(|slot| AutomaticSplitOrigin { epoch: EPOCH, slot });
+        let split_id = automatic.map_or(Uuid::from_u128(6), |origin| origin.id(&source));
+        let intent = SplitIntent {
+            split_id,
+            source: source.clone(),
+            boundary: protocol::Key::Int64(2),
+            page_bytes: MIN_IMAGE_PAGE_BYTES,
+            automatic,
+        };
+        let request = RequestBinding {
+            run_id: opened_by.run_id,
+            request_id: split_id,
+            digest: intent.digest().unwrap(),
+            accepted_context: Digest::from_bytes([1; 32]),
+        };
+        let txn = TxnId {
+            request_id: split_id,
+            attempt: 1,
+        };
+        let read_ts = Timestamp::new(10).unwrap();
+        let pin = StoragePin {
+            pin_id: Uuid::from_u128(7),
+            read_ts,
+            allocator_epoch: 1,
+        };
+        let catalog_group_id = Uuid::from_u128(8);
+        let image = bound.then(|| {
+            let guard = VerifiedLifecycleGuard::model_for_test(
+                LifecycleBinding {
+                    guard_id: Uuid::from_u128(9),
+                    catalog_group_id,
+                    table_id: Uuid::from_u128(2),
+                    lifecycle_version: None,
+                    schema_epoch: EPOCH.schema,
+                    txn,
+                    request,
+                    read_ts,
+                    authority: opened_by,
+                },
+                GuardMode::Exclusive,
+            )
+            .into_sealed();
+            let children = std::array::from_fn(|index| SplitBinding {
+                split_id,
+                source: source.clone(),
+                source_schema_epoch: EPOCH.schema,
+                source_routing_epoch: EPOCH.routing,
+                source_span: KeySpan {
+                    start: None,
+                    end: None,
+                },
+                target: GroupIdentity {
+                    group_id: Uuid::from_u128(10 + index as u128),
+                    ..source.clone()
+                },
+                target_span: if index == 0 {
+                    KeySpan {
+                        start: None,
+                        end: Some(intent.boundary.clone()),
+                    }
+                } else {
+                    KeySpan {
+                        start: Some(intent.boundary.clone()),
+                        end: None,
+                    }
+                },
+                read_ts,
+                guard: guard.clone(),
+            });
+            ImageCut {
+                pin,
+                guard,
+                children: Some(children),
+                placement: None,
+            }
+        });
+        SplitAttempt {
+            intent,
+            authority: opened_by,
+            catalog_group_id,
+            request,
+            txn,
+            snapshot: pin,
+            image,
+            closed: None,
+        }
+    }
+
+    #[test]
+    fn o16_o21_review_f4_only_unbound_automatic_attempts_of_this_term_are_left_to_select_work() {
+        let current = authority(3);
+        let older = authority(2);
+        let other_run = Authority {
+            run_id: Uuid::from_u128(99),
+            ..current
+        };
+        // Unbound and automatic in this owner term: select_work's capacity
+        // check fixes its placement before Bind.
+        assert!(leave_to_select_work(&attempt(current, Some(1), false), current));
+        // Cut (the source may be paused) but not bound: still unbound.
+        let mut cut = attempt(current, Some(3), true);
+        cut.image.as_mut().unwrap().children = None;
+        assert!(cut.children().is_err() && cut.image.is_some());
+        assert!(leave_to_select_work(&cut, current));
+        // Bound: its placement is fixed, resume_open resumes it with it.
+        assert!(!leave_to_select_work(&attempt(current, Some(1), true), current));
+        // Another owner term or run: resume_open cancels it.
+        for opened_by in [older, other_run] {
+            for bound in [false, true] {
+                assert!(!leave_to_select_work(&attempt(opened_by, Some(2), bound), current));
+            }
+        }
+        // Manual: select_work never selects it, resume_open resumes it.
+        for opened_by in [current, older] {
+            for bound in [false, true] {
+                assert!(!leave_to_select_work(&attempt(opened_by, None, bound), current));
+            }
+        }
+    }
+}
