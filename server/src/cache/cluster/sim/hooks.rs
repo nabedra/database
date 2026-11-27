@@ -44,6 +44,24 @@ pub(in crate::cache::cluster) struct Knobs {
     // fenced, so the target's grant starts at once instead of at the
     // source's last committed expiry (design review R-cache-14).
     pub staged_retire_is_fence: bool,
+    // CACHE-1, last live grant: the shipped planner commits a retired
+    // source's staged promotion before that source's grant ends. The
+    // target's grant still starts at the expiry, so leases stay exclusive.
+    pub retired_promotion_commits_early: bool,
+    // CACHE-1, assigned promotion: a copy stops pulling once its source
+    // incarnation retires (the shipped member gates).
+    pub copy_drops_retired_source: bool,
+    // CACHE-4: the last verified staged copy keeps the cutover lag gate, so
+    // the slot is reset instead of promoted.
+    pub last_copy_lag_gate: bool,
+    // Stale source reports: the controller replaces a source's newer
+    // progress with an older heartbeat delivered late.
+    pub controller_keeps_older_report: bool,
+    // Planned handover: the controller cuts over to a move target one
+    // mutation short of the frozen prefix.
+    pub handover_short_prefix: bool,
+    // Cold reset: a worker keeps its old store when it installs a cold epoch.
+    pub cold_reset_retains_data: bool,
 }
 
 pub(in crate::cache::cluster) enum Observed {
@@ -80,6 +98,7 @@ pub(in crate::cache::cluster) enum Observed {
         applied: bool,
     },
     Promoted {
+        worker: WorkerId,
         slot: u16,
         epoch: u64,
         prefix_epoch: u64,
@@ -90,6 +109,8 @@ pub(in crate::cache::cluster) enum Observed {
         slot: u16,
         epoch: u64,
         sequence: u64,
+        // The grant the actor authorized the turn with.
+        lease: Option<Lease>,
     },
     Charged {
         worker: WorkerId,
@@ -107,7 +128,16 @@ pub(in crate::cache::cluster) enum Observed {
 }
 
 type Observe = dyn Fn(u64, Observed) + Send + Sync;
-type Commit = dyn Fn(u64, u64, u64, u64, &Topology, &[(u16, StagedPromotion)]) + Send + Sync;
+type Commit = dyn Fn(u64, u64, u64, u64, &Topology, &Applied) + Send + Sync;
+
+/// What one controller apply decided beyond the topology itself.
+#[derive(Clone, Default)]
+pub(in crate::cache::cluster) struct Applied {
+    /// Committed staged promotions and their proofs.
+    pub staged: Vec<(u16, StagedPromotion)>,
+    /// Slots the planner cold-reset automatically (not an operator reset).
+    pub resets: Vec<u16>,
+}
 
 pub(super) struct Hooks {
     pub knobs: Knobs,
@@ -161,11 +191,11 @@ pub(in crate::cache::cluster) fn committed(
     term: u64,
     leader: u64,
     topology: &Topology,
-    staged: &[(u16, StagedPromotion)],
+    applied: &Applied,
 ) {
     if let (Some(world), Some(node)) = (sim::world(), sim::current_node()) {
         world.with_ext::<Hooks, _>(|hooks| {
-            (hooks.committed)(node, index, term, leader, topology, staged)
+            (hooks.committed)(node, index, term, leader, topology, applied)
         });
     }
 }

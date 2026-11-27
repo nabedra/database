@@ -450,6 +450,26 @@ async fn cold_reset(cluster: &mut Cluster, lost_key: Option<&str>) {
     }
 }
 
+/// The failover loss window of this fault model (SIM-2, lead decision 5).
+/// An old primary acknowledges nothing once its latest committed grant ends,
+/// and the nemesis runs one fault at a time, none longer than about a lease.
+/// A partition can stop replication when renewals stop, up to a lease before
+/// that instant, and a lost frame can stall a lane for up to two renewal
+/// intervals of timeouts and backoff before that. A write that reached no
+/// copy for longer than that before the grant ended was not lost to lag.
+const LAG_WINDOW_MS: u64 = LEASE_MS + 2 * RENEW_MS;
+
+/// The checker options of every Cache history, sweep and directed alike.
+pub(super) fn history_options() -> relaxed_kv::Options {
+    relaxed_kv::Options {
+        // A serving clock bounds its interval to 10 ms. Include the
+        // millisecond round-up used by actors, regardless of repair duration.
+        expiry_tolerance_ns: MAX_UNCERTAINTY_NS + 1_000_000,
+        lag_window_ns: Some(LAG_WINDOW_MS * 1_000_000),
+        ..relaxed_kv::Options::default()
+    }
+}
+
 fn result(cluster: &Cluster, seed: u64, workload: Workload) -> SeedRun {
     let observed = cluster.observed.lock().expect("observation lock");
     let mut history = Vec::new();
@@ -461,12 +481,7 @@ fn result(cluster: &Cluster, seed: u64, workload: Workload) -> SeedRun {
         .iter()
         .map(|(kind, detail)| format!("{kind}: {detail}"))
         .collect();
-    let options = relaxed_kv::Options {
-        // A serving clock bounds its interval to 10 ms. Include the
-        // millisecond round-up used by actors, regardless of repair duration.
-        expiry_tolerance_ns: MAX_UNCERTAINTY_NS + 1_000_000,
-        ..relaxed_kv::Options::default()
-    };
+    let options = history_options();
     let verdict =
         if workload == Workload::Memory && cluster.config.eviction == EvictionPolicy::SampledLru {
             let events = observed
@@ -648,9 +663,10 @@ fn seed_sweep() {
             "virtual_hours": report.virtual_ms() as f64 / 3_600_000.0,
             "fault_model": "Cache K01 expiry, K02 memory, K03 cluster",
             "partitions": partitions_name(partitions),
-            // Any acknowledged write above the promoted copy's prefix may be
-            // lost, however old. Only the prefix itself is checked.
-            "lag_window_ns": relaxed_kv::Options::default().lag_window_ns,
+            // A failover may lose only writes above the promoted copy's
+            // prefix acknowledged within this window before the old grant
+            // ended. A planned handover may lose none.
+            "lag_window_ns": history_options().lag_window_ns,
             "replayed": report.replayed(),
         })
     );

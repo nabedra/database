@@ -16,7 +16,11 @@
 //! can carry a top-level key to scope it to that key. A `cold-reset` marker records explicit
 //! data loss and starts an empty store. Simulated mutations can carry a `sequence` in the
 //! completion. A failover marker can carry the retained `prefix_epoch` and `prefix_sequence`
-//! of the promoted copy. In that case only the unreplicated suffix may be lost.
+//! of the promoted copy. In that case only the unreplicated suffix may be lost. It can also
+//! carry `authority_end_ns`, the instant after which the old primary could acknowledge
+//! nothing; a lag window is then measured back from it rather than from the marker.
+//! Markers named in `Options::handover_markers` (default `handover`) mark a planned owner
+//! change that moves the whole acknowledged prefix: no write may be lost across one.
 //! A simulated staged promotion includes its committed `reported_sequence`,
 //! `source_sequence`, and `max_lag` under `staged_promotion`. A larger gap reports
 //! `promotion-lag`, even if the worker catches up before it installs the new epoch.
@@ -47,8 +51,12 @@ use std::collections::{BTreeMap, HashMap};
 #[derive(Clone, Debug)]
 pub struct Options {
     pub failover_markers: Vec<String>,
+    /// Markers of a planned owner change (an online move's cutover). No
+    /// acknowledged write may be lost across one, whatever the lag window.
+    pub handover_markers: Vec<String>,
     /// When set, a loss is allowed only for writes acknowledged within this long before the
-    /// failover marker (needs `time_ns`).
+    /// failover marker (needs `time_ns`), or before its `authority_end_ns` when the marker
+    /// carries one: the instant after which the old primary could acknowledge nothing.
     pub lag_window_ns: Option<u64>,
     /// Clock tolerance on either side of the nominal expiry deadline.
     pub expiry_tolerance_ns: u64,
@@ -58,6 +66,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             failover_markers: vec!["failover".into(), "promote".into()],
+            handover_markers: vec!["handover".into()],
             lag_window_ns: None,
             expiry_tolerance_ns: 10_000_000,
         }
@@ -102,6 +111,7 @@ fn as_int(v: &Value) -> Option<i64> {
 
 struct Ctx<'a> {
     failovers: Vec<&'a Marker>,
+    handovers: Vec<&'a Marker>,
     resets: Vec<&'a Marker>,
     events: &'a [Event],
     opts: &'a Options,
@@ -153,7 +163,10 @@ impl Ctx<'_> {
             _ => false,
         };
         let Some(marker) = self.first_failover(w, read) else {
-            return epoch_advanced && self.opts.lag_window_ns.is_none();
+            // A planned handover moves the whole acknowledged prefix. An
+            // epoch change it explains is not a failover.
+            let handover = self.handovers.iter().any(|m| self.between(m, w, read));
+            return epoch_advanced && self.opts.lag_window_ns.is_none() && !handover;
         };
         if !before_cutoff(marker) {
             return false;
@@ -168,10 +181,11 @@ impl Ctx<'_> {
         {
             return false;
         }
-        match (self.opts.lag_window_ns, w.ret_time, marker.time_ns) {
-            (Some(lag), Some(wt), Some(mt)) => wt <= mt && mt - wt <= lag,
-            (Some(_), _, _) => false,
-            (None, _, _) => true,
+        let end = marker.value["authority_end_ns"].as_u64().or(marker.time_ns);
+        match (self.opts.lag_window_ns, w.ret_time, marker.time_ns, end) {
+            (Some(lag), Some(wt), Some(mt), Some(end)) => wt <= mt && end.saturating_sub(wt) <= lag,
+            (Some(_), ..) => false,
+            (None, ..) => true,
         }
     }
 
@@ -193,6 +207,11 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
             .markers
             .iter()
             .filter(|m| m.applied() && opts.failover_markers.contains(&m.f))
+            .collect(),
+        handovers: paired
+            .markers
+            .iter()
+            .filter(|m| m.applied() && opts.handover_markers.contains(&m.f))
             .collect(),
         resets: paired
             .markers

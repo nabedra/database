@@ -326,14 +326,29 @@ impl SlotStore {
     }
 
     pub fn prepare(&self, op: &Operation, now_ms: u64, limits: TurnLimits) -> Prepared {
+        self.prepare_within(op, now_ms, limits, usize::MAX)
+    }
+
+    /// Prepares a turn whose charge must also stay within `ceiling`, the
+    /// bytes the caller can give this store now, such as a cluster actor's
+    /// remaining share of its budget. Sampled LRU evicts against the lower
+    /// of that ceiling and the store's own limit.
+    pub fn prepare_within(
+        &self,
+        op: &Operation,
+        now_ms: u64,
+        limits: TurnLimits,
+        ceiling: usize,
+    ) -> Prepared {
         let mut turn = self.turn(now_ms);
+        let byte_limit = self.byte_limit.min(ceiling);
         let result = self
             .prepare_operation(op, limits, &mut turn)
             .and_then(|()| {
                 if turn.reply_bytes() > limits.reply_bytes {
                     Err(StoreError::ReplyLimit)
                 } else {
-                    self.fit_layout(&mut turn, limits.growth_bytes)
+                    self.fit_layout(&mut turn, limits.growth_bytes, byte_limit)
                 }
             });
         if let Err(error) = result {
@@ -652,8 +667,13 @@ impl SlotStore {
         });
     }
 
-    fn fit_layout(&self, turn: &mut Prepared, growth_bytes: usize) -> Result<(), StoreError> {
-        if let Some(layout) = self.fitting_layout(&turn.effects, growth_bytes) {
+    fn fit_layout(
+        &self,
+        turn: &mut Prepared,
+        growth_bytes: usize,
+        byte_limit: usize,
+    ) -> Result<(), StoreError> {
+        if let Some(layout) = self.fitting_layout(&turn.effects, growth_bytes, byte_limit) {
             turn.layout = layout;
             return Ok(());
         }
@@ -678,7 +698,7 @@ impl SlotStore {
             }
             turn.effects.push(Effect::Delete(victim));
             turn.effects.push(upsert.clone());
-            if let Some(layout) = self.fitting_layout(&turn.effects, growth_bytes) {
+            if let Some(layout) = self.fitting_layout(&turn.effects, growth_bytes, byte_limit) {
                 turn.layout = layout;
                 return Ok(());
             }
@@ -687,8 +707,13 @@ impl SlotStore {
         Err(StoreError::OutOfMemory)
     }
 
-    fn fitting_layout(&self, effects: &[Effect], growth_bytes: usize) -> Option<Layout> {
-        self.records.layout(effects, self.byte_limit, growth_bytes)
+    fn fitting_layout(
+        &self,
+        effects: &[Effect],
+        growth_bytes: usize,
+        byte_limit: usize,
+    ) -> Option<Layout> {
+        self.records.layout(effects, byte_limit, growth_bytes)
     }
 }
 

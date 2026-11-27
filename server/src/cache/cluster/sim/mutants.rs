@@ -34,6 +34,11 @@ enum Case {
     UnfencedStaged,
     LaggedStaged,
     RetiredStaged,
+    RetiredEarlyCommit,
+    StaleReport,
+    LastCopyGate,
+    HandoverShort,
+    ColdRetains,
 }
 
 impl Case {
@@ -48,18 +53,30 @@ impl Case {
             Self::UnfencedStaged => "P5",
             Self::LaggedStaged => "P6",
             Self::RetiredStaged => "P7",
+            Self::RetiredEarlyCommit => "last-live-grant",
+            Self::StaleReport => "stale-source-report",
+            Self::LastCopyGate => "last-copy-gate",
+            Self::HandoverShort => "handover-short-prefix",
+            Self::ColdRetains => "cold-reset-retains-data",
         }
     }
 
     fn invariant(self) -> &'static str {
         match self {
-            Self::BoundIgnored
-            | Self::LiveReset
+            // P1 bends the product's own lease rule. The closed-form check
+            // on each served turn catches it; the views stay exclusive.
+            Self::BoundIgnored => "ServedWithinLease",
+            Self::LiveReset
             | Self::ExcessDrift(_)
             | Self::LocalSkew
             | Self::UnfencedStaged
             | Self::RetiredStaged => "LeaseExclusive",
             Self::LaggedStaged => "promotion-lag",
+            Self::RetiredEarlyCommit => "AckAfterHandover",
+            Self::StaleReport => "TransferLag",
+            Self::LastCopyGate => "LastCopyDiscarded",
+            Self::HandoverShort => "lost-write",
+            Self::ColdRetains => "resurrection",
             Self::DeleteIgnored | Self::ExpiryDeleteIgnored => "ReplicaPrefix",
             Self::EpochReused => "SlotOwnership",
         }
@@ -89,7 +106,11 @@ impl Case {
             declared_ppm: 10,
             skew: matches!(
                 self,
-                Self::BoundIgnored | Self::LocalSkew | Self::ExcessDrift(_) | Self::RetiredStaged
+                Self::BoundIgnored
+                    | Self::LocalSkew
+                    | Self::ExcessDrift(_)
+                    | Self::RetiredStaged
+                    | Self::RetiredEarlyCommit
             ),
             gradual_drift: false,
             knobs: Knobs {
@@ -101,6 +122,11 @@ impl Case {
                 staged_ignores_fence: enabled && self == Self::UnfencedStaged,
                 staged_ignores_lag: enabled && self == Self::LaggedStaged,
                 staged_retire_is_fence: enabled && self == Self::RetiredStaged,
+                retired_promotion_commits_early: enabled && self == Self::RetiredEarlyCommit,
+                controller_keeps_older_report: enabled && self == Self::StaleReport,
+                last_copy_lag_gate: enabled && self == Self::LastCopyGate,
+                handover_short_prefix: enabled && self == Self::HandoverShort,
+                cold_reset_retains_data: enabled && self == Self::ColdRetains,
                 ..Knobs::default()
             },
             check_replica_prefix: true,
@@ -138,7 +164,12 @@ fn run_case_with(
         let mut choices = nabedra_sim::sweep::workload_gen(seed);
         let staged = matches!(
             case,
-            Case::UnfencedStaged | Case::LaggedStaged | Case::RetiredStaged
+            Case::UnfencedStaged
+                | Case::LaggedStaged
+                | Case::RetiredStaged
+                | Case::RetiredEarlyCommit
+                | Case::StaleReport
+                | Case::LastCopyGate
         );
         let slot_max = if generated && staged {
             1 + choices.below(63) as u16
@@ -156,9 +187,26 @@ fn run_case_with(
         config.check_replica_prefix = !history_only;
         config.partitions = partitions;
         let mut cluster = Cluster::boot(world, vec![key.clone()], config).await;
-        if case == Case::RetiredStaged {
+        {
+            let mut observed = cluster.observed.lock().unwrap();
+            observed.check_transfer_lag = case == Case::StaleReport;
+            observed.check_last_copy = matches!(case, Case::LaggedStaged | Case::LastCopyGate);
+        }
+        if matches!(case, Case::RetiredStaged | Case::RetiredEarlyCommit) {
             let jitter = generated.then(|| choices.below(30));
             retired_source_schedule(&mut cluster, &key, enabled, jitter).await;
+            return trial(&cluster, true);
+        }
+        if case == Case::StaleReport {
+            stale_report_schedule(&mut cluster, &key).await;
+            return trial(&cluster, false);
+        }
+        if case == Case::HandoverShort {
+            handover_schedule(&mut cluster, &key).await;
+            return trial(&cluster, true);
+        }
+        if case == Case::ColdRetains {
+            scoped_reset_schedule(&mut cluster, &key).await;
             return trial(&cluster, true);
         }
         if staged {
@@ -170,7 +218,10 @@ fn run_case_with(
                 generated.then(|| choices.below(30)),
             )
             .await;
-            return trial(&cluster, case == Case::LaggedStaged);
+            return trial(
+                &cluster,
+                matches!(case, Case::LaggedStaged | Case::LastCopyGate),
+            );
         }
         let before = cluster.slot(slot);
         let old = before.primary.unwrap();
@@ -356,7 +407,8 @@ async fn staged_schedule(
         assert!(cluster.now() < deadline, "staged copy did not finish");
         cluster.step(10).await;
     }
-    if case == Case::LaggedStaged {
+    let lagged = matches!(case, Case::LaggedStaged | Case::LastCopyGate);
+    if lagged {
         cluster.link(target.node, old.node, true);
         for i in 0..=MAX_CUTOVER_LAG {
             assert!(write_ok(
@@ -372,7 +424,7 @@ async fn staged_schedule(
     }
     cluster.heal();
     cluster.isolate_controller_links(old.node);
-    if case == Case::LaggedStaged {
+    if lagged {
         cluster.crash(old.node);
     }
     cluster.renew_once(target.node).await.unwrap();
@@ -399,8 +451,11 @@ async fn staged_schedule(
         );
         cluster.step(25).await;
     };
-    let reset = case == Case::LaggedStaged && !enabled;
-    assert_eq!(successor.cold, reset);
+    // CACHE-4: the target is the last verified copy of a crashed (still
+    // enrolled) source, so it is promoted even 33 mutations behind. Only the
+    // planted lag gate resets the slot.
+    let reset = case == Case::LastCopyGate && enabled;
+    assert_eq!(successor.cold, reset, "{case:?} enabled {enabled}");
     let expected = if reset {
         Response::Bulk(None)
     } else {
@@ -512,8 +567,9 @@ async fn retired_source_schedule(
     assert_eq!(promoted.primary, Some(target));
     assert!(!promoted.cold);
     if !enabled {
-        // The retirement proof prevents renewals. Publication still waits
-        // for the last committed grant to expire.
+        // Retirement prevents renewals. Publication still waits for the
+        // last committed grant to expire, and the proof names that expired
+        // lease, which every controller binary checks at apply.
         let (at, _, proof) = cluster
             .observed
             .lock()
@@ -523,7 +579,7 @@ async fn retired_source_schedule(
             .copied()
             .find(|(_, index, _)| *index == slot)
             .expect("committed staged proof");
-        assert_eq!(proof.fence, SourceFence::Retired);
+        assert_eq!(proof.fence, SourceFence::LeaseExpired);
         assert_eq!(proof.source, old);
         assert_eq!(proof.prior_lease, Some(grant));
         assert!(
@@ -586,6 +642,290 @@ async fn retired_source_schedule(
     let _ = cluster.send(key, Op::Get, Some(target.node)).await;
 }
 
+/// Stale source reports (record cache-older-source-heartbeat): a staged copy
+/// stops 40 mutations behind its source while the controller has the
+/// source's newest report. An older source heartbeat then arrives late. The
+/// controller must still measure the transfer against the newest progress.
+async fn stale_report_schedule(cluster: &mut Cluster, key: &str) {
+    let slot = key_slot(key.as_bytes());
+    let initial = cluster.slot(slot);
+    let old = initial.primary.unwrap();
+    let replica = initial.replica.unwrap();
+    assert!(write_ok(
+        cluster
+            .send(key, Op::Set("base".into(), None), Some(old.node))
+            .await
+    ));
+    cluster.crash(replica.node);
+    let deadline = cluster.now() + 2 * LEASE_MS;
+    let target = loop {
+        if let Some(moving) = cluster.slot(slot).moving {
+            assert!(moving.replica_only);
+            break moving.target;
+        }
+        assert!(cluster.now() < deadline, "staging did not start");
+        cluster.step(10).await;
+    };
+    let deadline = cluster.now() + 2 * LEASE_MS;
+    loop {
+        let source = cluster.sample(Some(old), slot).await.unwrap();
+        if cluster
+            .sample(Some(target), slot)
+            .await
+            .is_some_and(|copy| copy.baseline && copy.sequence == source.sequence)
+        {
+            break;
+        }
+        assert!(cluster.now() < deadline, "staged copy did not catch up");
+        cluster.step(10).await;
+    }
+    cluster.immediate_delivery();
+    // The source's report at the copy's sequence, kept for late delivery.
+    let older = cluster.capture_heartbeat(old.node).await;
+    cluster.link(target.node, old.node, true);
+    cluster.link(old.node, target.node, true);
+    for i in 0..MAX_CUTOVER_LAG + 8 {
+        assert!(write_ok(
+            cluster
+                .send(key, Op::Set(format!("update-{i}"), None), Some(old.node))
+                .await
+        ));
+    }
+    // The controller hears the newest progress of both and must keep the
+    // copy staged: it trails by 40, beyond the cutover limit.
+    cluster.renew_once(old.node).await.unwrap();
+    cluster.renew_once(target.node).await.unwrap();
+    cluster.reconcile_once().await;
+    assert!(
+        cluster
+            .slot(slot)
+            .moving
+            .is_some_and(|moving| moving.target == target),
+        "the transfer completed 40 mutations behind its source"
+    );
+    // The older heartbeat arrives after the newer one.
+    cluster.isolate_controller_links(old.node);
+    assert!(matches!(
+        cluster.deliver_heartbeat(old.node, older).await,
+        Some(Reply::Update(_))
+    ));
+    cluster.reconcile_once().await;
+    cluster.reconcile_once().await;
+    cluster.trace(format_args!(
+        "after the late heartbeat slot {slot} moving {:?} replica {:?}",
+        cluster.slot(slot).moving,
+        cluster.slot(slot).replica
+    ));
+    cluster.heal();
+    cluster.step(2 * RENEW_MS).await;
+}
+
+/// Planned handover: an online move whose target misses the source's last
+/// acknowledged write. The cutover needs the exact frozen prefix, so the
+/// source resumes under a new epoch instead and keeps every write.
+async fn handover_schedule(cluster: &mut Cluster, key: &str) {
+    let slot = key_slot(key.as_bytes());
+    let initial = cluster.slot(slot);
+    let old = initial.primary.unwrap();
+    let replica = initial.replica.unwrap();
+    let target = *cluster
+        .workers
+        .keys()
+        .find(|&&node| node != old.node && node != replica.node)
+        .unwrap();
+    assert!(write_ok(
+        cluster
+            .send(key, Op::Set("first".into(), None), Some(old.node))
+            .await
+    ));
+    let order = cluster
+        .admin(Admin::Rebalance {
+            first: slot,
+            last: slot,
+            target,
+        })
+        .await;
+    assert!(matches!(order, Reply::Applied { .. }), "{order:?}");
+    let deadline = cluster.now() + 4 * LEASE_MS;
+    let target = loop {
+        if let Some(moving) = cluster.slot(slot).moving
+            && !moving.replica_only
+        {
+            let source = cluster.sample(Some(old), slot).await.unwrap();
+            if cluster
+                .sample(Some(moving.target), slot)
+                .await
+                .is_some_and(|copy| copy.baseline && copy.sequence == source.sequence)
+            {
+                break moving.target;
+            }
+        }
+        assert!(cluster.now() < deadline, "move target did not catch up");
+        cluster.step(10).await;
+    };
+    // The target stops one write short of the source.
+    cluster.link(target.node, old.node, true);
+    cluster.link(old.node, target.node, true);
+    assert!(write_ok(
+        cluster
+            .send(key, Op::Set("last".into(), None), Some(old.node))
+            .await
+    ));
+    let deadline = cluster.now() + 3 * LEASE_MS;
+    let successor = loop {
+        let placement = cluster.slot(slot);
+        if placement.epoch > initial.epoch
+            && cluster
+                .sample(placement.primary, slot)
+                .await
+                .is_some_and(|sample| sample.authorized)
+        {
+            break placement;
+        }
+        assert!(cluster.now() < deadline, "no owner after the handover");
+        cluster.step(25).await;
+    };
+    cluster.trace(format_args!(
+        "handover of slot {slot} to {:?} at epoch {}",
+        successor.primary, successor.epoch
+    ));
+    let _ = cluster.send(key, Op::Get, None).await;
+    cluster.heal();
+    cluster.step(2 * RENEW_MS).await;
+    let _ = cluster.send(key, Op::Get, None).await;
+}
+
+/// Cold reset: an operator resets a slot whose primary still holds data.
+/// The controllers lose every report in a new term while the slot's two
+/// workers are cut off, so no copy can take over and the operator resets it.
+/// The reset epoch starts empty even on the worker that held the slot.
+async fn scoped_reset_schedule(cluster: &mut Cluster, key: &str) {
+    let slot = key_slot(key.as_bytes());
+    let initial = cluster.slot(slot);
+    let old = initial.primary.unwrap();
+    let replica = initial.replica.unwrap();
+    assert!(write_ok(
+        cluster
+            .send(key, Op::Set("before-reset".into(), None), Some(old.node))
+            .await
+    ));
+    cluster.isolate_controller_links(old.node);
+    cluster.isolate_controller_links(replica.node);
+    // A new term clears every report, so neither worker is live to it.
+    let leader = cluster.leader().unwrap();
+    cluster.crash(leader);
+    let grant = cluster.slot(slot).lease.expect("committed grant");
+    let expiry = grant.expires_ms - nabedra_rt::sim::EPOCH_MS;
+    cluster
+        .step((expiry + RENEW_MS).saturating_sub(cluster.now()))
+        .await;
+    let deadline = cluster.now() + 4 * LEASE_MS;
+    loop {
+        match cluster.admin(Admin::ColdReset { slot: Some(slot) }).await {
+            Reply::Applied { .. } => break,
+            reply => {
+                assert!(cluster.now() < deadline, "scoped reset refused: {reply:?}");
+                cluster.step(RENEW_MS).await;
+            }
+        }
+    }
+    cluster.start_controller(leader).await;
+    cluster.heal();
+    let deadline = cluster.now() + 3 * LEASE_MS;
+    let successor = loop {
+        let placement = cluster.slot(slot);
+        if placement.epoch > initial.epoch
+            && cluster
+                .sample(placement.primary, slot)
+                .await
+                .is_some_and(|sample| sample.authorized)
+        {
+            break placement;
+        }
+        assert!(cluster.now() < deadline, "no owner after the scoped reset");
+        cluster.step(25).await;
+    };
+    cluster.trace(format_args!(
+        "scoped reset of slot {slot}: owner {:?} epoch {}",
+        successor.primary, successor.epoch
+    ));
+    let _ = cluster.send(key, Op::Get, None).await;
+}
+
+/// K03 and CACHE-1, assigned promotion: after installing the retirement
+/// view, an existing replica must still pull an acknowledgement from the
+/// exact incarnation it follows. Returns whether it did.
+fn retired_tail(enabled: bool) -> bool {
+    runtime::run(1, |world| async move {
+        let key = (0..)
+            .map(|i| format!("{{retired-tail-{i}}}"))
+            .find(|key| key_slot(key.as_bytes()) < 63)
+            .unwrap();
+        let slot = key_slot(key.as_bytes());
+        let mut config = Case::RetiredStaged.config(false);
+        config.knobs.copy_drops_retired_source = enabled;
+        let mut cluster = Cluster::boot(world, vec![key.clone()], config).await;
+        let initial = cluster.slot(slot);
+        let old = initial.primary.unwrap();
+        let replica = initial.replica.unwrap();
+        assert!(write_ok(
+            cluster
+                .send(&key, Op::Set("before".into(), None), Some(old.node))
+                .await
+        ));
+        let deadline = cluster.now() + LEASE_MS;
+        let copied = loop {
+            if let Some(sample) = cluster.sample(Some(replica), slot).await
+                && sample.baseline
+                && sample.sequence > 0
+            {
+                break sample.sequence;
+            }
+            assert!(cluster.now() < deadline, "assigned copy did not catch up");
+            cluster.step(25).await;
+        };
+        cluster.immediate_delivery();
+        cluster.renew_once(old.node).await.unwrap();
+        cluster.isolate_controller_links(old.node);
+        assert!(matches!(
+            cluster.enroll_replacement(old.node).await,
+            Reply::Applied { .. }
+        ));
+        cluster.renew_once(replica.node).await.unwrap();
+        assert!(
+            cluster.workers[&replica.node]
+                .topology()
+                .member(old)
+                .is_none()
+        );
+        assert!(write_ok(
+            cluster
+                .send(&key, Op::Set("after".into(), None), Some(old.node))
+                .await
+        ));
+        // Allow a full poll cycle across the biggest possible source lane.
+        let poll_cycle = SLOT_COUNT.div_ceil(PROBES) as u64 * REPLICATION_POLL.as_millis() as u64;
+        let expires = cluster.slot(slot).lease.unwrap().expires_ms - nabedra_rt::sim::EPOCH_MS;
+        let deadline = (cluster.now() + poll_cycle + 250).min(expires);
+        loop {
+            let sample = cluster.sample(Some(replica), slot).await.unwrap();
+            assert_eq!(sample.epoch, initial.epoch);
+            if sample.sequence == copied + 1 {
+                return true;
+            }
+            if cluster.now() >= deadline {
+                eprintln!(
+                    "replica stopped pulling the retired tail at sequence {} instead of {}",
+                    sample.sequence,
+                    copied + 1
+                );
+                return false;
+            }
+            cluster.step(25).await;
+        }
+    })
+}
+
 pub(super) fn trial(cluster: &Cluster, history_only: bool) -> Trial {
     let observed = cluster.observed.lock().unwrap();
     let mut violations: Vec<_> = observed
@@ -594,7 +934,7 @@ pub(super) fn trial(cluster: &Cluster, history_only: bool) -> Trial {
         .map(|(name, detail)| format!("{name}: {detail}"))
         .collect();
     if history_only {
-        let verdict = relaxed_kv::check(&observed.history);
+        let verdict = relaxed_kv::check_with(&observed.history, &super::history_options());
         violations.extend(
             verdict
                 .anomalies
@@ -781,6 +1121,11 @@ fn planted_cases_under_late_partitions() {
         Case::UnfencedStaged,
         Case::LaggedStaged,
         Case::RetiredStaged,
+        Case::RetiredEarlyCommit,
+        Case::StaleReport,
+        Case::LastCopyGate,
+        Case::HandoverShort,
+        Case::ColdRetains,
     ] {
         let run = |enabled| run_case_with(Partitions::Late, case, seed, false, enabled, false);
         let (trial, clean) = (run(true), run(false));
@@ -878,75 +1223,55 @@ fn staged_promotion_after_live_source_retirement_waits_for_grant() {
     }
 }
 
-/// K03: after installing the retirement view, an existing replica must
-/// still pull an acknowledgement from the exact incarnation it follows.
+/// K03 and CACHE-1, assigned promotion: after installing the retirement
+/// view, an existing replica must still pull an acknowledgement from the
+/// exact incarnation it follows. The planted member gates stop it.
 #[test]
 fn assigned_replica_keeps_pulling_the_retired_source_tail() {
-    runtime::run(1, |world| async move {
-        let key = (0..)
-            .map(|i| format!("{{retired-tail-{i}}}"))
-            .find(|key| key_slot(key.as_bytes()) < 63)
-            .unwrap();
-        let slot = key_slot(key.as_bytes());
-        let config = Case::RetiredStaged.config(false);
-        let mut cluster = Cluster::boot(world, vec![key.clone()], config).await;
-        let initial = cluster.slot(slot);
-        let old = initial.primary.unwrap();
-        let replica = initial.replica.unwrap();
-        assert!(write_ok(
-            cluster
-                .send(&key, Op::Set("before".into(), None), Some(old.node))
-                .await
-        ));
-        let deadline = cluster.now() + LEASE_MS;
-        let copied = loop {
-            if let Some(sample) = cluster.sample(Some(replica), slot).await
-                && sample.baseline
-                && sample.sequence > 0
-            {
-                break sample.sequence;
-            }
-            assert!(cluster.now() < deadline, "assigned copy did not catch up");
-            cluster.step(25).await;
-        };
-        cluster.immediate_delivery();
-        cluster.renew_once(old.node).await.unwrap();
-        cluster.isolate_controller_links(old.node);
-        assert!(matches!(
-            cluster.enroll_replacement(old.node).await,
-            Reply::Applied { .. }
-        ));
-        cluster.renew_once(replica.node).await.unwrap();
-        assert!(
-            cluster.workers[&replica.node]
-                .topology()
-                .member(old)
-                .is_none()
-        );
-        assert!(write_ok(
-            cluster
-                .send(&key, Op::Set("after".into(), None), Some(old.node))
-                .await
-        ));
-        // Allow a full poll cycle across the biggest possible source lane.
-        let poll_cycle = SLOT_COUNT.div_ceil(PROBES) as u64 * REPLICATION_POLL.as_millis() as u64;
-        let expires = cluster.slot(slot).lease.unwrap().expires_ms - nabedra_rt::sim::EPOCH_MS;
-        let deadline = (cluster.now() + poll_cycle + 250).min(expires);
-        loop {
-            let sample = cluster.sample(Some(replica), slot).await.unwrap();
-            assert_eq!(sample.epoch, initial.epoch);
-            if sample.sequence == copied + 1 {
-                break;
-            }
-            assert!(
-                cluster.now() < deadline,
-                "replica stopped pulling the retired tail at sequence {} instead of {}",
-                sample.sequence,
-                copied + 1
-            );
-            cluster.step(25).await;
-        }
-    });
+    assert!(
+        retired_tail(false),
+        "clean twin stopped pulling the retired tail"
+    );
+    assert!(
+        !retired_tail(true),
+        "planted member gate still pulled the tail"
+    );
+}
+
+/// CACHE-1, last live grant: a planner that commits a retired source's staged
+/// promotion before its grant ends lets the source acknowledge writes the
+/// successor never holds.
+#[test]
+fn planted_retired_promotion_commits_early_scripted() {
+    scripted(Case::RetiredEarlyCommit);
+}
+
+/// Stale source reports (cache-older-source-heartbeat): an older source
+/// heartbeat delivered late must not complete a transfer beyond the limit.
+#[test]
+fn planted_older_source_report_scripted() {
+    scripted(Case::StaleReport);
+}
+
+/// CACHE-4: the last verified staged copy of a crashed source is promoted
+/// beyond the cutover limit. The planted lag gate resets it instead.
+#[test]
+fn planted_last_copy_lag_gate_scripted() {
+    scripted(Case::LastCopyGate);
+}
+
+/// Planned handover: no acknowledged write is lost across a cutover. The
+/// planted planner cuts over to a target one write short of the freeze.
+#[test]
+fn planted_handover_short_prefix_scripted() {
+    scripted(Case::HandoverShort);
+}
+
+/// Cold reset: a scoped reset starts the slot empty on every worker. The
+/// planted worker keeps its old store when it installs the reset epoch.
+#[test]
+fn planted_cold_reset_retains_data_scripted() {
+    scripted(Case::ColdRetains);
 }
 
 #[test]

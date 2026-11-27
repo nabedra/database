@@ -627,7 +627,11 @@ impl State {
                                 }
                             }
                     });
-                let retain = !placement.cold
+                #[cfg(feature = "sim")]
+                let cold = placement.cold && !hooks::knobs().cold_reset_retains_data;
+                #[cfg(not(feature = "sim"))]
+                let cold = placement.cold;
+                let retain = !cold
                     && state.baseline
                     && (matches!((state.role, role), (Role::Copy(source), Role::Primary) if old_placement.primary == Some(source))
                         || state.role == Role::Primary && role == Role::Primary
@@ -642,6 +646,7 @@ impl State {
                     #[cfg(feature = "sim")]
                     if role == Role::Primary && hooks::watched(slot_number) {
                         hooks::observe(Observed::Promoted {
+                            worker: self.config.id,
                             slot: slot_number,
                             epoch: placement.epoch,
                             prefix_epoch: state.epoch,
@@ -701,9 +706,16 @@ impl State {
             if !state.authorized(now) {
                 return unavailable();
             }
-            let turn = state
-                .store
-                .prepare(operation, now.upper_ms, self.config.turns);
+            // CACHE-5: evict against the bytes this actor can still give the
+            // slot, not only the slot's own limit. Otherwise `publish` turns
+            // a write that sampled LRU could admit into OOM.
+            let ceiling = self
+                .storage
+                .ceiling(&self.config, true, state.store.charged_bytes());
+            let turn =
+                state
+                    .store
+                    .prepare_within(operation, now.upper_ms, self.config.turns, ceiling);
             #[cfg(feature = "sim")]
             let sequence = state.sequence;
             let published = publish(
@@ -734,6 +746,7 @@ impl State {
                             slot,
                             epoch: state.epoch,
                             sequence: state.sequence,
+                            lease: state.lease,
                         });
                     }
                     state.operations = state.operations.saturating_add(1);
@@ -873,7 +886,13 @@ impl State {
                 packet,
                 reply,
             } => {
-                if generation == self.topology.generation {
+                #[cfg(feature = "sim")]
+                let member_gate = hooks::knobs().copy_drops_retired_source;
+                #[cfg(not(feature = "sim"))]
+                let member_gate = false;
+                if generation == self.topology.generation
+                    && (!member_gate || self.topology.member(source).is_some())
+                {
                     // The copy still follows its exact source incarnation
                     // and epoch while a retirement fences future grants.
                     self.apply(source, packet);

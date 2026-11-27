@@ -316,11 +316,15 @@ pub(super) async fn replicate(worker: Worker, tls: PeerTls) -> io::Result<()> {
             }
             topology = current;
         }
+        #[cfg(feature = "sim")]
+        let member_gate = super::super::sim::hooks::knobs().copy_drops_retired_source;
+        #[cfg(not(feature = "sim"))]
+        let member_gate = false;
         for (&source, group) in &groups {
             let Some(endpoint) = topology
                 .member(source)
                 .map(|member| &member.peer)
-                .or_else(|| retired_peers.get(&source))
+                .or_else(|| retired_peers.get(&source).filter(|_| !member_gate))
             else {
                 continue;
             };

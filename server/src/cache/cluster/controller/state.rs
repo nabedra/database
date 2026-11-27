@@ -67,7 +67,7 @@ pub(super) struct State {
     pub(super) staging: BTreeMap<u16, Staging>,
     #[cfg(feature = "sim")]
     #[serde(skip)]
-    pub(super) applied_staged: Vec<(u16, super::placement::StagedPromotion)>,
+    pub(super) applied: super::super::sim::hooks::Applied,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
