@@ -30,6 +30,25 @@ pub(super) struct Flags {
     pub(super) custom: i32,
 }
 
+impl Flags {
+    /// The flags of a raw `open(2)` call with the `mode` of a created file.
+    fn from_open(flags: i32, mode: u32) -> Flags {
+        let access = flags & libc::O_ACCMODE;
+        let create = flags & libc::O_CREAT != 0;
+        let exclusive = create && flags & libc::O_EXCL != 0;
+        Flags {
+            read: access == libc::O_RDONLY || access == libc::O_RDWR,
+            write: access == libc::O_WRONLY || access == libc::O_RDWR,
+            append: flags & libc::O_APPEND != 0,
+            truncate: flags & libc::O_TRUNC != 0,
+            create: create && !exclusive,
+            create_new: exclusive,
+            mode: create.then_some(mode),
+            custom: flags,
+        }
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -136,6 +155,12 @@ impl SimFile {
 
     pub(super) fn fd_path(&self) -> PathBuf {
         self.descriptor.path()
+    }
+
+    /// `fchmod`: on the inode's current name, so it follows renames.
+    pub(super) fn set_mode(&self, mode: u32) -> io::Result<()> {
+        let path = self.fs.descriptor_path(self.inode, &self.path)?;
+        self.fs.set_mode(&path, mode)
     }
 
     fn file(&self) -> io::Result<&FaultFile> {
@@ -343,6 +368,45 @@ pub(super) fn rename(fs: FaultFs, from: &Path, to: &Path, noreplace: bool) -> io
     } else {
         fs.rename(from, &to)
     }
+}
+
+pub(super) fn hard_link(fs: FaultFs, from: &Path, to: &Path) -> io::Result<()> {
+    let Route::Volume(target, to) = volumes::route(to)? else {
+        return Err(io::ErrorKind::CrossesDevices.into());
+    };
+    volumes::same_device(&fs, &target)?;
+    fs.hard_link(from, &to)
+}
+
+/// The volume and path `name` names relative to the open directory `dir`, as the `*at`
+/// calls resolve it (through the descriptor, so it follows renames of `dir`).
+fn at(dir: &SimFile, name: &Path) -> io::Result<(FaultFs, PathBuf)> {
+    match volumes::route(&dir.fd_path().join(name))? {
+        Route::Volume(fs, path) => Ok((fs, path.into_owned())),
+        Route::Host => Err(io::ErrorKind::NotFound.into()),
+    }
+}
+
+pub(super) fn create_dir_at(dir: &SimFile, name: &Path, mode: u32) -> io::Result<()> {
+    let (fs, path) = at(dir, name)?;
+    fs.create_dir_with_mode(&path, mode)
+}
+
+pub(super) fn open_at(dir: &SimFile, name: &Path, flags: i32, mode: u32) -> io::Result<SimFile> {
+    let (fs, path) = at(dir, name)?;
+    SimFile::open(fs, &path, &Flags::from_open(flags, mode))
+}
+
+pub(super) fn hard_link_at(dir: &SimFile, from: &Path, to: &Path) -> io::Result<()> {
+    let (fs, from) = at(dir, from)?;
+    let (target, to) = at(dir, to)?;
+    volumes::same_device(&fs, &target)?;
+    fs.hard_link(&from, &to)
+}
+
+pub(super) fn remove_file_at(dir: &SimFile, name: &Path) -> io::Result<()> {
+    let (fs, path) = at(dir, name)?;
+    Fs::remove(&fs, &path)
 }
 
 pub(super) fn read(fs: FaultFs, path: &Path) -> io::Result<Vec<u8>> {

@@ -1,12 +1,7 @@
 use super::*;
 use crate::oltp::pool::ExecutionClass;
-#[cfg(unix)]
-use std::os::{
-    fd::{AsRawFd, FromRawFd},
-    unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-};
+use nabedra_rt::fs::os::{self as fs, File, OpenOptions};
 use std::{
-    fs::{File, OpenOptions},
     io::{Read, Write},
     path::Path,
 };
@@ -14,7 +9,29 @@ use std::{
 #[doc(hidden)]
 pub struct FilesystemRepository {
     root: Arc<File>,
+    synced: Arc<SyncedDirectories>,
     shared: Arc<WorkerSharedResources>,
+}
+/// The cluster and archive directory entries this repository has synced in their parent
+/// since it was opened. The repository never renames or removes a directory, so an entry
+/// synced once by this process stays durable, and later puts into the same archive skip
+/// both directory syncs (each a device cache flush on ext4). A new process starts empty,
+/// so its first put syncs again, which covers a crash before an earlier sync (DUR-2).
+#[derive(Default)]
+struct SyncedDirectories(std::sync::Mutex<std::collections::HashSet<String>>);
+impl SyncedDirectories {
+    fn contains(&self, entry: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(entry)
+    }
+    fn insert(&self, entry: String) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(entry);
+    }
 }
 impl FilesystemRepository {
     #[doc(hidden)]
@@ -26,7 +43,7 @@ impl FilesystemRepository {
         {
             if !root.is_absolute()
                 || root.as_os_str().len() > 4096
-                || std::fs::canonicalize(root).map_err(|_| invalid())? != root
+                || fs::canonicalize(root).map_err(|_| invalid())? != root
             {
                 return Err(invalid());
             }
@@ -36,11 +53,12 @@ impl FilesystemRepository {
                 .open(root)
                 .map_err(|_| invalid())?;
             let metadata = root.metadata().map_err(|_| invalid())?;
-            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            if metadata.uid() != fs::euid() || metadata.mode() & 0o077 != 0 {
                 return Err(invalid());
             }
             Ok(Arc::new(Self {
                 root: Arc::new(root),
+                synced: Arc::default(),
                 shared,
             }))
         }
@@ -67,15 +85,16 @@ impl Repository for FilesystemRepository {
                 return Err(invalid());
             }
             let root = self.root.clone();
+            let synced = self.synced.clone();
             self.shared
                 .execute(ExecutionClass::Query, 0, 0, move || {
                     #[cfg(unix)]
                     {
-                        put_native(&root, key, &name, body)
+                        put_native(&root, &synced, key, &name, body)
                     }
                     #[cfg(not(unix))]
                     {
-                        let _ = (root, key, name, body);
+                        let _ = (root, synced, key, name, body);
                         Err(invalid())
                     }
                 })
@@ -111,57 +130,77 @@ impl Repository for FilesystemRepository {
     }
 }
 #[cfg(unix)]
-fn directory_at(parent: &File, name: &str, create: bool) -> Result<File, ProtocolError> {
-    let name = std::ffi::CString::new(name).map_err(|_| invalid())?;
-    if create {
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
+/// Opens the directory `name` in `parent`. With `create`, it is created if missing and
+/// its entry made durable before it is returned: `entry` names it in `synced`.
+fn directory_at(
+    parent: &File,
+    name: &str,
+    create: Option<(&SyncedDirectories, String)>,
+) -> Result<File, ProtocolError> {
+    if name.contains(char::from(0)) {
+        return Err(invalid());
+    }
+    if let Some((synced, entry)) = create {
+        let created = match parent.create_dir_at(name, 0o700) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(_) => return Err(unavailable()),
+        };
+        // A put that finds the directory syncs it too, unless this process already did:
+        // it may follow a crash before the creator's sync, or run beside a creator still
+        // inside it, and its object would be lost with the directory (DUR-2). The archive
+        // directory sync after each object covers only the object.
+        if created || !synced.contains(&entry) {
             parent.sync_all().map_err(|_| unavailable())?;
-        } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
-            return Err(unavailable());
+            synced.insert(entry);
         }
     }
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
+    let directory = parent
+        .open_at(
+            name,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
         )
-    };
-    if fd < 0 {
-        return Err(unavailable());
-    }
-    let directory = unsafe { File::from_raw_fd(fd) };
+        .map_err(|_| unavailable())?;
     let metadata = directory.metadata().map_err(|_| unavailable())?;
-    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+    if metadata.uid() != fs::euid() || metadata.mode() & 0o077 != 0 {
         return Err(corrupt());
     }
     Ok(directory)
 }
 #[cfg(unix)]
-fn archive_directory(root: &File, key: ArchiveKey, create: bool) -> Result<File, ProtocolError> {
-    let cluster = directory_at(root, &key.cluster_id.to_string(), create)?;
-    directory_at(&cluster, &key.archive_id.to_string(), create)
+fn archive_directory(
+    root: &File,
+    key: ArchiveKey,
+    create: Option<&SyncedDirectories>,
+) -> Result<File, ProtocolError> {
+    let cluster_name = key.cluster_id.to_string();
+    let archive_name = key.archive_id.to_string();
+    let cluster = directory_at(
+        root,
+        &cluster_name,
+        create.map(|synced| (synced, cluster_name.clone())),
+    )?;
+    directory_at(
+        &cluster,
+        &archive_name,
+        create.map(|synced| (synced, format!("{cluster_name}/{archive_name}"))),
+    )
 }
 #[cfg(unix)]
 fn file_at(directory: &File, name: &str, flags: i32) -> Result<File, ProtocolError> {
-    let name = std::ffi::CString::new(name).map_err(|_| invalid())?;
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
+    if name.contains(char::from(0)) {
+        return Err(invalid());
+    }
+    let file = directory
+        .open_at(
+            name,
             flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             0o600,
         )
-    };
-    if fd < 0 {
-        return Err(unavailable());
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
+        .map_err(|_| unavailable())?;
     let metadata = file.metadata().map_err(|_| unavailable())?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
+    if !metadata.is_file() || metadata.uid() != fs::euid() || metadata.mode() & 0o077 != 0 {
         return Err(corrupt());
     }
     Ok(file)
@@ -174,7 +213,7 @@ fn read_native(
     limit: usize,
     shared: &Arc<WorkerSharedResources>,
 ) -> Result<ChargedBytes, ProtocolError> {
-    let directory = archive_directory(root, key, false)?;
+    let directory = archive_directory(root, key, None)?;
     let mut file = file_at(&directory, name, libc::O_RDONLY)?;
     let len = usize::try_from(file.metadata().map_err(|_| unavailable())?.len())
         .map_err(|_| corrupt())?;
@@ -193,11 +232,12 @@ fn read_native(
 #[cfg(unix)]
 fn put_native(
     root: &File,
+    synced: &SyncedDirectories,
     key: ArchiveKey,
     name: &str,
     body: ChargedBytes,
 ) -> Result<Digest, ProtocolError> {
-    let directory = archive_directory(root, key, true)?;
+    let directory = archive_directory(root, key, Some(synced))?;
     let expected = hash(body.as_ref());
     let temporary = format!(".upload-{}", nabedra_rt::ids::uuid_v4());
     let mut file = file_at(
@@ -209,22 +249,13 @@ fn put_native(
     // Cancelling its awaiter cannot release them while fsync is still live.
     let written = (|| {
         file.write_all(body.as_ref()).map_err(|_| unavailable())?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o400))
-            .map_err(|_| unavailable())?;
+        file.set_mode(0o400).map_err(|_| unavailable())?;
         file.sync_all().map_err(|_| unavailable())?;
-        let from = std::ffi::CString::new(temporary.as_str()).map_err(|_| invalid())?;
-        let to = std::ffi::CString::new(name).map_err(|_| invalid())?;
-        if unsafe {
-            libc::linkat(
-                directory.as_raw_fd(),
-                from.as_ptr(),
-                directory.as_raw_fd(),
-                to.as_ptr(),
-                0,
-            )
-        } != 0
-        {
-            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+        if name.contains(char::from(0)) {
+            return Err(invalid());
+        }
+        if let Err(error) = directory.hard_link_at(&temporary, name) {
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(unavailable());
             }
             // Existing objects and lost acknowledgements reconcile by actual
@@ -254,10 +285,11 @@ fn put_native(
         }
         Ok(expected)
     })();
-    let temporary = std::ffi::CString::new(temporary).map_err(|_| invalid())?;
-    if unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) } != 0 {
-        return Err(unavailable());
-    }
+    directory
+        .remove_file_at(&temporary)
+        .map_err(|_| unavailable())?;
     directory.sync_all().map_err(|_| unavailable())?;
     written
 }
+#[cfg(all(test, feature = "sim", target_os = "linux"))]
+mod sim_tests;

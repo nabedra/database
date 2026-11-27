@@ -1,0 +1,16 @@
+# Found by code reading in fx-lsm (wave-rv/reports/fx-lsm.md, "Same pattern elsewhere", site 5) and
+# confirmed by the FaultFs regression below, which fails on the base and passes with the fix.
+id = "RV-DUR-5"
+title = "A power loss after a local worker first opens a new data directory loses the directory with its synced topology and pool"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G01"]
+scenarios = ["O11", "NS04"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/oltp-replication/src/oltp_replication/manager/local/sim_tests.rs::dur5_worker_directory_survives_a_kill_at_every_step_then_power_loss"
+seed = 41
+why_not_caught = "The local worker tests open a directory on the host and never lose power; the pool sim tests open the pool at the mount root."
+invariant_added = "Every lock of a worker data directory syncs the parent of each directory it creates and of the data directory, except at a mount root."
+fix_commits = ["924bf1994f93b7fd7b612467b3e4e9e49fdfff35"]
+revert_patch_ok = true

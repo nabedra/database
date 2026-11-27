@@ -1,0 +1,16 @@
+# Found by code reading in fx-lsm (wave-rv/reports/fx-lsm.md, "Same pattern elsewhere", site 3) and
+# confirmed by the FaultFs regression below, which fails on the base and passes with the fix.
+id = "RV-DUR-3"
+title = "A power loss after a retried volume verify restores the previous manifest generation, and the fenced worker verifies again"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17", "O26"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/oltp-storage/src/oltp/pool/sim_tests.rs::dur3_volume_manifest_generation_bump_survives_a_kill_at_every_step"
+seed = 41
+why_not_caught = "The mount tests verify each generation once and never crash between the manifest rename and the mount root sync."
+invariant_added = "Every verify syncs the mount root after accepting the manifest, and the manifest is always published by a rename, so a generation never goes back and a kill never leaves a partial manifest."
+fix_commits = ["eb4f29f24443ea3c355ac0a2eca7767ec516dacd"]
+revert_patch_ok = true

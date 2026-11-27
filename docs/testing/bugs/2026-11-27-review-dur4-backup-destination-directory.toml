@@ -1,0 +1,16 @@
+# Found by code reading in fx-lsm (wave-rv/reports/fx-lsm.md, "Same pattern elsewhere", site 4) and
+# confirmed by the FaultFs regression below, which fails on the base and passes with the fix.
+id = "RV-DUR-4"
+title = "A power loss after a native backup loses its destination directory with the synced locator and repository objects"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G11"]
+scenarios = ["O19"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/src/oltp_runtime/worker_runtime/archive/sim_tests.rs::dur4_backup_destination_survives_a_kill_at_every_step_then_power_loss"
+seed = 41
+why_not_caught = "ensure_private_directory used std::fs directly, so FaultFs could not cut it, and the backup tests never lose power."
+invariant_added = "Every call that ensures the backup destination syncs its parent, so the locator and objects synced inside it survive a power loss."
+fix_commits = ["c99d3560290722722bbea922d0e64fa6402c472c"]
+revert_patch_ok = true

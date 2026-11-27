@@ -1,0 +1,16 @@
+# Found by code reading in fx-lsm (wave-rv/reports/fx-lsm.md, "Same pattern elsewhere", site 6) and
+# confirmed by the FaultFs regression below, which fails on the base and passes with the fix.
+id = "RV-DUR-6"
+title = "A development pool directory is lost with its synced writes after a power loss, and a kill inside its first manifest write refuses every later open"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G01"]
+scenarios = ["O11", "NS04"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/oltp-storage/src/oltp/pool/sim_tests.rs::dur6_pool_manifest_survives_a_kill_at_every_step_then_power_loss"
+seed = 41
+why_not_caught = "The pool sim tests open a development pool at the mount root, whose entry needs no sync, and only the mounted profile synced the parent."
+invariant_added = "Every pool open syncs the pool directory in its parent in both profiles and the manifest entry, and publishes the manifest by a rename from a temporary file the next open replaces."
+fix_commits = ["eb4f29f24443ea3c355ac0a2eca7767ec516dacd"]
+revert_patch_ok = true

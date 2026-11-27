@@ -1,4 +1,9 @@
 use super::*;
+// Scratch state under the host's temporary directory, not on the data volume: std::fs.
+use std::{
+    fs::{File, OpenOptions},
+    os::unix::fs::OpenOptionsExt,
+};
 use crate::oltp::{
     mvcc::{
         CanonicalJson,
@@ -14,6 +19,16 @@ use crate::oltp::{
     },
     pool::{ScratchLease, WorkerSharedResources},
 };
+
+/// A private (`0o700`) scratch directory; an existing one is reused.
+fn ensure_scratch_directory(path: &Path) -> Result<(), ProtocolError> {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(_) => Err(unknown()),
+    }
+}
 
 const STAGED_RECORD_BYTES: usize = 2 * crate::oltp::mvcc::MAX_FIXED_COMMAND_BYTES + 4096;
 #[path = "split_graph.rs"]
@@ -50,7 +65,7 @@ struct SourceGroup {
 impl RestoreGraph {
     pub(super) fn new(shared: Arc<WorkerSharedResources>) -> Result<Self, ProtocolError> {
         let path = std::env::temp_dir().join(format!("nabedra-restore-graph-{}", nabedra_rt::ids::uuid_v4()));
-        ensure_private_directory(&path)?;
+        ensure_scratch_directory(&path)?;
         let graph = Self {
             path,
             catalog: None,
@@ -73,7 +88,7 @@ impl RestoreGraph {
             "split-sources",
             "split-genesis-routes",
         ] {
-            ensure_private_directory(&graph.path.join(child))?;
+            ensure_scratch_directory(&graph.path.join(child))?;
         }
         Ok(graph)
     }

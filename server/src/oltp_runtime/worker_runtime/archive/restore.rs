@@ -15,6 +15,11 @@ use crate::oltp::{
 };
 use crate::oltp_backup_repository::Repository;
 use std::io::Seek;
+// Downloaded archive files under the host's temporary directory, not on the data volume.
+use std::{
+    fs::{File, OpenOptions},
+    os::unix::fs::OpenOptionsExt,
+};
 
 pub(crate) struct VerifiedNativeRestore {
     downloaded: Vec<(File, IndexClosureArchiveOrigin)>,
