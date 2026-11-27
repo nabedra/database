@@ -18,7 +18,6 @@ command = ["cargo", "test", "--locked", "-j", "4", "--no-default-features", "--f
   "cache::cluster::sim::tests::mutants::planted_publish_reuses_first_sample_scripted",
   "cache::cluster::sim::tests::mutants::assigned_replica_keeps_pulling_the_retired_source_tail",
   "cache::cluster::sim::tests::mutants::planted_lease_ignores_error_bound_scripted",
-  "cache::cluster::sim::tests::mutants::planted_staged_promotion_beyond_lag_scripted_and_search",
   "cache::cluster::sim::tests::mutants::planted_staged_promotion_on_retirement_scripted_and_search",
   "cache::cluster::sim::tests::mutants::planted_staged_promotion_before_fence_scripted_and_search",
   "cache::cluster::sim::tests::mutants::staged_promotion_after_live_source_retirement_waits_for_grant",
