@@ -252,6 +252,44 @@ both!(vs10_restart_empties_the_files, |b| {
 
 // ----- Damage.
 
+// Review rv-dense (2026-11-27). A released record on a damaged page goes back to the top of the
+// free list when its put fails, so every later put of the file takes it again and fails, although
+// appending a new record would work. In an index each failed put fails the range (Error::Store),
+// so a resync of any range of that core fails as soon as its puts reach that record.
+#[test]
+#[ignore = "VEC-BUG-nvme-damaged-free-record-blocks-puts"]
+fn vs52_a_damaged_free_record_does_not_refuse_every_later_put_uring() {
+    if have(Backend::Uring) {
+        damaged_free_record(Backend::Uring);
+    }
+}
+
+#[test]
+#[ignore = "VEC-BUG-nvme-damaged-free-record-blocks-puts"]
+fn vs52_a_damaged_free_record_does_not_refuse_every_later_put_pread() {
+    damaged_free_record(Backend::Pread);
+}
+
+fn damaged_free_record(b: Backend) {
+    let dim = 16; // 64 bytes: 64 records per page.
+    let f = files("poisoned-free", b, 1);
+    let s = NvmeVectors::on(f.disks.clone(), dim).unwrap();
+    for i in 0..256u32 {
+        s.put(key(i, 1), &vector(dim, u64::from(i))).unwrap();
+    }
+    s.flush().unwrap();
+    // Damage page 0 (records 0 to 63) on disk, and release record 0.
+    flip(&f.dir.join("raw-0"), 100);
+    s.release(key(0, 1));
+    // Taking the released record has to read page 0: an error, once, is fair.
+    assert!(matches!(s.put(key(1000, 1), &vector(dim, 1000)), Err(Error::Store(_))));
+    // Later puts of other versions must not all fail on the same damaged record.
+    let failed = (1001..1011u32)
+        .filter(|&i| s.put(key(i, 1), &vector(dim, u64::from(i))).is_err())
+        .count();
+    assert_eq!(failed, 0, "{failed} of 10 later puts failed on the one damaged free record");
+}
+
 /// Every key reads back exactly what was put, or an error.
 fn exact_or_error(s: &NvmeVectors, dim: usize, keys: &[(VecKey, u64)]) -> usize {
     let mut errors = 0;
