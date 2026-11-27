@@ -8,6 +8,8 @@ pub mod index;
 pub mod planner;
 #[doc(hidden)]
 pub mod store;
+#[doc(hidden)]
+pub mod vector;
 use super::{
     failure,
     pool::{ByteClass, ChargedBytes, ScratchLease, WorkerSharedResources},
@@ -328,6 +330,26 @@ pub enum Change {
     Keep,
     Put(CanonicalJson),
     Delete,
+    /// A row of a table with search columns, with the vectors this write names.
+    /// A `Put` names none, so it keeps the row's vectors.
+    PutRow {
+        value: CanonicalJson,
+        search: Box<vector::RowSearch>,
+    },
+}
+impl Change {
+    pub(crate) fn value(&self) -> Option<&CanonicalJson> {
+        match self {
+            Self::Put(value) | Self::PutRow { value, .. } => Some(value),
+            Self::Keep | Self::Delete => None,
+        }
+    }
+    pub(crate) fn search(&self) -> Option<&vector::RowSearch> {
+        match self {
+            Self::PutRow { search, .. } => Some(search),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -339,27 +361,31 @@ pub struct PreparedWrite {
 }
 impl PreparedWrite {
     pub fn attach_charge(&self, owner: Arc<ScratchLease>) -> Result<(), ProtocolError> {
-        if let Change::Put(value) = &self.change {
-            value.attach_charge(owner)?;
+        if let Some(value) = self.change.value() {
+            value.attach_charge(owner.clone())?;
         }
-        Ok(())
+        self.change
+            .search()
+            .map_or(Ok(()), |search| search.attach_charge(owner))
     }
     pub fn fields_attached(&self) -> bool {
-        match &self.change {
-            Change::Put(value) => value.is_charged(),
-            _ => true,
-        }
+        self.change.value().is_none_or(CanonicalJson::is_charged)
+            && self.change.search().is_none_or(|search| search.is_charged())
     }
 }
 impl nabedra_oltp_types::owned::OwnedPayload for PreparedWrite {
     fn heap_bytes(&self) -> Result<usize, ProtocolError> {
-        let value = match &self.change {
-            Change::Put(value) => value.heap_bytes()?,
-            _ => 0,
-        };
+        let value = self.change.value().map_or(Ok(0), CanonicalJson::heap_bytes)?;
+        let search = self.change.search().map_or(Ok(0), |search| {
+            search
+                .heap_bytes()?
+                .checked_add(std::mem::size_of::<vector::RowSearch>())
+                .ok_or_else(invalid_json)
+        })?;
         self.key
             .heap_bytes()
             .checked_add(value)
+            .and_then(|bytes| bytes.checked_add(search))
             .ok_or_else(invalid_json)
     }
     fn attach_fields(&self, owner: Arc<ScratchLease>) -> Result<(), ProtocolError> {

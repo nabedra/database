@@ -66,6 +66,7 @@ impl CatalogEntry {
             schema: self.schema.clone(),
             key: self.key.clone(),
             format: self.format,
+            search: Default::default(),
         }
     }
     pub fn snapshot_key(&self) -> Result<ObjectKey, StorageError> {
@@ -97,6 +98,7 @@ impl Catalog {
                 .validate()
                 .map_err(|_| StorageError::InvalidCatalog)?;
             if !ids.insert(table.id)
+                || table.schema.values().any(|ty| !ty.is_scalar())
                 || table.row_count > MAX_TABLE_ROWS as u64
                 || (self.format_version == 1 && !matches!(table.data, TableData::Legacy { .. }))
             {

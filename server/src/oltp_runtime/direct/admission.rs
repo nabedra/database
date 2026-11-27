@@ -17,6 +17,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// keys, the encoded entry and its reply.
 pub(crate) const REQUEST_OVERHEAD_BYTES: usize = 64 << 10;
 
+/// Fixed charge per concurrent row of a `*_many` group: its task state, key
+/// and small proposal fields.
+const ROW_OVERHEAD_BYTES: usize = 8 << 10;
+
 /// The charge for a body of `body_bytes`: twice the body (its decoded form
 /// and the encoded entry) plus a fixed overhead.
 pub(crate) fn working_bytes(body_bytes: usize) -> usize {
@@ -62,6 +66,14 @@ impl DirectAdmission {
             _slot: slot,
             _bytes: bytes,
         })
+    }
+
+    /// Charges what `rows` concurrent rows of one admitted group need beyond
+    /// the group's own working set, which covers their bytes.
+    pub(crate) fn try_rows(&self, rows: usize) -> Result<ScratchLease, DirectResponse> {
+        self.resources
+            .reserve_scratch(ByteClass::Data, rows.saturating_mul(ROW_OVERHEAD_BYTES))
+            .map_err(|_| DirectResponse::overloaded("worker memory budget is full"))
     }
 
     pub(crate) fn in_flight(&self) -> usize {

@@ -24,7 +24,8 @@ use crate::{
     oltp_replication::{
         authority::control::{
             ControlClient, DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectCapability,
-            DirectCapabilityOperation, QUEUED_SNAPSHOT_RETRY_FEATURE,
+            DirectCapabilityOperation, EnabledFeatures, QUEUED_SNAPSHOT_RETRY_FEATURE,
+            VECTOR_FEATURE, watch_cluster_features,
         },
         types::WorkerIdentity,
     },
@@ -90,6 +91,8 @@ pub(crate) struct DirectSwitch {
     /// GC2: Control enabled `data.direct.batch` (as last observed; sticky).
     batch: AtomicBool,
     snapshot_retry: SnapshotRetry,
+    /// `data.vector.v1`, watched from activation on.
+    features: Arc<EnabledFeatures>,
     /// End (Unix ms) of the queued-history window, 0 without one (T7c).
     history_until: AtomicU64,
     /// Control recorded this owner's pre-activation queued history (T7c).
@@ -127,6 +130,7 @@ impl DirectSwitch {
             active: AtomicBool::new(false),
             batch: AtomicBool::new(false),
             snapshot_retry: SnapshotRetry::default(),
+            features: Arc::default(),
             history_until: AtomicU64::new(0),
             history_noted: AtomicBool::new(false),
             #[cfg(test)]
@@ -164,6 +168,10 @@ impl DirectSwitch {
     /// reverts). Only meaningful once the capability is active.
     pub(crate) fn is_batch_enabled(&self) -> bool {
         self.batch.load(Ordering::Acquire)
+    }
+    /// Control enabled `data.vector.v1` (as last observed; never reverts).
+    pub(crate) fn vector_enabled(&self) -> bool {
+        self.features.enabled(VECTOR_FEATURE)
     }
     pub(crate) async fn queued_snapshot_retry_enabled(&self) -> bool {
         self.snapshot_retry
@@ -324,6 +332,10 @@ impl DirectSwitch {
     /// direct commits, direct batching and queued snapshot retries.
     /// An older Control or a leader change may require another poll.
     pub(crate) fn start(self: &Arc<Self>) {
+        let (control, local, features) = (self.control.clone(), self.local, self.features.clone());
+        self.on_active(move || {
+            watch_cluster_features(&control, local, &[VECTOR_FEATURE], &features);
+        });
         let switch = Arc::downgrade(self);
         let mut stop = self.stop.subscribe();
         let task = nabedra_rt::task::spawn(async move {
@@ -496,6 +508,9 @@ impl crate::oltp_runtime::direct::DirectGate for DirectSwitch {
     }
     fn history_settling(&self) -> bool {
         DirectSwitch::history_settling(self)
+    }
+    fn vector(&self) -> bool {
+        self.vector_enabled()
     }
 }
 

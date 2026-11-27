@@ -22,7 +22,7 @@ pub(crate) use data_worker::DataWorkerGrowthProof;
 pub use data_worker::DataWorkerIntent;
 pub(crate) use direct::{ClusterFeatureState, DirectActivation, DirectFeatures, FeatureActivation, cluster_feature, feature_operation_id};
 #[doc(hidden)]
-pub use direct::{CLUSTER_FEATURES, DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectCapability, DirectCapabilityOperation, INDEX_RECLAIM_FEATURE, QUEUED_SNAPSHOT_RETRY_FEATURE};
+pub use direct::{CLUSTER_FEATURES, DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectCapability, DirectCapabilityOperation, INDEX_RECLAIM_FEATURE, QUEUED_SNAPSHOT_RETRY_FEATURE, VECTOR_FEATURE};
 pub(crate) use endpoint::ReplicaRoutes;
 #[doc(hidden)]
 pub use endpoint::{ControlClient, ControlEndpoint, ControlRoutes, PublishedControlRoutes};

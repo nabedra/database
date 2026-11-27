@@ -584,6 +584,54 @@ async fn o11_ns07_purge_deletes_only_the_range_after_the_previous_purge() {
     assert_eq!(retained(f.log.try_get_log_entries(..).await.unwrap()), [61]);
 }
 
+/// DB-5: the log's purge deletes the change records of the entries it purges,
+/// and only those, in its own batch.
+#[tokio::test]
+async fn vs02_purge_deletes_the_change_records_of_the_purged_entries() {
+    let mut f = Fixture::new().await;
+    for index in 0..10 {
+        f.log.append([blank(index)], IOFlushed::noop()).await.unwrap();
+    }
+    let group = f.log.group().clone();
+    let budget = crate::oltp::pool::TransactionBudget {
+        scratch_bytes: 1 << 20,
+        batch_bytes: 1 << 20,
+        output_bytes: 64 << 10,
+    };
+    // A change record per applied entry, as apply writes them.
+    for index in 0..10u64 {
+        let meta = crate::oltp::pool::ApplyMeta {
+            position: crate::oltp::pool::AppliedPosition { term: 1, node_id: 1, index },
+            command_digest: crate::oltp_replication::types::Digest::from_bytes([1; 32]),
+            membership: None,
+        };
+        group
+            .transaction(meta, budget, move |tx| {
+                tx.put_change_for_test(index, b"change")?;
+                Ok(crate::oltp::pool::Transition::Commit(tx.copy_output(b"null")?))
+            })
+            .await
+            .unwrap();
+    }
+    let first = |group: GroupStore| async move {
+        let raw = group
+            .read(budget, |view| {
+                let first = view.change_from(0)?.map(|(index, _)| index);
+                view.encode(&first)
+            })
+            .await
+            .unwrap();
+        serde_json::from_slice::<Option<u64>>(raw.as_slice()).unwrap()
+    };
+    assert_eq!(first(group.clone()).await, Some(0));
+    f.log.purge(id(4)).await.unwrap();
+    assert_eq!(first(group.clone()).await, Some(5));
+    f.log.purge(id(4)).await.unwrap();
+    assert_eq!(first(group.clone()).await, Some(5), "a repeated purge deletes nothing more");
+    f.log.purge(id(9)).await.unwrap();
+    assert_eq!(first(group).await, None);
+}
+
 /// O05/M01/F03: actual14MiB fixed bytes survive native log decode and retain
 /// their dynamic owner after both the reader's apply arena and entry are gone.
 #[tokio::test]

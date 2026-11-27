@@ -27,6 +27,8 @@ pub enum ErrorCode {
     LimitExceeded,
     Overloaded,
     StorageUnavailable,
+    /// A range has no search replica that can answer. Retryable.
+    SearchUnavailable,
     #[doc(hidden)]
     SplitPublicationPending,
     OutcomeUnknown,
@@ -41,7 +43,10 @@ impl ErrorCode {
             Self::Conflict => 409,
             Self::LimitExceeded => 413,
             Self::Overloaded => 429,
-            Self::StorageUnavailable | Self::SplitPublicationPending | Self::OutcomeUnknown => 503,
+            Self::StorageUnavailable
+            | Self::SearchUnavailable
+            | Self::SplitPublicationPending
+            | Self::OutcomeUnknown => 503,
             Self::InternalError => 500,
         }
     }
@@ -96,16 +101,34 @@ pub struct ErrorResponse {
     pub error: ProtocolError,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Scalar types are strings on the wire, the others objects. Only OLTP tables
+/// have the latter: see [`parse_oltp_request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
-    #[serde(rename = "utf8")]
     Utf8,
-    #[serde(rename = "int64")]
     Int64,
-    #[serde(rename = "float64")]
     Float64,
-    #[serde(rename = "bool")]
     Bool,
+    /// A dense float32 vector of this dimension.
+    Vector(u16),
+    /// `{index: weight}`.
+    SparseVector,
+    /// Several dense vectors of this dimension.
+    VectorList(u16),
+    /// A list of strings.
+    Utf8List,
+}
+impl ColumnType {
+    pub fn is_scalar(self) -> bool {
+        matches!(self, Self::Utf8 | Self::Int64 | Self::Float64 | Self::Bool)
+    }
+    /// Nullable, and ranked by vector operations.
+    pub fn is_vector(self) -> bool {
+        matches!(
+            self,
+            Self::Vector(_) | Self::SparseVector | Self::VectorList(_)
+        )
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum TableFormat {
@@ -126,8 +149,9 @@ macro_rules! string_enum_deserialize {
         }
     };
 }
-string_enum_deserialize!(ColumnType, "utf8" => Utf8, "int64" => Int64,
-    "float64" => Float64, "bool" => Bool);
+mod search;
+pub use search::*;
+
 string_enum_deserialize!(TableFormat, "parquet" => Parquet);
 string_enum_deserialize!(ComparisonOp, "eq" => Eq, "ne" => Ne, "gt" => Gt,
     "ge" => Ge, "lt" => Lt, "le" => Le);
@@ -135,7 +159,9 @@ string_enum_deserialize!(ComparisonOp, "eq" => Eq, "ne" => Ne, "gt" => Gt,
 pub type Schema = BTreeMap<String, ColumnType>;
 pub type Row = BTreeMap<String, Scalar>;
 
-/// No null, arrays, objects, numeric coercion, or executable expressions.
+/// A row value. Deserialization accepts the four scalars only: no null,
+/// arrays, objects, numeric coercion, or executable expressions. Rows with
+/// other column types decode through [`decode_row`].
 /// Deserialization requires JSON raw-value support so syntax is checked before
 /// serde_json can interpret its private number markers. Deserialize directly
 /// from JSON or a serde_json::Value, rather than through Serde content buffers.
@@ -145,34 +171,43 @@ pub enum Scalar {
     Int64(i64),
     Float64(f64),
     Bool(bool),
+    /// Vector columns only.
+    Null,
+    Utf8List(Box<[String]>),
+    Vector(Box<Vector>),
 }
 impl<'de> Deserialize<'de> for Scalar {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = Box::<RawValue>::deserialize(d)?;
-        let text = raw.get().trim_start();
+        Self::from_json(raw.get()).map_err(serde::de::Error::custom)
+    }
+}
+impl Scalar {
+    /// One of the four scalars from a complete JSON value.
+    fn from_json(raw: &str) -> Result<Self, serde_json::Error> {
+        use serde::de::Error;
+        let text = raw.trim_start();
         if text.starts_with(['{', '[']) || text == "null" {
-            return Err(serde::de::Error::custom("expected a non-null scalar"));
+            return Err(Error::custom("expected a non-null scalar"));
         }
-        match serde_json::from_str::<Value>(text).map_err(serde::de::Error::custom)? {
+        match serde_json::from_str::<Value>(text)? {
             Value::String(v) => Ok(Self::Utf8(v)),
             Value::Bool(v) => Ok(Self::Bool(v)),
             Value::Number(v) => {
                 // arbitrary_precision retains integer syntax even outside i64 bounds.
                 let text = v.to_string();
                 if text.contains(['.', 'e', 'E']) {
-                    let n = text.parse::<f64>().map_err(serde::de::Error::custom)?;
+                    let n = text.parse::<f64>().map_err(Error::custom)?;
                     if n.is_finite() {
                         Ok(Self::Float64(n))
                     } else {
-                        Err(serde::de::Error::custom("float64 must be finite"))
+                        Err(Error::custom("float64 must be finite"))
                     }
                 } else {
-                    text.parse::<i64>()
-                        .map(Self::Int64)
-                        .map_err(serde::de::Error::custom)
+                    text.parse::<i64>().map(Self::Int64).map_err(Error::custom)
                 }
             }
-            _ => Err(serde::de::Error::custom("expected a non-null scalar")),
+            _ => Err(Error::custom("expected a non-null scalar")),
         }
     }
 }
@@ -184,11 +219,14 @@ impl Serialize for Scalar {
             Self::Bool(v) => s.serialize_bool(*v),
             Self::Float64(v) if v.is_finite() => s.serialize_f64(*v),
             Self::Float64(_) => Err(serde::ser::Error::custom("float64 must be finite")),
+            Self::Null => s.serialize_unit(),
+            Self::Utf8List(v) => v.serialize(s),
+            Self::Vector(v) => v.serialize(s),
         }
     }
 }
 /// Key syntax is restricted before a schema is available.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Key {
     Utf8(String),
@@ -203,27 +241,41 @@ impl Key {
     }
 }
 
+/// Without search options, the bytes are those of builds without them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "search::DescriptorWire")]
 pub struct TableDescriptor {
     pub id: Uuid,
     pub name: String,
     pub schema: Schema,
     pub key: String,
     pub format: TableFormat,
+    #[serde(flatten)]
+    pub search: SearchOptions,
 }
 impl TableDescriptor {
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        validate_schema(&self.name, &self.schema, &self.key)
+        validate_schema(&self.name, &self.schema, &self.key)?;
+        self.search.validate(&self.schema)
+    }
+    /// Vector and full-text columns.
+    pub fn search_columns(&self) -> usize {
+        search::search_columns(&self.schema, &self.search)
+    }
+    /// Whether the table needs the cluster feature `data.vector.v1`.
+    pub fn uses_search(&self) -> bool {
+        uses_search(&self.schema, &self.search)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "search::CreateWire")]
 pub struct CreatePayload {
     pub name: String,
     pub schema: Schema,
     pub key: String,
     pub format: TableFormat,
+    #[serde(flatten)]
+    pub search: SearchOptions,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -300,6 +352,24 @@ pub enum Operation {
     Count(QueryPayload),
     #[serde(rename = "query.explain")]
     Explain(QueryPayload),
+    #[serde(rename = "table.upsert_many")]
+    UpsertMany(BatchPayload),
+    #[serde(rename = "table.delete_many")]
+    DeleteMany(KeysPayload),
+    #[serde(rename = "table.add_column")]
+    AddColumn(AddColumnPayload),
+    #[serde(rename = "table.drop_column")]
+    DropColumn(ColumnPayload),
+    #[serde(rename = "table.add_full_text")]
+    AddFullText(AddFullTextPayload),
+    #[serde(rename = "table.drop_full_text")]
+    DropFullText(FullTextPayload),
+    #[serde(rename = "table.search_status")]
+    SearchStatus(TablePayload),
+    #[serde(rename = "query.rank")]
+    Rank(RankPayload),
+    #[serde(rename = "query.rank_many")]
+    RankMany(RankManyPayload),
 }
 impl<'de> Deserialize<'de> for Operation {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -311,7 +381,8 @@ impl<'de> Deserialize<'de> for Operation {
         }
         // Preserve raw scalars even when payload precedes the operation tag.
         let wire: Wire = deserialize_object(d)?;
-        decode_operation(&wire.operation, &wire.payload).map_err(serde::de::Error::custom)
+        decode_operation(&wire.operation, &wire.payload, Grammar::Scalar)
+            .map_err(serde::de::Error::custom)
     }
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -329,12 +400,25 @@ struct RawRequest {
 }
 impl<'de> Deserialize<'de> for Request {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        decode_request(deserialize_object(d)?).map_err(serde::de::Error::custom)
+        decode_request(deserialize_object(d)?, Grammar::Scalar).map_err(serde::de::Error::custom)
     }
 }
 /// Authoritative byte entry point preserves unsupported_operation classification
 /// and enforces body size. Direct Serde deserialization has only Serde errors.
+/// Both accept scalar columns only, for engines without the others.
 pub fn parse_request(bytes: &[u8]) -> Result<Request, ProtocolError> {
+    parse(bytes, Grammar::Scalar)
+}
+/// As `parse_request`, with vector and list columns and the operations on them.
+pub fn parse_oltp_request(bytes: &[u8]) -> Result<Request, ProtocolError> {
+    parse(bytes, Grammar::Full)
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Grammar {
+    Scalar,
+    Full,
+}
+fn parse(bytes: &[u8], grammar: Grammar) -> Result<Request, ProtocolError> {
     if bytes.len() > MAX_BODY_BYTES {
         return Err(limit("request body exceeds 8 MiB"));
     }
@@ -344,23 +428,32 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request, ProtocolError> {
     deserializer
         .end()
         .map_err(|_| invalid("trailing request content"))?;
-    decode_request(raw)
+    decode_request(raw, grammar)
 }
 fn payload<T: DeserializeOwned>(raw: &RawValue) -> Result<T, ProtocolError> {
     deserialize_object(&mut serde_json::Deserializer::from_str(raw.get()))
         .map_err(|_| invalid("malformed operation payload"))
 }
-fn decode_request(raw: RawRequest) -> Result<Request, ProtocolError> {
-    let operation = decode_operation(&raw.operation, &raw.payload)?;
+fn decode_request(raw: RawRequest, grammar: Grammar) -> Result<Request, ProtocolError> {
+    let operation = decode_operation(&raw.operation, &raw.payload, grammar)?;
     operation.validate()?;
     Ok(Request {
         request_id: raw.request_id,
         operation,
     })
 }
-fn decode_operation(name: &str, p: &RawValue) -> Result<Operation, ProtocolError> {
+fn decode_operation(
+    name: &str,
+    p: &RawValue,
+    grammar: Grammar,
+) -> Result<Operation, ProtocolError> {
+    if grammar == Grammar::Full
+        && let Some(operation) = search::decode_operation(name, p)?
+    {
+        return Ok(operation);
+    }
     let operation = match name {
-        "table.create" => Operation::Create(payload(p)?),
+        "table.create" => Operation::Create(search::scalar_create(payload(p)?)?),
         "table.describe" => Operation::Describe(payload(p)?),
         "table.list" => Operation::List(payload(p)?),
         "table.drop" => Operation::Drop(payload(p)?),
@@ -400,6 +493,15 @@ impl Operation {
             Self::Collect(_) => "query.collect",
             Self::Count(_) => "query.count",
             Self::Explain(_) => "query.explain",
+            Self::UpsertMany(_) => "table.upsert_many",
+            Self::DeleteMany(_) => "table.delete_many",
+            Self::AddColumn(_) => "table.add_column",
+            Self::DropColumn(_) => "table.drop_column",
+            Self::AddFullText(_) => "table.add_full_text",
+            Self::DropFullText(_) => "table.drop_full_text",
+            Self::SearchStatus(_) => "table.search_status",
+            Self::Rank(_) => "query.rank",
+            Self::RankMany(_) => "query.rank_many",
         }
     }
 
@@ -412,8 +514,17 @@ impl Operation {
             | Self::InsertMany(_)
             | Self::Update(_)
             | Self::Upsert(_)
-            | Self::Delete(_) => true,
-            Self::Describe(_)
+            | Self::Delete(_)
+            | Self::UpsertMany(_)
+            | Self::DeleteMany(_)
+            | Self::AddColumn(_)
+            | Self::DropColumn(_)
+            | Self::AddFullText(_)
+            | Self::DropFullText(_) => true,
+            Self::SearchStatus(_)
+            | Self::Rank(_)
+            | Self::RankMany(_)
+            | Self::Describe(_)
             | Self::List(_)
             | Self::Get(_)
             | Self::Collect(_)
@@ -425,11 +536,21 @@ impl Operation {
     /// Checks independent of catalog resolution. Call again for constructed values.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         match self {
-            Self::Create(p) => validate_schema(&p.name, &p.schema, &p.key),
+            Self::Create(p) => {
+                validate_schema(&p.name, &p.schema, &p.key)?;
+                p.search.validate(&p.schema)
+            }
             Self::Describe(p) => validate_identifier(&p.name),
-            Self::InsertMany(p) if p.rows.len() > MAX_BATCH_ROWS => {
+            Self::InsertMany(p) | Self::UpsertMany(p) if p.rows.len() > MAX_BATCH_ROWS => {
                 Err(limit("batch exceeds 10000 rows"))
             }
+            Self::DeleteMany(p) => p.validate(),
+            Self::AddColumn(p) => p.validate(),
+            Self::DropColumn(p) => validate_identifier(&p.name),
+            Self::AddFullText(p) => p.validate(),
+            Self::DropFullText(p) => validate_identifier(&p.column),
+            Self::Rank(p) => p.validate_structure(),
+            Self::RankMany(p) => p.validate_structure(),
             Self::Collect(p) | Self::Count(p) | Self::Explain(p) => p.query.validate_structure(),
             _ => Ok(()),
         }
@@ -440,9 +561,16 @@ impl Operation {
         self.validate()?;
         table.validate()?;
         let id = match self {
-            Self::Drop(p) => p.table_id,
+            Self::Drop(p) | Self::SearchStatus(p) => p.table_id,
             Self::Insert(p) | Self::Upsert(p) => p.table_id,
-            Self::InsertMany(p) => p.table_id,
+            Self::InsertMany(p) | Self::UpsertMany(p) => p.table_id,
+            Self::DeleteMany(p) => p.table_id,
+            Self::AddColumn(p) => p.table_id,
+            Self::DropColumn(p) => p.table_id,
+            Self::AddFullText(p) => p.table_id,
+            Self::DropFullText(p) => p.table_id,
+            Self::Rank(p) => p.table_id,
+            Self::RankMany(p) => p.table_id,
             Self::Get(p) | Self::Delete(p) => p.table_id,
             Self::Update(p) => p.table_id,
             Self::Collect(p) | Self::Count(p) | Self::Explain(p) => p.table_id,
@@ -457,6 +585,26 @@ impl Operation {
                 .rows
                 .iter()
                 .try_for_each(|row| validate_row(row, table, RowMode::Complete)),
+            Self::UpsertMany(p) => {
+                let mut seen = std::collections::HashSet::with_capacity(p.rows.len());
+                p.rows.iter().try_for_each(|row| {
+                    validate_row(row, table, RowMode::Complete)?;
+                    if !seen.insert(row_key(row, &table.key)?) {
+                        return Err(duplicate_key());
+                    }
+                    Ok(())
+                })
+            }
+            Self::DeleteMany(p) => p
+                .keys
+                .iter()
+                .try_for_each(|key| key.validate(table.schema[&table.key])),
+            Self::AddColumn(p) => p.validate_for(table),
+            Self::DropColumn(p) => p.validate_for(table),
+            Self::AddFullText(p) => p.validate_for(table),
+            Self::DropFullText(p) => p.validate_for(table),
+            Self::Rank(p) => p.validate(table),
+            Self::RankMany(p) => p.validate(table),
             Self::Get(p) | Self::Delete(p) => p.key.validate(table.schema[&table.key]),
             Self::Update(p) => {
                 p.key.validate(table.schema[&table.key])?;
@@ -493,7 +641,11 @@ pub fn validate_schema(name: &str, schema: &Schema, key: &str) -> Result<(), Pro
         _ => Err(invalid("primary key must name a utf8 or int64 column")),
     }
 }
+/// `value` in a row column of type `ty`.
 pub fn validate_scalar(value: &Scalar, ty: ColumnType) -> Result<(), ProtocolError> {
+    if !ty.is_scalar() {
+        return search::validate_value(value, ty);
+    }
     match (value, ty) {
         (Scalar::Utf8(_), ColumnType::Utf8)
         | (Scalar::Int64(_), ColumnType::Int64)
@@ -506,17 +658,28 @@ pub fn validate_scalar(value: &Scalar, ty: ColumnType) -> Result<(), ProtocolErr
 pub enum RowMode {
     Complete,
     PartialUpdate,
+    /// A complete row that may hold the embedded columns a client omits.
+    Stored,
 }
 pub fn validate_row(
     row: &Row,
     table: &TableDescriptor,
     mode: RowMode,
 ) -> Result<(), ProtocolError> {
-    if mode == RowMode::Complete && row.len() != table.schema.len() {
+    let embed = &table.search.embed;
+    let embedded = row.keys().filter(|name| embed.contains_key(*name)).count();
+    if embedded != 0 && mode != RowMode::Stored {
+        return Err(invalid("an embedded column cannot be written"));
+    }
+    if mode == RowMode::PartialUpdate {
+        if row.contains_key(&table.key) {
+            return Err(invalid("update cannot contain the primary key"));
+        }
+    } else if row.len() - embedded + embed.len() != table.schema.len() {
         return Err(invalid("complete row must contain every schema column"));
     }
-    if mode == RowMode::PartialUpdate && row.contains_key(&table.key) {
-        return Err(invalid("update cannot contain the primary key"));
+    if table.search_columns() != 0 {
+        search::validate_row_size(row)?;
     }
     for (column, value) in row {
         let ty = table
@@ -586,6 +749,7 @@ pub enum ComparisonOp {
 pub enum Predicate {
     Comparison(Comparison),
     Logical(LogicalPredicate),
+    Text(TextPredicate),
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -604,10 +768,14 @@ pub enum LogicalPredicate {
 impl<'de> Deserialize<'de> for Predicate {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = Box::<RawValue>::deserialize(d)?;
-        decode_predicate(&raw, 1).map_err(serde::de::Error::custom)
+        decode_predicate(&raw, 1, Grammar::Scalar).map_err(serde::de::Error::custom)
     }
 }
-fn decode_predicate(raw: &RawValue, depth: usize) -> Result<Predicate, ProtocolError> {
+fn decode_predicate(
+    raw: &RawValue,
+    depth: usize,
+    grammar: Grammar,
+) -> Result<Predicate, ProtocolError> {
     // Untagged/internal-tagged derives buffer scalar numbers as private maps.
     // Dispatch from raw JSON instead, including every nested predicate. Bound
     // recursion here because each raw subtree starts a fresh JSON deserializer.
@@ -632,7 +800,7 @@ fn decode_predicate(raw: &RawValue, depth: usize) -> Result<Predicate, ProtocolE
             let args = wire
                 .args
                 .iter()
-                .map(|arg| decode_predicate(arg, depth + 1))
+                .map(|arg| decode_predicate(arg, depth + 1, grammar))
                 .collect::<Result<_, _>>()?;
             Ok(Predicate::Logical(if tag.op == "and" {
                 LogicalPredicate::And { args }
@@ -649,8 +817,11 @@ fn decode_predicate(raw: &RawValue, depth: usize) -> Result<Predicate, ProtocolE
                 arg: Box<RawValue>,
             }
             let wire: Arg = payload(raw)?;
-            let arg = Box::new(decode_predicate(&wire.arg, depth + 1)?);
+            let arg = Box::new(decode_predicate(&wire.arg, depth + 1, grammar)?);
             Ok(Predicate::Logical(LogicalPredicate::Not { arg }))
+        }
+        "contains" | "contains_any" | "starts_with" if grammar == Grammar::Full => {
+            search::decode_text_predicate(&tag.op, raw).map(Predicate::Text)
         }
         _ => payload(raw).map(Predicate::Comparison),
     }
@@ -659,7 +830,7 @@ impl<'de> Deserialize<'de> for LogicalPredicate {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         match Predicate::deserialize(d)? {
             Predicate::Logical(value) => Ok(value),
-            Predicate::Comparison(_) => {
+            Predicate::Comparison(_) | Predicate::Text(_) => {
                 Err(serde::de::Error::custom("expected a logical predicate"))
             }
         }
@@ -723,8 +894,10 @@ impl Query {
                 column_type(schema, col)?;
             }
         }
-        if let Some(order) = &self.order_by {
-            column_type(schema, &order.column)?;
+        if let Some(order) = &self.order_by
+            && !column_type(schema, &order.column)?.is_scalar()
+        {
+            return Err(invalid("order_by requires a scalar column"));
         }
         if let Some(filter) = &self.filter {
             filter.validate_at(Some(schema), 1)?;
@@ -751,6 +924,9 @@ impl Predicate {
                 validate_identifier(&p.column)?;
                 if let Some(schema) = schema {
                     let ty = column_type(schema, &p.column)?;
+                    if !ty.is_scalar() {
+                        return Err(invalid("comparison requires a scalar column"));
+                    }
                     validate_scalar(&p.value, ty)?;
                     if ty == ColumnType::Bool
                         && !matches!(p.op, ComparisonOp::Eq | ComparisonOp::Ne)
@@ -770,6 +946,7 @@ impl Predicate {
                     .try_for_each(|arg| arg.validate_at(schema, depth + 1))
             }
             Self::Logical(LogicalPredicate::Not { arg }) => arg.validate_at(schema, depth + 1),
+            Self::Text(p) => p.validate(schema),
         }
     }
 }

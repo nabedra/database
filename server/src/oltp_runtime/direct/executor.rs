@@ -2,7 +2,7 @@
 //! `DirectForward` and dedup expiry. See the module doc in `mod.rs`.
 use super::{
     admission::{Admitted, DirectAdmission},
-    batcher::{Batchers, Committed},
+    batcher::{Batchers, Committed, Seat},
     latches::{DEFAULT_STRIPES, KeyLatches},
     schema::{DirectSchema, DirectTable, SchemaLookup},
     stats::{DirectStats, DirectStatsSnapshot, ProposalFailure, RetryCause},
@@ -20,8 +20,8 @@ use crate::{
                     ClockRejection, DEFAULT_DIRECT_DEDUP_RETENTION_MS, DedupLookup, DirectCommit,
                     DirectExpire, DirectForward, DirectReply, DirectSchema as GroupSchema,
                     DirectSchemaChange, DirectWrite, IndexChange, LeaderToken,
-                    MAX_DIRECT_EXPIRE_ITEMS, MAX_DIRECT_INDEX_CHANGES, MAX_DIRECT_RESULT_BYTES,
-                    MAX_DIRECT_WRITES, RangeClock, expiry_cutoff,
+                    MAX_DIRECT_BATCH_MEMBERS, MAX_DIRECT_EXPIRE_ITEMS, MAX_DIRECT_INDEX_CHANGES,
+                    MAX_DIRECT_RESULT_BYTES, MAX_DIRECT_WRITES, RangeClock, expiry_cutoff,
                 },
             },
         },
@@ -37,12 +37,14 @@ use crate::{
         },
         types::{CommitTs, Digest, GroupKind},
     },
-    protocol::{self, ErrorCode, Key, Operation, Outcome, ProtocolError, Row},
+    protocol::{self, ErrorCode, Key, Operation, Outcome, ProtocolError, Request, Row},
 };
+use futures_util::future::join_all;
+use nabedra_oltp_types::owned::serialized_digest;
 use serde_json::value::RawValue;
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, Weak},
     time::{Duration, UNIX_EPOCH},
 };
@@ -52,6 +54,8 @@ use uuid::Uuid;
 /// The largest encoded `DirectCommit` the leader proposes (plan "Eligible
 /// operations": `insert_many` up to 1 MiB). Larger entries use the queued path.
 pub(crate) const MAX_DIRECT_ENTRY_BYTES: usize = 1 << 20;
+/// Rows of a `*_many` group that are latched, prepared and proposed together.
+const WINDOW_ROWS: usize = MAX_DIRECT_BATCH_MEMBERS;
 /// Pause between attempts while this node waits for its first entry of a
 /// new term to apply (range clock rule 3) or storage to come back.
 const RETRY_PAUSE: Duration = Duration::from_millis(2);
@@ -71,6 +75,11 @@ pub(crate) trait DirectGate: Send + Sync {
     /// range may share a `DirectBatch` entry. False proposes one entry per
     /// commit.
     fn direct_batch(&self) -> bool {
+        false
+    }
+    /// Control enabled `data.vector.v1` in this worker's applied state. While
+    /// false no operation on a table that needs it is served.
+    fn vector(&self) -> bool {
         false
     }
 }
@@ -146,6 +155,13 @@ enum Activation {
     Wait,
 }
 
+/// Who latches a mutation's keys.
+enum Latching {
+    Own,
+    /// Its window, whose members it may share an entry with.
+    Window(Option<Seat>),
+}
+
 enum Attempt<T> {
     Done(T),
     Retry(RetryCause),
@@ -213,13 +229,20 @@ impl DirectExecutor {
             Err(response) => response,
             Ok((admitted, parsed)) => {
                 let deadline = nabedra_rt::time::now() + request.deadline.min(MAX_DIRECT_DEADLINE);
-                let response = if matches!(parsed.operation, Operation::Get(_)) {
-                    get = true;
-                    self.stats.get();
-                    self.get(handle, &request, parsed, deadline).await
-                } else {
-                    self.stats.mutation();
-                    self.mutate(handle, &request, parsed, deadline).await
+                let response = match &parsed.operation {
+                    Operation::Get(_) => {
+                        get = true;
+                        self.stats.get();
+                        self.get(handle, &request, parsed, deadline).await
+                    }
+                    Operation::UpsertMany(_) | Operation::DeleteMany(_) => {
+                        self.many(handle, &request, parsed, deadline).await
+                    }
+                    _ => {
+                        self.stats.mutation();
+                        self.mutate(handle, &request, parsed, deadline, Latching::Own)
+                            .await
+                    }
                 };
                 drop(admitted);
                 response
@@ -319,7 +342,7 @@ impl DirectExecutor {
                 "direct request digest differs from its body",
             )));
         }
-        let parsed = protocol::parse_request(request.body.as_slice()).map_err(failed)?;
+        let parsed = protocol::parse_oltp_request(request.body.as_slice()).map_err(failed)?;
         if parsed.request_id != request.request_id {
             return Err(failed(invalid("direct request id differs from its body")));
         }
@@ -327,7 +350,10 @@ impl DirectExecutor {
             Operation::Get(p) | Operation::Delete(p) => Some(p.table_id),
             Operation::Insert(p) | Operation::Upsert(p) => Some(p.table_id),
             Operation::Update(p) => Some(p.table_id),
-            Operation::InsertMany(p) if !p.rows.is_empty() => Some(p.table_id),
+            Operation::InsertMany(p) | Operation::UpsertMany(p) if !p.rows.is_empty() => {
+                Some(p.table_id)
+            }
+            Operation::DeleteMany(p) if !p.keys.is_empty() => Some(p.table_id),
             _ => None,
         };
         match table {
@@ -561,7 +587,7 @@ impl DirectExecutor {
         handle: &Arc<ParticipantHandle>,
         clock: &RangeClock,
         request: &DirectRequest,
-        operation: &Operation,
+        operation: Option<&Operation>,
         deadline: Instant,
     ) -> Result<(Option<GroupSchema>, Arc<DirectTable>), DirectResponse> {
         if let Some(epochs) = self.known_epochs(handle)
@@ -579,11 +605,12 @@ impl DirectExecutor {
         Ok((epochs.direct_schema, table))
     }
 
+    /// The table, with `operation` checked against its descriptor.
     async fn table(
         &self,
         request: &DirectRequest,
         epochs: &ParticipantEpochs,
-        operation: &Operation,
+        operation: Option<&Operation>,
         deadline: Instant,
     ) -> Result<Arc<DirectTable>, DirectResponse> {
         let lookup = catalog_read(
@@ -612,9 +639,14 @@ impl DirectExecutor {
                 )));
             }
         };
-        operation
-            .validate_for_table(&table.descriptor)
-            .map_err(failed)?;
+        if table.descriptor.uses_search() && !self.gate.vector() {
+            return Err(failed(protocol::search_disabled()));
+        }
+        if let Some(operation) = operation {
+            operation
+                .validate_for_table(&table.descriptor)
+                .map_err(failed)?;
+        }
         Ok(table)
     }
 
@@ -743,7 +775,7 @@ impl DirectExecutor {
                 self.learn_epochs(handle, epochs);
                 timed(
                     perf_stage!("leader.get.table"),
-                    self.table(request, &epochs, &parsed.operation, deadline),
+                    self.table(request, &epochs, Some(&parsed.operation), deadline),
                 )
                 .await?;
                 match snapshot.latest {
@@ -802,7 +834,7 @@ impl DirectExecutor {
                 value: Some(raw), ..
             } => {
                 // Re-encode the decoded row exactly as the queued path does.
-                let row: Row = serde_json::from_str(raw.get()).map_err(|_| failed(corrupt()))?;
+                let row = protocol::decode_row(raw.get()).map_err(|_| failed(corrupt()))?;
                 let encoded = serde_json::to_string(&row).map_err(|_| failed(corrupt()))?;
                 Ok(DirectResponse::Done(
                     DirectData::from_json(&encoded).map_err(failed)?,
@@ -858,13 +890,128 @@ impl DirectExecutor {
         Ok(keys)
     }
 
-    async fn mutate(
+    /// `table.upsert_many` and `table.delete_many`. Each row runs steps 3 to 6
+    /// as the request `protocol::upsert_row_request` or `delete_row_request`
+    /// makes of it, with that request's id, digest and dedup record. The
+    /// result is one `DirectResponse` per row, in order: a row that cannot
+    /// run here says why, and no row decides for another.
+    async fn many(
         &self,
         handle: &Arc<ParticipantHandle>,
         request: &DirectRequest,
         parsed: Parsed,
         deadline: Instant,
     ) -> DirectResponse {
+        let result = async {
+            let clock = handle.direct_clock().map_err(failed)?;
+            self.token(handle, clock, deadline).await?;
+            let (_, table) = self
+                .mutation_table(handle, clock, request, None, deadline)
+                .await?;
+            let key_column = &table.descriptor.key;
+            let call = request.request_id;
+            let rows: Result<Vec<Request>, ProtocolError> = match parsed.operation {
+                Operation::UpsertMany(p) => p
+                    .rows
+                    .into_iter()
+                    .map(|row| protocol::upsert_row_request(call, p.table_id, key_column, row))
+                    .collect(),
+                Operation::DeleteMany(p) => p
+                    .keys
+                    .into_iter()
+                    .map(|key| protocol::delete_row_request(call, p.table_id, key))
+                    .collect(),
+                _ => unreachable!("only groups reach many"),
+            };
+            let mut keyed = Vec::new();
+            let mut seen = HashSet::new();
+            for row in rows.map_err(failed)? {
+                if !seen.insert(row.request_id) {
+                    return Err(failed(protocol::duplicate_key()));
+                }
+                let keys = self.row_keys(&table, &row.operation)?;
+                let key = serde_json::to_vec(&keys[0]).map_err(|_| failed(corrupt()))?;
+                keyed.push((row, key));
+            }
+            let rows = keyed;
+            // Nothing after this fails the group: a row may have applied.
+            let _rows = self.admission.try_rows(rows.len().min(WINDOW_ROWS))?;
+            let mut replies = Vec::with_capacity(rows.len());
+            let mut rows = rows.into_iter().peekable();
+            while rows.peek().is_some() {
+                let window = rows.by_ref().take(WINDOW_ROWS).collect();
+                replies.extend(self.window(handle, request, window, deadline).await);
+            }
+            let data = serde_json::to_string(&replies).map_err(|_| failed(corrupt()))?;
+            DirectData::from_json(&data)
+                .map(DirectResponse::Done)
+                .map_err(failed)
+        }
+        .await;
+        result.unwrap_or_else(|response| response)
+    }
+
+    /// Latches the rows' keys together, in the latches' order, so that the
+    /// rows can wait for each other and share entries (`Seat`).
+    async fn window(
+        &self,
+        handle: &Arc<ParticipantHandle>,
+        group: &DirectRequest,
+        rows: Vec<(Request, Vec<u8>)>,
+        deadline: Instant,
+    ) -> Vec<DirectResponse> {
+        let keys = rows.iter().map(|(_, key)| key.as_slice());
+        let Ok(latched) = self.latches.lock(keys, deadline).await else {
+            return vec![failed(latch_timeout()); rows.len()];
+        };
+        if let Some(waited) = latched.waited {
+            self.stats.latch_wait(waited);
+        }
+        let seats = if self.gate.direct_batch() {
+            self.batchers.seats(&self.stats, handle, rows.len())
+        } else {
+            Vec::new()
+        };
+        let mut seats = seats.into_iter();
+        join_all(rows.into_iter().map(|(row, _)| {
+            let seat = seats.next();
+            async move {
+                self.stats.mutation();
+                let response = match serialized_digest(&row) {
+                    Err(error) => failed(error),
+                    Ok(digest) => {
+                        let request = DirectRequest {
+                            request_id: row.request_id,
+                            digest,
+                            ..group.clone()
+                        };
+                        let parsed = Parsed {
+                            operation: row.operation,
+                        };
+                        self.mutate(handle, &request, parsed, deadline, Latching::Window(seat))
+                            .await
+                    }
+                };
+                self.count(&response);
+                response
+            }
+        }))
+        .await
+    }
+
+    async fn mutate(
+        &self,
+        handle: &Arc<ParticipantHandle>,
+        request: &DirectRequest,
+        parsed: Parsed,
+        deadline: Instant,
+        latching: Latching,
+    ) -> DirectResponse {
+        let (own, mut seat) = match latching {
+            Latching::Own => (true, None),
+            Latching::Window(seat) => (false, seat),
+        };
+        let seat = &mut seat;
         let result = async {
             let clock = handle.direct_clock().map_err(failed)?;
             timed(
@@ -877,12 +1024,13 @@ impl DirectExecutor {
             loop {
                 let (table_schema, table) = timed(
                     perf_stage!("leader.mutation.table"),
-                    self.mutation_table(handle, clock, request, &parsed.operation, deadline),
+                    self.mutation_table(handle, clock, request, Some(&parsed.operation), deadline),
                 )
                 .await?;
                 let keys = self.row_keys(&table, &parsed.operation)?;
                 let encoded: Vec<Vec<u8>> = keys
                     .iter()
+                    .filter(|_| own)
                     .map(|key| serde_json::to_vec(key).map_err(|_| failed(corrupt())))
                     .collect::<Result<_, _>>()?;
                 let latched = timed(
@@ -891,13 +1039,7 @@ impl DirectExecutor {
                         .lock(encoded.iter().map(Vec::as_slice), deadline),
                 )
                 .await
-                .map_err(|_| {
-                    failed(ProtocolError::new(
-                        ErrorCode::StorageUnavailable,
-                        "deadline expired waiting for a key latch",
-                        Outcome::NotApplied,
-                    ))
-                })?;
+                .map_err(|_| failed(latch_timeout()))?;
                 if let Some(waited) = latched.waited {
                     self.stats.latch_wait(waited);
                 }
@@ -916,15 +1058,19 @@ impl DirectExecutor {
                             &parsed.operation,
                             &keys,
                             deadline,
+                            seat,
                         )
                         .await?
                     {
                         Attempt::Done(response) => return Ok(response),
                         Attempt::Retry(RetryCause::Schema) => {
+                            *seat = None;
                             self.stats.retry(RetryCause::Schema);
                             break;
                         }
                         Attempt::Retry(cause) => {
+                            // The window does not wait for a retry.
+                            *seat = None;
                             if !self.pause(deadline, cause).await {
                                 return Err(failed(unavailable_not_applied()));
                             }
@@ -953,6 +1099,7 @@ impl DirectExecutor {
         operation: &Operation,
         keys: &[MvccKey],
         deadline: Instant,
+        seat: &mut Option<Seat>,
     ) -> Result<Attempt<DirectResponse>, DirectResponse> {
         // T4fix F4: the token is taken before the timestamp is fetched.
         let token = timed(
@@ -1057,10 +1204,11 @@ impl DirectExecutor {
             timed(
                 perf_stage!("leader.attempt.propose"),
                 self.batchers
-                    .propose(&self.stats, handle, commit, bytes, deadline),
+                    .propose(&self.stats, handle, commit, bytes, deadline, seat.take()),
             )
             .await
         } else {
+            *seat = None;
             let command = match OwnedCommand::new_owned(
                 ParticipantCommand::Direct(commit),
                 &self.resources,
@@ -1296,7 +1444,7 @@ impl DirectExecutor {
                 Some((version, value)) => {
                     // Row keys hold rows; index entries are read separately.
                     let row = value
-                        .map(|raw| serde_json::from_str::<Row>(raw.get()))
+                        .map(|raw| protocol::decode_row(raw.get()))
                         .transpose()
                         .map_err(|_| failed(corrupt()))?;
                     current.push((version, row));
@@ -1497,6 +1645,9 @@ impl DirectExecutor {
                 expected_version: version,
                 value,
                 index,
+                // C1: `Some` (also with no vector) for every row of a table with
+                // search columns; apply refuses `None` there.
+                search: None,
             });
         }
         Ok(Some(Computed { writes, result }))
@@ -1882,6 +2033,13 @@ async fn catalog_read<T>(
 }
 fn failed(error: ProtocolError) -> DirectResponse {
     DirectResponse::Failed(error)
+}
+fn latch_timeout() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        "deadline expired waiting for a key latch",
+        Outcome::NotApplied,
+    )
 }
 fn unavailable_not_applied() -> ProtocolError {
     ProtocolError::new(

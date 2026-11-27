@@ -676,6 +676,9 @@ fn required_columns(
             protocol::Predicate::Logical(protocol::LogicalPredicate::Not { arg }) => {
                 predicate(arg, fields)
             }
+            protocol::Predicate::Text(p) => {
+                fields.insert(p.column().to_owned());
+            }
         }
     }
     let mut fields = BTreeSet::new();

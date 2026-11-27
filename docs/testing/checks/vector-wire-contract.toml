@@ -1,0 +1,11 @@
+id = "vector-wire-contract"
+module = "vector"
+kinds = ["U"]
+guarantees = ["VEC-G11", "VEC-G12"]
+scenarios = ["VS17", "VS18"]
+tiers = ["T1"]
+command = ["cargo", "test", "--locked", "--jobs", "4", "-p", "nabedra-protocol", "--lib", "--test", "sdk_replay", "--test", "vector_rules", "--test", "vector_adversarial"]
+cwd = "server"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"

@@ -337,7 +337,10 @@ impl WorkerRuntime {
                 crate::oltp_replication::authority::control::watch_cluster_features(
                     &control,
                     local,
-                    &[crate::oltp_replication::authority::control::INDEX_RECLAIM_FEATURE],
+                    &[
+                        crate::oltp_replication::authority::control::INDEX_RECLAIM_FEATURE,
+                        crate::oltp_replication::authority::control::VECTOR_FEATURE,
+                    ],
                     &features,
                 );
             });
@@ -1289,6 +1292,11 @@ impl WorkerRuntime {
     ) -> Result<(protocol::Request, Arc<ScratchLease>), ProtocolError> {
         let shared = self.services.shared.clone();
         let resources = shared.clone();
+        let vector = self
+            .services
+            .manager
+            .cluster_features()
+            .enabled(crate::oltp_replication::authority::control::VECTOR_FEATURE);
         shared
             .execute(ExecutionClass::Query, 0, 0, move || {
                 let budget = crate::oltp::mvcc::request_decode_budget(body.as_ref())?
@@ -1301,7 +1309,8 @@ impl WorkerRuntime {
                     })
                     .ok_or_else(unknown)?;
                 let owner = Arc::new(resources.reserve_scratch(ByteClass::Data, budget)?);
-                let request = protocol::parse_request(body.as_ref())?;
+                let request = protocol::parse_oltp_request(body.as_ref())?;
+                request.operation.check_queued(vector)?;
                 Ok((request, owner))
             })
             .await

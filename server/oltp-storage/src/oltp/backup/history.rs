@@ -11,7 +11,8 @@ use crate::{
                 encoded_length,
                 image_archive::CommittedImage,
                 index::{ArchivedIndexClosure, index_closure_row},
-                restore::validate_archive_image,
+                restore::{check_schema, validate_archive_image},
+                search::SearchSchema,
                 split_closure::{
                     ArchivedSplitPublication, CatalogSplitClosed, SplitArchiveOrigin, fold_image,
                     image_seed, split_closure_row,
@@ -163,6 +164,9 @@ pub enum HistoryFrame {
     Scope(HistoryScope),
     StatusClosure(ArchiveClosureStatement),
     BeginGroup(GroupImageScope),
+    /// The search columns of the group that began, before its first image,
+    /// only for a table with search columns (L7).
+    GroupSearch(Box<crate::oltp::mvcc::store::search::SearchSchema>),
     Image(CommittedImage),
     CatalogIndexClosure(ArchivedIndexClosure),
     CatalogSplitPublication(ArchivedSplitPublication),
@@ -170,6 +174,8 @@ pub enum HistoryFrame {
         row: Box<CatalogSplitClosed>,
         publication: ArchivedSplitPublication,
     },
+    /// Search schema carried before the first image of an incremental split child.
+    SplitSearch(Box<SearchSchema>),
     SplitImage(CommittedImage),
     EndSplitChild {
         group_id: Uuid,
@@ -198,6 +204,11 @@ pub enum HistoryFrame {
         root: Digest,
     },
 }
+/// Metadata of a cloned image: 1 KiB, and 8 KiB with a vector list and column
+/// maps. The values themselves keep the owner of their frame.
+fn clone_bytes(search: bool) -> usize {
+    if search { 8 << 10 } else { 1024 }
+}
 pub struct OwnedImage {
     image: CommittedImage,
     _source: OwnedCommand<HistoryFrame>,
@@ -217,7 +228,7 @@ impl OwnedImage {
             image
                 .key
                 .heap_bytes()
-                .checked_add(1024)
+                .checked_add(clone_bytes(image.search.is_some()))
                 .ok_or_else(invalid)?,
         )?;
         let image = image.clone();
@@ -241,13 +252,14 @@ impl OwnedImage {
             effect
                 .key
                 .heap_bytes()
-                .checked_add(1024)
+                .checked_add(clone_bytes(effect.search.is_some()))
                 .ok_or_else(invalid)?,
         )?;
         let image = CommittedImage {
             key: effect.key.clone(),
             commit_ts: page.commit_ts,
             value: effect.value.clone(),
+            search: effect.search.clone(),
         };
         Ok(Self {
             image,
@@ -325,13 +337,11 @@ impl OwnedPayload for HistoryFrame {
             Self::BeginGroup(group) => {
                 group.group.database.capacity_bytes() + span_bytes(&group.span)
             }
-            Self::Image(image) | Self::SplitImage(image) => {
-                image.key.heap_bytes()
-                    + image
-                        .value
-                        .as_ref()
-                        .map_or(Ok(0), CanonicalJson::heap_bytes)?
-            }
+            Self::Image(image) | Self::SplitImage(image) => image
+                .key
+                .heap_bytes()
+                .checked_add(image.value_bytes()?)
+                .ok_or_else(invalid)?,
             Self::CatalogIndexClosure(closure) => closure.source.database.capacity_bytes(),
             Self::CatalogSplitPublication(publication) => {
                 publication.catalog.group.database.capacity_bytes()
@@ -346,29 +356,20 @@ impl OwnedPayload for HistoryFrame {
             Self::Identity { identity, .. } => serialized_size(identity)?,
             Self::BeginTransaction(decision) => serialized_size(decision)?,
             Self::ParticipantEffects(effects) => effects.heap_bytes()?,
+            Self::GroupSearch(schema) | Self::SplitSearch(schema) => serialized_size(schema)?,
             _ => 0,
         })
     }
     fn attach_fields(&self, owner: Arc<ScratchLease>) -> Result<(), ProtocolError> {
         match self {
-            Self::Image(CommittedImage {
-                value: Some(value), ..
-            })
-            | Self::SplitImage(CommittedImage {
-                value: Some(value), ..
-            }) => value.attach_charge(owner),
+            Self::Image(image) | Self::SplitImage(image) => image.attach_charge(owner),
             Self::ParticipantEffects(effects) => effects.attach_fields(owner),
             _ => Ok(()),
         }
     }
     fn fields_attached(&self) -> bool {
         match self {
-            Self::Image(CommittedImage {
-                value: Some(value), ..
-            })
-            | Self::SplitImage(CommittedImage {
-                value: Some(value), ..
-            }) => value.is_charged(),
+            Self::Image(image) | Self::SplitImage(image) => image.is_charged(),
             Self::ParticipantEffects(effects) => effects.fields_attached(),
             _ => true,
         }
@@ -405,6 +406,7 @@ struct GroupProgress {
     scope: GroupImageScope,
     count: u64,
     root: Digest,
+    searched: bool,
 }
 struct TxnProgress {
     decision: ArchivedDecision,
@@ -429,6 +431,7 @@ struct SplitProgress {
     count: u64,
     root: Digest,
     last: Option<crate::oltp::mvcc::MvccKey>,
+    search: Option<Box<SearchSchema>>,
 }
 impl SplitProgress {
     fn new(row: CatalogSplitClosed) -> Result<Self, ProtocolError> {
@@ -438,7 +441,16 @@ impl SplitProgress {
             count: 0,
             root: image_seed()?,
             last: None,
+            search: None,
         })
+    }
+
+    fn search(&mut self, schema: &SearchSchema) -> Result<(), ProtocolError> {
+        if self.search.is_some() || self.count != 0 || !schema.valid() {
+            return Err(invalid());
+        }
+        self.search = Some(Box::new(schema.clone()));
+        Ok(())
     }
 
     fn image(&mut self, image: &CommittedImage) -> Result<(), ProtocolError> {
@@ -452,6 +464,7 @@ impl SplitProgress {
         {
             return Err(invalid());
         }
+        check_schema(self.search.as_deref(), &[image])?;
         self.root = fold_image(self.root, image)?;
         self.count = self.count.checked_add(1).ok_or_else(invalid)?;
         self.last = Some(image.key.clone());
@@ -470,6 +483,7 @@ impl SplitProgress {
         self.count = 0;
         self.root = image_seed()?;
         self.last = None;
+        self.search = None;
         Ok(self.child == self.row.children.len())
     }
 }
@@ -566,7 +580,9 @@ impl Chain {
             || self.split.is_some()
                 != matches!(
                     frame,
-                    HistoryFrame::SplitImage(_) | HistoryFrame::EndSplitChild { .. }
+                    HistoryFrame::SplitImage(_)
+                        | HistoryFrame::SplitSearch(_)
+                        | HistoryFrame::EndSplitChild { .. }
                 )
         {
             return Err(invalid());
@@ -660,6 +676,7 @@ impl Chain {
                 group.group.validate().map_err(|_| invalid())?;
                 self.previous_group = Some(order);
                 self.group = Some(GroupProgress {
+                    searched: false,
                     scope: group.clone(),
                     count: 0,
                     root: serialized_digest(&(b"nabedra/history-group/v1", group))?,
@@ -737,6 +754,9 @@ impl Chain {
                 self.last_split = Some(order);
                 self.split = Some(SplitProgress::new(row.as_ref().clone())?);
             }
+            HistoryFrame::SplitSearch(schema) => {
+                self.split.as_mut().ok_or_else(invalid)?.search(schema)?;
+            }
             HistoryFrame::SplitImage(image) => {
                 self.split.as_mut().ok_or_else(invalid)?.image(image)?;
             }
@@ -763,6 +783,17 @@ impl Chain {
                 }) {
                     return Err(invalid());
                 }
+            }
+            HistoryFrame::GroupSearch(schema) => {
+                let group = self.group.as_mut().ok_or_else(invalid)?;
+                if group.searched
+                    || !schema.valid()
+                    || group.count != 0
+                    || !matches!(group.scope.group.kind, GroupKind::Data { .. })
+                {
+                    return Err(invalid());
+                }
+                group.searched = true;
             }
             HistoryFrame::EndGroup {
                 group_id,

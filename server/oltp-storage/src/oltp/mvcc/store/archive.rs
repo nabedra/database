@@ -10,6 +10,9 @@ pub struct ArchiveEffect {
     pub ordinal: u64,
     pub key: MvccKey,
     pub value: Option<super::super::CanonicalJson>,
+    /// The vectors of the row version this effect wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<Box<row::RowImage>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,7 +71,8 @@ impl ParticipantMachine {
                 .await?,
         );
         let group = self.store.identity().clone();
-        self.store
+        let page = self
+            .store
             .read_owned(
                 TransactionBudget {
                     scratch_bytes: 32 << 20,
@@ -182,13 +186,7 @@ impl ParticipantMachine {
                                 return Ok(Some(None));
                             }
                             let version = version.ok_or_else(recovery_unknown)?;
-                            #[derive(Deserialize)]
-                            struct Version<'a> {
-                                #[serde(borrow)]
-                                value: Option<&'a RawValue>,
-                            }
-                            let version: Version<'_> =
-                                serde_json::from_slice(&version).map_err(|_| recovery_unknown())?;
+                            let version = row::Version::decode(&version)?;
                             match (audit.change, version.value, audit.value_digest) {
                                 (IntentChange::Put, Some(value), Some(expected))
                                     if Digest::from_bytes(
@@ -197,9 +195,12 @@ impl ParticipantMachine {
                                 (IntentChange::Delete, None, None) => {}
                                 _ => return Err(recovery_unknown()),
                             }
+                            let vectors = row::image_cost(view, &logical, &version, false)?
+                                .ok_or_else(row::damaged_value)?;
                             let cost = logical
                                 .len()
                                 .checked_add(version.value.map_or(0, |v| v.get().len()))
+                                .and_then(|n| n.checked_add(vectors))
                                 .and_then(|n| n.checked_add(8192))
                                 .ok_or_else(invalid)?;
                             if used.checked_add(cost).is_none_or(|n| n > max_bytes) {
@@ -207,6 +208,7 @@ impl ParticipantMachine {
                             }
                             used += cost;
                             let key = decode_logical(&logical)?;
+                            let search = row::image(view, &config, &logical, &version, false, &owner)?;
                             let value = version
                                 .value
                                 .map(|value| {
@@ -220,6 +222,7 @@ impl ParticipantMachine {
                                 ordinal: next,
                                 key,
                                 value,
+                                search,
                             })))
                         })?;
                         match effect {
@@ -254,7 +257,8 @@ impl ParticipantMachine {
                     )
                 },
             )
-            .await
+            .await;
+        self.note_damage(page).await
     }
 }
 impl ParticipantHandle {
@@ -349,6 +353,10 @@ impl OwnedPayload for ArchiveEffects {
                             .ok()
                             .and_then(|v| n.checked_add(v))
                     })
+                    .and_then(|n| {
+                        let search = e.search.as_ref().map_or(Ok(0), |search| search.heap_bytes());
+                        n.checked_add(search.ok()?)
+                    })
                     .ok_or_else(invalid)
             },
         )
@@ -357,6 +365,9 @@ impl OwnedPayload for ArchiveEffects {
         for effect in self.effects.iter() {
             if let Some(value) = &effect.value {
                 value.attach_charge(owner.clone())?;
+            }
+            if let Some(search) = &effect.search {
+                search.attach_charge(owner.clone())?;
             }
         }
         Ok(())
@@ -367,6 +378,7 @@ impl OwnedPayload for ArchiveEffects {
                 .value
                 .as_ref()
                 .is_none_or(|v| v.ensure_charged().is_ok())
+                && effect.search.as_ref().is_none_or(|search| search.is_charged())
         })
     }
 }

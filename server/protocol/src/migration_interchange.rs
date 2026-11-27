@@ -94,6 +94,9 @@ impl State {
                     return Err(invalid("invalid table boundary"));
                 }
                 table.validate()?;
+                if table.uses_search() {
+                    return Err(invalid("migration does not support search columns"));
+                }
                 self.table = Some(TableState {
                     descriptor: table.clone(),
                     last: None,
@@ -409,6 +412,7 @@ mod tests {
             ]),
             key: "id".into(),
             format: crate::protocol::TableFormat::Parquet,
+            search: Default::default(),
         };
         let header = ArchiveHeader {
             format_version: 1,

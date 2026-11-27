@@ -17,6 +17,7 @@ fn table() -> TableDescriptor {
             ("b".into(), ColumnType::Bool),
         ]
         .into(),
+        search: Default::default(),
     }
 }
 fn row(id: i64) -> Row {

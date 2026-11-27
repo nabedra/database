@@ -93,6 +93,7 @@ fn lower(p: &Predicate) -> (Predicate, Predicate) {
             let (yes, no) = args.iter().map(lower).unzip();
             (combine(and, yes), combine(!and, no))
         }
+        Predicate::Text(_) => unreachable!("OLAP filters are scalar"),
     }
 }
 
@@ -143,6 +144,7 @@ fn evaluate(p: &Predicate, row: &Row) -> Truth {
         Predicate::Logical(LogicalPredicate::Or { args }) => {
             args.iter().map(|p| evaluate(p, row)).max().unwrap()
         }
+        Predicate::Text(_) => unreachable!("OLAP filters are scalar"),
     }
 }
 

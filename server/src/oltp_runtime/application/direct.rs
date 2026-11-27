@@ -5,7 +5,10 @@
 //! An eligible `/v1/operations` request (`table.get`, `insert`, `upsert`,
 //! `update`, `delete`, or an `insert_many` whose keys share one range) goes
 //! straight to the leader of its key range's Data group over the worker's
-//! persistent session. The gateway:
+//! persistent session.
+//! `table.upsert_many` and `table.delete_many` do the same per row (`many`).
+//!
+//! The gateway:
 //!
 //! - resolves the range from a bounded [`TopologyCache`]. A miss costs one
 //!   Catalog point lookup and one Control placement read per range. An
@@ -68,6 +71,10 @@ use std::{
 use tokio::time::Instant;
 use uuid::Uuid;
 
+mod many;
+#[allow(unused_imports)] // `http.rs` passes the queued path.
+pub(crate) use many::{HttpQueue, QueuedRows};
+
 /// Time a direct request may take at the gateway, forward included.
 pub(crate) const GATEWAY_DEADLINE: Duration = Duration::from_secs(10);
 /// The largest `insert_many` body the gateway sends directly. The leader
@@ -107,6 +114,10 @@ pub(crate) enum DirectMode {
 /// `DirectSwitch` in production.
 pub(crate) trait DirectRouting: Send + Sync {
     fn mode(&self) -> DirectMode;
+    /// Control enabled `data.vector.v1`, as last observed.
+    fn vector(&self) -> bool {
+        false
+    }
 }
 impl crate::oltp_runtime::worker_runtime::direct_capability::DirectSwitch {
     /// The gateway's mode: `requires_forward()` is the capability,
@@ -124,6 +135,9 @@ impl DirectRouting for crate::oltp_runtime::worker_runtime::direct_capability::D
     fn mode(&self) -> DirectMode {
         crate::oltp_runtime::worker_runtime::direct_capability::DirectSwitch::mode(self)
     }
+    fn vector(&self) -> bool {
+        self.vector_enabled()
+    }
 }
 
 /// Two flags, for tests: `active` is the capability, `direct_oltp` the
@@ -134,6 +148,8 @@ pub(crate) struct GatewaySwitch {
     direct_oltp: std::sync::atomic::AtomicBool,
     /// The queued-history window (T7c).
     history: std::sync::atomic::AtomicBool,
+    /// `data.vector.v1`.
+    vector: std::sync::atomic::AtomicBool,
 }
 #[cfg(test)]
 impl Default for GatewaySwitch {
@@ -142,6 +158,7 @@ impl Default for GatewaySwitch {
             active: std::sync::atomic::AtomicBool::new(false),
             direct_oltp: std::sync::atomic::AtomicBool::new(true),
             history: std::sync::atomic::AtomicBool::new(false),
+            vector: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -156,6 +173,9 @@ impl GatewaySwitch {
     pub(crate) fn set_history(&self, settling: bool) {
         self.history.store(settling, Ordering::Release);
     }
+    pub(crate) fn set_vector(&self, enabled: bool) {
+        self.vector.store(enabled, Ordering::Release);
+    }
 }
 #[cfg(test)]
 impl DirectRouting for GatewaySwitch {
@@ -167,6 +187,9 @@ impl DirectRouting for GatewaySwitch {
             DirectMode::Direct if self.history.load(Ordering::Acquire) => DirectMode::Settling,
             mode => mode,
         }
+    }
+    fn vector(&self) -> bool {
+        self.vector.load(Ordering::Acquire)
     }
 }
 /// `forward`: the capability is active (every queued eligible request is
@@ -606,6 +629,10 @@ impl DirectGateway {
     pub(crate) fn mode(&self) -> DirectMode {
         self.switch.mode()
     }
+    /// Control enabled `data.vector.v1`, as last observed.
+    pub(crate) fn vector(&self) -> bool {
+        self.switch.vector()
+    }
     pub(crate) fn stats(&self) -> GatewayStatsSnapshot {
         self.stats.snapshot(&self.cache)
     }
@@ -626,6 +653,17 @@ impl DirectGateway {
         body: &[u8],
         asynchronous: bool,
     ) -> Result<Routed, ProtocolError> {
+        self.route_with(body, asynchronous, None).await
+    }
+
+    /// As `route`. `queue` runs the rows of a `*_many` call that cannot run
+    /// directly; a row that needs it and finds none is `outcome_unknown`.
+    pub(crate) async fn route_with(
+        &self,
+        body: &[u8],
+        asynchronous: bool,
+        queue: Option<&dyn QueuedRows>,
+    ) -> Result<Routed, ProtocolError> {
         let mode = self.switch.mode();
         if mode == DirectMode::Off {
             return Ok(Routed::Queued);
@@ -633,7 +671,31 @@ impl DirectGateway {
         // Anything the scan does not recognize is not eligible, or is
         // malformed: the queued path gives the exact answer, and a body that
         // does not parse can never have committed directly.
-        let Some(scanned) = scan(body) else {
+        let Some(envelope) = envelope(body) else {
+            return Ok(Routed::Queued);
+        };
+        match envelope.operation.as_ref() {
+            "table.upsert_many" | "table.delete_many" => {
+                return self
+                    .many(&envelope, body.len(), asynchronous, mode, queue)
+                    .await;
+            }
+            "table.create" => {
+                if let Ok(request) = crate::protocol::parse_oltp_request(body) {
+                    request.operation.check_served(self.vector())?;
+                }
+                return Ok(Routed::Queued);
+            }
+            "table.add_column" | "table.drop_column" | "table.add_full_text"
+            | "table.drop_full_text" | "table.search_status" | "query.rank"
+            | "query.rank_many" => {
+                let request = crate::protocol::parse_oltp_request(body)?;
+                request.operation.check_served(self.vector())?;
+                return Ok(Routed::Queued);
+            }
+            _ => {}
+        }
+        let Some(scanned) = scan_envelope(&envelope) else {
             return Ok(Routed::Queued);
         };
         let get = scanned.op == Op::Get;
@@ -1602,23 +1664,31 @@ pub(crate) fn settled_before_queue(body: &[u8]) -> bool {
 }
 
 fn scan(body: &[u8]) -> Option<Scanned<'_>> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Envelope<'a> {
-        request_id: Uuid,
-        #[serde(borrow)]
-        operation: std::borrow::Cow<'a, str>,
-        #[serde(borrow)]
-        payload: &'a RawValue,
+    scan_envelope(&envelope(body)?)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Envelope<'a> {
+    request_id: Uuid,
+    #[serde(borrow)]
+    operation: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    payload: &'a RawValue,
+}
+fn envelope(body: &[u8]) -> Option<Envelope<'_>> {
+    // Serde also reads a struct from an array; a request is an object.
+    if body.len() > crate::protocol::MAX_BODY_BYTES || !body.trim_ascii_start().starts_with(b"{") {
+        return None;
     }
+    serde_json::from_slice(body).ok()
+}
+
+fn scan_envelope<'a>(envelope: &Envelope<'a>) -> Option<Scanned<'a>> {
     #[derive(Deserialize)]
     struct Table {
         table_id: Uuid,
     }
-    if body.len() > crate::protocol::MAX_BODY_BYTES {
-        return None;
-    }
-    let envelope: Envelope<'_> = serde_json::from_slice(body).ok()?;
     let op = Op::parse(&envelope.operation)?;
     // Only the table id: other fields are checked against the route.
     let Table { table_id } = serde_json::from_str(envelope.payload.get()).ok()?;

@@ -3,7 +3,9 @@
 //! recommendation per entry. Scalar literals and row data never enter the hash.
 use crate::{
     oltp::pool::WorkerSharedResources,
-    protocol::{ComparisonOp, LogicalPredicate, Predicate, ProtocolError, Query, TableDescriptor},
+    protocol::{
+        ComparisonOp, LogicalPredicate, Predicate, ProtocolError, Query, TableDescriptor, TextPredicate,
+    },
     scheduling::MemoryCharge,
 };
 use nabedra_oltp_types::types::{Digest, Text};
@@ -253,6 +255,14 @@ fn hash_predicate<'a>(
         Predicate::Logical(LogicalPredicate::Not { arg }) => {
             digest.update(b"n");
             hash_predicate(arg, digest, primary, false, candidate);
+        }
+        Predicate::Text(text) => {
+            digest.update(match text {
+                TextPredicate::Contains { .. } => b"tc",
+                TextPredicate::ContainsAny { .. } => b"ta",
+                TextPredicate::StartsWith { .. } => b"ts",
+            });
+            identifier(text.column(), digest);
         }
     }
 }

@@ -357,12 +357,6 @@ fn latest_in<'a, R>(
             }
             Ok(Some(record)) => record,
         };
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Version<'a> {
-            #[serde(borrow)]
-            value: Option<&'a RawValue>,
-        }
         let decoded = (|| {
             if record.key().len() != buffer.len() {
                 return Err(recovery_unknown());
@@ -373,8 +367,7 @@ fn latest_in<'a, R>(
                     .map_err(|_| recovery_unknown())?,
             ))
             .map_err(|_| recovery_unknown())?;
-            let value: Version<'_> =
-                serde_json::from_slice(record.value()).map_err(|_| recovery_unknown())?;
+            let value = row::Version::decode(record.value())?;
             Ok((version, value.value))
         })();
         match decoded {

@@ -689,6 +689,7 @@ async fn calculate(
                 schema: p.schema,
                 key: p.key,
                 format: p.format,
+                search: p.search,
             };
             tables.insert(
                 table.name.clone(),

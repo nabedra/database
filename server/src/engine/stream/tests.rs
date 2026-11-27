@@ -57,6 +57,7 @@ fn table() -> TableDescriptor {
             ("text".into(), ColumnType::Utf8),
         ]
         .into(),
+        search: Default::default(),
     }
 }
 

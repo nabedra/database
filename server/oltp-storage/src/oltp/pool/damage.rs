@@ -34,7 +34,7 @@ use std::{
     path::Path,
     sync::{
         Mutex, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use tokio::sync::watch;
@@ -46,6 +46,33 @@ const ACCEPTED_KEY: &[u8] = b"\0typed-pool-quarantine-v1";
 /// Created by an operator to accept the damage of a pool that R6 refused.
 pub const ACCEPT_DAMAGE_FILE: &str = "NABEDRA_OLTP_POOL_ACCEPT_DAMAGE";
 const MAX_ACCEPTED_BYTES: usize = 1 << 20;
+/// The synced set of groups quarantined for damaged vector values (L6, JSON
+/// `[Uuid]`). Store-wide scope, like the accepted record.
+const VALUE_DAMAGE_KEY: &[u8] = b"\0typed-pool-value-damage-v1";
+
+/// The groups an earlier run quarantined for damaged vector values.
+pub(super) fn read_value_damage(store: &Store) -> Result<Vec<Uuid>, ProtocolError> {
+    let Some(raw) = store.snapshot().get(VALUE_DAMAGE_KEY).map_err(storage_error)? else {
+        return Ok(Vec::new());
+    };
+    if raw.len() > MAX_ACCEPTED_BYTES {
+        return Err(accepted_unreadable());
+    }
+    serde_json::from_slice(&raw).map_err(|_| accepted_unreadable())
+}
+fn write_value_damage(store: &Store, groups: &BTreeSet<Uuid>) -> Result<(), ProtocolError> {
+    let bytes = serde_json::to_vec(groups).map_err(|_| accepted_unreadable())?;
+    if bytes.len() > MAX_ACCEPTED_BYTES {
+        return Err(accepted_unreadable());
+    }
+    let mut batch = WriteBatch::new();
+    batch.put(VALUE_DAMAGE_KEY, &bytes);
+    let commit = store
+        .submit(batch, Durability::Sync, Box::new(()))
+        .map_err(|error| commit_error(error).1)?;
+    wait_commit(commit).map_err(|error| commit_error(error).1)?;
+    Ok(())
+}
 /// R6: more than this many groups quarantined by one open refuses the pool.
 const R6_MAX_GROUPS: usize = 8;
 
@@ -106,6 +133,12 @@ pub(super) struct DamageState {
     accept: Mutex<()>,
     refused_writes: AtomicU64,
     releases: AtomicU64,
+    /// Groups whose stored vector values failed their own checksum, which kv
+    /// cannot see. Loaded from the pool's synced record at open.
+    values: Mutex<BTreeSet<Uuid>>,
+    any_value: AtomicBool,
+    /// Orders the rewrites of the value damage record.
+    value_writes: Mutex<()>,
 }
 impl DamageState {
     pub(super) fn new() -> Self {
@@ -115,7 +148,28 @@ impl DamageState {
             accept: Mutex::new(()),
             refused_writes: AtomicU64::new(0),
             releases: AtomicU64::new(0),
+            values: Mutex::new(BTreeSet::new()),
+            any_value: AtomicBool::new(false),
+            value_writes: Mutex::new(()),
         }
+    }
+    fn values(&self) -> std::sync::MutexGuard<'_, BTreeSet<Uuid>> {
+        self.values.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+    /// Groups quarantined for damaged values, at open or at run time.
+    pub(super) fn mark_values(&self, groups: impl IntoIterator<Item = Uuid>) {
+        let mut values = self.values();
+        values.extend(groups);
+        if !values.is_empty() {
+            self.any_value.store(true, Ordering::Release);
+        }
+    }
+    pub(super) fn damaged_values(&self) -> Vec<Uuid> {
+        self.values().iter().copied().collect()
+    }
+    /// One atomic load while no value is damaged.
+    pub(super) fn value_damaged(&self, group: Uuid) -> bool {
+        self.any_value.load(Ordering::Acquire) && self.values().contains(&group)
     }
     pub(super) fn bind(&self, pool: Weak<PoolInner>) {
         let _ = self.pool.set(pool);
@@ -254,6 +308,39 @@ fn write_accepted(store: &Store, accepted: &BTreeSet<Uuid>) -> Result<(), Protoc
 }
 
 impl OltpPool {
+    /// Quarantines a group with a missing or damaged vector value (L6).
+    /// Publish the quarantine after persisting the pool's set. Serialize the
+    /// complete rewrite with other reports and releases.
+    pub(crate) async fn report_value_damage(&self, group: Uuid) {
+        if self.inner.damage.value_damaged(group) {
+            return;
+        }
+        let pool = self.clone();
+        let saved = nabedra_rt::task::spawn_blocking(move || {
+            let damage = &pool.inner.damage;
+            let _serial = damage.value_writes.lock().unwrap_or_else(|poison| poison.into_inner());
+            let mut groups = damage.values().clone();
+            if !groups.insert(group) {
+                return;
+            }
+            if let Err(error) = pool
+                .healthy()
+                .and_then(|()| write_value_damage(&pool.inner.store, &groups))
+            {
+                pool.latch();
+                tracing::error!(%group, %error, "could not persist a vector damage quarantine");
+            }
+            damage.mark_values([group]);
+            damage.events.send_if_modified(|groups| groups.insert(group));
+            tracing::error!(%group, "OLTP group quarantined: a stored vector value is damaged");
+        })
+        .await;
+        if let Err(error) = saved {
+            self.latch();
+            tracing::error!(%group, %error, "vector damage quarantine was interrupted");
+        }
+    }
+
     /// Rewrites the accepted record to the store's current quarantined groups.
     /// Blocks on a synced write: call it off the async runtime.
     fn accept_current(&self) -> Result<(), ProtocolError> {
@@ -292,6 +379,17 @@ impl OltpPool {
                     first_bad_seq: damage.first_bad_seq,
                 })
             })
+            .chain(
+                self.inner
+                    .damage
+                    .damaged_values()
+                    .into_iter()
+                    .map(|group| GroupDamage {
+                        group,
+                        cause: DamageCause::RunBlock,
+                        first_bad_seq: None,
+                    }),
+            )
             .collect()
     }
     pub fn group_damage(&self, group: Uuid) -> Option<GroupDamage> {
@@ -368,6 +466,12 @@ impl OltpPool {
                     .release_scope(&group_scope(id))
                     .map_err(|error| pool.failed(error))?;
                 pool.inner.damage.releases.fetch_add(1, Ordering::Relaxed);
+                let damage = &pool.inner.damage;
+                let _serial = damage.value_writes.lock().unwrap_or_else(|poison| poison.into_inner());
+                if damage.values().remove(&id) {
+                    let rest = damage.values().clone();
+                    write_value_damage(&pool.inner.store, &rest).inspect_err(|_| pool.latch())?;
+                }
                 ReleaseOutcome::Released
             } else {
                 ReleaseOutcome::AlreadyReleased

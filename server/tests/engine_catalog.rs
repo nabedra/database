@@ -24,6 +24,7 @@ fn payload(name: &str) -> CreatePayload {
         .into(),
         key: "id".into(),
         format: TableFormat::Parquet,
+        search: Default::default(),
     }
 }
 

@@ -150,6 +150,8 @@ struct Fixture {
     /// The exact first entry, so another replica can apply the same log.
     first_fence: ParticipantCommand,
     dir: Dir,
+    /// The table has search columns (`search` tests).
+    search: bool,
 }
 /// A replica in its own pool: keeps the pool and directory alive.
 #[cfg(test)]
@@ -272,6 +274,7 @@ impl Fixture {
             catalog_group_id,
             first_fence: first_fence.clone(),
             dir,
+            search: false,
         };
         let fence = f.first_fence.clone();
         assert!(matches!(f.submit(fence).await, ParticipantReply::Fenced(_)));
@@ -357,6 +360,7 @@ impl Fixture {
             expected_version: expected.map(ts),
             value: value.map(|value| self.json(value)),
             index: Vec::new(),
+            search: None,
         }
     }
     fn commit(
@@ -514,10 +518,18 @@ impl Fixture {
         expected: Option<u64>,
         value: serde_json::Value,
     ) -> PreparedWrite {
+        let value = self.json(value);
         PreparedWrite {
             key: self.key(key),
             expected_version: expected.map(ts),
-            change: Change::Put(self.json(value)),
+            // A table with search columns takes no plain row put.
+            change: match self.search {
+                true => Change::PutRow {
+                    value,
+                    search: Box::default(),
+                },
+                false => Change::Put(value),
+            },
         }
     }
 }
@@ -2709,3 +2721,5 @@ async fn d06_latest_reads_track_pending_writers_per_key() {
 mod batch;
 #[cfg(test)]
 mod t7;
+#[cfg(test)]
+mod search;

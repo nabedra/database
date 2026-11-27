@@ -605,6 +605,7 @@ impl WorkerRuntime {
         };
         let mut index = None;
         let mut count = 0u64;
+        let mut searched = false;
         let mut after = None;
         let mut after_owner = None;
         let mut pending_deadline = None;
@@ -660,10 +661,22 @@ impl WorkerRuntime {
                     images,
                     after: _,
                     exhausted,
+                    search,
                 } => {
                     if group != &scope.group || *read_ts != cut {
                         return Err(unknown());
                     }
+                    // The restore checks every vector against these columns (L7).
+                    if let Some(search) = search.as_ref().filter(|_| !searched) {
+                        let schema = Box::new(search.schema.clone());
+                        let frame = if root.is_some() {
+                            HistoryFrame::GroupSearch(schema)
+                        } else {
+                            HistoryFrame::SplitSearch(schema)
+                        };
+                        export.frame(frame).await?;
+                    }
+                    searched = true;
                     for image in images.iter() {
                         if let (
                             Some(pin),

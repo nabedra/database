@@ -1,0 +1,14 @@
+id = "server-row-limit-code"
+title = "A value over a limit is limit_exceeded only in the last column of a row"
+class = "other"
+module = "oltp"
+guarantees = ["VEC-G11", "VEC-G12"]
+scenarios = ["VS17", "VS18"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/protocol/tests/sdk_replay.rs::a_limit_in_any_column_of_a_row_is_limit_exceeded"
+seed = "unknown"
+why_not_caught = "Limit tests put the long value in the last column."
+invariant_added = "The error class of a limit does not depend on the position of the column."
+fix_commits = ["11649ce473e43645f230c3131f88345116d7aaaf"]
+revert_patch_ok = true

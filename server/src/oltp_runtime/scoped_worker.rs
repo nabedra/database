@@ -318,7 +318,7 @@ impl ScopedWorker {
                     .ok_or_else(unavailable)?;
                 let held = Arc::new(task.reserve_scratch(ByteClass::Data, bytes)?);
                 Ok((
-                    protocol::parse_request(body.as_ref())?,
+                    protocol::parse_oltp_request(body.as_ref())?,
                     digest(body.as_ref()),
                     held,
                 ))
