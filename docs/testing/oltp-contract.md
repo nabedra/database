@@ -142,7 +142,7 @@ queued path. Run the existing OLTP library suite, the OLTP integration tests,
 | D09 | Kill all workers under write load, then cold start | Every acknowledged write is present. Dedup records replay acknowledged IDs. |
 | D10 | Drop sessions mid-stream, exhaust a lane, offer an old one-shot peer | Callers see unknown-outcome or overload errors, Raft progress continues, and the old peer still interoperates. |
 | D11 | Drop a table and publish an index during direct writes | No row lands in a dropped table and no write uses a retired schema epoch. |
-| D12 | Offer more load than the leader's in-flight budget | Explicit `429` before execution, bounded memory, and every acknowledged ID verified afterwards. |
+| D12 | Offer more load than the leader's in-flight budget | Refusal before execution: a get answers `429`, a mutation `outcome_unknown` naming the overload (OD-3). Bounded memory, refused rows absent, and every acknowledged ID verified afterwards. |
 
 D05 "row unchanged" applies to a `not_applied` answer. When the gateway answers
 `outcome_unknown`, the proposed entry may still commit once the followers return. A

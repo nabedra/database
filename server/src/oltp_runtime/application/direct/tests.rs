@@ -55,7 +55,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     path::PathBuf,
-    sync::atomic::{AtomicBool, AtomicUsize},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize},
 };
 use tokio::{net::TcpListener, sync::oneshot};
 
@@ -492,6 +492,7 @@ impl Cluster {
             down: Mutex::default(),
             retired: Mutex::default(),
             deny: AtomicBool::new(false),
+            overload: AtomicU8::new(NO_OVERLOAD),
             lose: AtomicUsize::new(0),
             after_lose: Mutex::default(),
             sent: AtomicU64::new(0),
@@ -592,11 +593,18 @@ impl Cluster {
 /// `down` is unreachable.
 /// A replica's executor and handle, by (group id, node id).
 type Replicas = HashMap<(Uuid, u64), (Arc<DirectExecutor>, Arc<ParticipantHandle>)>;
+const NO_OVERLOAD: u8 = 0;
+const LEADER_BUDGET_FULL: u8 = 1;
+const HANDLER_LANE_FULL: u8 = 2;
 struct InProcess {
     routes: Mutex<Replicas>,
     down: Mutex<HashSet<u64>>,
     retired: Mutex<HashSet<Uuid>>,
     deny: AtomicBool,
+    /// `LEADER_BUDGET_FULL`: the leader answers its typed 429 before
+    /// executing; `HANDLER_LANE_FULL`: the worker's handler lane refuses the
+    /// call before it reaches the executor.
+    overload: AtomicU8,
     lose: AtomicUsize,
     /// Runs once, when a reply is lost (before the gateway resends).
     after_lose: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -618,6 +626,21 @@ impl DirectTransport for InProcess {
                     "fixture worker denied the caller",
                     Outcome::NotApplied,
                 )));
+            }
+            match self.overload.load(Ordering::SeqCst) {
+                LEADER_BUDGET_FULL => {
+                    return Ok(DirectResponse::overloaded(
+                        "direct in-flight budget is full",
+                    ));
+                }
+                HANDLER_LANE_FULL => {
+                    return Err(DirectSendError::NotApplied(ProtocolError::new(
+                        ErrorCode::Overloaded,
+                        "worker handler lane full",
+                        Outcome::NotApplied,
+                    )));
+                }
+                _ => {}
             }
             let unreachable = || {
                 DirectSendError::Uncertain(ProtocolError::new(
@@ -2224,5 +2247,85 @@ async fn d02_od2_row_conflict_keeps_its_answer_through_the_gateway() {
     );
     assert_eq!(answer(&gateway, &conflict, id).await, refused);
     assert_eq!(cluster.latest(group, 0, 1).await.1, None, "the retry never inserted");
+    cluster.shutdown().await;
+}
+
+/// D12 after OD-3: an admission refusal of a mutation (the leader's in-flight
+/// budget, a full handler lane) answers `outcome_unknown`, names its cause and
+/// counts as overloaded; nothing executed, and the same id and body commit
+/// once the leader has room. On the settling path too (`asynchronous`). A get
+/// keeps its typed 429.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d12_od3_an_admission_refusal_names_its_cause() {
+    let mut cluster = Cluster::new().await;
+    let group = cluster.add_group(span(None, None), 1, &[1]).await;
+    let source = Source::new(vec![cluster.fill(&[group])], cluster.voters());
+    let transport = cluster.transport();
+    let gateway = cluster.gateway(direct_on(), source, transport.clone());
+    let cases = [
+        (LEADER_BUDGET_FULL, false, "direct in-flight budget is full"),
+        (HANDLER_LANE_FULL, false, "worker handler lane full"),
+        (LEADER_BUDGET_FULL, true, "direct in-flight budget is full"),
+        (HANDLER_LANE_FULL, true, "worker handler lane full"),
+    ];
+    for (index, (mode, asynchronous, cause)) in cases.into_iter().enumerate() {
+        let key = 20 + index as i64;
+        let id = nabedra_rt::ids::uuid_v4();
+        let body = cluster.body(id, "table.insert", json!({"row": {"id": key, "value": 1}}));
+        let before = gateway.stats();
+        transport.overload.store(mode, Ordering::SeqCst);
+        let error = match gateway.route(&body, asynchronous).await {
+            Err(error) => error,
+            Ok(_) => panic!("case {index}: a full leader answered"),
+        };
+        assert_eq!(
+            (error.code, error.outcome),
+            (ErrorCode::OutcomeUnknown, Outcome::Unknown),
+            "case {index}: {error:?}"
+        );
+        assert_eq!(
+            error.message,
+            format!(
+                "direct request outcome unknown after overloaded: {cause}; retry the same request_id and body"
+            ),
+            "case {index}"
+        );
+        let after = gateway.stats();
+        assert_eq!(after.overloaded, before.overloaded + 1, "case {index}");
+        assert_eq!(after.unknown, before.unknown + 1, "case {index}");
+        assert_eq!(
+            cluster.latest(group, 0, key).await,
+            (None, None),
+            "case {index}"
+        );
+        transport.overload.store(NO_OVERLOAD, Ordering::SeqCst);
+        if asynchronous {
+            assert!(
+                matches!(gateway.route(&body, true).await, Ok(Routed::Queued)),
+                "case {index}: the settled retry goes queued"
+            );
+            assert!(cluster.settled(group, key, id).await, "case {index}");
+        } else {
+            assert_eq!(
+                answer(&gateway, &body, id).await,
+                Answer::Data(Value::Null),
+                "case {index}"
+            );
+            assert!(
+                cluster.latest(group, 0, key).await.0.is_some(),
+                "case {index}"
+            );
+        }
+    }
+    transport
+        .overload
+        .store(LEADER_BUDGET_FULL, Ordering::SeqCst);
+    let id = nabedra_rt::ids::uuid_v4();
+    let get = cluster.body(id, "table.get", json!({"key": 20}));
+    assert_eq!(
+        answer(&gateway, &get, id).await,
+        Answer::Error(ErrorCode::Overloaded, Outcome::NotApplied)
+    );
+    transport.overload.store(NO_OVERLOAD, Ordering::SeqCst);
     cluster.shutdown().await;
 }

@@ -656,7 +656,7 @@ impl DirectGateway {
             Ok(Some(table)) => table,
             Ok(None) => return Ok(self.queued()),
             Err(_) if get => return Ok(self.queued()),
-            Err(error) => return Err(unsettled(error)),
+            Err(error) => return Err(self.final_unsettled(error)),
         };
         let keys = match point {
             Some(key) if key.validate(descriptor.key_type).is_ok() => RouteKeys::single(key),
@@ -676,9 +676,9 @@ impl DirectGateway {
             {
                 Ok(Some(table)) if table.schema_epoch == descriptor.schema_epoch => table,
                 Ok(_) if get => return Err(route_unavailable()),
-                Ok(_) => return Err(unsettled(route_unavailable())),
+                Ok(_) => return Err(self.final_unsettled(route_unavailable())),
                 Err(error) if get => return Err(error),
-                Err(error) => return Err(unsettled(error)),
+                Err(error) => return Err(self.final_unsettled(error)),
             }
         };
         let mut request = DirectRequest {
@@ -689,10 +689,13 @@ impl DirectGateway {
             group: Uuid::nil(),
             request_id: scanned.request_id,
             digest: digest(body),
-            body: self
-                .shared
-                .copy_bytes(body)
-                .map_err(|error| if get { error } else { unsettled(error) })?,
+            body: self.shared.copy_bytes(body).map_err(|error| {
+                if get {
+                    error
+                } else {
+                    self.final_unsettled(error)
+                }
+            })?,
             deadline: self.deadline,
         };
         let mut uncertain = false;
@@ -768,7 +771,7 @@ impl DirectGateway {
                 Outcome::NotApplied,
             )),
             Err(error) if get => Err(self.final_error(error)),
-            Err(error) => Err(self.final_error(unsettled(error))),
+            Err(error) => Err(self.final_unsettled(error)),
         }
     }
 
@@ -784,6 +787,16 @@ impl DirectGateway {
             GatewayStats::bump(&self.stats.overloaded);
         }
         error
+    }
+
+    /// A mutation's refusal before its anchor answered, as its final answer:
+    /// `outcome_unknown` that names the refusal (`unsettled`), counted as
+    /// unknown and, when the refusal was an admission refusal, as overloaded.
+    fn final_unsettled(&self, error: ProtocolError) -> ProtocolError {
+        if error.code == ErrorCode::Overloaded && error.outcome == Outcome::NotApplied {
+            GatewayStats::bump(&self.stats.overloaded);
+        }
+        self.final_error(unsettled(error))
     }
 
     /// The addendum's rule: commit `DirectForward` at the anchor's range
@@ -852,23 +865,28 @@ impl DirectGateway {
                     return Err(self.final_error(unknown()));
                 }
                 Ok(Terminal::Failed(error)) => return Err(self.final_error(error)),
-                // OD-3: a refusal before the anchor answered (a full leader,
-                // the deadline) proves nothing about an earlier call of this
-                // id, so the identity's outcome is unknown.
+                // OD-3: a refusal before the anchor answered (a full leader
+                // or lane) proves nothing about an earlier call of this id,
+                // so the identity's outcome is unknown; the answer names the
+                // refusal.
                 Err(error)
                     if error.code == ErrorCode::Overloaded
                         && error.outcome == Outcome::NotApplied =>
                 {
-                    return Err(self.final_error(unsettled(error)));
+                    return Err(self.final_unsettled(error));
                 }
                 // The anchor cannot be reached: the request may have run
                 // directly before, so it must not go queued.
-                Err(_) => {
+                Err(error) => {
                     // A retired parent cannot answer StaleRoute. Refresh
                     // for the next settlement while keeping warm routes
                     // usable by direct requests during a queue outage.
                     current.refresh_before_settle.store(true, Ordering::Relaxed);
-                    return Err(self.final_error(unknown()));
+                    return Err(if error.outcome == Outcome::NotApplied {
+                        self.final_unsettled(error)
+                    } else {
+                        self.final_error(unknown())
+                    });
                 }
             }
         }
@@ -1597,12 +1615,24 @@ fn unknown() -> ProtocolError {
 /// which may still commit. It is `outcome_unknown`; the client retries the
 /// same id and body. A definite answer from the leader, given after its dedup
 /// lookup, is not passed through here. Gets keep their refusals.
+/// The message keeps the refusal's code and text (D12: an admission refusal
+/// still names its budget or lane).
 fn unsettled(error: ProtocolError) -> ProtocolError {
-    if error.outcome == Outcome::NotApplied {
-        unknown()
-    } else {
-        error
+    if error.outcome != Outcome::NotApplied {
+        return error;
     }
+    let cause = serde_json::to_value(error.code)
+        .ok()
+        .and_then(|code| code.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    ProtocolError::new(
+        ErrorCode::OutcomeUnknown,
+        format!(
+            "direct request outcome unknown after {cause}: {}; retry the same request_id and body",
+            error.message
+        ),
+        Outcome::Unknown,
+    )
 }
 
 fn route_unavailable() -> ProtocolError {
