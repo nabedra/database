@@ -149,6 +149,9 @@ time, which can differ from `sha`. Trust the `Tested revision` line in the run s
 
 ## Wait without blocking
 
+Follow [Keep CI waits out of Opus](../../nabedra-change/SKILL.md#keep-ci-waits-out-of-opus)
+for model choice and the handoff back to the decision-maker.
+
 Start the watch as a background command and keep working on something else. When it exits, read the
 results:
 
