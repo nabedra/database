@@ -1,0 +1,14 @@
+# Design check of the nabedra-kv journal integrity upgrade, format 1 to format 2 (LSM-1;
+# plans/native-storage-engine.md, sections 2 and 9): specs/lsm/integrity/JournalIntegrity, its safety and
+# liveness baselines exhaustive with coverage, then every mutant.
+id = "lsm-journal-integrity"
+module = "lsm"
+kinds = ["T"]
+guarantees = []
+scenarios = ["NS05", "NS22", "NS25"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/lsm/integrity", "JournalIntegrity", "--module", "lsm"]
+cwd = "."
+timeout_s = 1800
+needs = ["tlc"]
+result_parser = "tlc"
