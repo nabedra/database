@@ -36,6 +36,48 @@ pub(crate) const STAGE_JUDGED: &str = "resources stage judged";
 const SETUP_DEADLINE: Duration = Duration::from_secs(20);
 const SETTLE_LIMIT: Duration = Duration::from_secs(2);
 
+/// SIM-8: a probe rule that got no input is silent, and silence is not a pass.
+pub(crate) const PROBE_INPUT: &str = "ProbeInput";
+
+/// SIM-8: a seed that acknowledged an insert must have fed the probe rules that judge it.
+/// A committed insert is a Raft entry that each replica appends and applies, and on the
+/// direct path a dedup record. A probe that stops reaching the sink (an emit from outside
+/// any node, a sink that is gone) leaves those rules without input; this makes it red.
+fn probe_input(
+    checks: &Invariants,
+    world: &World,
+    workload: Workload,
+    events: &[nabedra_check::history::Event],
+) {
+    use crate::invariants::protocol::{APPLIED_PREFIXES_AGREE, DEDUP_UNIQUE, LOG_MATCHING};
+    use nabedra_check::history::EventType;
+    let Some(probes) = checks.probes() else {
+        // No sink: every probe rule is listed as not run for the range.
+        return;
+    };
+    let inserts = events
+        .iter()
+        .filter(|event| event.kind == EventType::Ok && event.f == "table.insert")
+        .count();
+    if inserts == 0 {
+        return;
+    }
+    let exercised = probes.exercised();
+    let mut needed = vec![LOG_MATCHING, APPLIED_PREFIXES_AGREE];
+    if workload != Workload::Queued {
+        needed.push(DEDUP_UNIQUE);
+    }
+    for rule in needed {
+        if exercised.get(rule).copied().unwrap_or(0) == 0 {
+            checks.violate(
+                world,
+                PROBE_INPUT,
+                format!("{inserts} inserts were acknowledged and {rule} judged no probe"),
+            );
+        }
+    }
+}
+
 pub(crate) fn run_seed(seed: u64, generator: &mut Gen, defect: Defect, setup: &Setup) -> RunResult {
     run(seed, generator, defect, None, setup)
 }
@@ -410,7 +452,11 @@ async fn execute(body: Body<'_>, world: Arc<World>) -> RunResult {
         checks.check_history(&world, &verdict);
     }
     checks.check_outcomes(&world, history.events(), history.bodies());
-    assertions.insert("probe invariants", checks.probe_invariants_hold());
+    probe_input(&checks, &world, workload, history.events());
+    assertions.insert(
+        "probe invariants",
+        checks.probe_invariants_hold() && !has_violation(&checks, PROBE_INPUT),
+    );
     let mut capture = trace.lock().unwrap();
     capture.flush_frames();
     let trace = &capture.trace;

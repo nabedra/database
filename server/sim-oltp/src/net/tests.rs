@@ -323,40 +323,63 @@ fn reply_cut() {
     });
 }
 
-#[test]
-fn stream_delay() {
-    run_replays("stream-delay", async |world, net, seed| {
-        let fixture = WorkerFixture::start(world, PeerProtocol::Current).await;
-        ok(fixture.call(0), 0).await;
+/// One reply of a session is delayed. With `Action::Delay`, as on TCP, the replies that
+/// follow it on the session wait behind it (SIM-14, `ConnectionFifo` of `specs/sim/net`).
+/// Only the beyond-TCP `Action::Overtake` lets the calls of other streams pass it.
+async fn stream_delay_case(world: &Arc<World>, net: &SimNet, seed: u64, overtake: bool) {
+    let fixture = WorkerFixture::start(world, PeerProtocol::Current).await;
+    ok(fixture.call(0), 0).await;
 
-        let planned = Arc::new(Notify::new());
-        let delay = Duration::from_millis(30 + seed % 17);
-        let mut first = true;
-        net.set_frame_profile({
-            let planned = planned.clone();
-            move |frame| {
-                if first && frame.kind == FrameKind::Reply {
-                    first = false;
-                    planned.notify_one();
-                    Action::Delay(delay)
+    let planned = Arc::new(Notify::new());
+    let delay = Duration::from_millis(30 + seed % 17);
+    let mut first = true;
+    net.set_frame_profile({
+        let planned = planned.clone();
+        move |frame| {
+            if first && frame.kind == FrameKind::Reply {
+                first = false;
+                planned.notify_one();
+                if overtake {
+                    Action::Overtake(delay)
                 } else {
-                    Action::Pass
+                    Action::Delay(delay)
                 }
+            } else {
+                Action::Pass
             }
-        });
+        }
+    });
 
-        let slow = world.spawn_node(CLIENT, fixture.call(1));
-        planned.notified().await;
-        let start = world.elapsed();
-        ok(fixture.call(2), 2).await;
+    let slow = world.spawn_node(CLIENT, fixture.call(1));
+    planned.notified().await;
+    let start = world.elapsed();
+    ok(fixture.call(2), 2).await;
+    if overtake {
         ok(fixture.call(3), 3).await;
         assert!(world.elapsed() - start < delay);
         assert!(!slow.is_finished());
-        let reply = slow.await.unwrap().unwrap();
-        assert_eq!(reply.header.as_slice(), b"1");
+    } else {
+        // The reply to call 2 left after the delayed one, so it cannot arrive first.
         assert!(world.elapsed() - start >= delay);
-        assert_eq!(world.connections().len(), 1, "calls must share a session");
-        fixture.stop().await;
+    }
+    let reply = slow.await.unwrap().unwrap();
+    assert_eq!(reply.header.as_slice(), b"1");
+    assert!(world.elapsed() - start >= delay);
+    assert_eq!(world.connections().len(), 1, "calls must share a session");
+    fixture.stop().await;
+}
+
+#[test]
+fn stream_delay_keeps_the_session_in_order() {
+    run_replays("stream-delay", async |world, net, seed| {
+        stream_delay_case(world, net, seed, false).await;
+    });
+}
+
+#[test]
+fn beyond_tcp_overtake_passes_a_delayed_stream() {
+    run_replays("stream-overtake", async |world, net, seed| {
+        stream_delay_case(world, net, seed, true).await;
     });
 }
 

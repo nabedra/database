@@ -6,6 +6,7 @@
 //! record open findings and no check runs them.
 #![cfg(test)]
 
+mod lease_drift;
 mod oltp_direct;
 
 use std::{
@@ -421,6 +422,10 @@ where
                         cluster.teardown().await;
                     }
                     Ok((table, leader)) => {
+                        // So that elections of the table's range are known on the wire.
+                        if let Ok(id) = Uuid::parse_str(&table) {
+                            cluster.watch_table(id);
+                        }
                         let driver = Arc::new(Driver {
                             cluster,
                             history: history.clone(),

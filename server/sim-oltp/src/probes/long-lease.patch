@@ -1,0 +1,25 @@
+diff --git a/server/oltp-replication/src/oltp_replication/hosted.rs b/server/oltp-replication/src/oltp_replication/hosted.rs
+index 643182f7..4823e53a 100644
+--- a/server/oltp-replication/src/oltp_replication/hosted.rs
++++ b/server/oltp-replication/src/oltp_replication/hosted.rs
+@@ -1117,8 +1117,19 @@ where
+             unavailable()
+         };
+         let raft: &HostRaft<C, M> = &self.raft;
++        // Planted defect: a lease read is served while a quorum acknowledged this leader
++        // within 10 s, far past the window in which voters refuse another leader.
++        let option = if lease {
++            openraft::raft::linearizable_read::LinearizerOption::new(
++                Some(std::time::Duration::from_secs(10)),
++                false,
++            )
++            .with_wait_timeout(std::time::Duration::ZERO)
++        } else {
++            policy.into()
++        };
+         let linearizer = raft
+-            .get_local_read_linearizer(policy)
++            .get_local_read_linearizer(option)
+             .await
+             .map_err(|error| failed(&error))?;
+         linearizer

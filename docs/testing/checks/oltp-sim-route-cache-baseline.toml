@@ -1,0 +1,62 @@
+id = "oltp-sim-route-cache-baseline"
+module = "oltp"
+kinds = ["S", "H"]
+# Fault model (SIM-1). ResourceBaseline judges the Control replica route cache by its own bounds
+# (64 routes of at most 4 KiB per cache, as the cache reports them through LedgerSnapshot) and every
+# other ledger strictly. The unit twins: a warm cache, one a restart refilled and one at its cap are
+# clean; a lease held beside a warm cache, one the size of a route, a recurring charge, and a cache
+# over its count or entry size are red. The sweep twin: in a scratch worktree, `mixed` seeds 1 to 24
+# run unmodified, then with server/sim-oltp/src/probes/held-route-lease.patch, which makes a worker
+# hold one route-sized lease for good after its first direct entry. Every seed that is clean
+# unmodified must report ResourceBaseline with the patch, and at least one must be clean. It proves
+# no product guarantee by itself.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euo", "pipefail", "-c", '''
+root="$(git rev-parse --show-toplevel)"
+export CARGO_TARGET_DIR="$PWD/target/sim"
+mkdir -p "$PWD/target"
+scratch="$(mktemp -d "$PWD/target/route-cache-baseline.XXXXXX")"
+trap 'git -C "$root" worktree remove --force "$scratch" >/dev/null 2>&1 || true' EXIT
+git -C "$root" worktree add --detach "$scratch" HEAD >/dev/null
+out="$root/target/testing-logs/oltp-sim-route-cache-baseline"
+mkdir -p "$out"
+cd "$scratch/server"
+build=(cargo test --locked --release -p nabedra-sim-oltp --lib)
+"${build[@]}" --no-run
+"${build[@]}" -- --exact --test-threads=1 \
+    invariants::tests::a_warm_route_cache_is_judged_by_its_bounds \
+    invariants::tests::a_route_cache_does_not_excuse_a_held_lease \
+    invariants::tests::a_route_cache_split_is_exact \
+    invariants::tests::a_recurring_charge_is_not_back_at_baseline \
+    invariants::tests::work_that_ends_and_short_messages_are_back_at_baseline
+sweep() {
+    NABEDRA_SIM_ARTIFACTS="$out/$1" NABEDRA_SIM_CHECK_ID="oltp-sim-route-cache-$1" \
+        timeout 2400s "${build[@]}" -- --exact --nocapture --test-threads=1 sweep::tests::sweep || true
+}
+sweep clean
+git -C "$scratch" apply --verbose server/sim-oltp/src/probes/held-route-lease.patch
+"${build[@]}" --no-run
+sweep planted
+python3 - "$out/clean/sweep-report.json" "$out/planted/sweep-report.json" "$NABEDRA_SEEDS" <<'PY'
+import json, sys
+clean, planted, count = json.load(open(sys.argv[1])), json.load(open(sys.argv[2])), int(sys.argv[3])
+rows = {s["seed"]: s for s in clean["seeds"]}
+leaky = {s["seed"]: s for s in planted["seeds"]}
+assert len(rows) == len(leaky) == count, (len(rows), len(leaky))
+twins = [seed for seed, row in rows.items() if row["verdict"] == "clean"]
+print(f"route cache baseline: {len(twins)} of {count} seeds clean unmodified: {twins}")
+missed = [seed for seed in twins if "ResourceBaseline" not in leaky[seed]["violations"]]
+for seed in twins:
+    print(f"seed {seed}: planted lease -> {leaky[seed]['violations']}")
+assert twins, "no clean twin"
+assert not missed, f"the planted lease was not caught on {missed}"
+print(f"route cache baseline: the planted lease is caught on all {len(twins)} clean twins")
+PY
+''']
+cwd = "server"
+timeout_s = 7200
+needs = []
+result_parser = "exit-code"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", NABEDRA_SEED = "1", NABEDRA_SEEDS = "24", NABEDRA_SIM_JOBS = "4", NABEDRA_SIM_VERIFY_REPLAY = "1", NABEDRA_SIM_WORKLOAD = "mixed" }

@@ -15,6 +15,33 @@ use crate::bootstrap::{BOOTSTRAP_CLIENT, CLIENTS, GATEWAYS, WORKERS};
 /// Worker and gateway drift may change during a run within this bound.
 pub(crate) const CLOCK_DRIFT_BOUND_PPM: i64 = 200;
 
+/// The clock rate error per node that the OLTP leader lease is built to tolerate, rho
+/// (SIM-10, RANGES-3): a leader serves a lease read only while
+/// `now < quorum_acked_send_time + L * (1 - 2 * rho) - eps`, with eps 1 ms (`hosted.rs`
+/// `linearized()`). Every sampled or nemesis drift stays inside it. A run whose clocks go
+/// past it is a beyond-bound twin and says so with [`BeyondDriftBound`].
+pub(crate) const LEASE_DRIFT_BOUND_PPM: i64 = 1_000;
+const _: () = assert!(CLOCK_DRIFT_BOUND_PPM <= LEASE_DRIFT_BOUND_PPM);
+
+/// Marks a world whose clocks may drift past [`LEASE_DRIFT_BOUND_PPM`]. Only a beyond-bound
+/// twin installs it, and its verdict says nothing about the in-bound guarantee.
+pub(crate) struct BeyondDriftBound;
+
+/// Changes `node`'s drift. Refuses a drift past [`LEASE_DRIFT_BOUND_PPM`] unless the world is
+/// marked [`BeyondDriftBound`], so that no in-bound run leaves the lease's assumption.
+pub(crate) fn set_drift(world: &World, node: u64, drift_ppm: i64) {
+    assert_in_bound(world, node, drift_ppm);
+    world.set_drift_ppm(node, drift_ppm);
+}
+
+fn assert_in_bound(world: &World, node: u64, drift_ppm: i64) {
+    assert!(
+        drift_ppm.abs() <= LEASE_DRIFT_BOUND_PPM
+            || world.with_ext::<BeyondDriftBound, _>(|_| ()).is_some(),
+        "n{node} drift {drift_ppm} ppm is past the lease bound of {LEASE_DRIFT_BOUND_PPM} ppm in a run not marked beyond-bound"
+    );
+}
+
 const CLOCKS: &[(u64, &str, &str)] = &[
     (1, "n1.drift_ppm", "n1.wall_jump_ms"),
     (2, "n2.drift_ppm", "n2.wall_jump_ms"),
@@ -79,6 +106,7 @@ impl Config {
             .chain(CLIENTS);
         assert!(nodes.eq(CLOCKS.iter().map(|clock| clock.0)));
         for &(node, drift, _) in CLOCKS {
+            assert_in_bound(world, node, self.knobs[drift].as_i64().unwrap());
             world.add_node(
                 node,
                 NodeClock {

@@ -4,7 +4,8 @@ kinds = ["S"]
 guarantees = ["OLTP-G04"]
 scenarios = ["D10"]
 tiers = ["T0", "T1"]
-# Component fault model. The process scenarios also run over real networking.
+# Component fault model. The process scenarios also run over real networking. A delayed frame
+# keeps its session in order, as TCP does; only the beyond-TCP overtake passes it (SIM-14).
 command = ["bash", "-euo", "pipefail", "-c", '''
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
@@ -15,14 +16,15 @@ export CARGO_TARGET_DIR="$PWD/$CARGO_TARGET_DIR"
 cargo test --locked -p nabedra-sim-oltp --lib net::tests:: -- --test-threads=1 --nocapture
 cargo test --locked -p nabedra-database --no-default-features --features oltp,sim --lib oltp_runtime::api_process::sim_net_tests::sim_net_reaches_oltp_handler -- --exact --test-threads=1 --nocapture
 ) | tee "$log"
-for case in request-cut reply-cut stream-delay fallback-only axum-handler; do
+for case in request-cut reply-cut stream-delay stream-overtake fallback-only axum-handler; do
     grep -F "sim-net $case: 50/50 passing with matching replay hashes" "$log"
 done
 NABEDRA_CASES=1 python3 ../scripts/testing/repeat_gate.py --features oltp,sim <<'JSON'
 [
   {"id": "net::tests::request_cut", "file": "server/sim-oltp/src/net/tests.rs", "lang": "rust"},
   {"id": "net::tests::reply_cut", "file": "server/sim-oltp/src/net/tests.rs", "lang": "rust"},
-  {"id": "net::tests::stream_delay", "file": "server/sim-oltp/src/net/tests.rs", "lang": "rust"},
+  {"id": "net::tests::stream_delay_keeps_the_session_in_order", "file": "server/sim-oltp/src/net/tests.rs", "lang": "rust"},
+  {"id": "net::tests::beyond_tcp_overtake_passes_a_delayed_stream", "file": "server/sim-oltp/src/net/tests.rs", "lang": "rust"},
   {"id": "net::tests::fallback_only", "file": "server/sim-oltp/src/net/tests.rs", "lang": "rust"},
   {"id": "oltp_runtime::api_process::sim_net_tests::sim_net_reaches_oltp_handler", "file": "server/src/oltp_runtime/api_process.rs", "lang": "rust"}
 ]
