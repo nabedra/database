@@ -124,6 +124,12 @@ impl Rows {
         self.vectors.as_ref().is_some_and(|v| v.on_disk())
     }
 
+    /// Logs that the store failed a version of a generation, so that its range fails.
+    pub fn log_damage(&self, generation: Gen) {
+        let mut damage = self.damage.lock().unwrap_or_else(PoisonError::into_inner);
+        damage.insert(generation);
+    }
+
     /// The generations logged as damaged since the last call.
     pub fn take_damage(&self) -> Vec<Gen> {
         let mut damage = self.damage.lock().unwrap_or_else(PoisonError::into_inner);

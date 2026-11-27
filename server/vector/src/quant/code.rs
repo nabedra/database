@@ -79,8 +79,24 @@ impl CodeBlock {
     /// the exact length of the vector.
     ///
     /// Panics unless both have the padded length and are unit within 1e-3, and `len` is a positive
-    /// normal number: zero-length vectors have no direction and never reach this module.
+    /// normal number: zero-length vectors have no direction and never reach this module. Panics on
+    /// a block that keeps its extensions elsewhere.
     pub fn push(&mut self, dir: &[f32], centroid: &[f32], len: f32) {
+        assert_eq!(self.ext.len(), self.len() * self.ext_bytes(), "a detached block");
+        let ext = self.encode(dir, centroid, len);
+        self.ext.extend_from_slice(&ext);
+    }
+
+    /// [`CodeBlock::push`] without keeping the 4-bit extension, which it returns: the caller keeps
+    /// it and hands it to [`QueryCode::refine_with`]. A block holds every extension or none, so this
+    /// panics on a block that holds some.
+    pub fn push_detached(&mut self, dir: &[f32], centroid: &[f32], len: f32) -> Vec<u8> {
+        assert!(self.ext.is_empty(), "a block holds every extension or none");
+        self.encode(dir, centroid, len)
+    }
+
+    /// Appends everything but the extension, which it returns.
+    fn encode(&mut self, dir: &[f32], centroid: &[f32], len: f32) -> Vec<u8> {
         assert_direction(dir, self.padded);
         assert_direction(centroid, self.padded);
         assert!(super::is_length(len), "vector length {len}");
@@ -112,17 +128,30 @@ impl CodeBlock {
             level => 15 - level,
         };
         let pairs = residual.chunks_exact(2);
-        self.ext
-            .extend(pairs.map(|p| nibble(p[0]) | nibble(p[1]) << 4));
+        pairs.map(|p| nibble(p[0]) | nibble(p[1]) << 4).collect()
     }
 
     /// Replaces entry `i` with the last one, which it removes. Panics when there is no entry `i`.
     pub fn swap_remove(&mut self, i: usize) {
+        let inline = !self.ext.is_empty();
         self.factors.swap_remove(i);
         self.r2.swap_remove(i);
         self.scale1.swap_remove(i);
         swap_remove_row(&mut self.bits, i, self.padded / 64);
-        swap_remove_row(&mut self.ext, i, self.padded / 2);
+        if inline {
+            swap_remove_row(&mut self.ext, i, self.padded / 2);
+        }
+    }
+
+    /// Bytes of the 4-bit extension of one entry.
+    pub fn ext_bytes(&self) -> usize {
+        self.padded / 2
+    }
+
+    /// Bytes of codes and factors the block holds, extensions included when it keeps them.
+    pub fn held(&self) -> usize {
+        let per = 2 * size_of::<f32>() + size_of::<Factors>();
+        self.bits.len() * size_of::<u64>() + self.ext.len() + self.len() * per
     }
 
     fn bits(&self, i: usize) -> &[u64] {
@@ -331,9 +360,16 @@ impl QueryCode {
     /// The 5-bit estimate of entry `i`. Panics when there is no entry `i`, or when the block has
     /// other padded dimensions.
     pub fn refine(&self, block: &CodeBlock, i: usize) -> Estimate {
+        self.refine_with(block, i, block.ext(i))
+    }
+
+    /// [`QueryCode::refine`] of an entry whose extension [`CodeBlock::push_detached`] returned.
+    /// Panics when there is no entry `i`, or on dimensions or an extension of another size.
+    pub fn refine_with(&self, block: &CodeBlock, i: usize, ext: &[u8]) -> Estimate {
         assert_eq!(self.padded, block.padded, "padded dimensions");
+        assert_eq!(ext.len(), block.ext_bytes(), "extension bytes");
         let (f, r2, d) = (block.factors[i], block.r2[i], self.padded as f32);
-        let dot = Kernels::detect().code_dot(block.bits(i), block.ext(i), &self.levels);
+        let dot = Kernels::detect().code_dot(block.bits(i), ext, &self.levels);
         let dot = f.scale5 * self.step8 * (f64::from(dot) - self.center8) as f32;
         let var = self.q2 * f.var5 + (r2 + f.var5 * (d - 1.0)) * self.error8 / d;
         self.estimate(r2, dot, var)

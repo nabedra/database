@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
-use crate::store::Vectors;
+use crate::store::{Extensions, Vectors};
 use crate::types::{
     Change, ColumnType, CommitTs, Error, Key, MAX_DIM, Page, PartId, Pos, RangeId, Result, Row,
     Schema,
@@ -67,6 +67,9 @@ pub struct Config {
     pub summary_pairs: usize,
     /// Where raw vectors live. `None` keeps them in the rows, in RAM.
     pub vectors: Option<Arc<dyn Vectors>>,
+    /// Where 4-bit extensions live: in RAM while its code memory lasts, which every code block is
+    /// charged to as well, and on NVMe after. `None` keeps extensions in the blocks, uncharged.
+    pub codes: Option<Arc<Extensions>>,
 }
 
 impl Config {
@@ -84,6 +87,7 @@ impl Config {
             reassigns: 8,
             summary_pairs: 1 << 22,
             vectors: None,
+            codes: None,
         }
     }
 
@@ -304,6 +308,7 @@ struct Shared {
     next_gen: Gen,
     shards: usize,
     partition_by: Option<usize>,
+    codes: Option<Arc<Extensions>>,
 }
 
 impl Shared {
@@ -518,6 +523,10 @@ impl<C: Codec> Index<C> {
         if !codec.fits(cfg.schema.dim) {
             return Err(Error::Internal("code dimension does not match the index"));
         }
+        let ext = codec.ext_bytes();
+        if cfg.codes.as_ref().is_some_and(|c| ext > 0 && c.bytes() != ext) {
+            return Err(Error::Internal("extensions of another size"));
+        }
         let shared = Shared {
             ranges: BTreeMap::new(),
             gens: BTreeMap::new(),
@@ -535,6 +544,7 @@ impl<C: Codec> Index<C> {
             next_gen: 0,
             shards: cfg.shards,
             partition_by: cfg.schema.partition_by,
+            codes: cfg.codes.clone(),
         };
         Ok(Index {
             shards: vec![Shard::new(); cfg.shards],
@@ -1116,6 +1126,12 @@ impl<C: Codec> Index<C> {
         shard.collect(sh, codec, part)
     }
 
+    fn promote(&mut self, part: PartId) -> usize {
+        let n = self.cfg.copies;
+        let (sh, shard, _) = self.owner(part);
+        shard.promote(sh, part, n)
+    }
+
     fn reassign(&mut self, part: PartId, id: u64, to: PartId) -> bool {
         let (sh, shard, codec) = self.owner(part);
         let same = sh.dir.get(&part).map(|m| &m.group) == sh.dir.get(&to).map(|m| &m.group);
@@ -1170,6 +1186,7 @@ impl<C: Codec> Index<C> {
             }
             State::Ready => {
                 let removed = self.remove_moved(part) + self.collect(part) > 0;
+                let removed = self.promote(part) > 0 || removed;
                 let meta = &self.shared.dir[&part];
                 let entries = meta.entries;
                 if entries == 0

@@ -1,6 +1,7 @@
 //! 4-bit code extensions: in RAM while the worker's code memory lasts, otherwise on NVMe. 1-bit
 //! codes are charged to the same [`Memory`] and always stay in RAM, so they come first and
-//! extensions take what is left. An extension stays where it was put.
+//! extensions take what is left. An extension stays where it was put until [`Extensions::promote`]
+//! brings it back to RAM, which the index's maintenance does once memory is free again.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -45,6 +46,16 @@ impl Extensions {
         })
     }
 
+    /// Bytes of one extension.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The code memory that extensions in RAM, and the 1-bit codes, are charged to.
+    pub fn memory(&self) -> &Arc<Memory> {
+        &self.memory
+    }
+
     fn ram(&self) -> std::sync::MutexGuard<'_, HashMap<ExtKey, Arc<[u8]>>> {
         self.ram.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -83,6 +94,34 @@ impl Extensions {
         self.file(key).contains(key).then_some(Tier::Nvme)
     }
 
+    /// Brings an extension on NVMe back to RAM if the code memory has room for it. Returns whether
+    /// it moved. A record that cannot be read stays where it is, and the error says why.
+    pub fn promote(&self, key: &ExtKey) -> Result<bool> {
+        if self.ram().contains_key(key) || !self.file(key).contains(key) {
+            return Ok(false);
+        }
+        if !self.memory.try_extension(self.bytes as u64) {
+            return Ok(false);
+        }
+        match self.file(key).get(key) {
+            Ok(ext) => {
+                self.ram().insert(*key, ext.into());
+                self.file(key).release(key);
+                Ok(true)
+            }
+            Err(e) => {
+                self.memory.release_extension(self.bytes as u64);
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether the code memory has room for one more extension.
+    pub fn room(&self) -> bool {
+        let (codes, ext) = self.memory.used();
+        codes.saturating_add(ext).saturating_add(self.bytes as u64) <= self.memory.limit()
+    }
+
     /// The entry went: its RAM goes back to the budget, or its record may be reused.
     pub fn release(&self, key: &ExtKey) {
         if self.ram().remove(key).is_some() {
@@ -90,6 +129,12 @@ impl Extensions {
         } else {
             self.file(key).release(key);
         }
+    }
+
+    /// Extensions held in RAM and on NVMe.
+    pub fn counts(&self) -> (usize, usize) {
+        let nvme = self.files.iter().map(|f| f.stats().records).sum();
+        (self.ram().len(), nvme)
     }
 
     pub fn flush(&self) -> Result<()> {

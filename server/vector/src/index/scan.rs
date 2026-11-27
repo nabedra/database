@@ -9,10 +9,10 @@ use super::codec::{Codec, best, direction, dot, exact, goodness, optimistic};
 use super::filter::{Bits, Filter, Scalar, evaluate};
 use super::mutant::mutant;
 use super::rows::Slot;
-use super::shard::{Band, Entry, band_span};
+use super::shard::{Band, Entry, band_span, ext_key};
 use super::tree::{SCAN_BEAM, Walk};
 use super::{Index, Meta, Pin, parts_of};
-use crate::runtime::{Budget, Meter, Usage};
+use crate::runtime::{Budget, Meter, Tier, Usage};
 use crate::types::{CommitTs, Error, Key, MAX_LIMIT, Op, PartId, Pos, RangeId, Result, Row};
 
 #[derive(Clone, PartialEq, Debug)]
@@ -460,7 +460,7 @@ impl<C: Codec> Index<C> {
                 .map(|f| evaluate(f, &b.cols, b.entries.len()));
             match &query {
                 None => any |= self.offer_all(scan, b, bits)?,
-                Some(q) => any |= self.offer_best(scan, b, bits, q)?,
+                Some(q) => any |= self.offer_best(scan, part, b, bits, q)?,
             }
         }
         drop(query);
@@ -519,6 +519,7 @@ impl<C: Codec> Index<C> {
     fn offer_best(
         &self,
         scan: &mut Scan,
+        part: PartId,
         b: &Band<C::Block>,
         bits: Option<Bits>,
         q: &C::Query,
@@ -542,16 +543,43 @@ impl<C: Codec> Index<C> {
             if floor.is_some_and(|f| good < f) {
                 break;
             }
-            if floor.is_some() {
-                scan.charge(dim / 2 + 1, 0, 0)?;
-            }
-            if floor.is_some_and(|f| hope(self.codec.refine(q, &b.codes, i), i) < f) {
+            if let Some(f) = floor
+                && hope(self.refine(scan, part, b, q, i, e)?, i) < f
+            {
                 continue;
             }
             self.score_entry(scan, e)?;
         }
         scan.release(held);
         Ok(!order.is_empty())
+    }
+
+    /// The finer estimate of entry `i`, through its extension where the store keeps it: in RAM, or
+    /// read from NVMe, which counts as I/O. A store that cannot read it fails the scan and the range.
+    fn refine(
+        &self,
+        scan: &mut Scan,
+        part: PartId,
+        b: &Band<C::Block>,
+        q: &C::Query,
+        i: usize,
+        e: &Entry,
+    ) -> Result<super::codec::Estimate> {
+        scan.charge(scan.vec.len() as u64 / 2 + 1, 0, 0)?;
+        let Some(store) = self.shared.codes.as_ref().filter(|_| self.codec.ext_bytes() > 0) else {
+            return Ok(self.codec.refine(q, &b.codes, i));
+        };
+        let key = ext_key(part, e.id);
+        if store.tier(&key) != Some(Tier::Ram) {
+            scan.charge(0, store.bytes() as u64, 0)?;
+        }
+        match store.get(&key) {
+            Ok(ext) => Ok(self.codec.refine_with(q, &b.codes, i, &ext)),
+            Err(error) => {
+                self.shared.rows.log_damage(e.generation);
+                Err(error)
+            }
+        }
     }
 
     /// `FinishScan`: the rows, best first and then by key.

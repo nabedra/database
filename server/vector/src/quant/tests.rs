@@ -989,3 +989,44 @@ fn measure_recall() {
         rows * per_query / scan_time / 1e6,
     );
 }
+
+/// A block that hands its extensions back estimates as one that keeps them, through pushes and
+/// removals, and holds exactly the extension bytes less.
+#[test]
+fn vs07_a_detached_extension_refines_like_one_in_the_block() {
+    let mut rng = SplitMix64::new(41);
+    for dim in [1, 3, 64, 100, 768] {
+        let rotation = Rotation::new(dim, 7);
+        let centroid = rotated(&rotation, &random_unit(dim, &mut rng));
+        let (mut inline, mut detached) = (CodeBlock::new(rotation.padded()), CodeBlock::new(rotation.padded()));
+        let mut exts: Vec<Vec<u8>> = Vec::new();
+        for i in 0..20 {
+            let dir = rotated(&rotation, &random_unit(dim, &mut rng));
+            let len = 0.5 + i as f32;
+            inline.push(&dir, &centroid, len);
+            exts.push(detached.push_detached(&dir, &centroid, len));
+        }
+        for i in [3, 0, 17, 5] {
+            inline.swap_remove(i);
+            detached.swap_remove(i);
+            exts.swap_remove(i);
+        }
+        assert_eq!(inline.len(), detached.len());
+        assert_eq!(inline.held(), detached.held() + inline.len() * inline.ext_bytes(), "dim {dim}");
+        let query = QueryCode::new(&rotated(&rotation, &random_unit(dim, &mut rng)), &centroid);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        query.scan(&inline, &mut a);
+        query.scan(&detached, &mut b);
+        assert_eq!(a, b);
+        for (i, ext) in exts.iter().enumerate() {
+            assert_eq!(ext.len(), detached.ext_bytes());
+            assert_eq!(query.refine(&inline, i), query.refine_with(&detached, i, ext), "dim {dim} entry {i}");
+            assert_eq!(inline.length(i), detached.length(i));
+        }
+        // A block holds every extension or none.
+        let dir = rotated(&rotation, &random_unit(dim, &mut rng));
+        assert!(refuses(|| detached.clone().push(&dir, &centroid, 1.0)));
+        assert!(refuses(|| inline.clone().push_detached(&dir, &centroid, 1.0)));
+        assert!(refuses(|| query.refine_with(&detached, 0, &exts[0][1..])));
+    }
+}

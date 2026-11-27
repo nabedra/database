@@ -31,6 +31,24 @@ pub trait Codec: Clone + Send + Sync + 'static {
     fn scan(&self, q: &Self::Query, block: &Self::Block, out: &mut Vec<Estimate>);
     /// A finer estimate of one entry.
     fn refine(&self, q: &Self::Query, block: &Self::Block, i: usize) -> Estimate;
+    /// Bytes of the extension that [`Codec::push_detached`] hands back, or 0 for a codec that
+    /// keeps everything in its block.
+    fn ext_bytes(&self) -> usize {
+        0
+    }
+    /// Bytes a block holds in RAM: what the worker's code memory is charged for it.
+    fn held(&self, _block: &Self::Block) -> u64 {
+        0
+    }
+    /// [`Codec::push`] that hands the extension back for the caller to keep.
+    fn push_detached(&self, block: &mut Self::Block, dir: &[f32], centroid: &[f32], len: f32) -> Vec<u8> {
+        self.push(block, dir, centroid, len);
+        Vec::new()
+    }
+    /// [`Codec::refine`] with the extension that [`Codec::push_detached`] handed back.
+    fn refine_with(&self, q: &Self::Query, block: &Self::Block, i: usize, _ext: &[u8]) -> Estimate {
+        self.refine(q, block, i)
+    }
 }
 
 /// Seeded direction codes for the approximate index. Raw vectors still
@@ -90,6 +108,18 @@ impl Codec for DirectionCodec {
     fn refine(&self, query: &QueryCode, block: &CodeBlock, i: usize) -> Estimate {
         query.refine(block, i)
     }
+    fn ext_bytes(&self) -> usize {
+        self.rotation.padded() / 2
+    }
+    fn held(&self, block: &CodeBlock) -> u64 {
+        block.held() as u64
+    }
+    fn push_detached(&self, block: &mut CodeBlock, dir: &[f32], centroid: &[f32], len: f32) -> Vec<u8> {
+        block.push_detached(dir, centroid, len)
+    }
+    fn refine_with(&self, query: &QueryCode, block: &CodeBlock, i: usize, ext: &[u8]) -> Estimate {
+        query.refine_with(block, i, ext)
+    }
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -125,6 +155,9 @@ impl Codec for ExactCodec {
             cos: dot(q, &block[i]),
             err: DOT_ERR,
         }
+    }
+    fn held(&self, block: &Self::Block) -> u64 {
+        block.iter().map(|d| (d.len() * size_of::<f32>()) as u64).sum()
     }
 }
 

@@ -3,6 +3,7 @@ mod adversary_ck;
 mod adversary_moves;
 mod adversary_multi;
 mod adversary_rules;
+mod codes;
 mod crash;
 mod diff;
 mod model;

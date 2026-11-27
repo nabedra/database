@@ -10,6 +10,7 @@ use super::filter::Column;
 use super::mutant::mutant;
 use super::rows::{Gen, Slot};
 use super::{Append, Copy, Msg, Shared, State};
+use crate::store::ExtKey;
 use crate::types::{PartId, Pos, Row};
 
 /// An entry instance. A removal names `id`, never the row.
@@ -53,6 +54,11 @@ pub struct Partition<B> {
     pub bands: Vec<Band<B>>,
     /// Entries that moved away: instance, and the pins to wait for once the copy landed.
     removals: BTreeMap<u64, Option<u64>>,
+}
+
+/// Where the extension of an entry instance lives in the store.
+pub fn ext_key(part: PartId, id: u64) -> ExtKey {
+    ExtKey { part: part.0, id }
 }
 
 /// The band of a length: lengths within a factor √2 of a power of two. Unit vectors share one.
@@ -115,7 +121,6 @@ impl<C: Codec> Shard<C> {
         let Some(meta) = sh.dir.get_mut(&part) else {
             return;
         };
-        let rotated = codec.rotate(&dir);
         let p = self.parts.entry(part).or_insert_with(|| Partition {
             centroid: (!meta.undirected).then(|| codec.rotate(&meta.centroid)),
             bands: Vec::new(),
@@ -138,7 +143,24 @@ impl<C: Codec> Shard<C> {
             });
         let band = &mut p.bands[i];
         if let Some(centroid) = &p.centroid {
-            codec.push(&mut band.codes, &rotated, centroid, len as f32);
+            let rotated = codec.rotate(&dir);
+            let before = codec.held(&band.codes);
+            let detached = sh.codes.is_some() && codec.ext_bytes() > 0;
+            let ext = if detached {
+                codec.push_detached(&mut band.codes, &rotated, centroid, len as f32)
+            } else {
+                codec.push(&mut band.codes, &rotated, centroid, len as f32);
+                Vec::new()
+            };
+            if let Some(store) = &sh.codes {
+                // 1-bit codes first: the extension takes what they leave.
+                let grown = codec.held(&band.codes).saturating_sub(before);
+                store.memory().charge_codes(grown);
+                // A store that cannot take it fails the range after this step.
+                if detached && store.put(ext_key(part, e.id), &ext).is_err() {
+                    sh.rows.log_damage(e.generation);
+                }
+            }
             meta.radius = meta.radius.min(super::codec::dot(&dir, &meta.centroid));
         }
         band.entries.push(e);
@@ -174,7 +196,13 @@ impl<C: Codec> Shard<C> {
         band.lens.swap_remove(i);
         let cols: Vec<_> = band.cols.iter_mut().map(|c| c.swap_remove(i)).collect();
         if p.centroid.is_some() {
+            let before = codec.held(&band.codes);
             codec.swap_remove(&mut band.codes, i);
+            if let Some(store) = &sh.codes {
+                let shrunk = before.saturating_sub(codec.held(&band.codes));
+                store.memory().release_codes(shrunk);
+                store.release(&ext_key(part, id));
+            }
         }
         let exp = band.exp;
         if band.entries.is_empty() {
@@ -458,6 +486,29 @@ impl<C: Codec> Shard<C> {
             self.take(sh, codec, part, *id);
         }
         dead.len()
+    }
+
+    /// Brings up to `n` extensions of a partition from NVMe back to RAM while the code memory has
+    /// room. A store that cannot read one fails its range after this step.
+    pub fn promote(&mut self, sh: &mut Shared, part: PartId, n: usize) -> usize {
+        let (Some(store), Some(p)) = (&sh.codes, self.parts.get(&part)) else {
+            return 0;
+        };
+        if p.centroid.is_none() || !store.room() || store.counts().1 == 0 {
+            return 0;
+        }
+        let mut moved = 0;
+        for e in p.entries() {
+            if moved == n || !store.room() {
+                break;
+            }
+            match store.promote(&ext_key(part, e.id)) {
+                Ok(true) => moved += 1,
+                Ok(false) => {}
+                Err(_) => sh.rows.log_damage(e.generation),
+            }
+        }
+        moved
     }
 
     /// A resync or a drop takes every entry of a generation.
