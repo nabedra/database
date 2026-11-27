@@ -1,0 +1,16 @@
+# Found by code reading in fx-lsm (wave-rv/reports/fx-lsm.md, "Same pattern elsewhere", site 2) and
+# confirmed by the FaultFs regression below, which fails on the base and passes with the fix.
+id = "RV-DUR-2"
+title = "A filesystem backup object acknowledged after a crash or beside a concurrent first put is lost with its cluster or archive directory"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G11"]
+scenarios = ["O19"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/oltp-replication/src/oltp_backup_repository/filesystem/sim_tests.rs::dur2_acknowledged_object_survives_a_kill_at_every_step_then_power_loss"
+seed = 41
+why_not_caught = "The repository used raw libc calls on directory descriptors, so no FaultFs test could cut it, and its tests run on a real directory that never loses power."
+invariant_added = "Every put syncs the root and the cluster directory after mkdirat, also when the directory already exists, so an acknowledged object survives a power loss after any earlier crash."
+fix_commits = ["4f4e47eef4e9182050dc274024a0c3eb0d7b8711"]
+revert_patch_ok = true

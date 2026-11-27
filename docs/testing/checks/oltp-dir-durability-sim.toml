@@ -1,0 +1,21 @@
+id = "oltp-dir-durability-sim"
+module = "oltp"
+kinds = ["S"]
+guarantees = ["OLTP-G01", "OLTP-G08", "OLTP-G11"]
+scenarios = ["O11", "NS04", "O17", "O19", "O26"]
+tiers = ["T1"]
+# Fault model: a kill at every mutating step of creating an OLTP directory or manifest, a retry,
+# then the loss of every unsynced write (RV-DUR-2 to RV-DUR-6). Each test replays every cut.
+command = ["bash", "-eo", "pipefail", "-c", '''
+echo "Fault model: OLTP directory entries on simulated volumes, kill then power loss at every step"
+export CARGO_TARGET_DIR="$PWD/$CARGO_TARGET_DIR"
+cargo test --locked -p nabedra-rt --features sim --lib fs::os::tests::create_dir_all_synced -- --test-threads=1
+cargo test --locked -p nabedra-oltp-storage --features sim --lib oltp::pool::sim_tests::dur -- --nocapture --test-threads=1
+cargo test --locked -p nabedra-oltp-replication --features sim --lib sim_tests::dur -- --nocapture --test-threads=1
+cargo test --locked --no-default-features --features oltp,sim --lib oltp_runtime::worker_runtime::archive::sim_tests -- --nocapture --test-threads=1
+''']
+cwd = "server"
+timeout_s = 3600
+needs = []
+result_parser = "cargo-test"
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim" }
