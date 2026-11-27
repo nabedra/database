@@ -656,7 +656,7 @@ impl DirectGateway {
             Ok(Some(table)) => table,
             Ok(None) => return Ok(self.queued()),
             Err(_) if get => return Ok(self.queued()),
-            Err(error) => return Err(unsettled(error)),
+            Err(error) => return Err(error),
         };
         let keys = match point {
             Some(key) if key.validate(descriptor.key_type).is_ok() => RouteKeys::single(key),
@@ -675,10 +675,8 @@ impl DirectGateway {
                 .await
             {
                 Ok(Some(table)) if table.schema_epoch == descriptor.schema_epoch => table,
-                Ok(_) if get => return Err(route_unavailable()),
-                Ok(_) => return Err(unsettled(route_unavailable())),
-                Err(error) if get => return Err(error),
-                Err(error) => return Err(unsettled(error)),
+                Ok(_) => return Err(route_unavailable()),
+                Err(error) => return Err(error),
             }
         };
         let mut request = DirectRequest {
@@ -689,10 +687,7 @@ impl DirectGateway {
             group: Uuid::nil(),
             request_id: scanned.request_id,
             digest: digest(body),
-            body: self
-                .shared
-                .copy_bytes(body)
-                .map_err(|error| if get { error } else { unsettled(error) })?,
+            body: self.shared.copy_bytes(body)?,
             deadline: self.deadline,
         };
         let mut uncertain = false;
@@ -767,8 +762,7 @@ impl DirectGateway {
                 "direct read result unavailable",
                 Outcome::NotApplied,
             )),
-            Err(error) if get => Err(self.final_error(error)),
-            Err(error) => Err(self.final_error(unsettled(error))),
+            Err(error) => Err(self.final_error(error)),
         }
     }
 
@@ -852,14 +846,12 @@ impl DirectGateway {
                     return Err(self.final_error(unknown()));
                 }
                 Ok(Terminal::Failed(error)) => return Err(self.final_error(error)),
-                // OD-3: a refusal before the anchor answered (a full leader,
-                // the deadline) proves nothing about an earlier call of this
-                // id, so the identity's outcome is unknown.
                 Err(error)
                     if error.code == ErrorCode::Overloaded
-                        && error.outcome == Outcome::NotApplied =>
+                        && error.outcome == Outcome::NotApplied
+                        && !*uncertain =>
                 {
-                    return Err(self.final_error(unsettled(error)));
+                    return Err(self.final_error(error));
                 }
                 // The anchor cannot be reached: the request may have run
                 // directly before, so it must not go queued.
@@ -1588,21 +1580,6 @@ fn unknown() -> ProtocolError {
         "direct request outcome unknown; retry the same request_id and body",
         Outcome::Unknown,
     )
-}
-
-/// OD-3 and OD-7: a mutation identity spans gateway calls, and only its
-/// anchor can settle it. A refusal the gateway gives before the anchor
-/// answered (the deadline, an unreachable route, a full leader or lane, a
-/// latch that timed out) says nothing about an attempt of an earlier call,
-/// which may still commit. It is `outcome_unknown`; the client retries the
-/// same id and body. A definite answer from the leader, given after its dedup
-/// lookup, is not passed through here. Gets keep their refusals.
-fn unsettled(error: ProtocolError) -> ProtocolError {
-    if error.outcome == Outcome::NotApplied {
-        unknown()
-    } else {
-        error
-    }
 }
 
 fn route_unavailable() -> ProtocolError {

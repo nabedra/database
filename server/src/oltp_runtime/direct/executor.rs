@@ -566,7 +566,6 @@ impl DirectExecutor {
     ) -> Result<(Option<GroupSchema>, Arc<DirectTable>), DirectResponse> {
         if let Some(epochs) = self.known_epochs(handle)
             && let Ok(table) = self.table(request, &epochs, operation, deadline).await
-            && operation.validate_for_table(&table.descriptor).is_ok()
         {
             return Ok((epochs.direct_schema, table));
         }
@@ -577,69 +576,7 @@ impl DirectExecutor {
         )
         .await?;
         let table = self.table(request, &epochs, operation, deadline).await?;
-        if let Err(error) = operation.validate_for_table(&table.descriptor) {
-            return Err(self
-                .refuse_unless_recorded(handle, clock, request, operation, &table, error, deadline)
-                .await);
-        }
         Ok((epochs.direct_schema, table))
-    }
-
-    /// OD-7: the dedup record decides before the current descriptor does. A
-    /// retry of a committed request whose body no longer validates (an index
-    /// or constraint published since) replays its result. Without a record the
-    /// validation error stands: an older attempt validated under an older
-    /// descriptor carries an older direct epoch, which apply refuses.
-    #[allow(clippy::too_many_arguments)]
-    async fn refuse_unless_recorded(
-        &self,
-        handle: &Arc<ParticipantHandle>,
-        clock: &RangeClock,
-        request: &DirectRequest,
-        operation: &Operation,
-        table: &DirectTable,
-        error: ProtocolError,
-        deadline: Instant,
-    ) -> DirectResponse {
-        let key_column = &table.descriptor.key;
-        let has_key = |row: &Row| row.contains_key(key_column.as_str());
-        let keyed = match operation {
-            Operation::Insert(p) | Operation::Upsert(p) => has_key(&p.row),
-            Operation::InsertMany(p) => p.rows.iter().all(has_key),
-            _ => true,
-        };
-        // A body without its key column names no anchor, so it never committed.
-        let Some(keys) = keyed.then(|| self.row_keys(table, operation).ok()).flatten() else {
-            return failed(error);
-        };
-        let MvccKey::Row {
-            primary_key: anchor,
-            ..
-        } = &keys[0]
-        else {
-            unreachable!("row keys only");
-        };
-        let Ok(encoded) = serde_json::to_vec(&keys[0]) else {
-            return failed(corrupt());
-        };
-        let Ok(_latched) = self.latches.lock([encoded.as_slice()], deadline).await else {
-            return failed(unavailable_not_applied());
-        };
-        if by(deadline, handle.direct_barrier()).await.is_err()
-            || by(deadline, clock.wait_latest(&keys[0])).await.is_err()
-        {
-            return failed(unavailable_not_applied());
-        }
-        match by(
-            deadline,
-            handle.direct_dedup_after_barrier(request.table_id, anchor.clone(), request.request_id),
-        )
-        .await
-        {
-            Ok(Some(found)) => self.settled(found, request.digest).unwrap_or_else(|r| r),
-            Ok(None) => failed(error),
-            Err(_) => failed(unavailable_not_applied()),
-        }
     }
 
     async fn table(
@@ -659,7 +596,6 @@ impl DirectExecutor {
             ),
         )
         .await?;
-        // Validation against the descriptor is the caller's (OD-7).
         let table = match lookup {
             SchemaLookup::Table(table) => table,
             SchemaLookup::Blocked => {
@@ -676,6 +612,9 @@ impl DirectExecutor {
                 )));
             }
         };
+        operation
+            .validate_for_table(&table.descriptor)
+            .map_err(failed)?;
         Ok(table)
     }
 
@@ -802,15 +741,11 @@ impl DirectExecutor {
                 )
                 .await?;
                 self.learn_epochs(handle, epochs);
-                let table = timed(
+                timed(
                     perf_stage!("leader.get.table"),
                     self.table(request, &epochs, &parsed.operation, deadline),
                 )
                 .await?;
-                parsed
-                    .operation
-                    .validate_for_table(&table.descriptor)
-                    .map_err(failed)?;
                 match snapshot.latest {
                     Err(error) if error.code == ErrorCode::StorageUnavailable => {
                         if !self.pause(deadline, RetryCause::Unavailable).await {
@@ -1154,11 +1089,8 @@ impl DirectExecutor {
         let committed = match proposed {
             Ok(committed) => committed,
             Err(error) => {
-                // A submitted entry may still apply after its reply is lost.
-                // Keep it visible to readers until apply or a leadership change.
-                if error.outcome == Outcome::NotApplied {
-                    clock.settle(commit_ts);
-                }
+                // T4: the proposal no longer holds its local pending slot.
+                clock.settle(commit_ts);
                 self.proposal_failed(handle, clock, token, deadline, error)?;
                 return Ok(Attempt::Retry(RetryCause::Unavailable));
             }
@@ -1390,9 +1322,7 @@ impl DirectExecutor {
             reason: FallbackReason::ResourceLimit,
         })?;
         if computed.writes.is_empty() {
-            // No eligible mutation plans no write since OD-2 (a miss records
-            // a tombstone). Kept for a future read-only operation, which
-            // would commit nothing and be recomputed on retry.
+            // A read-only outcome commits nothing and is recomputed on retry.
             self.stats.read_only();
             return Ok(Prepared::Exit(Attempt::Done(DirectResponse::Done(
                 DirectData::from_json(result.as_str()).map_err(failed)?,
@@ -1460,7 +1390,7 @@ impl DirectExecutor {
                 let insert = matches!(operation, Operation::Insert(_));
                 let (version, old) = current.into_iter().next().expect("one key");
                 if insert && old.is_some() {
-                    return Err(row_conflict());
+                    return Err(failed(already_exists()));
                 }
                 changes.push((keys[0].clone(), version, old, Some(p.row.clone())));
                 serde_json::Value::Null
@@ -1479,7 +1409,7 @@ impl DirectExecutor {
                 }
                 for (key, (version, old)) in keys.iter().zip(current) {
                     if old.is_some() {
-                        return Err(row_conflict());
+                        return Err(failed(already_exists()));
                     }
                     let encoded = serde_json::to_vec(key).map_err(|_| failed(corrupt()))?;
                     let row = rows.get(&encoded).ok_or_else(|| failed(corrupt()))?;
@@ -1490,10 +1420,7 @@ impl DirectExecutor {
             Operation::Update(p) => {
                 let (version, old) = current.into_iter().next().expect("one key");
                 match old {
-                    None => {
-                        changes.push(recorded_miss(&keys[0], version));
-                        serde_json::Value::Bool(false)
-                    }
+                    None => serde_json::Value::Bool(false),
                     Some(old) => {
                         let new = updated_row(&old, p.values.clone());
                         changes.push((keys[0].clone(), version, Some(old), Some(new)));
@@ -1504,10 +1431,7 @@ impl DirectExecutor {
             Operation::Delete(_) => {
                 let (version, old) = current.into_iter().next().expect("one key");
                 match old {
-                    None => {
-                        changes.push(recorded_miss(&keys[0], version));
-                        serde_json::Value::Bool(false)
-                    }
+                    None => serde_json::Value::Bool(false),
                     Some(old) => {
                         changes.push((keys[0].clone(), version, Some(old), None));
                         serde_json::Value::Bool(true)
@@ -1983,26 +1907,12 @@ fn reused() -> ProtocolError {
         Outcome::NotApplied,
     )
 }
-/// OD-2: an insert whose row exists is a row conflict, a definite answer
-/// that must stay the identity's answer on every retry. The entry format
-/// cannot record a refusal, so the leader does not answer it: the gateway
-/// settles the id at its anchor (`DirectForward`) and the queued path,
-/// which records its terminal answer, decides. A later attempt of the id
-/// finds the marker and cannot apply.
-fn row_conflict() -> DirectResponse {
-    DirectResponse::Fallback {
-        reason: FallbackReason::Ineligible,
-    }
-}
-
-/// OD-2: an update or delete that finds no row records its `false` result
-/// like a write: a tombstone over the head it read, with that head as its
-/// expected version. Apply refuses it with `Conflict` when a writer (direct
-/// or queued) changed the row since, so the recorded answer holds at its log
-/// position, and a retry replays it instead of recomputing. Every build
-/// already applies this shape, so no cluster feature gates it.
-fn recorded_miss(key: &MvccKey, version: Option<CommitTs>) -> RowChange {
-    (key.clone(), version, None, None)
+fn already_exists() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::Conflict,
+        "primary key already exists",
+        Outcome::NotApplied,
+    )
 }
 fn unix_ms() -> u64 {
     nabedra_rt::time::wall_now()
