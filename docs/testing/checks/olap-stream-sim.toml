@@ -8,7 +8,7 @@ tiers = ["T1"]
 # seeded nemesis (lost replies, coordinator kills before and after checkpoint
 # replication, concurrent commits, GET faults, cold start). Includes the three
 # planted-bug sensitivity tests. Seams: docs/testing/olap-stream-sim.md.
-command = ["cargo", "test", "-j", "2", "--locked", "--lib", "node::stream::sim_tests::", "--", "--nocapture", "--test-threads=1"]
+command = ["cargo", "test", "--locked", "--lib", "node::stream::sim_tests::", "--", "--nocapture", "--test-threads=1"]
 cwd = "server"
 timeout_s = 1800
 needs = []

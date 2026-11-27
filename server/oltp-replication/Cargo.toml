@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94.1"
 license = "MIT"
-repository = "https://github.com/zPy52/nabedra-database"
+repository = "https://github.com/nabedra/database"
 publish = ["crates-io"]
 description = "Nabedra OLTP replication"
 

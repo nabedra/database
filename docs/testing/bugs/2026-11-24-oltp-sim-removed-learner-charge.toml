@@ -9,7 +9,7 @@ found_date = "2026-11-24"
 lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
 seed = 7
 why_not_caught = "The O26 runner compares budgets around the mount, not decode charges after the move."
-invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=move NABEDRA_SIM_PROFILE=none, seed 7 (ResourceBaseline): working_decode_bytes returns to its baseline after the move retired."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=move NABEDRA_SIM_PROFILE=none, seed 7 (ResourceBaseline): working_decode_bytes returns to its baseline after the move retired. At c2aad866, where every run installs the probes and has another schedule: seed 7 (dc2035b9171e03c9) still shows it on n2, 444,340 B against 2,056 B (local, unattested, replayed equal)."
 fix_commits = []
 revert_patch_ok = false
 status = "open"

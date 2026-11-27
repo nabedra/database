@@ -1,6 +1,7 @@
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -26,7 +27,7 @@ class RepeatGateTests(unittest.TestCase):
         self.assertFalse(real)
         self.assertEqual(cwd, repeat_gate.ROOT)
         self.assertEqual(rust, [
-            "cargo", "test", "--locked", "--jobs", "2", "--manifest-path", "server/events/Cargo.toml",
+            "cargo", "test", "--locked", "--manifest-path", "server/events/Cargo.toml",
             "--lib", "rust_candidate::tests::replay", "--", "--exact", "--include-ignored",
             "--test-threads=1",
         ])
@@ -47,7 +48,7 @@ class RepeatGateTests(unittest.TestCase):
             )
             test = {"id": "case::test_query", "kind": "rust", "file": "server/tests/query/cases.rs"}
             command, _, _ = repeat_gate.test_command(test, root)
-        self.assertEqual(command[7:13], ["--no-default-features", "--features", "olap",
+        self.assertEqual(command[5:11], ["--no-default-features", "--features", "olap",
                                         "--test", "query", "case::test_query"])
 
     def test_catalog_rust_name_resolves_nested_tests_and_reuses_listing(self):
@@ -101,6 +102,15 @@ class RepeatGateTests(unittest.TestCase):
         for kind, log in log_cases.items():
             with self.subTest(kind=kind):
                 self.assertFalse(repeat_gate.assertion_ran(kind, log))
+
+    def test_cargo_builds_with_two_jobs_unless_the_caller_chose(self):
+        for caller, jobs in (({}, "2"), ({"CARGO_BUILD_JOBS": "4"}, "4")):
+            with self.subTest(caller=caller), patch.dict(os.environ, caller):
+                if not caller:
+                    os.environ.pop("CARGO_BUILD_JOBS", None)
+                with patch("sys.stdin", io.StringIO("[]")), redirect_stdout(io.StringIO()):
+                    self.assertEqual(repeat_gate.main([]), 0)
+                self.assertEqual(os.environ["CARGO_BUILD_JOBS"], jobs)
 
     def test_dry_run_consumes_catalog_and_never_spawns(self):
         body = json.dumps({"tests": [RUST, NODE]})

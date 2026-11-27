@@ -5,7 +5,7 @@ guarantees = ["LSM-G01", "LSM-G02", "LSM-G03"]
 scenarios = ["LSM01", "NS05"]
 tiers = ["T1"]
 # Fault model. Repeat the sampled T1 workload with five times its seed count.
-command = ["cargo", "test", "--locked", "-j", "2", "-p", "nabedra-kv", "--features", "sim", "--test", "campaign", "sim::lsm01_sampled_replay_sweep", "--", "--exact", "--nocapture", "--test-threads=1"]
+command = ["cargo", "test", "--locked", "-p", "nabedra-kv", "--features", "sim", "--test", "campaign", "sim::lsm01_sampled_replay_sweep", "--", "--exact", "--nocapture", "--test-threads=1"]
 cwd = "server"
 timeout_s = 1800
 needs = []

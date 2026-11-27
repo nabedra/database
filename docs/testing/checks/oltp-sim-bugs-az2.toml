@@ -1,0 +1,17 @@
+id = "oltp-sim-bugs-az2"
+module = "oltp"
+kinds = ["S", "H"]
+# The counting run of az2, searched in shards (server/sim-oltp/bugs/SHARDS.md). It reads the attested records of
+# oltp-sim-bugs-az2-1 to -8 from az2/ of the branch evidence/sim-bugs, verifies each, merges them again, refuses a
+# recorded merge that differs, and repeats both builds, the hit, its twin, the base run around it and the regression. It passes
+# only when the target is found by the rule in server/sim-oltp/bugs/README.md. A missing or unattested shard is incomplete.
+guarantees = ["OLTP-G08"]
+scenarios = ["O26"]
+tiers = ["T3"]
+command = ["python3", "scripts/testing/sim_bugs.py", "count", "az2", "--jobs", "4", "--sim-jobs", "4",
+           "--out", "target/testing-logs/oltp-sim-bugs-az2"]
+cwd = "."
+timeout_s = 18000
+needs = []
+result_parser = "exit-code"
+env = { RUSTFLAGS = "--cfg tokio_unstable", RUST_MIN_STACK = "16777216" }

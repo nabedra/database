@@ -1,0 +1,32 @@
+# Observed on main 78334d4e in Actions run 45727968538 (request verify-78334d4-012010), job 139602640550, check
+# oltp-growth-activation-repeat: O16 direct_oltp=off attempt 5 of 20 failed, the other 39 attempts passed (on 20/20,
+# off 19/20). Test oltp_growth_acceptance::acceptance_o16, which panicked at src/oltp_acceptance/growth.rs:50:5 with
+# "O16 RF3 assertions failed"; the atomic-activation clause did not run.
+# Failing line: server/tests/oltp_direct_cluster.py:435 (check_exits, from wait_workers at 466), called from
+# launch_retained (server/tests/oltp_growth_acceptance.py:166) in snapshot_recovery (263). The fixture had stopped w2
+# while a Data snapshot install was staged on it, and relaunched it with its retained volume. The child
+# oltp_runtime::recovery_tests::actual_runtime_child printed "rolling worker ... enrollment applied" and
+# "registered ... enrolled", then "registered startup Conflict: registered worker cannot join the current ready
+# revision" and panicked at src/oltp_runtime/recovery_tests.rs:512:14 ("registered worker startup failed"), exit 101.
+# That text is server/src/oltp_runtime/bootstrap/registered/restart.rs:119: Control answered the ready join with
+# something other than JoinBegun or a Busy, Stale or NotReady rejection.
+# Not diagnosed: which answer Control gave, and why, is not in the log. Not reproduced locally. The record
+# OLTP-sim-enrolled-restart-blocks-prepare (seed 41) is about later restart prepares after a failed enrolled restart in
+# the simulator. This is a real-process run and no shared cause is shown.
+id = "O16-RETAINED-RESTART-JOIN-REFUSED"
+title = "An O16 retained restart during a staged snapshot install exited because Control refused its ready join"
+class = "other"
+module = "oltp"
+guarantees = []
+scenarios = ["O16"]
+found_by = "ci-flake"
+found_date = "2026-11-26"
+lowest_regression = "check oltp-growth-activation-repeat (server/tests/oltp_growth_acceptance.py o16, snapshot_recovery, launch_retained)"
+seed = "unknown"
+why_not_caught = "The failure is intermittent, 1 of 40 O16 attempts in this run. Other runs of the check were not read for it."
+invariant_added = "Intended, not met: a worker restarted with its retained volume while a Data snapshot install is staged rejoins the same run's ready set, so the retry can activate the staged snapshot."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-26"

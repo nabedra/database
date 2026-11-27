@@ -17,12 +17,10 @@ When you are given a task or asked to make a change, do the following:
      focused Actions checks on the PR head when useful during development. Merge after the
      applicable [review](../code-review/SKILL.md#verification-rules), then run broad Actions verification once on the resulting `main` SHA
      after a batch of PRs merges.
-7. After the merge, remove the PR branch and worktree if they are no longer needed. Then run `git pull` on the base branch.
+7. After the merge, retarget PRs stacked on the branch (`gh pr edit <n> --base main`), or GitHub closes them when the branch goes. Remove the PR branch and worktree if they are no longer needed. Then run `git pull` on the base branch.
 
 Use the [Nabedra builds skill](../nabedra-builds/SKILL.md) to choose where to
 run builds and expensive checks. Apply it when coordinating concurrent agents.
-GitHub Actions runs by manual dispatch only. Follow
-[GitHub Actions for checks](../code-review/references/gh-actions.md) for dispatch commands.
 
 When the user asks to release, publish, tag or ship a version, or whether a release is due,
 follow [Releasing Nabedra](references/releasing.md). Never publish outside that process.

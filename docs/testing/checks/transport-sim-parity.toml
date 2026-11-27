@@ -6,7 +6,7 @@ scenarios = ["D10", "O05", "C07", "O17"]
 tiers = ["T0", "T1"]
 # Transport fault model. The parity fixtures run the same assertions over loopback mTLS
 # and the simulated network. Cluster acceptance runs separately.
-command = ["cargo", "test", "--locked", "-p", "nabedra-transport", "--lib", "-j", "2", "--features", "sim", "sim_parity", "--", "--test-threads=1"]
+command = ["cargo", "test", "--locked", "-p", "nabedra-transport", "--lib", "--features", "sim", "sim_parity", "--", "--test-threads=1"]
 cwd = "server"
 timeout_s = 1800
 needs = []

@@ -70,7 +70,7 @@ Logs and histories stay in Actions artifacts. A record stays valid after its art
 The workflow signs each record it writes with `actions/attest-build-provenance`. The matrix accepts
 only records whose signatures verify, so a hand-written or locally produced record never counts.
 Local records help the author iterate. They are not evidence of verification. To check a record by
-hand, run `gh attestation verify <record> --repo zPy52/nabedra-database`. Release evidence is also
+hand, run `gh attestation verify <record> --repo nabedra/database`. Release evidence is also
 attached to the GitHub release.
 
 After a build dispatch or schedule completes, `nabedra-evidence.yml` downloads its evidence

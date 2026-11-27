@@ -8,9 +8,8 @@ description: Decide where Nabedra builds and expensive verification run. Offload
 Use standard GitHub-hosted Linux runners for builds and verification that are
 slow or resource-heavy on this machine. The repository is public, so they cost
 nothing. The limits are 20 concurrent jobs, the 10 GB cache and the shared API
-rate limit. Start every run by deliberate dispatch, pinned to a commit, as
-[GitHub Actions for checks](../code-review/references/gh-actions.md) describes.
-Pushes and commit messages start nothing. That page covers dispatching,
+rate limit. Runs start only by dispatch, pinned to a commit.
+[GitHub Actions for checks](../code-review/references/gh-actions.md) covers dispatching,
 finding, waiting on, rerunning and recording runs, and the quarantine.
 
 Keep these local:

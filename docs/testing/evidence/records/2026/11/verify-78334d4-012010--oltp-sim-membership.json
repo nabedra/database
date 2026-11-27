@@ -1,0 +1,41 @@
+{
+  "artifacts": [
+    {
+      "name": "verify-78334d4-012010--oltp-sim-membership.log",
+      "sha256": "18ee47e57a9e5616e24a5498ece3d67a626e7a8bade580e1ca5b595577b26aa3"
+    }
+  ],
+  "assertions": {
+    "executed": 52,
+    "failed": 1,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "oltp-sim-membership",
+  "duration_s": 891.859,
+  "guarantees": [
+    "OLTP-G07",
+    "OLTP-G08"
+  ],
+  "kind": "S H",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-26T01:17:04.482870+00:00",
+    "request_id": "verify-78334d4-012010",
+    "runner": "GitHub Actions 1000014594",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45727968538"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "78334d4eb3b5d05ae7c72eb39bcf3eca0b792ee5",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

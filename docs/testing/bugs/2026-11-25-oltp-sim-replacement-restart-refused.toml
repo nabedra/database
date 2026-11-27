@@ -1,0 +1,17 @@
+id = "OLTP-sim-replacement-restart-refused"
+title = "The retained restart of a replacement worker is refused until the survivors restart with its certificate pin"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G08"]
+scenarios = ["O17"]
+found_by = "campaign"
+found_date = "2026-11-25"
+lowest_regression = "server/sim-oltp/src/sweep.rs sweep::tests::sweep"
+seed = 5
+why_not_caught = "No test restarts a replacement before the survivors restart."
+invariant_added = "Fault model, NABEDRA_SIM_WORKLOAD=membership, default profile, seeds 2, 5, 17, 19 and 23 of 1 to 32 at d63ba0dc (check oltp-sim-membership, Actions run 45648985850, kind ReplacementRestart, each replayed equal; seed 5 is trace 2a0313d24ed5f4af): worker.restart.prepare for a completed replacement answers Control role is not authorized on both survivors. By reading, prepare_restart tests the pins read at the survivors' own start, while other operator checks use the registered directory. Operator guidance only: docs/oltp-recovery.md step 7 says that a restart after queue join needs the normal retained-mount procedure, and does not mention the survivors' pins. At c2aad866, where every run installs the probes and has another schedule: the same seeds, 2 (27998cfaacb2f1e3), 5 (4d97c72d0dd48b92), 17, 19 and 23 (Actions run 45687381596, each replayed equal)."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

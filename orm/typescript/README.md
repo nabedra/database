@@ -179,7 +179,7 @@ unchanged, or `null` when the key is missing. Counters take and return
 For a cluster, pass `cluster: true` and a list of seed endpoints. If the
 cluster nodes have different hostnames from the seeds, list them in
 `allowedNodes` or give their common DNS suffix in `allowedNodeSuffix`. The
-[shared Cache contract](https://github.com/zPy52/nabedra-database/tree/main/orm/cache-contract)
+[shared Cache contract](https://github.com/nabedra/database/tree/main/orm/cache-contract)
 describes deadlines, routing and errors.
 
 ## Other entry points

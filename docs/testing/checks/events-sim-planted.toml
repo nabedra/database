@@ -9,7 +9,7 @@ kinds = ["S", "H"]
 guarantees = []
 scenarios = []
 tiers = ["T1", "T2"]
-command = ["cargo", "test", "--locked", "-j", "2", "--features", "sim", "--lib", "sim::tests::planted_", "--", "--nocapture", "--test-threads=1"]
+command = ["cargo", "test", "--locked", "--features", "sim", "--lib", "sim::tests::planted_", "--", "--nocapture", "--test-threads=1"]
 cwd = "server/events"
 timeout_s = 3600
 needs = []

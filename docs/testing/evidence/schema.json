@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/zPy52/nabedra-database/docs/testing/evidence/schema.json",
+  "$id": "https://github.com/nabedra/database/blob/main/docs/testing/evidence/schema.json",
   "title": "nabedra.evidence/1",
   "description": "One record per run and check, stored at docs/testing/evidence/records/<yyyy>/<mm>/<request_id>--<check>.json and kept under 20 KB. `kind` holds one or more check-kind letters separated by single spaces (a check that provides U and S writes \"U S\"). Logs and histories stay in Actions artifacts; `artifacts` lists their SHA-256 digests.",
   "type": "object",

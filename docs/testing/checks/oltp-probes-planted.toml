@@ -22,8 +22,8 @@ git -C "$root" worktree add --detach "$scratch" HEAD >/dev/null
 probes=server/sim-oltp/src/probes
 cd "$scratch/server"
 sweep() {
-    cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib --no-run
-    timeout 900s cargo test --locked -j 2 --release -p nabedra-sim-oltp --lib -- \
+    cargo test --locked --release -p nabedra-sim-oltp --lib --no-run
+    timeout 900s cargo test --locked --release -p nabedra-sim-oltp --lib -- \
         --exact --ignored --nocapture --test-threads=1 "probes::tests::$1"
 }
 sweep clean_twin_reports_nothing
