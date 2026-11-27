@@ -1,0 +1,18 @@
+# Finding SIM-2 of the review wave (rv-sim, 2026-11-26). The Cache sweep ran the relaxed checker with
+# lag_window_ns = None, so a failover could lose any acknowledged write above the promoted copy's prefix, however old,
+# and every owner change, planned moves included, was written as a failover marker. The checker regressions in
+# server/check/tests/history_cache_handover.rs failed on 6417c4dd (run 45975845424) and pass on the fix.
+id = "cache-sim-unbounded-failover-loss"
+title = "The Cache fault model excused any lost write above the promoted prefix, also across a planned handover"
+class = "other"
+module = "cache"
+guarantees = ["CACHE-G05"]
+scenarios = ["K03"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/check/tests/history_cache_handover.rs::k03_loss_across_a_planned_handover_is_flagged_with_or_without_a_window"
+seed = "unknown"
+why_not_caught = "Phase 12 left the lag window unset on the grounds that ReplicaPrefix bounds the copies' digests, which does not bound the loss in a client history."
+invariant_added = "No acknowledged write is lost across a handover marker; a failover loses only writes acknowledged within the fault model's lag window before the old grant ended; AckAfterHandover flags a mutation published after a successor kept its prefix."
+fix_commits = ["7ed7f21bdc4ceb62253ebbe40f22c6ac6d40171a"]
+revert_patch_ok = false

@@ -58,9 +58,11 @@ Default to sampled LRU within each slot. Also support a `noeviction` profile tha
 
 **Failover and restart.** After fencing the previous authority, promote an eligible replica from its last contiguous prefix, assign a new epoch, and build a replacement copy. At controller startup and after a change of term, start a 3 s observation window. During that window, treat an enrolled incarnation without a current-term report as unknown. Defer failover and replica replacement that would rely on its silence. A current-term report or a committed retirement can establish the incarnation's status earlier. A worker first heard late gets a full report-age interval from receipt before its report can expire. Rebuild a replica's verified baseline as early as possible to reduce the interval without an eligible recovery copy. Start failed workers with empty RAM and a fresh incarnation. Require catch-up before they can take over. Continue serving unrelated slots under their valid grants. Outside staged recovery, when both usable copies are lost, an operator requests a scoped cold reset that fences the old epoch and starts the slot empty. A complete fleet cold reset increments the cluster generation and clears all slot data and pending cache work. If scoped repair issued grants to returning workers, pause their renewals and wait for those grants to expire before requesting the fleet reset. Persist only the new topology. A peer returning late with the old generation cannot republish data.
 
-**Recovery during replica replacement.** For K03, prefer a ready assigned replica. Once the current-term observation rule permits recovery, an enrolled staged target that reports a verified current-epoch baseline can become primary when it holds the last verified copy. Promote it even when the retained prefix trails the latest committed source progress by more than 32 mutations. Ordinary transfers still use the 32-mutation cutover limit. The source watermark is recorded when staging starts and advanced by committed renewals for that move. A target can hold more mutations than the last source report records, so this watermark alone cannot bound lost acknowledgments. The committed transition identifies both incarnations, the retained epoch and sequence, the source watermark, and the source's retirement or latest expired lease. Validate the transition against the expected slot, including its epoch, staged target and latest lease. The choice of the best verified copy uses observations from the current term.
+**Recovery during replica replacement.** For K03, prefer a ready assigned replica. Once the current-term observation rule permits recovery, an enrolled staged target that reports a verified current-epoch baseline can become primary when it holds the last verified copy. Promote it even when the retained prefix trails the latest committed source progress by more than 32 mutations. Ordinary transfers still use the 32-mutation cutover limit. The source watermark is recorded when staging starts and advanced by committed renewals for that move. A target can hold more mutations than the last source report records, so this watermark alone cannot bound lost acknowledgments. The committed transition identifies both incarnations, the retained epoch and sequence, the source watermark, and the source's retirement or latest expired lease. Validate the transition against the expected slot, including its epoch, staged target and latest lease. The choice of the best verified copy uses observations from the current term. A heartbeat carries no order, so the controller keeps the newest progress it has received for a primary's slot in the current term. A late, older heartbeat from the same incarnation cannot lower the source progress that an ordinary transfer is measured against.
 
-Retirement prevents renewals. A copy follows the source incarnation for its assigned epoch until it installs a newer epoch, including after that source retires. The controller commits staged promotion only once its lower bound reaches the source's latest committed expiry. The new grant starts at or after that expiry. Writes acknowledged on the last grant remain subject to asynchronous replication loss.
+The committed proof states whether the target held the last verified copy. Apply accepts a lag beyond the cutover limit only for such a proof, and the planner proposes one only when neither the source nor the assigned replica can serve. This holds for a crashed and for a retired source.
+
+Retirement prevents renewals. A copy follows the source incarnation for its assigned epoch until it installs a newer epoch, including after that source retires. The controller commits staged promotion only once its lower bound reaches the source's latest committed expiry. The new grant starts at or after that expiry. Writes acknowledged on the last grant remain subject to asynchronous replication loss. Apply checks the time fence again for every staged promotion: the entry's lower bound must reach the prior grant's expiry, whether the source retired or its lease expired. Retirement only spares the wait for the source's report to age out.
 
 When the source and assigned replica are unavailable during a staged replica replacement and the target has no usable verified baseline, the controller can cold-reset that slot automatically. It waits one progress-report window (3 s) after the later of the last committed grant's expiry and the start of observations in the current term. Outside a staged replica replacement, a slot without a usable copy waits for a scoped operator reset. Recovery changes take priority in batches of up to 256 per 250 ms reconcile turn. With a stable quorum and reachable workers, allow one renewal interval to install the placement and another for a fresh grant. A cold reset advances the epoch, records the loss, and initializes empty storage. Unrelated slots keep their contents and authority.
 
@@ -159,7 +161,7 @@ Reviewed 2026-11-26 by rv-cache against the shipped code on main `e6b4040b` wher
 
 ### Baseline configurations
 
-All 16 broad configurations use three workers, two client IDs, one slot and one key. Time is in model ticks.
+All 20 broad configurations use three workers, two client IDs, one slot and one key. Time is in model ticks.
 `D = MaxDrift = TTL = 1`, `L = RA = G = 3` and `MaxLag = 0`. The model requires staged promotion to retain at least the
 reported prefix. The production threshold of 32 mutations is outside these bounds. All safety configurations
 use worker and client symmetry and start from any distinct primary and replica. Clocks start at zero skew
@@ -175,16 +177,20 @@ except `.live` which uses three.
 | --- | ---: | ---: | --- |
 | `CacheCluster.cfg` | 4 | 1 | Crash and controller partition. |
 | `CacheCluster.autoreset.cfg` | 7 | 0 | Crash and leadership change during automatic staged reset. |
-| `CacheCluster.data.cfg` | 4 | 2 | Delayed replication reply with SET, TTL and DEL interleavings. |
+| `CacheCluster.data.cfg` | 4 | 1 | Delayed replication reply with one SET or TTL write and its expiry. |
+| `CacheCluster.datadel.cfg` | 4 | 2 | Delayed replication reply with a SET and a DEL. |
+| `CacheCluster.drift.cfg` | 4 | 1 | One worker or controller clock drift step. |
 | `CacheCluster.failover2.cfg` | 4 | 2 | Controller partition with SET and DEL across failover. |
 | `CacheCluster.fixed.cfg` | 4 | 1 | Live source re-enrollment with the `follow_retired` and `observe_window` variants enabled. |
-| `CacheCluster.lead.cfg` | 4 | 1 | Leadership change and one worker or controller clock drift step. |
+| `CacheCluster.lead.cfg` | 4 | 1 | Leadership change. |
 | `CacheCluster.live.cfg` | 8 | 0 | Crash before tick 2 and the `D6_StagedRepair` liveness property. |
 | `CacheCluster.move.cfg` | 5 | 1 | Crash and an operator-ordered online move. |
 | `CacheCluster.peer.cfg` | 4 | 1 | Peer partition and crash while the replica lags. |
-| `CacheCluster.reset.cfg` | 4 | 1 | Operator cold reset (scoped or fleet) and delayed replication reply. |
+| `CacheCluster.reset.cfg` | 4 | 1 | Operator cold reset (scoped or fleet) and delayed replication reply, SET only. |
 | `CacheCluster.restart.cfg` | 4 | 0 | Crash, restart with a new incarnation, and lost heartbeat reply. |
-| `CacheCluster.skew.cfg` | 4 | 1 | Clock drift and controller partition from extreme initial clock skew. |
+| `CacheCluster.skew.cfg` | 4 | 0 | Clock drift and controller partition from extreme initial clock skew. |
+| `CacheCluster.skewcut.cfg` | 3 | 2 | Controller partition from extreme initial clock skew, SET only. |
+| `CacheCluster.skewttl.cfg` | 4 | 1 | Controller partition from extreme initial clock skew, one TTL write. |
 | `CacheCluster.skewstaged.cfg` | 5 | 0 | Live source re-enrollment from extreme initial clock skew. |
 | `CacheCluster.staged.cfg` | 4 | 1 | Live source re-enrollment during staged promotion. |
 | `CacheCluster.stagedcut.cfg` | 5 | 0 | Controller partition during staged promotion or reset. |
@@ -192,13 +198,18 @@ except `.live` which uses three.
 
 ### Search limits
 
-The first run reached the 900 s limit per configuration with broader parameter combinations.
+The first run reached the 900 s limit per configuration with broader parameter combinations, and the second
+stopped four of 16 (data, lead, reset and skew). Phase 2 split those four: TTL writes and two-write SET and DEL
+interleavings run in separate data baselines, the leadership change and the drift step run apart, the reset baseline
+writes SET only, and the skew baselines separate the drift step, a two-SET overlap and a TTL write. The two P1 mutants
+moved to the skewed two-SET bounds, since exact clocks cannot show an ignored error bound, and the early-commit mutant
+moved to the staged bounds, where a staged promotion is reachable.
 The new settings include every modelled fault kind across the safety baselines. They cover selected overlaps.
 Live source re-enrollment with a peer partition remains outside these bounds. The separate recovery policy check
 covers late reporting around a term change and controller partition. Report-age timing after late receipt
 requires the runtime checker. Review of the L2 fault bounds is pending. The model caps the time, epoch and mutation
 counts through its constants, with no TLC state constraint, depth cap or `VIEW`.
-At most two writes run in the broad data and controller-partition baselines. The other broad configurations
+At most two writes run in the datadel, failover2 and skewcut baselines. The other broad configurations
 have at most one write. `Write` abstracts each mutation as one actor turn and its effect omits client identity.
 These bounds cover mutation order within that abstraction and leave queueing and request overlap before or
 after the actor turn outside the model. The liveness check covers a crash without ongoing writes from one
@@ -234,12 +245,12 @@ replication in 10 states (`G05_LossOnlyFromLag`). Observation-window mutants fai
 ordinary transfer lag mutants failed in 57 and 47 states. The broad baselines retain their original properties and
 bounds. These schedules provide evidence for the listed cases only.
 
-### Retired-source rollout
+### Retired-source handover
 
-New controllers wait for grant expiry when planning a retired-source promotion. The state machine retains its original
-validation of previously committed reconciliation entries so log replay produces the same topology after upgrading.
-Finish upgrading controller leadership before relying on this planner rule throughout a cluster. Apply-time enforcement
-across mixed binaries requires a separately versioned command and rollout model.
+The controller and worker protocol is version 2 (`protocol.rs` `VERSION`). Version 2 changed the staged promotion
+proof (`last_copy`) and its apply rule, and the controller state's receipt and retired-incarnation histories. Every
+controller, worker and peer message checks the version, and a controller log or snapshot of version 1 does not decode,
+so an older peer or store is refused rather than read. There is no mixed-version rollout.
 
 A replica in the same generation keeps the exact authenticated endpoint from its previous view while its slots still
 name that incarnation as their source. It continues pulling the retiring source's acknowledged tail. Replica apply
@@ -249,3 +260,33 @@ copy needs it or the cluster generation changes. A worker commissioned after ret
 The model batches planning and commitment into one action. K03 must exercise reports and an outstanding recovery
 proposal crossing a controller term change, as well as the measured age of a late first report and the time needed
 to rebuild a replica baseline.
+
+### Capacity limits found in review
+
+These limits come from code reading and constants, except where a run is named. They bound the asynchronous loss
+window that CACHE-G05 allows, so K02, K04b and K05 measure them.
+
+- Replication throughput per slot (CACHE-6). A copy probes at most 256 slots per 25 ms poll of a source lane and takes
+  at most 8 deltas per probe, one actor round trip per packet. A slot in a lane of 5,461 slots is probed about every
+  550 ms, so it sustains about 15 writes/s. Sweep seed 191 (run 45979686152) showed it: after a 2.7 s replica pause a
+  hot slot at about 10 writes/s stayed 15 mutations behind for 8 s. A slot whose reply carried a full batch is now
+  probed again on the next poll. Batching `Apply` per actor and a per-slot journal floor remain open. One actor
+  journal of 3 MiB serves all its slots, so an actor above about 1,260 writes/s restarts snapshots that it cannot
+  resume.
+- Controller fan-out (CACHE-7). A reply carries the whole topology (about 4.5 MB of JSON for 16,384 slots) whenever
+  the revision changed, and each heartbeat carries every slot's progress and commits one Raft entry. During repair the
+  revision changes every 250 ms: about 54 MB/s of leader egress at 12 workers. Revision diffs, changed-slot progress
+  and batched renewals change the heartbeat and update messages. They are a redesign of the control channel and
+  are not implemented yet.
+- Repair after an AZ loss (CACHE-9). With one of three workers lost: lease (3 s), then about 22 reconcile turns of
+  256 promotions (5.5 s), then replica rebuilds at 64 moves per worker, about 171 waves of about 2.25 s, so about
+  6.4 min until every slot has a replica again. Time to full coverage is about
+  `L + ceil(S / 256) * 250 ms + ceil(S / (64 * W)) * (4 * renewal + 2 * reconcile + lane sweep)` for `S` lost slots and
+  `W` surviving workers. A slot is without an eligible recovery copy during that time.
+- Hot-path admission (CACHE-10). Two I/O threads carry all TLS, RESP, peer and controller work, and one worker-wide
+  semaphore of 32 pending turns serves 64 connections, so one stalled actor can turn every slot of the worker `BUSY`.
+- Smaller costs (CACHE-11): a table grow rehashes a slot in one turn, a snapshot pin clones the slot in one turn, and
+  `noeviction` returns OOM without reclaiming due keys first.
+- Controller histories (CACHE-8). Operator receipts keep the latest 8,192 operations and drop the oldest, so an
+  operation ID is deduplicated across at least that many topology operations. Each node keeps its last 8 retired
+  incarnations. Restarts and operations no longer fill the state machine.
