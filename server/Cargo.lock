@@ -1939,6 +1939,8 @@ dependencies = [
  "bytes",
  "libc",
  "nabedra-rt",
+ "nabedra-sim",
+ "serde_json",
  "tokio",
 ]
 

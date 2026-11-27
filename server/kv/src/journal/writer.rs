@@ -536,6 +536,11 @@ impl Writer {
             };
             ok = written.is_ok();
         }
+        #[cfg(feature = "sim")]
+        if ok && !self.placements.is_empty() {
+            let last_seq = self.next_write_seq - 1;
+            crate::sim_trace::report(crate::sim_trace::JournalStep::Written { last_seq });
+        }
         if !ok {
             self.fail_group(items);
             return Ok(());
@@ -650,6 +655,15 @@ impl Writer {
         self.shared.visible.store(visible, Ordering::Release);
         if synced {
             self.shared.durable.store(self.durable, Ordering::Release);
+        }
+        #[cfg(feature = "sim")]
+        if !self.placements.is_empty() {
+            let durable = self.shared.durable.load(Ordering::Acquire);
+            crate::sim_trace::report(if synced {
+                crate::sim_trace::JournalStep::Synced { synced: self.durable, visible, durable }
+            } else {
+                crate::sim_trace::JournalStep::Published { visible, durable }
+            });
         }
 
         // Count the group before any waiter wakes: a caller that reads the stats right
@@ -967,6 +981,11 @@ impl Writer {
         }
         if let Some(visible) = visible {
             self.shared.visible.store(visible, Ordering::Release);
+            #[cfg(feature = "sim")]
+            crate::sim_trace::report(crate::sim_trace::JournalStep::Published {
+                visible,
+                durable: self.shared.durable.load(Ordering::Acquire),
+            });
         }
         // Count before any waiter wakes (ns08).
         let stats = &self.shared.stats;
