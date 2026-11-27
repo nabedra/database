@@ -190,7 +190,7 @@ impl Cluster {
                 node,
                 process_sim::with_supervisor(
                     server,
-                    api_process::run_api_configured(path, false, false),
+                    api_process::run_api_configured(path, false),
                 ),
             )
             .await
