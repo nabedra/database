@@ -263,12 +263,13 @@ fn votes_twice(fault: DiskFault, planted: bool) -> bool {
             DiskFault::Wipe => {
                 world.crash(1);
                 world.wipe(1, Path::new(DATA), Wipe::Reformat);
-                world.restart(1);
+                // The other volumes come back as the crash left them.
+                world.restart_with(1, Cut::Crash);
             }
             DiskFault::Restore => {
                 world.power_off(1);
                 world.restore_volume(&before);
-                world.restart(1);
+                world.restart_with(1, Cut::Crash);
             }
         }
         in_node(1, async { vote(5, 8, planted) }).await

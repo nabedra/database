@@ -638,7 +638,9 @@ impl World {
     /// Puts `snapshot` back as the volume it was taken of, on its crashed node, under the
     /// same identity (device, filesystem uuid, mount id): the disk is rolled back, and
     /// nothing at the mount tells the node so. The old image is halted. One snapshot can be
-    /// restored many times; each restore is a copy. Then [`World::restart`] the node.
+    /// restored many times; each restore is a copy. Then restart the node with
+    /// [`World::restart_with`], which also brings its other volumes back from the cut (a
+    /// plain [`World::restart`] leaves them halted).
     ///
     /// # Panics
     ///

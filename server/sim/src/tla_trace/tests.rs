@@ -787,7 +787,7 @@ fn world_faults_are_logged_in_order() {
         volume.inject(nabedra_rt::fs::Fault::on(nabedra_rt::fs::FsOp::Open));
         world.set_volume_capacity(2, Path::new("/data"), Some(0));
         {
-            use nabedra_rt::fs::{Fs, FsFile, OpenMode};
+            use nabedra_rt::fs::{Fs, OpenMode};
             assert!(
                 volume
                     .open(Path::new("/data/a"), OpenMode::CreateNew)
@@ -933,7 +933,13 @@ fn a_mapped_fault_must_meet_its_declaration() {
     };
     assert_eq!(
         crash(|mut line| {
-            assert_eq!(line.fault, Fault::Crash { node: 2, power_off: false });
+            assert_eq!(
+                line.fault,
+                Fault::Crash {
+                    node: 2,
+                    power_off: false
+                }
+            );
             line.action = "Stop".into();
             line.vars = json!({"up": false});
             line.msg = None;
@@ -983,8 +989,9 @@ fn a_label_names_one_of_several_traces_of_a_seed() {
 #[test]
 fn a_workload_without_a_world_traces_on_a_hosting_world() {
     let dir = Dir::new();
+    let dir = &dir;
     let path = runtime::run(9, |world| async move {
-        let trace = open(builder(), &world, &dir).unwrap();
+        let trace = open(builder(), &world, dir).unwrap();
         // No World node: the spec's names stand alone.
         trace
             .steps()
@@ -1018,10 +1025,11 @@ fn stream_network_faults_are_logged_in_order() {
         }
     }
     let dir = Dir::new();
+    let dir = &dir;
     let path = runtime::run(7, |world| async move {
         world.add_node(1, NodeClock::default());
         world.add_node(2, NodeClock::default());
-        let trace = open(builder(), &world, &dir).unwrap();
+        let trace = open(builder(), &world, dir).unwrap();
         good(&trace.steps());
         let listener = world.listen(2, "0.0.0.0:7000".parse().unwrap()).unwrap();
         let addr = listener.local_addr();

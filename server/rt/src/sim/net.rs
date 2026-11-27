@@ -788,7 +788,7 @@ pub(crate) fn crash(world: &World, node: u64, black_hole: bool) {
         let flush = state.fidelity.kill_flush_per_mille;
         let State {
             conns, rng, faults, ..
-        } = state;
+        } = &mut *state;
         for (id, conn) in conns.iter_mut() {
             let Some(side) = [Side::Client, Side::Server]
                 .into_iter()

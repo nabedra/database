@@ -997,7 +997,7 @@ impl World {
             .filter(|job| job.context.id == node)
             .filter_map(|job| match &lock(&job.ends).stop.as_ref()?.at {
                 At::Call(call) => Some(call.clone()),
-                At::Clock => None,
+                At::Clock | At::Sleep => None,
             })
             .collect()
     }
