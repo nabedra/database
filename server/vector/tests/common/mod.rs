@@ -174,7 +174,7 @@ pub struct ChaosDisk {
 }
 
 fn aligned(ptr: *const u8, offset: u64, len: usize) -> Option<String> {
-    let bad = offset % PAGE as u64 != 0 || len % PAGE != 0 || (ptr as usize) % PAGE != 0;
+    let bad = !offset.is_multiple_of(PAGE as u64) || !len.is_multiple_of(PAGE) || !(ptr as usize).is_multiple_of(PAGE);
     bad.then(|| format!("offset {offset}, length {len}, buffer at {:#x}", ptr as usize))
 }
 
@@ -510,10 +510,15 @@ pub fn grid(g: &mut Gen, dim: usize) -> Vec<f32> {
     (0..dim).map(|_| g.range_i64(-8, 8) as f32 / 8.0 * scale).collect()
 }
 
+/// A thread of a test, started through `nabedra-rt` as product threads are.
+pub fn spawn_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> std::thread::JoinHandle<T> {
+    nabedra_rt::task::spawn_service("vector-test", f).expect("a test thread starts")
+}
+
 /// Runs `f` on a thread and fails the test if it does not finish in time, instead of hanging.
 pub fn within<T: Send + 'static>(secs: u64, what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    spawn_thread(move || {
         let _ = tx.send(f());
     });
     match rx.recv_timeout(std::time::Duration::from_secs(secs)) {

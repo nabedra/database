@@ -441,10 +441,10 @@ fn nr08_stopping_with_messages_in_flight_drops_every_job_once_and_runs_none_afte
             let job = spread(Token(dropped.clone()), ran.clone(), made.clone(), 4);
             let _ = cores.submit((i % 3) as usize, Class::ALL[(i % 5) as usize], 1, job);
         }
-        std::thread::sleep(Duration::from_micros(100 + (iter * 53) % 2000));
+        nabedra_rt::time::thread_sleep(Duration::from_micros(100 + (iter * 53) % 2000));
         within(10, "shutdown", move || cores.shutdown());
         let ran_after = ran.load(Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(2));
+        nabedra_rt::time::thread_sleep(Duration::from_millis(2));
         assert_eq!(ran.load(Ordering::SeqCst), ran_after, "a job ran after shutdown");
         assert_eq!(
             dropped.load(Ordering::SeqCst),
@@ -463,7 +463,7 @@ fn nr09_a_call_racing_stop_always_gets_an_answer() {
         let hs: Vec<_> = (0..3)
             .map(|_| {
                 let cores = cores.clone();
-                std::thread::spawn(move || {
+                spawn_thread(move || {
                     for _ in 0..50_000 {
                         if cores.call(0, Class::Interactive, 1, |s, _| {
                             *s += 1;
@@ -476,7 +476,7 @@ fn nr09_a_call_racing_stop_always_gets_an_answer() {
                 })
             })
             .collect();
-        std::thread::sleep(Duration::from_micros(50 + iter % 300));
+        nabedra_rt::time::thread_sleep(Duration::from_micros(50 + iter % 300));
         cores.stop();
         within(10, &format!("iteration {iter}: a call that raced stop never answered"), move || {
             hs.into_iter().for_each(|h| h.join().unwrap());
@@ -494,7 +494,7 @@ fn nr10_dropping_the_cores_drops_queued_jobs_once_and_settles_their_callers() {
     let answers: Vec<_> = (0..20)
         .map(|_| {
             let (cores, token) = (cores.clone(), Token(dropped.clone()));
-            std::thread::spawn(move || cores.call(0, Class::Batch, 1, move |_, _| drop(token)))
+            spawn_thread(move || cores.call(0, Class::Batch, 1, move |_, _| drop(token)))
         })
         .collect();
     while cores.queued(0) < 20 {
@@ -728,7 +728,7 @@ fn nr16_code_memory_grants_exactly_what_fits_under_contention() {
         let hs: Vec<_> = (0..8)
             .map(|_| {
                 let (mem, granted) = (mem.clone(), granted.clone());
-                std::thread::spawn(move || {
+                spawn_thread(move || {
                     for _ in 0..500 {
                         if mem.try_extension(bytes) {
                             granted.fetch_add(1, Ordering::SeqCst);
@@ -922,7 +922,7 @@ fn nr18_budgets_are_counted_deterministically_across_stores() {
         // The same again on another thread, and on a fresh index: the same spending.
         let rows2 = rows.clone();
         let q2 = q.clone();
-        let again = std::thread::spawn(move || {
+        let again = spawn_thread(move || {
             let mut w = world("ram", dim, &rows2);
             run(&mut w, &q2, Budget::UNLIMITED)
         })
