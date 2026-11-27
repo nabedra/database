@@ -516,6 +516,15 @@ impl QueueRuntime {
         })
     }
 }
+/// OLAP-5: a denial is `unauthorized`; a slow or failed probe is retryable.
+fn access_failure(error: crate::storage::ObjectAccessError) -> crate::protocol::ProtocolError {
+    match error {
+        crate::storage::ObjectAccessError::Denied => {
+            http::failure(crate::protocol::ErrorCode::Unauthorized)
+        }
+        crate::storage::ObjectAccessError::Storage(_) => unavailable(),
+    }
+}
 fn encode_pin(loaded: &LoadedClusterCatalog) -> Result<Vec<u8>> {
     let catalog = loaded.catalog().encode().map_err(|_| invalid())?;
     let etag = loaded.etag().as_bytes();
@@ -1505,12 +1514,12 @@ impl Worker {
                     let loaded = self.owned_catalog(root, &grant).await?;
                     grant
                         .storage()
-                        .authorize_catalog_objects(
+                        .authorize_catalog_access(
                             &loaded,
                             nabedra_rt::time::now() + Duration::from_secs(30),
                         )
                         .await
-                        .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
+                        .map_err(access_failure)?;
                     Some(grant)
                 } else {
                     None
@@ -1587,14 +1596,14 @@ impl Worker {
                     }
                     let deadline = nabedra_rt::time::now() + Duration::from_secs(30);
                     storage
-                        .authorize_catalog_objects(&loaded, deadline)
+                        .authorize_catalog_access(&loaded, deadline)
                         .await
-                        .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
+                        .map_err(access_failure)?;
                     if let Some(pinned) = self.queue.pinned(key.clone()) {
                         storage
-                            .authorize_catalog_objects(&pinned, deadline)
+                            .authorize_catalog_access(&pinned, deadline)
                             .await
-                            .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
+                            .map_err(access_failure)?;
                     }
                 }
                 let result = {
