@@ -246,7 +246,17 @@ impl WorkerRuntime {
             // RANGES-1: the barrier comes before the cut, so no direct commit
             // stamped after the cut applies before the freeze. An older source
             // worker cannot decode the request: split without it, as before.
-            match client.pause(&attempt).await {
+            let mut paused = client.pause(&attempt).await;
+            // A late copy of a settled attempt's pause may hold the source:
+            // release that one and take the barrier again.
+            if paused.as_ref().is_err_and(|error| error.code == ErrorCode::Conflict)
+                && self
+                    .release_settled_barrier(client, &attempt.intent.source, authority)
+                    .await?
+            {
+                paused = client.pause(&attempt).await;
+            }
+            match paused {
                 Ok(()) => {}
                 Err(error)
                     if matches!(
@@ -378,6 +388,35 @@ impl WorkerRuntime {
         Ok(SplitResult::Importing {
             pages: left.pages.min(right.pages),
         })
+    }
+
+    /// RANGES-1: release the source's direct barrier when the split holding
+    /// it is already settled (a late copy of its pause). Returns whether it
+    /// released one. The owner's sweep does the same for an idle source.
+    pub(super) async fn release_settled_barrier(
+        &self,
+        client: &SplitClient,
+        source: &GroupIdentity,
+        authority: Authority,
+    ) -> Result<bool, ProtocolError> {
+        use crate::oltp_replication::manager::shard_split::Usage;
+        let Some(record) = self.services.control.group(source.group_id).await? else {
+            return Ok(false);
+        };
+        let placement = client.source_placement(&record, authority).await?;
+        let Usage::Frozen { split_id, .. } =
+            client.observe_usage(&placement, authority, u64::MAX, None).await?
+        else {
+            return Ok(false);
+        };
+        let Some(holder) = client.job(split_id).await? else {
+            return Ok(false);
+        };
+        if holder.closed.is_none() || holder.intent.source != *source {
+            return Ok(false);
+        }
+        client.release(&holder).await?;
+        Ok(true)
     }
 
     async fn plan_split(

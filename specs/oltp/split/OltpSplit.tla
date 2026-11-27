@@ -61,9 +61,12 @@ Barrier == Mutant # "prefix_no_pause"
 \* SHIPPED settle_split_proof sends SplitFinishSource only after Bind
 \* (split.rs:446); the fix sends it for every decided attempt.
 ReleaseUnbound == Mutant # "pause_leak_unbound_abort"
-\* DirectPause applies only for an attempt the source has not settled.
-\* SHIPPED pause() does not read the split's receipt (direct.rs:919-963).
-PauseChecksReceipt == Mutant # "pause_leak_late"
+\* A late copy of a settled attempt's DirectPause still applies: every
+\* release of the store applies the same rule (direct.rs:919-963), so the
+\* replicas of a group in a rolling upgrade agree. The owner's sweep then
+\* releases a barrier whose attempt the source already settled
+\* (automatic_split.rs, split `Release`). SHIPPED: nothing releases it.
+SweepReleases == Mutant # "pause_leak_late"
 \* Every decided or stuck attempt is resumed by a sweep. SHIPPED: only the
 \* owner loop resumes automatic splits (automatic_split.rs:350-366); a
 \* manual split is resumed only by an operator retry of the same id.
@@ -235,7 +238,12 @@ OpenSplit(k) ==
 \* DirectPause (direct.rs:919-963).
 PauseApplies(a) ==
     /\ frozen = 0 /\ pause = 0
-    /\ PauseChecksReceipt => a \notin receipts
+\* The coordinator's own pause: when the source answers Conflict because a
+\* settled attempt's late pause holds it, the coordinator releases that one
+\* first (split.rs `release_settled_barrier`) and pauses again.
+CoordPauseApplies(a) ==
+    \/ PauseApplies(a)
+    \/ SweepReleases /\ frozen = 0 /\ pause \in receipts
 
 \* The barrier applies, or another attempt's barrier or freeze answers
 \* Conflict (direct.rs:950), which ends the attempt like a refused freeze.
@@ -243,7 +251,7 @@ PauseApplies(a) ==
 ProposeDirectPause ==
     /\ Barrier /\ coord /\ phase = "open" /\ dec = None /\ ~pausedOk /\ Can("src")
     /\ ~refused
-    /\ IF pause = att \/ PauseApplies(att)
+    /\ IF pause = att \/ CoordPauseApplies(att)
        THEN /\ pause' = att
             /\ \/ pausedOk' = TRUE /\ UNCHANGED <<latePause, bud>>
                \/ /\ bud.dup < MaxDup /\ bud' = [bud EXCEPT !.dup = @ + 1]
@@ -261,6 +269,14 @@ LatePause(a) ==
     /\ pause' = IF PauseApplies(a) THEN a ELSE pause
     /\ UNCHANGED <<hostV, ldr, auth, frozen, pub, receipts, hi, above, attV, coV, route,
                    cliV, lateReq, ghostV, bud>>
+
+\* The owner's sweep finds the source held by a settled attempt and sends
+\* DirectPause { paused: false } for that split id.
+SweepRelease ==
+    /\ SweepReleases /\ pause # 0 /\ pause \in receipts /\ Can("src")
+    /\ pause' = 0
+    /\ UNCHANGED <<hostV, ldr, auth, frozen, pub, receipts, hi, above, attV, coV, route,
+                   cliV, lateV, ghostV, bud>>
 
 \* Cut: the image pin is high_watermark + 1 (timestamp/split.rs:431-443), so
 \* every timestamp issued so far is at or below it. A resumed attempt keeps
@@ -414,7 +430,7 @@ CoordStep ==
 Next ==
     \/ ElectAny \/ CrashAny \/ RestartAny \/ PartitionAny \/ Heal
     \/ ProposeAny \/ ProposeLateAny \/ ApplyAny \/ RefreshAny
-    \/ OpenAny \/ CoordStep \/ LatePauseAny \/ DecideAbort
+    \/ OpenAny \/ CoordStep \/ LatePauseAny \/ SweepRelease \/ DecideAbort
     \/ CoordCrash \/ ResumeSplit \/ OperatorRetry \/ FenceSource
     \/ Terminal
 
@@ -430,7 +446,7 @@ NeedLeader(r) == ~Can(r) /\ \E n \in Node : NewLeader(r, n)
 \* gateway refresh. Client writes get no fairness: they are the load. An
 \* operator retry is not a mechanism.
 Fairness ==
-    /\ WF_vars(CoordStep) /\ WF_vars(ResumeSplit)
+    /\ WF_vars(CoordStep) /\ WF_vars(ResumeSplit) /\ WF_vars(SweepRelease)
     /\ WF_vars(OpenSplit("auto"))
     /\ WF_vars(refused /\ DecideAbort)
     /\ \A r \in Range : WF_vars(NeedLeader(r))

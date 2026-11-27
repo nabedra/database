@@ -2510,10 +2510,12 @@ async fn o16_the_split_barrier_belongs_to_one_split() {
 
 /// RANGES-1 (`specs/oltp/split`, mutants `pause_leak_unbound_abort` and
 /// `pause_leak_late`): an attempt aborted before its children were bound
-/// releases the barrier with its FinishSource, and a late or repeated pause
-/// of that settled attempt is refused, so it cannot hold the range again.
+/// releases the barrier with its FinishSource. A late copy of its pause
+/// applies (every release applies the same rule, so replicas of mixed
+/// releases agree), and the owner's sweep then releases it by the same split
+/// id, which is what this test drives.
 #[tokio::test]
-async fn o16_ranges1_a_settled_split_never_takes_the_barrier_again() {
+async fn o16_ranges1_a_settled_split_barrier_is_released_by_its_split() {
     use nabedra_oltp_types::authority::{SealedSettlement, SettlementStatement};
     use nabedra_oltp_types::types::{AbortReason, DecisionStatement, TxnDecision};
     let mut f = Fixture::new().await;
@@ -2572,15 +2574,17 @@ async fn o16_ranges1_a_settled_split_never_takes_the_barrier_again() {
     );
     // Released: direct commits resume.
     assert_eq!(f.direct(&f.put(1, None, 11)).await, applied(11));
-    // A late copy of the pause, or a retry of it, is refused; a release is a no-op.
-    let state = f.dump().await;
+    // A late copy of the pause holds the range again, until the sweep's
+    // release of the same split id; another split cannot release it.
+    assert_eq!(f.submit(pause(&f, split_id, true)).await, paused(true));
+    let blocked = f.put(2, None, 12);
+    assert_rejected_without_writes(&mut f, &blocked, Fault::SplitInProgress).await;
     assert_eq!(
-        f.submit(pause(&f, split_id, true)).await,
-        ParticipantReply::Rejected(Fault::AlreadyDecided)
+        f.submit(pause(&f, nabedra_rt::ids::uuid_v4(), false)).await,
+        ParticipantReply::Rejected(Fault::Conflict)
     );
     assert_eq!(f.submit(pause(&f, split_id, false)).await, paused(false));
-    assert_eq!(f.dump().await, state);
-    assert_eq!(f.direct(&f.put(2, None, 12)).await, applied(12));
+    assert_eq!(f.direct(&f.put(2, None, 13)).await, applied(13));
 }
 
 /// F7: stamps never go below the group high-water, and an expire cutoff

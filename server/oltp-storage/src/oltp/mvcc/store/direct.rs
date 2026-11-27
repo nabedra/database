@@ -962,16 +962,6 @@ pub(super) fn pause(
         split_id: command.split_id,
         paused: command.paused,
     };
-    // RANGES-1: a settled split never takes the barrier again. A late or
-    // repeated pause of it would hold the range with nobody left to release
-    // it; its release is already done (`finish_source` clears the barrier).
-    if tx.pinned(&super::lineage::source_receipt(command.split_id))?.is_some() {
-        return if command.paused {
-            reject(tx, Fault::AlreadyDecided)
-        } else {
-            commit(tx, &done)
-        };
-    }
     let frozen_by = config
         .split_source
         .as_ref()

@@ -778,6 +778,34 @@ impl SplitEndpoint {
                     _ => Err(conflict("source refused the split barrier")),
                 }
             }
+            Operation::Release => {
+                let request = input!(SourceRequest);
+                let attempt = self.job(request.split_id).await?;
+                let participant = self.open_source(&attempt, &request, node).await?;
+                if attempt.closed.is_none() {
+                    return Err(invalid());
+                }
+                let applied = participant
+                    .propose(OwnedCommand::new_owned(
+                        ParticipantCommand::DirectPause(
+                            crate::oltp::mvcc::store::direct::DirectPause {
+                                authority: self.current().await?,
+                                split_id: attempt.intent.split_id,
+                                paused: false,
+                            },
+                        ),
+                        shared,
+                        ByteClass::Progress,
+                    )?)
+                    .await?;
+                match applied.reply {
+                    ParticipantReply::DirectPaused { .. } => output!(()),
+                    ParticipantReply::Rejected(
+                        crate::oltp::mvcc::store::Fault::DirectInactive,
+                    ) => output!(()),
+                    _ => Err(conflict("source refused the split barrier release")),
+                }
+            }
             Operation::Source => {
                 let request = input!(SourceRequest);
                 self.authorize_proof(session, request.source.group_id)
