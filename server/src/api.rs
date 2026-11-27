@@ -98,23 +98,12 @@ pub fn router_configured<B: ObjectStore + 'static>(
     execution: crate::config::ExecutionConfig,
     cold_start: bool,
 ) -> Result<(Router, Executor), ProtocolError> {
-    router_with_migration(engine, executor, token, execution, cold_start, false)
-}
-pub fn router_with_migration<B: ObjectStore + 'static>(
-    engine: Engine<B>,
-    executor: Executor,
-    token: String,
-    execution: crate::config::ExecutionConfig,
-    cold_start: bool,
-    migration_allowed: bool,
-) -> Result<(Router, Executor), ProtocolError> {
     let (router, tasks, _queue) = router_with_queue_startup(
         engine,
         executor,
         token,
         execution,
         cold_start,
-        migration_allowed,
         Arc::new(stream::Frontend::new()?),
     )?;
     Ok((router, tasks))
@@ -125,10 +114,9 @@ pub(crate) fn router_with_queue_startup<B: ObjectStore + 'static>(
     token: String,
     execution: crate::config::ExecutionConfig,
     cold_start: bool,
-    migration_allowed: bool,
     stream_frontend: Arc<stream::Frontend>,
 ) -> Result<(Router, Executor, Arc<queue::LocalQueue>), ProtocolError> {
-    let queue = queue::LocalQueue::new(&engine, execution, cold_start, migration_allowed)?;
+    let queue = queue::LocalQueue::new(&engine, execution, cold_start)?;
     let tasks = queue.executor();
     Ok((
         Router::new()

@@ -477,19 +477,6 @@ print(json.dumps({'isolated_installed_import':True,'optional_dependencies_absent
         check(doctor.returncode==0 and json.loads(doctor.stdout)['storage_write']=='unverified')
         check(before==probe.snapshot('control'))
         passed('native_s3_doctor_no_observed_object_changes_write_permission_unverified')
-        phase('explicit-stopped-writer-migration')
-        legacy={'format_version':2,'revision':0,'commit_id':str(uuid.uuid4()),'tables':{}}
-        check(probe.put('migration/catalog.json',json.dumps(legacy).encode()).returncode==0)
-        uri='s3://'+config.bucket+'/'+namespace.key('migration')+'/'
-        owner=str(uuid.uuid4())
-        command=['database','migrate','--storage',uri,'--region',config.region,'--cluster-id',owner,'--confirm-writers-stopped']
-        check(cluster.command(command).returncode==0)
-        migrated=probe.read('migration/catalog.json'); catalog=json.loads(migrated)
-        check(catalog['format_version']==5 and catalog['owner_cluster']==owner)
-        command[command.index(owner)]=str(uuid.uuid4())
-        check(cluster.command(command).returncode!=0)
-        check(probe.read('migration/catalog.json')==migrated)
-        passed('explicit_legacy_catalog_migration_owner_and_foreign_owner_conflict')
     report.update(phase='complete',result='passed')
 
 

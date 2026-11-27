@@ -43,12 +43,11 @@ async fn fixture(queue: usize) -> (Router, Engine<Fake>, Executor, WorkerThreads
     let engine = Engine::new(storage, pool, PartitionSize::default());
     let executor = Executor::new(1, queue).unwrap();
     (
-        api::router_with_migration(
+        api::router_configured(
             engine.clone(),
             executor.clone(),
             "test-token".into(),
             Default::default(),
-            false,
             false,
         )
         .unwrap()

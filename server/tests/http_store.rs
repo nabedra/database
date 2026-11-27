@@ -135,13 +135,12 @@ async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicit
     )
     .unwrap();
     let engine = Engine::new(storage, pool, "1 B".parse().unwrap());
-    let (app, queue_tasks) = api::router_with_migration(
+    let (app, queue_tasks) = api::router_configured(
         engine.clone(),
         Executor::new(1, 0).unwrap(),
         "api-token".into(),
         Default::default(),
         false,
-        true,
     )
     .unwrap();
     let (status, created) = request(
@@ -190,13 +189,12 @@ async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicit
     )
     .unwrap();
     let engine = Engine::new(restarted.storage(), pool, "1 B".parse().unwrap());
-    let (app, queue_tasks) = api::router_with_migration(
+    let (app, queue_tasks) = api::router_configured(
         engine.clone(),
         Executor::new(1, 0).unwrap(),
         "api-token".into(),
         Default::default(),
         true,
-        false,
     )
     .unwrap();
     let query = json!({"select":["label"],"filter":{"op":"ge","column":"rank","value":1},"order_by":{"column":"rank","desc":true},"limit":3});

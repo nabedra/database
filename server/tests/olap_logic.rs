@@ -532,16 +532,10 @@ impl OlapEngine {
         .unwrap();
         let engine = Engine::new(storage, pool, PartitionSize::default());
         let executor = Executor::new(2, 64).unwrap();
-        let router = api::router_with_migration(
-            engine,
-            executor,
-            TOKEN.into(),
-            Default::default(),
-            false,
-            true,
-        )
-        .unwrap()
-        .0;
+        let router =
+            api::router_configured(engine, executor, TOKEN.into(), Default::default(), false)
+                .unwrap()
+                .0;
         Self {
             router,
             _workers: workers,

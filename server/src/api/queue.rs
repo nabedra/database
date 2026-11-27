@@ -25,7 +25,6 @@ pub(crate) struct LocalQueue {
     tasks: Executor,
     config: crate::config::ExecutionConfig,
     cold_start: bool,
-    migration_allowed: bool,
     execution_headroom: u64,
     _charge: crate::scheduling::MemoryCharge,
 }
@@ -34,7 +33,6 @@ impl LocalQueue {
         engine: &Engine<B>,
         config: crate::config::ExecutionConfig,
         cold_start: bool,
-        migration_allowed: bool,
     ) -> Result<Arc<Self>, ProtocolError> {
         config.validate().map_err(|_| {
             ProtocolError::new(
@@ -85,7 +83,6 @@ impl LocalQueue {
             tasks: Executor::new(config.max_pending_requests as usize, 0)?,
             config,
             cold_start,
-            migration_allowed,
             execution_headroom,
             _charge: charge,
         }))
@@ -102,14 +99,6 @@ impl LocalQueue {
             run_id: nabedra_rt::ids::uuid_v4(),
             scheduler_term: 1,
         };
-        // Catalog format 6 is the only format, so there is nothing to migrate.
-        if self.migration_allowed {
-            return Err(ProtocolError::new(
-                ErrorCode::ValidationError,
-                "--migrate-catalog is not supported: catalog format 6 is the only format",
-                Outcome::NotApplied,
-            ));
-        }
         let loaded = engine
             .storage()
             .initialize_fenced_cluster_catalog(proposed, self.cold_start)
@@ -566,7 +555,7 @@ mod tests {
             pool.clone(),
             Default::default(),
         );
-        let queue = LocalQueue::new(&engine, Default::default(), false, false).unwrap();
+        let queue = LocalQueue::new(&engine, Default::default(), false).unwrap();
         queue.initialize(&engine).await.unwrap();
         let id = nabedra_rt::ids::uuid_v4();
         let body = serde_json::to_vec(
@@ -641,7 +630,7 @@ mod tests {
                 pool.clone(),
                 Default::default(),
             );
-            let queue = LocalQueue::new(&engine, Default::default(), false, false).unwrap();
+            let queue = LocalQueue::new(&engine, Default::default(), false).unwrap();
             let fence = queue.initialize(&engine).await.unwrap();
             let baseline = pool.scheduler().usage();
             engine
