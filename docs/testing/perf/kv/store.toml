@@ -1,0 +1,20 @@
+name = "Native store microbench (NS5, NS18)"
+module = "kv"
+# {bin} is the release `store_bench` test executable of nabedra-kv. Both ignored benches run:
+# NS5 for flush and compaction throughput, NS18 for put, read and install costs.
+command = ["{bin}", "--ignored", "--nocapture", "--test-threads", "1"]
+warmup = 1
+rounds = 6
+timeout_s = 900
+
+[metrics]
+put_unsynced_us = 'ns18 put unsynced 100 B writers= 1: \d+ ops/s \(([\d.]+) \S+/op\)'
+put_synced_p99_us = 'ns18 put synced 100 B writers= 1: [^;]*; p50 \d+ \S+, p95 \d+ \S+, p99 (\d+) '
+put_synced_16w_us = 'ns18 put synced 100 B writers=16: \d+ ops/s \(([\d.]+) \S+/op\)'
+raft_append_us = 'ns18 raft append 64 x 1 KiB synced writers= 1: \d+ ops/s \(([\d.]+) \S+/op\)'
+get_hot_us = 'ns18 get hot \(256 MiB cache, second pass\): \d+ ops/s \(([\d.]+) \S+/op\)'
+scan10_hot_us = 'ns18 scan 10 hot \(256 MiB cache, second pass\): \d+ ops/s \(([\d.]+) \S+/op\)'
+get_cold_us = 'ns18 get cold \(1 MiB cache\): \d+ ops/s \(([\d.]+) \S+/op\)'
+install_mibps = { pattern = 'ns18 install 256 MiB: \S+ \((\d+) MiB/s\)', higher_is_better = true }
+flush_mibps = { pattern = 'flush: [\d.]+ MiB of memtable -> [\d.]+ MiB of runs in \S+ \((\d+) MiB/s written\)', higher_is_better = true }
+compaction_mibps = { pattern = 'compaction: [\d.]+ MiB written in \S+ \((\d+) MiB/s\)', higher_is_better = true }

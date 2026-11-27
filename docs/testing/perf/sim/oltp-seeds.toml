@@ -1,0 +1,14 @@
+name = "OLTP simulator smoke sweep wall time"
+module = "sim"
+# {bin} is the release `nabedra-sim` binary (RUSTFLAGS='--cfg tokio_unstable'). A fixed seed
+# list, one job, every seed replayed, so the cost is seconds per 16 seed runs. A red seed
+# fails the command, so the comparison never times a run that stopped early.
+command = [
+    "env", "RUST_MIN_STACK=16777216", "NABEDRA_SIM_WORKLOAD=smoke", "NABEDRA_SEED=1",
+    "NABEDRA_SEEDS=8", "NABEDRA_SIM_JOBS=1", "NABEDRA_SIM_VERIFY_REPLAY=1",
+    "NABEDRA_SIM_ARTIFACTS={work}/artifacts", "{bin}", "sweep",
+]
+warmup = 1
+rounds = 6
+timeout_s = 1800
+metric = "wall"
