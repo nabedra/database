@@ -482,7 +482,7 @@ impl Api {
                 match serde_json::from_slice::<Reply>(&result).map_err(|_| invalid())? {
                     Reply::FencedJoined { base: copied } if copied == base => Ok(()),
                     Reply::Error { error } => Err(error),
-                    // A legacy expiry-based reply cannot authorize readiness.
+                    // Only the reply bound to this base authorizes readiness.
                     _ => Err(unavailable()),
                 }
             }

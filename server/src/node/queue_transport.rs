@@ -19,6 +19,11 @@ use uuid::Uuid;
 
 pub(super) const PATH: &str = "/internal/v1/queue";
 pub(super) const MAX_BYTES: usize = 128 * 1024 * 1024;
+/// Signed queue and stream message format. Version 2 (fx-sched, 2026-11-27)
+/// binds join copy resets to their control-root base, drops the unfenced
+/// `join` command and pages snapshots by bytes. A peer of another version is
+/// refused, never misread.
+pub(crate) const PROTOCOL_VERSION: u8 = 2;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Claims {
@@ -61,7 +66,7 @@ pub(crate) fn command_class(command: &str) -> Result<&'static str> {
         "lookup" => "receipt",
         "install" => "replica",
         "snapshot" | "bootstrap" => "bootstrap",
-        "stats" | "seal" | "unseal" | "join" | "fenced_join" | "stream_release" => "progress",
+        "stats" | "seal" | "unseal" | "fenced_join" | "stream_release" => "progress",
         "stream_request" => "ingress",
         "stream_install" => "replica",
         "stream_reset" | "stream_page" => "bootstrap",
@@ -78,7 +83,6 @@ fn wire_command(bytes: &[u8]) -> Result<&'static str> {
         "stats",
         "seal",
         "unseal",
-        "join",
         "fenced_join",
         "stream_request",
         "stream_install",
@@ -103,7 +107,7 @@ fn claims(
 ) -> Result<Claims> {
     let sender = signer.sender();
     Ok(Claims {
-        version: 1,
+        version: PROTOCOL_VERSION,
         command: wire_command(bytes)?.into(),
         class: command_class(wire_command(bytes)?)?.into(),
         cluster: root.cluster_id,
@@ -152,7 +156,7 @@ fn verify(
     }
     let stale_stream =
         stream && c.scheduler_term > 0 && c.scheduler_term < root.scheduler.scheduler_term;
-    if c.version != 1
+    if c.version != PROTOCOL_VERSION
         || c.cluster != root.cluster_id
         || (stream && !c.command.starts_with("stream_"))
         || (c.scheduler_term != root.scheduler.scheduler_term && !stale_stream)
@@ -457,7 +461,7 @@ pub(super) async fn exchange_accounted<T>(
     if c.command != expected_command || c.class != expected_class {
         return Err(invalid());
     }
-    if c.version != 1
+    if c.version != PROTOCOL_VERSION
         || c.cluster != root.cluster_id
         || c.scheduler_term != root.scheduler.scheduler_term
         || c.membership_revision > root.revision
@@ -571,7 +575,7 @@ fn signed_reply(
     let request: Claims = serde_json::from_slice(&decoded).map_err(|_| invalid())?;
     let sender = signer.sender();
     let c = Claims {
-        version: 1,
+        version: PROTOCOL_VERSION,
         command: request.command,
         class: request.class,
         cluster: root.cluster_id,

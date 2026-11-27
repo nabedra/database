@@ -94,14 +94,8 @@ pub(crate) enum Command {
     },
     Bootstrap {
         snapshot: QueueSnapshot,
-        /// The control-root base of the fenced join that sends this reset.
-        /// Absent only for a legacy `Join`. A receiver that never saw the
-        /// field rejects it, so a fenced join to a legacy joiner pauses.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        base: Option<JoinBase>,
-    },
-    Join {
-        node_id: Uuid,
+        /// The control-root base of the join that sends this reset.
+        base: JoinBase,
     },
     FencedJoin {
         node_id: Uuid,
@@ -121,7 +115,6 @@ impl Command {
             Self::Bootstrap { .. } => "bootstrap",
             Self::Stats => "stats",
             Self::Seal => "seal",
-            Self::Join { .. } => "join",
             Self::FencedJoin { .. } => "fenced_join",
             Self::Unseal { .. } => "unseal",
         }
@@ -421,7 +414,7 @@ impl QueueRuntime {
     pub(in crate::node) fn admit_join_reset<T>(
         &self,
         kind: JoinReset,
-        base: Option<JoinBase>,
+        base: JoinBase,
         root: &Control,
         apply: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
@@ -430,25 +423,13 @@ impl QueueRuntime {
             JoinReset::Queue => &mut floor.queue,
             JoinReset::Stream => &mut floor.stream,
         };
-        match base {
-            // A legacy reset carries no base. Once a fenced join reached this
-            // worker, a legacy reset can only be a delayed or foreign one.
-            None if slot.is_some() => return Err(unavailable()),
-            None => {}
-            Some(base) => {
-                if JoinBase::of(root) != base
-                    || slot.is_some_and(|seen| {
-                        seen.cluster != base.cluster || seen.revision >= base.revision
-                    })
-                {
-                    return Err(unavailable());
-                }
-            }
+        if JoinBase::of(root) != base
+            || slot.is_some_and(|seen| seen.cluster != base.cluster || seen.revision >= base.revision)
+        {
+            return Err(unavailable());
         }
         let applied = apply()?;
-        if base.is_some() {
-            *slot = base;
-        }
+        *slot = Some(base);
         Ok(applied)
     }
 
@@ -1664,12 +1645,10 @@ impl Worker {
                 let token = self.queue.retain_seal(seal, stream_seal);
                 Ok(Reply::Joined { token })
             }
-            Command::Join { node_id } | Command::FencedJoin { node_id, .. } => {
-                let join_base = match command {
-                    Command::FencedJoin { base, .. } if base == JoinBase::of(root) => Some(base),
-                    Command::FencedJoin { .. } => return Err(unavailable()),
-                    _ => None,
-                };
+            Command::FencedJoin { node_id, base } => {
+                if base != JoinBase::of(root) {
+                    return Err(unavailable());
+                }
                 if sender.is_some()
                     || Some(scheduler(root)?.node_id) != self.signer.sender().node_id()
                 {
@@ -1711,7 +1690,7 @@ impl Worker {
                         node,
                         &Command::Bootstrap {
                             snapshot: metadata,
-                            base: join_base,
+                            base,
                         },
                         Some("bootstrap"),
                     )
@@ -1744,27 +1723,22 @@ impl Worker {
                     }
                 }
                 drop(installs);
-                self.copy_stream_replicas(root, node, self.queue.fence()?.run_id, join_base)
+                self.copy_stream_replicas(root, node, self.queue.fence()?.run_id, base)
                     .await?;
-                if let Some(base) = join_base {
-                    // An ownership or membership change while copying already
-                    // fenced this attempt. It cannot authorize a new-root CAS.
-                    if JoinBase::of(&self.root().await?) != base {
-                        return Err(unavailable());
-                    }
-                    self.queue.insert_seal(
-                        seal,
-                        stream_seal,
-                        SealRelease::Successor {
-                            base,
-                            joiner: node_id,
-                        },
-                    );
-                    Ok(Reply::FencedJoined { base })
-                } else {
-                    let token = self.queue.retain_seal(seal, stream_seal);
-                    Ok(Reply::Joined { token })
+                // An ownership or membership change while copying already
+                // fenced this attempt. It cannot authorize a new-root CAS.
+                if JoinBase::of(&self.root().await?) != base {
+                    return Err(unavailable());
                 }
+                self.queue.insert_seal(
+                    seal,
+                    stream_seal,
+                    SealRelease::Successor {
+                        base,
+                        joiner: node_id,
+                    },
+                );
+                Ok(Reply::FencedJoined { base })
             }
             Command::Unseal { token } => {
                 if sender.is_some() {
@@ -2797,48 +2771,41 @@ mod join_tests {
             applied.set(0);
             // Attempt one resets at revision 7; its reply is lost.
             queue
-                .admit_join_reset(kind, Some(JoinBase::of(&first)), &first, apply)
+                .admit_join_reset(kind, JoinBase::of(&first), &first, apply)
                 .unwrap();
             // The same base cannot be reset twice: a second attempt waits for
             // the root to advance, so a delayed first reset is distinguishable.
             assert!(
                 queue
-                    .admit_join_reset(kind, Some(JoinBase::of(&first)), &first, apply)
+                    .admit_join_reset(kind, JoinBase::of(&first), &first, apply)
                     .is_err()
             );
             // A reset for a base the receiver already sees as fenced.
             assert!(
                 queue
-                    .admit_join_reset(kind, Some(JoinBase::of(&first)), &second, apply)
+                    .admit_join_reset(kind, JoinBase::of(&first), &second, apply)
                     .is_err()
             );
             // Attempt two copies at revision 9.
             queue
-                .admit_join_reset(kind, Some(JoinBase::of(&second)), &second, apply)
+                .admit_join_reset(kind, JoinBase::of(&second), &second, apply)
                 .unwrap();
             // Attempt one's reset arrives late, read against a stale root: it
             // must not erase attempt two's copy.
             assert!(
                 queue
-                    .admit_join_reset(kind, Some(JoinBase::of(&first)), &first, apply)
+                    .admit_join_reset(kind, JoinBase::of(&first), &first, apply)
                     .is_err()
             );
-            // A legacy reset after a fenced one.
-            assert!(queue.admit_join_reset(kind, None, &second, apply).is_err());
             assert_eq!(applied.get(), 2, "only the two current resets applied");
         }
-        // A worker that never saw a fenced join still accepts a legacy join.
-        let legacy = QueueRuntime::new();
-        legacy
-            .admit_join_reset(JoinReset::Queue, None, &root, || Ok(()))
-            .unwrap();
     }
 
     #[test]
     fn st04_r03_failed_reset_does_not_consume_its_base() {
         let queue = QueueRuntime::new();
         let root = at(&fixture_root(1), 7);
-        let base = Some(JoinBase::of(&root));
+        let base = JoinBase::of(&root);
         assert!(
             queue
                 .admit_join_reset(

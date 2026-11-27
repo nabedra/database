@@ -107,9 +107,8 @@ enum Command {
     },
     StreamReset {
         run: Uuid,
-        /// The fenced join's control-root base; absent for a legacy join.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        base: Option<JoinBase>,
+        /// The control-root base of the join that sends this reset.
+        base: JoinBase,
     },
     StreamPage {
         run: Uuid,
@@ -837,7 +836,7 @@ impl Worker {
         root: &Control,
         node: &Node,
         run: Uuid,
-        base: Option<JoinBase>,
+        base: JoinBase,
     ) -> Result<(), ProtocolError> {
         let authority = Authority {
             run,

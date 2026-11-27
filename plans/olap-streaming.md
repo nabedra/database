@@ -357,7 +357,7 @@ join stalls admission and every stream commit for the whole copy (OLAPS-3). Neit
 Simulation coverage of the same design stays partial: the in-process workload has one worker registry, so it cannot
 reproduce F1 or any transfer loss.
 
-### Fenced join implementation and rollout
+### Fenced join implementation
 
 The join lock covers both stream replicas and accepted queue records. Copy them at an exact
 control-root base identified by cluster, revision and change ID. The controller submits readiness
@@ -377,25 +377,7 @@ operations. Commands that waited behind a seal must re-read authority before mut
 stream state. A published join must use the exact candidate corresponding to the copied worker
 incarnation and session. A failed join retries the copy with a new observation.
 
-The following sequence supports rolling workers and APIs that share the existing root format:
-
-1. Roll workers through the existing handoff while the old API is still active. Before activating
-   the new protocol, ensure the coordinator and workers eligible to take over can handle the
-   fenced join command. A new API uses a distinct signed join command and accepts a fenced reply
-   only. An old worker rejects the distinct command, so joins pause if it is coordinator.
-2. Quiesce admissions and legacy joins before transferring controller ownership. Stop every legacy
-   controller incarnation eligible to reacquire control. The new controller's acquisition must
-   advance the control root by Match before it enables fenced joins. It must observe the root that
-   won, because a pending legacy readiness write can race acquisition. Verify the current ready
-   copy set and repair its queue and stream state from surviving current holders before resuming
-   admitted work. If that state cannot be recovered, leave admission closed and use the existing
-   recovery procedure.
-3. Resume under the new API. Keep the old join command for workers talking to an old API before
-   activation. Return to a legacy controller only from a stopped, fenced deployment through an
-   explicit recovery procedure. Running old controllers may not compete for ownership after
-   activation.
-
-This adds an internal command discriminant and binds the reply to the captured base. It needs no
+The join command binds its reply to the captured base. It needs no
 extra round trip for a successful join or on ordinary client traffic. Resolution of an ambiguous
 join can add a control read and conditional metadata write. ST04 and R03 cover stream and queue
 continuity. The runtime regression must delay readiness at the object store, roll the seal clock
@@ -404,22 +386,9 @@ the old write after the competing CAS and assert a conditional conflict. Also te
 readiness wins and the controller loses the reply. The joiner must have the accepted request and
 stream copies before the coordinator reopens either path.
 
-The rollout refinement is `specs/olap-stream/join/rollout/OlapJoinRollout.tla`. It covers one
-coordinator, a ready peer, a joiner, mixed-version coordination, the controller activation fence
-and an ambiguous readiness write. Its initial committed prefix is recoverable. Worker crash and
-controller takeover after activation are covered by `OlapJoinFence`. Eventual coordinator upgrade
-follows the operator's rollout, and the controller drives conditional resolution and retry.
-Local TLC completed both safety and liveness over 570 distinct states at depth 16, with 14 covered
-actions and minimum coverage 12. Mutant traces have 8 states for legacy fallback, 7 for a reused
-activation base, 4 for a legacy controller returning, and a 7-state lasso for missing coordinator
-upgrade. The `olap-join-rollout` check is pending attestation on this revision.
 **Runtime coverage boundary.** The focused regression exercises the worker's two local guards and
-both conditional write winners independently. Lost-reply end-to-end admission, deployed mixed
-binaries and simulator replay still require an integrated fixture. Delayed receiver-side copy RPCs
-are a separate candidate: a legacy-shaped Bootstrap or StreamReset may authenticate against its
-old root and wait before applying. Verify whether an old copy can erase newer data across a join
-retry, including on an already-ready target. A future fix should bind destructive copy steps to
-the copy generation at the receiver without adding control reads to successful ordinary operations.
+both conditional write winners independently. Lost-reply end-to-end admission and simulator
+replay still require an integrated fixture. Delayed receiver-side copy resets are handled below.
 
 **Receiver-side copy generation (fx-sched, 2026-11-27).** A fenced join sends its control-root base
 with the two destructive copy steps, `Bootstrap` and `StreamReset`. The joiner applies each reset
@@ -427,11 +396,13 @@ only when its own fresh root equals that base, at most once per base, and never 
 The check and the reset run under one lock. A reset delayed from an earlier attempt therefore cannot
 erase a later attempt's copy, and a reset the joiner already sees as fenced is refused. A second
 attempt at an unchanged base waits until the root advances, for example at the next lease renewal
-or the controller's competing CAS. Once a fenced reset has reached a worker, a legacy reset (no
-base) is refused there. Installs need no binding: they are version-monotone, and an older record
-version is refused as stale. The field is serialized only for a fenced join; a legacy joiner rejects
-it, so a fenced join to a legacy joiner pauses, as the rollout above already requires. Successful
-ordinary operations read nothing extra. Regression tests:
+or the controller's competing CAS. Installs need no binding: they are version-monotone, and an older
+record version is refused as stale. Successful ordinary operations read nothing extra.
+
+There is no unfenced join and no mixed-version path (user, 2026-11-27: breaking changes are allowed).
+The signed queue and stream messages carry protocol version 2 (`PROTOCOL_VERSION`), and a peer of
+another version is refused. The rollout model `specs/olap-stream/join/rollout/` and its check
+`olap-join-rollout` existed only for the upgrade from the unfenced join and were removed. Regression tests:
 `st04_r03_delayed_reset_from_an_earlier_join_attempt_is_refused` and
 `st04_r03_failed_reset_does_not_consume_its_base`. `OlapJoinFence` models it: a failed attempt leaves its
 reset in flight (`JoinFail`), the reset lands later (`LateReset`), and the mutant `unbound_reset`, the
