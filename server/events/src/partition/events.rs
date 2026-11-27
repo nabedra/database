@@ -166,6 +166,11 @@ pub(super) fn publish(
         tx.put(&records.event_key, &records.event_value)?;
         tx.put(&records.dedup_key, &records.dedup_value)?;
     }
+    // The simulator's EVT-G03 check under retention: which IDs got a new offset.
+    #[cfg(feature = "sim")]
+    for event in receipts.iter().filter(|event| event.offset >= head.next_offset) {
+        crate::sim::hooks::assigned(event.event_id, event.offset);
+    }
     if !inserted.is_empty() {
         head.next_offset = next_offset;
         head.retained_event_bytes = retained_event_bytes;
@@ -233,6 +238,8 @@ pub(super) fn retain(
             .context("retained event byte counter is inconsistent")?;
         tx.delete(&key)?;
         tx.delete(&dedup_key)?;
+        #[cfg(feature = "sim")]
+        crate::sim::hooks::retained(oldest.event.event_id);
         head.earliest_offset += 1;
         removed += 1;
     }

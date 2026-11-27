@@ -231,7 +231,12 @@ impl Model {
                         "acknowledgment is outside the delivered prefix",
                     ));
                 }
-                if *through > self.checkpoint && self.checkpoint < self.removed as u64 {
+                // EVENTS-8: a token that starts at the checkpoint covers only delivered
+                // offsets, so it advances even after retention passed the checkpoint.
+                if *through > self.checkpoint
+                    && self.checkpoint < self.removed as u64
+                    && *after != self.checkpoint
+                {
                     return Err(self.expired());
                 }
                 self.checkpoint = self.checkpoint.max(*through);

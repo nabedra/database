@@ -230,7 +230,7 @@ def rf1_http(clusters, temporary, args, evidence):
         "event_id": malformed_id, "data": None,
     }, bearer=reader), 403, "forbidden")
     status(raw("GET", "/events"), (404, 405))
-    status(cluster.rpc(1, "/internal/events/v1/control", method="POST", body={}), 404)
+    status(cluster.rpc(1, "/internal/events/v2/control", method="POST", body={}), 404)
     over_event = {"event_id": str(uuid4()), "data": "p" * EVENT_BYTES}
     status(raw("POST", "/events", over_event), 413, "payload_too_large")
     accepted_big_id = uuid4()
@@ -720,9 +720,7 @@ def backup(clusters, temporary, args, evidence):
                 "backup image length, checksum, or committed applied index differs")
     source.kill([1, 2, 3])
 
-    def config(_, settings):
-        settings["initialize_new_cluster"] = False
-    target = make_cluster(clusters, temporary, args, 3, name="target", standby=1, config=config)
+    target = make_cluster(clusters, temporary, args, 3, name="target", standby=1, initialize=False)
     require(target.cluster_id != source.cluster_id, "restore is using the source cluster identity")
     corrupt = bundle_area / "corrupt"
     shutil.copytree(bundle, corrupt)
@@ -787,7 +785,7 @@ def mtls_rotation(clusters, temporary, args, evidence):
     ))
     require(original.offset == 1, "mTLS peer forwarding did not commit on RF3")
     peer_url = "https://" + cluster.docker("port", cluster.service(1), "8081").stdout.strip()
-    path = "/internal/events/v1/control"
+    path = "/internal/events/v2/control"
     status(request(peer_url, path, method="POST", body={}, tls=context), 0)
     authorized_tls = ssl.create_default_context(cafile=ca)
     authorized_tls.load_cert_chain(

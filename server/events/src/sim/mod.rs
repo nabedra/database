@@ -14,7 +14,7 @@ pub mod runtime;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -34,6 +34,17 @@ pub(crate) struct State {
     pub history: history::History,
     /// The broker each running node serves.
     pub brokers: BTreeMap<u64, Arc<Broker>>,
+    /// Nodes whose volume lost the group: the empty-volume rule (EVENTS-1) keeps them out
+    /// of it, so they neither vote nor acknowledge.
+    pub lost: BTreeSet<u64>,
+    /// Clients stamp commands from `Group::time_bounds`, as a product leader does after
+    /// EVENTS-2. Off only for the planted `unguarded_clock`.
+    pub guarded_time: bool,
+    /// Per replica, in apply order: the offset each event ID was assigned, and the IDs
+    /// retention removed. A new offset for an ID is legal only after its removal (EVT-G03
+    /// within retention, EVENTS-9).
+    pub assigned: BTreeMap<u64, BTreeMap<uuid::Uuid, u64>>,
+    pub retained: BTreeMap<u64, BTreeSet<uuid::Uuid>>,
 }
 
 /// The Events part of one simulated run: the `nabedra_rt` world plus the network plan,
@@ -56,6 +67,10 @@ impl Harness {
                 observer: RaftObserver::new(voters),
                 history: history::History::default(),
                 brokers: BTreeMap::new(),
+                lost: BTreeSet::new(),
+                guarded_time: false,
+                assigned: BTreeMap::new(),
+                retained: BTreeMap::new(),
             }),
         })
     }
@@ -228,6 +243,46 @@ pub(crate) mod hooks {
             return;
         };
         harness.lock().observer.truncated(group, node, index);
+    }
+
+    /// A replica applied a publish that gave `event_id` the new offset `offset`. A
+    /// different earlier offset on the same replica must have been removed by retention.
+    pub fn assigned(event_id: uuid::Uuid, offset: u64) {
+        let (Some(harness), Some(node)) = (harness(), current_node()) else {
+            return;
+        };
+        let now = harness.elapsed_ms();
+        let mut state = harness.lock();
+        let removed = state
+            .retained
+            .get(&node)
+            .is_some_and(|ids| ids.contains(&event_id));
+        let previous = state
+            .assigned
+            .entry(node)
+            .or_default()
+            .insert(event_id, offset);
+        if let Some(previous) = previous.filter(|previous| *previous != offset && !removed) {
+            state.observer.violate(
+                now,
+                format!(
+                    "EVT-G03 dedup-miss: n{node} gave {event_id} offset {offset} while its offset {previous} was retained"
+                ),
+            );
+        }
+    }
+
+    /// A replica's retention removed `event_id` with its deduplication record.
+    pub fn retained(event_id: uuid::Uuid) {
+        let (Some(harness), Some(node)) = (harness(), current_node()) else {
+            return;
+        };
+        harness
+            .lock()
+            .retained
+            .entry(node)
+            .or_default()
+            .insert(event_id);
     }
 
     pub fn reuse_offset_after_dedup() -> bool {

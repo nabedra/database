@@ -2,6 +2,7 @@
 //! A broker shares its disk, cache, and I/O limits across its hosted groups.
 
 mod batch;
+mod clock;
 mod log;
 mod network;
 mod snapshot;
@@ -27,12 +28,14 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
 
+pub use clock::{ClockError, ClockPolicy, TimeBounds};
 pub use network::PeerTransport;
 pub use snapshot::SnapshotCut;
 pub use state_machine::StateMachine;
 pub use store::{QuarantinedGroup, StorageHealth, Transaction};
 
 use batch::PublishBatcher;
+use clock::Clocks;
 use log::LogStore;
 use network::NetworkFactory;
 use snapshot::{CHUNK_BYTES, MAX_SNAPSHOT_BYTES, SnapshotFile, Snapshots};
@@ -106,6 +109,7 @@ pub struct Broker {
     change_groups: Arc<Mutex<()>>,
     publish_budget: Arc<Semaphore>,
     control_slots: Arc<Semaphore>,
+    clocks: Arc<Clocks>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -136,6 +140,63 @@ pub struct Membership {
     pub membership_index: Option<u64>,
 }
 
+/// What one broker's volume holds for a group (EVENTS-1). A broker that starts without the
+/// group on its disk asks its peers for this before it opens the group as a voter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskState {
+    /// The volume hosts the group, or retired it, or holds it quarantined.
+    pub hosted: bool,
+    /// The group has Raft state here: a vote or a log entry, or a retirement or a
+    /// quarantine. A hosted group that is not running counts as formed.
+    pub formed: bool,
+    /// The volume hosts or retired some other group.
+    pub other_groups: bool,
+}
+
+/// The outcome of the empty-volume rule (EVENTS-1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rejoin {
+    /// No peer holds any group state: the cluster is new, and this broker may vote.
+    Genesis,
+    /// A peer holds group state: this volume lost its replica. The broker must not vote
+    /// under its old membership; an operator re-adds it (remove, learner, promote) or
+    /// gives the replacement a new broker ID.
+    Lost,
+    /// Some peer has not answered, or (for the initializer) has not opened the group yet.
+    Wait,
+}
+
+/// Decides whether a broker whose volume lacks the group may open it as a voter. A volume
+/// that once held the group cannot be told from a new one, so the answer comes from the
+/// peers: the broker votes only when every peer answered and none holds state of any
+/// group. `answers` holds one entry per peer (bootstrap broker other than this one),
+/// `None` for no answer. The initializer also waits until every other initial voter
+/// has opened the group, so no voter of a new cluster first finds the group formed.
+pub fn rejoin(
+    initializer: bool,
+    voters: &BTreeSet<u64>,
+    answers: &BTreeMap<u64, Option<DiskState>>,
+) -> Rejoin {
+    if answers
+        .values()
+        .flatten()
+        .any(|state| state.formed || state.other_groups)
+    {
+        return Rejoin::Lost;
+    }
+    if answers.values().any(Option::is_none) {
+        return Rejoin::Wait;
+    }
+    if initializer
+        && answers
+            .iter()
+            .any(|(id, state)| voters.contains(id) && !state.is_some_and(|state| state.hosted))
+    {
+        return Rejoin::Wait;
+    }
+    Rejoin::Genesis
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GroupStatus {
     pub term: u64,
@@ -158,6 +219,7 @@ pub struct Group {
     peers: PeerTransport,
     election_after: Option<u64>,
     accepts_votes: AtomicBool,
+    clocks: Arc<Clocks>,
 }
 
 impl Broker {
@@ -206,6 +268,7 @@ impl Broker {
             change_groups: Arc::default(),
             publish_budget: Arc::new(Semaphore::new(PUBLISH_BUDGET_BYTES)),
             control_slots: Arc::new(Semaphore::new(64)),
+            clocks: Arc::new(Clocks::new(ClockPolicy::default())),
         });
         // Damage found while serving quarantines a group: stop its Raft node so it neither
         // votes nor acknowledges appends (section 3, rule 1).
@@ -238,6 +301,11 @@ impl Broker {
 
     pub fn peers(&self) -> &PeerTransport {
         &self.peers
+    }
+
+    /// Sets the clock bound this broker's groups stamp commands with (EVENTS-2).
+    pub fn set_clock_policy(&self, policy: ClockPolicy) {
+        self.clocks.set_policy(policy);
     }
 
     pub fn router(self: &Arc<Self>) -> axum::Router {
@@ -499,6 +567,7 @@ impl Broker {
             peers: self.peers.clone(),
             election_after,
             accepts_votes: AtomicBool::new(accepts_votes),
+            clocks: self.clocks.clone(),
         });
         if let Some(cut) = election_after.filter(|_| !accepts_votes) {
             crate::rt::spawn(group.clone().enable_votes_after(cut));
@@ -553,6 +622,38 @@ impl Broker {
         Ok(GroupStore::new(self.database.clone(), id)
             .retired_at()?
             .is_some())
+    }
+
+    /// What this volume holds for group `id` (EVENTS-1), the answer to a peer's
+    /// empty-volume probe.
+    pub fn disk_state(&self, id: &str) -> Result<DiskState> {
+        validate_group_id(id)?;
+        let quarantined = self.database.is_quarantined(id);
+        let retired = self.was_retired(id)?;
+        let hosted = quarantined || retired || self.database.is_hosted(id)?;
+        // The vote record on disk covers an initialize whose metrics have not updated.
+        let voted = hosted
+            && GroupStore::new(self.database.clone(), id)
+                .read::<openraft::Vote<u64>>(log::VOTE_KEY)?
+                .is_some();
+        let formed = quarantined
+            || retired
+            || voted
+            || match self.group(id) {
+                Some(group) => !group.status().running || group.is_initialized(),
+                None => hosted,
+            };
+        let other_groups = self
+            .database
+            .stored_group_ids()?
+            .into_iter()
+            .chain(self.database.retired_group_ids()?)
+            .any(|group| group != id);
+        Ok(DiskState {
+            hosted,
+            formed,
+            other_groups,
+        })
     }
 
     /// Delete the incarnation excluded by an authoritative committed membership.
@@ -657,6 +758,51 @@ impl Group {
 
     pub fn id(&self) -> &str {
         &self.snapshots.store.id
+    }
+
+    /// An interval that holds the true time now (EVENTS-2), built from the clocks of this
+    /// group's voters (`raft::clock`). A leader stamps publish, lease and retention
+    /// commands from it. `Unavailable` when too few voters answered or their clocks
+    /// disagree beyond the configured bound.
+    pub async fn time_bounds(&self) -> GroupResult<TimeBounds> {
+        let (voters, nodes) = {
+            let metrics = self.raft.metrics();
+            let metrics = metrics.borrow();
+            let config = metrics.membership_config.membership();
+            let voters: BTreeSet<u64> = config.voter_ids().collect();
+            let nodes: BTreeMap<u64, String> = config
+                .nodes()
+                .filter(|(id, _)| voters.contains(id))
+                .map(|(id, node)| (*id, node.addr.clone()))
+                .collect();
+            (voters, nodes)
+        };
+        if voters.is_empty() {
+            return Err(GroupError::Unavailable);
+        }
+        if self.clocks.needs_round(self.local_id, &voters, crate::rt::now()) {
+            let _round = self.clocks.round.lock().await;
+            if self.clocks.needs_round(self.local_id, &voters, crate::rt::now()) {
+                let samples = nodes
+                    .iter()
+                    .filter(|(id, _)| **id != self.local_id)
+                    .map(|(id, address)| async move {
+                        let sent = crate::rt::now();
+                        (*id, sent, self.peers.sample_clock(*id, address).await)
+                    });
+                for (id, sent, answer) in futures_util::future::join_all(samples).await {
+                    self.clocks.record(id, sent, answer);
+                }
+            }
+        }
+        self.clocks
+            .bounds(
+                self.local_id,
+                crate::rt::unix_ms() as i64,
+                crate::rt::now(),
+                &voters,
+            )
+            .map_err(|_| GroupError::Unavailable)
     }
 
     pub fn leader(&self) -> Option<u64> {

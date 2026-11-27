@@ -1,0 +1,22 @@
+# Found by reading the simulator code (server/rt/src/sim/net.rs Pipe::push keeps one barrier per stream;
+# server/sim-oltp/src/net/mod.rs gives every worker frame Fate::Frame) and confirmed as a counterexample of
+# specs/sim/net (mutant prefix_frames_overtake breaks ConnectionFifo). Not reproduced in a running simulator. The swept
+# OLTP profiles reach it through Rule::Delay (DeadlineEdge) and Rule::Slow, against the nemesis header that calls
+# reordering beyond-TCP and opt-in.
+id = "SIM-FRAMES-OVERTAKE"
+title = "Frames of different streams on one simulated session overtake each other, which no TCP session does"
+class = "other"
+module = "sim"
+guarantees = ["OLTP-G03", "OLTP-G04"]
+scenarios = ["D02", "D10", "O10"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "specs/sim/net/mutants/prefix_frames_overtake.cfg"
+seed = "unknown"
+why_not_caught = "The one-stream delay of #101 was designed as a feature, and no rt check asserts connection-wide FIFO across streams."
+invariant_added = "ConnectionFifo: a reader sees the frames of one connection in send order across streams (specs/sim/net/SimNet.tla)."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

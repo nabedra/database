@@ -26,7 +26,7 @@ We close these without review:
 - Wire protocol or on-disk format changes
 - Support for more platforms or deployment targets
 
-If you want one of these, open an [issue](https://github.com/zPy52/nabedra-database/issues)
+If you want one of these, open an [issue](https://github.com/nabedra/database/issues)
 and explain the problem you are trying to solve. We read them.
 
 This policy is adapted from [T3 Code's](https://github.com/pingdotgg/t3code/blob/main/CONTRIBUTING.md).

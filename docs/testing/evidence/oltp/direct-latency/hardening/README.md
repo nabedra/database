@@ -55,8 +55,8 @@ internal disk. Every comparison below is within this session.
 
 | System | Binary | Notes |
 | --- | --- | --- |
-| Candidate | `nabedra-db-c38a4a7`, SHA-256 `426516e8…7011d2`, `nabedra-db 0.1.1 oltp` | `bench` job of [run 45008607422](https://github.com/zPy52/nabedra-database/actions/runs/45008607422) (request `bench3-c38a4a7-093930`, branch `nabedra/hd-bench3`), `rust:1.94.1-bookworm`, glibc 2.36, 475 s; `--direct-oltp on`. `data.direct.batch` is enabled by the workers themselves |
-| main | `nabedra-db-6141321`, SHA-256 `107127bd…59f8f5` | `bench` job of [run 45008609476](https://github.com/zPy52/nabedra-database/actions/runs/45008609476) (request `bench3-6141321-093930`, dispatched on `main`), 433 s; `--direct-oltp on` |
+| Candidate | `nabedra-db-c38a4a7`, SHA-256 `426516e8…7011d2`, `nabedra-db 0.1.1 oltp` | `bench` job of [run 45008607422](https://github.com/nabedra/database/actions/runs/45008607422) (request `bench3-c38a4a7-093930`, branch `nabedra/hd-bench3`), `rust:1.94.1-bookworm`, glibc 2.36, 475 s; `--direct-oltp on`. `data.direct.batch` is enabled by the workers themselves |
+| main | `nabedra-db-6141321`, SHA-256 `107127bd…59f8f5` | `bench` job of [run 45008609476](https://github.com/nabedra/database/actions/runs/45008609476) (request `bench3-6141321-093930`, dispatched on `main`), 433 s; `--direct-oltp on` |
 | ScyllaDB | `scylladb/scylla:6.2.3@sha256:a9d90408…` | RF3, QUORUM, `--commitlog-sync=batch`, `--smp=1`, `--memory=1700M`, driver 3.29.13 |
 
 - **Image and ORM.** Both Nabedra binaries ran in image `nabedra-oltp-perf-builder:1.94.1` (`sha256:1547483c…`,

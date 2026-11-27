@@ -1,0 +1,14 @@
+id = "SIM-EVENTS-DUP-PARTITION"
+title = "An Events simulation duplicate is handled across a partition that opened after the original arrived"
+class = "other"
+module = "sim"
+guarantees = ["EVT-G01", "EVT-G03"]
+scenarios = ["EV01", "EV02"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "server/events/src/sim/cluster.rs::rpc_delivery_tests"
+seed = 1
+why_not_caught = "The duplicate copy reuses the original's link check, a partition inside its 1 ms gap is rare in seeds, and no test covers it."
+invariant_added = "NothingCrossesBlockedLink: no handler runs for a request copy that arrives while its link is blocked (specs/sim/net-rpc/SimNetRpc.tla)."
+fix_commits = ["649e496eab2083efccc900bec06c146f3810641d"]
+revert_patch_ok = false

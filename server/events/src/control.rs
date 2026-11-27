@@ -9,7 +9,7 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use crate::{
         PartitionRoute,
     },
     partition,
-    raft::{Broker, BrokerConfig, Group, GroupError},
+    raft::{Broker, BrokerConfig, ClockPolicy, Group, GroupError},
 };
 
 use catalog::{Bootstrap, BrokerSpec, Header, Topic};
@@ -36,6 +36,10 @@ pub use serve::{RECOVERY_EXIT_CODE, StoreRecoveryRequired, serve};
 
 const METADATA: &str = "metadata";
 const RESTORE_REBIND: &str = "restore-rebind";
+/// Written by `nabedra-events init` on the first metadata voter's empty volume: the one
+/// authorization to create a new cluster. `Control::join_metadata` removes it once the
+/// metadata group is initialized, and a volume that loses its data loses it too.
+const INITIALIZE_CLUSTER: &str = "initialize-cluster";
 const CACHE_TOPICS: usize = 32;
 const CACHE_LEADERS: usize = 512;
 const CACHE_FRESH_FOR: Duration = Duration::from_secs(3);
@@ -57,12 +61,15 @@ pub struct Config {
     public_tls: Option<TlsFiles>,
     peer_tls: Option<TlsFiles>,
     bootstrap: Bootstrap,
-    initialize_new_cluster: Option<bool>,
     keyring: Option<KeyringConfig>,
     #[serde(default)]
     http_limits: HttpLimits,
     #[serde(default = "default_disk_reserve")]
     min_free_disk_bytes: u64,
+    /// The stated broker clock bound (EVENTS-2, EVT-G08). Older configs omit it and get
+    /// the defaults.
+    #[serde(default)]
+    clock: ClockPolicy,
 }
 
 #[derive(Deserialize)]
@@ -113,6 +120,13 @@ impl Config {
             "public TLS is required"
         );
         ensure!(
+            (0..=60_000).contains(&self.clock.max_clock_error_ms)
+                && self.clock.max_uncertainty_ms >= 2 * self.clock.max_clock_error_ms
+                && (1..=60_000).contains(&self.clock.sample_max_age_ms),
+            "the clock bound needs 0 to 60000 ms of error, an uncertainty budget of at least \
+             twice the error and a sample age of 1 to 60000 ms"
+        );
+        ensure!(
             self.allow_plaintext
                 || self.peer_tls.is_some()
                     && self.peer_ca.is_some()
@@ -146,6 +160,27 @@ impl Config {
                 .take()
                 .context("broker config needs a keyring")?,
         )
+    }
+
+    /// `nabedra-events init`: authorize this broker to create a new cluster on its next
+    /// start. Only the first bootstrap metadata voter, only on a volume that never served.
+    /// After a total loss of the bootstrap disks a new cluster also needs a new
+    /// `cluster_id` and keyring, so old grants, tokens and stray brokers are refused.
+    pub fn initialize(&self) -> Result<()> {
+        ensure!(
+            self.bootstrap.metadata_voters.first() == Some(&self.broker_id),
+            "only the first bootstrap metadata voter initializes a new cluster"
+        );
+        ensure!(
+            !self.data_dir.join("kv").try_exists()?,
+            "this volume already holds an Events store; a new cluster starts on an empty volume"
+        );
+        std::fs::create_dir_all(&self.data_dir)?;
+        let marker = self.data_dir.join(INITIALIZE_CLUSTER);
+        let file = std::fs::File::create(&marker)?;
+        file.sync_all()?;
+        std::fs::File::open(&self.data_dir)?.sync_all()?;
+        Ok(())
     }
 
     pub(super) fn open_broker(&self) -> Result<Arc<Broker>> {
@@ -299,6 +334,11 @@ pub(super) struct Control {
     peer_control: Semaphore,
     publish_metrics: Calls,
     poll_metrics: Calls,
+    /// The metadata group still waits for the empty-volume rule (EVENTS-1). It holds
+    /// `true` on the broker that initializes a new cluster.
+    metadata_join: Mutex<Option<bool>>,
+    /// The rule found this volume's metadata replica lost: an operator re-adds it.
+    metadata_lost: AtomicBool,
 }
 
 const LATENCY_BOUNDS_MS: [u64; 11] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000];
@@ -332,6 +372,7 @@ impl Control {
     fn new(mut config: Config, broker: Arc<Broker>) -> Result<Arc<Self>> {
         let bootstrap = config.bootstrap.broker_map(config.allow_plaintext)?;
         let keyring = Arc::new(config.take_keyring()?);
+        broker.set_clock_policy(config.clock);
         let disk_available = AtomicU64::new(broker.disk_available_bytes()?);
         Ok(Arc::new(Self {
             config,
@@ -348,6 +389,8 @@ impl Control {
             peer_control: Semaphore::new(24),
             publish_metrics: Calls::default(),
             poll_metrics: Calls::default(),
+            metadata_join: Mutex::new(None),
+            metadata_lost: AtomicBool::new(false),
         }))
     }
 

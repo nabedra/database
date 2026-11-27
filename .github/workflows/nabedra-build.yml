@@ -18,6 +18,8 @@
 #   migrate     MIG1/MIG2 RocksDB-era RF3 archive export and restore
 #   live3, live3-fixture  LIVE3 Linux release binaries per engine; the library test executable
 #   campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1  long, image and measurement jobs
+#   ab, insn    paired docs/testing/perf specs (ab_specs, default all) and Callgrind counts of ab_base
+#               (default: sha, an A/A run) against sha
 #   engine-tests, check-tests  Cache, OLAP and nabedra-check tests, also in the base jobs
 #   clippy      the phase 7 runtime seam bans (server/clippy.toml) for every product feature set, also a base job
 #   features    engine feature checks and the OLTP S3 loopback fixture, also a base job
@@ -56,9 +58,21 @@ on:
         type: boolean
         default: true
       jobs:
-        description: "Comma-separated opt-in jobs: direct, acceptance, o02, growth, rep1, rep4-mixed, o22, blackhole, migrate, live3, live3-fixture, campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1, engine-tests, check-tests, features, clippy, quarantine, fuzz, mutants"
+        description: "Comma-separated opt-in jobs: direct, acceptance, o02, growth, rep1, rep4-mixed, o22, blackhole, migrate, live3, live3-fixture, campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1, ab, insn, engine-tests, check-tests, features, clippy, quarantine, fuzz, mutants"
         type: string
         default: ""
+      ab_base:
+        description: "Full base commit for jobs=ab and insn; empty compares sha with itself (A/A)"
+        type: string
+        default: ""
+      ab_specs:
+        description: "Comma-separated docs/testing/perf specs for jobs=ab, e.g. kv/store (default: all)"
+        type: string
+        default: ""
+      ab_drivers:
+        description: "jobs=ab drivers and fixtures: harness (the workflow ref's, both sides) or side (each side's own tree)"
+        type: string
+        default: harness
       checks:
         description: Comma-separated check IDs from docs/testing/checks
         type: string
@@ -130,6 +144,8 @@ jobs:
       has_growth: ${{ steps.plan.outputs.has_growth }}
       checks: ${{ steps.checks.outputs.matrix }}
       fuzz: ${{ steps.fuzz.outputs.matrix }}
+      ab_base: ${{ steps.ab.outputs.base }}
+      ab_matrix: ${{ steps.ab.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -160,7 +176,7 @@ jobs:
             [[ "$REPEAT" =~ ^[0-9]+$ ]] && [ "$REPEAT" -ge 1 ] && [ "$REPEAT" -le 200 ] || fail "repeat must be 1-200"
             [[ "$FUZZ_SECONDS" =~ ^[0-9]+$ ]] && [ "$FUZZ_SECONDS" -ge 1 ] || fail "fuzz_seconds must be a positive integer"
           fi
-          known=",direct,acceptance,o02,growth,rep1,rep4-mixed,o22,blackhole,migrate,live3,live3-fixture,campaign,docker,memory,bench,perf,g7,gc1,perf1,snap1,engine-tests,check-tests,features,clippy,quarantine,fuzz,mutants,"
+          known=",direct,acceptance,o02,growth,rep1,rep4-mixed,o22,blackhole,migrate,live3,live3-fixture,campaign,docker,memory,bench,perf,g7,gc1,perf1,snap1,ab,insn,engine-tests,check-tests,features,clippy,quarantine,fuzz,mutants,"
           selected=","
           add() { [[ "$selected" == *",$1,"* ]] || selected+="$1,"; }
           has() { [[ "$selected" == *",$1,"* ]]; }
@@ -257,6 +273,27 @@ jobs:
             echo
             python3 scripts/ci_quarantine.py report
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Resolve the A/B base and specs
+        id: ab
+        if: contains(steps.plan.outputs.jobs, ',ab,') || contains(steps.plan.outputs.jobs, ',insn,')
+        env:
+          AB_BASE: ${{ inputs.ab_base }}
+          AB_SPECS: ${{ inputs.ab_specs }}
+        run: |
+          base=${AB_BASE:-$TESTED_SHA}
+          [[ "$base" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::ab_base must be a full 40-character commit, got '$base'"; exit 1; }
+          # spec:target, one leg each; ab_specs selects a subset (default all).
+          all="cache/get-hit:cache events/publish:events olap/streaming:olap olap/streaming-sparse:olap"
+          all+=" oltp/point-update:oltp oltp/queued-update:oltp kv/store:kv sim/oltp-seeds:sim"
+          for spec in ${AB_SPECS//,/ }; do [[ " $all " == *" $spec:"* ]] || { echo "::error::unknown ab spec '$spec'"; exit 1; }; done
+          legs=()
+          for entry in $all; do
+            spec=${entry%%:*}
+            [ -z "$AB_SPECS" ] || [[ ",$AB_SPECS," == *",$spec,"* ]] || continue
+            legs+=("{\"spec\":\"$spec\",\"name\":\"${spec//\//-}\",\"target\":\"${entry##*:}\"}")
+          done
+          { echo "base=$base"; echo "matrix={\"include\":[$(IFS=,; echo "${legs[*]}")]}"; } >> "$GITHUB_OUTPUT"
+          printf '\nA/B base: `%s`, head: `%s`, harness: `%s`, specs: %s\n' "$base" "$TESTED_SHA" "$GITHUB_SHA" "${AB_SPECS:-all}" >> "$GITHUB_STEP_SUMMARY"
       - name: Validate registered checks and plan their jobs
         id: checks
         if: github.event_name == 'workflow_dispatch' && inputs.checks != ''
@@ -2383,6 +2420,173 @@ jobs:
         with:
           name: perf-profile
           path: perf-out
+          retention-days: 14
+
+  # Paired A/B benchmarks (docs/testing/perf/README.md). Opt-in with jobs=ab. One runner per spec
+  # builds release binaries of ab_base (default: sha, an A/A run) and sha, then runs
+  # scripts/testing/ab.py with both sides. ab.py and the specs come from the workflow ref. With
+  # ab_drivers=harness (default) both sides run the workflow ref's drivers, fixtures and ORM; with
+  # ab_drivers=side each side runs from its own tree, for a head whose config, wire protocol or on-disk
+  # format differs from the base. Every invocation starts one side's cluster on fresh data.
+  ab:
+    name: A/B ${{ matrix.spec }}
+    needs: revision
+    if: contains(needs.revision.outputs.jobs, ',ab,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      # One leg per selected spec (revision job, "Resolve the A/B base and specs").
+      matrix: ${{ fromJSON(needs.revision.outputs.ab_matrix) }}
+    env:
+      SPEC: ${{ matrix.spec }}
+      NAME: ${{ matrix.name }}
+      TARGET: ${{ matrix.target }}
+      AB_BASE: ${{ needs.revision.outputs.ab_base }}
+      AB_DRIVERS: ${{ inputs.ab_drivers || 'harness' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+          fetch-depth: 0
+          path: code-under-test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build each side
+        working-directory: code-under-test
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+          mkdir -p "$RUNNER_TEMP/ab-bin"
+          for sha in $(printf '%s\n' "$TESTED_SHA" "$AB_BASE" | awk '!seen[$0]++'); do
+            git checkout --quiet --detach "$sha"
+            out="$RUNNER_TEMP/ab-bin/$TARGET-$sha"
+            start=$(date +%s)
+            case "$TARGET" in
+              oltp|cache|olap)
+                # The Dockerfile's bookworm base, so the binary also runs in the OLTP benchmark image.
+                docker run --rm -v "$PWD:/w" -w /w/server -e CARGO_BUILD_JOBS -e CARGO_TERM_COLOR "rust:${RUST_TOOLCHAIN}-bookworm" \
+                  cargo build --locked --release --no-default-features --features "$TARGET" --bin nabedra-db
+                cp server/target/release/nabedra-db "$out" ;;
+              events)
+                docker build -q -f server/events/deploy/Dockerfile --build-arg BUILD_JOBS=4 -t "nabedra-events:$sha" server
+                docker image inspect --format '{{.Id}}' "nabedra-events:$sha" > "$out" ;;
+              kv)
+                exe=$(cd server && cargo test --locked --release -p nabedra-kv --test store_bench --no-run --message-format=json \
+                  | jq -r 'select(.executable != null and .target.name == "store_bench") | .executable')
+                cp "$exe" "$out" ;;
+              sim)
+                (cd server && RUSTFLAGS="--cfg tokio_unstable" CARGO_TARGET_DIR=target/sim \
+                  cargo build --locked --release -p nabedra-sim-oltp --bin nabedra-sim)
+                cp server/target/sim/release/nabedra-sim "$out" ;;
+            esac
+            echo "$TARGET ${sha::10} built in $(( $(date +%s) - start )) s" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          sha256sum "$RUNNER_TEMP"/ab-bin/*
+      - name: Runner setup
+        run: |
+          base="$RUNNER_TEMP/ab-bin/$TARGET-$AB_BASE"; head="$RUNNER_TEMP/ab-bin/$TARGET-$TESTED_SHA"
+          case "$TARGET" in
+            events)
+              base="nabedra-events:$AB_BASE"; head="nabedra-events:$TESTED_SHA" ;;
+            oltp)
+              printf 'FROM python:3.11-slim-bookworm\nENV TOKIO_WORKER_THREADS=2\n' | docker build -t nabedra-perf-ci:1 -
+              echo "NABEDRA_PERF_OLTP_IMAGE=nabedra-perf-ci:1" >> "$GITHUB_ENV" ;;
+            cache)
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends valkey-server valkey-tools || sudo apt-get install -y --no-install-recommends valkey-server
+              sudo systemctl stop valkey-server || true
+              python3.11 -m pip install --quiet 'redis==6.4.0' 'hiredis==3.2.1'
+              valkey-server --version
+              {
+                echo "NABEDRA_PERF_VALKEY=$(command -v valkey-server)"
+                echo "NABEDRA_PERF_VALKEY_CLI=$(command -v valkey-cli)"
+                echo "NABEDRA_PERF_CLIENT_CPU=$(( $(nproc) - 1 ))"
+              } >> "$GITHUB_ENV" ;;
+            olap)
+              {
+                echo "NABEDRA_PERF_BASE_SHA=$AB_BASE"
+                echo "NABEDRA_PERF_HEAD_SHA=$TESTED_SHA"
+                echo "NABEDRA_PERF_FIXTURE_SHA=$GITHUB_SHA"
+              } >> "$GITHUB_ENV" ;;
+          esac
+          roots=""
+          case "$AB_DRIVERS" in
+            harness) ;;
+            side)
+              for side in base head; do
+                sha=$AB_BASE; [ "$side" = head ] && sha=$TESTED_SHA
+                tree="$RUNNER_TEMP/tree-$side"
+                git -C code-under-test worktree add --quiet --detach "$tree" "$sha"
+                roots+=" --$side-root $tree"
+              done ;;
+            *) echo "::error::ab_drivers must be harness or side, got '$AB_DRIVERS'"; exit 1 ;;
+          esac
+          { echo "AB_BASE_BIN=$base"; echo "AB_HEAD_BIN=$head"; echo "AB_ROOTS=$roots"; } >> "$GITHUB_ENV"
+          nproc; free -m; df -h .; grep -m1 'model name' /proc/cpuinfo
+      - name: Paired run
+        run: |
+          out="$RUNNER_TEMP/ab-out/$NAME"; mkdir -p "$out"
+          start=$(date +%s)
+          set +e
+          # shellcheck disable=SC2086 # AB_ROOTS is empty or two --<side>-root options.
+          python3.11 scripts/testing/ab.py "$PWD/docs/testing/perf/$SPEC.toml" "$AB_BASE_BIN" "$AB_HEAD_BIN" --output "$out" $AB_ROOTS 2>&1 | tee "$out/ab.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "ab.py exit $status after $(( $(date +%s) - start )) s (base \`${AB_BASE::10}\`, head \`${TESTED_SHA::10}\`, drivers $AB_DRIVERS)" | tee -a "$GITHUB_STEP_SUMMARY"
+          cat "$out/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          exit "$status"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ab-${{ matrix.name }}
+          path: ${{ runner.temp }}/ab-out
+          retention-days: 14
+
+  # Callgrind instruction counts per operation (scripts/testing/insn_count.py) of ab_base against sha.
+  # Opt-in with jobs=insn. The counting driver comes from the workflow ref and goes into both trees.
+  insn:
+    name: instruction counts (insn_count.py)
+    needs: revision
+    if: contains(needs.revision.outputs.jobs, ',insn,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      AB_BASE: ${{ needs.revision.outputs.ab_base }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Toolchain and Callgrind
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends valgrind
+          git fetch --quiet origin "$AB_BASE" "$TESTED_SHA"
+      - name: Counts
+        run: |
+          start=$(date +%s)
+          set +e
+          python3 scripts/testing/insn_count.py --base "$AB_BASE" --head "$TESTED_SHA" --output insn.json \
+            --work-dir "$RUNNER_TEMP/insn" 2>&1 | tee insn.log
+          status=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "insn_count.py exit $status after $(( $(date +%s) - start )) s"
+            echo '```'
+            grep -E '^(PASS|FAIL|NOISY|INCONCLUSIVE)' insn.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: insn-counts
+          path: |
+            insn.json
+            insn.log
+          if-no-files-found: ignore
           retention-days: 14
 
   # LIVE3: Linux release binaries per engine, built in the Dockerfile's bookworm base, with checksums.

@@ -245,7 +245,9 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as temp, ExitStack() as scope:
-        fleet = fixture.Fleet(args.binary, Path(temp), args.output, scope)
+        # The fleet fixture records its client and nemesis operations (5985c245).
+        recorder = scope.enter_context(fixture.HistoryWriter(args.output / 'fleet-history.jsonl'))
+        fleet = fixture.Fleet(args.binary, Path(temp), args.output, scope, recorder)
         for node in range(1, 4):
             fleet.controller(node)
         fixture.wait('controller majority', fleet.status, seconds=45)

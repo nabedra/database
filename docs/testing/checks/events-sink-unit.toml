@@ -1,0 +1,12 @@
+# The OLAP sink reconciliation of rows that already exist (EVENTS-9).
+id = "events-sink-unit"
+module = "orm-python"
+kinds = ["U"]
+guarantees = ["EVT-G03", "EVT-G10"]
+scenarios = ["EV04"]
+tiers = ["T1"]
+command = ["python3", "-m", "unittest", "discover", "-v", "-s", "tests/events", "-t", ".", "-p", "test_sink_ingest.py"]
+cwd = "orm/python"
+timeout_s = 600
+needs = ["python-orm"]
+result_parser = "unittest"

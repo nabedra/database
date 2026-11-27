@@ -196,11 +196,9 @@ impl Writer {
         let dir = &shared.dir;
         let options = &shared.options;
 
-        // Unused header-less segments (L4) hold nothing; delete them first.
+        // Unused segment files (L4) hold nothing; delete them first.
         if !discard.is_empty() {
-            for h in discard {
-                let path = h.path;
-                drop(h.file);
+            for path in discard {
                 fs.remove(&path).map_err(segment::io)?;
             }
             fs.sync_dir(dir).map_err(segment::io)?;

@@ -199,11 +199,15 @@ fn same_term_leader_handoff_preserves_safety() {
 /// Runs seeds from a fixed start until one violation mentions `expect`, then runs the
 /// catching seed again and requires the same trace, history and violations.
 fn find_planted(knobs: Knobs, expect: &[&str], label: &str) {
+    find_planted_with(|config| config.knobs = knobs, expect, label);
+}
+
+fn find_planted_with(configure: impl Fn(&mut SimConfig), expect: &[&str], label: &str) {
     let first = env_u64("NABEDRA_PLANTED_SEED", PLANTED_FIRST);
     let budget = env_u64("NABEDRA_PLANTED_SEEDS", PLANTED_BUDGET);
     let planted = |seed| {
         let mut config = SimConfig::new(seed);
-        config.knobs = knobs;
+        configure(&mut config);
         run(config)
     };
     for seed in first..first + budget {
@@ -309,6 +313,92 @@ fn planted_fsynced_data_loss_is_caught() {
     );
 }
 
+/// EVENTS-1: the seed sweep with volume wipes. A crashed node restarts on an empty
+/// volume now and then; the empty-volume rule keeps it out of the group, so every safety
+/// invariant holds. Before the fix (the planted reopen below, which is what the harness
+/// and `Control::reopen` did), seeds 1 to 40 broke a safety invariant in 8 seeds.
+#[test]
+fn wipe_sweep() {
+    let first = env_u64("NABEDRA_SEED", 1);
+    let count = env_u64("NABEDRA_SEEDS", 20);
+    let mut failures = Vec::new();
+    let mut lost = 0;
+    for seed in first..first + count {
+        let mut config = SimConfig::new(seed);
+        config.wipes = true;
+        let report = run(config);
+        lost += report.stats.lost_replicas;
+        if !report.passed() {
+            eprintln!("{}", describe(&report, "wipes"));
+            failures.push(seed);
+        }
+    }
+    eprintln!(
+        "events sim wipes: {count} seeds from {first}: {} failed; {lost} replicas lost to wipes",
+        failures.len()
+    );
+    assert!(lost > 0, "no seed wiped a volume");
+    assert!(failures.is_empty(), "failing seeds: {failures:?}");
+}
+
+#[test]
+fn planted_rejoin_of_a_wiped_voter_is_caught() {
+    find_planted_with(
+        |config| {
+            config.wipes = true;
+            config.knobs.rejoin_wiped_voter = true;
+        },
+        &[
+            "MajorityReachedHighWatermark",
+            "AppliedPrefixesAgree",
+            "ConsistentCommittedData",
+            "lost-write",
+        ],
+        "rejoin-wiped-voter",
+    );
+}
+
+/// EVENTS-2, EVENTS-3, EVENTS-8: the seed sweep with the retention loop (3 s), guarded
+/// time stamps and clock jumps within and beyond the stated bound for one clock at a time.
+/// Every removal is checked against EVT-G08 in true time.
+#[test]
+fn retention_sweep() {
+    let first = env_u64("NABEDRA_SEED", 1);
+    let count = env_u64("NABEDRA_SEEDS", 20);
+    let mut failures = Vec::new();
+    let (mut removed, mut jumps, mut steps) = (0, 0, 0);
+    for seed in first..first + count {
+        let mut config = SimConfig::new(seed);
+        config.retention_ms = Some(3_000);
+        let report = run(config);
+        removed += report.stats.retained_removed;
+        jumps += report.stats.clock_jumps;
+        steps += report.stats.clock_steps;
+        if !report.passed() {
+            eprintln!("{}", describe(&report, "retention"));
+            failures.push(seed);
+        }
+    }
+    eprintln!(
+        "events sim retention: {count} seeds from {first}: {} failed; {removed} events removed, {jumps} clock jumps, {steps} clock steps",
+        failures.len()
+    );
+    assert!(removed > 0, "retention removed nothing");
+    assert!(failures.is_empty(), "failing seeds: {failures:?}");
+}
+
+#[test]
+fn planted_unguarded_clock_is_caught() {
+    find_planted_with(
+        |config| {
+            config.retention_ms = Some(3_000);
+            config.knobs.unguarded_clock = true;
+        },
+        &["EVT-G08 early-removal"],
+        "unguarded-clock",
+    );
+}
+
 mod checkers {
     use nabedra_sim::RaftObserver;
     use openraft::{CommittedLeaderId, LogId, Vote};
@@ -363,7 +453,7 @@ mod checkers {
             ("ok", "poll", poll(0, &[(1, 1), (2, 2)])),
         ]);
         assert_eq!(
-            history::check(&h, &log(&[(1, 1), (2, 2)]), 2),
+            history::check(&h, &log(&[(1, 1), (2, 2)]), 2, 1, &Default::default()),
             Vec::<String>::new()
         );
     }
@@ -453,7 +543,7 @@ mod checkers {
             ),
         ];
         for (expected, h, final_log, checkpoint) in cases {
-            let anomalies = history::check(h, final_log, *checkpoint);
+            let anomalies = history::check(h, final_log, *checkpoint, 1, &Default::default());
             assert!(
                 anomalies.iter().any(|a| a.contains(expected)),
                 "{expected} not flagged: {anomalies:?}"

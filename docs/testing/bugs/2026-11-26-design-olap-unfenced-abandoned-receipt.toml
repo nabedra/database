@@ -1,0 +1,20 @@
+# Evidence: specs/olap (design review, rv-olap). The shipped receipt is the mutant prefix_unfenced_receipt; the
+# baseline requires the current run's fence on the root before `abandoned`. Code: server/src/node/queue_runtime.rs
+# Command::Lookup (1473-1611) and server/src/request_queue.rs:843-845.
+id = "DESIGN-olap-unfenced-abandoned-receipt"
+title = "An old-run OLAP receipt says abandoned from a catalog the new run has not fenced, while an old PUT can still apply"
+class = "fence-lifecycle-order"
+module = "olap"
+guarantees = ["OLAP-G03", "OLAP-G04"]
+scenarios = ["T05", "R04"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/olap/mutants/prefix_unfenced_receipt.cfg"
+seed = "unknown"
+why_not_caught = "The T05 tests order a held PUT against the cold-start fence, and the receipt tests run after the fence; no test polls an old-run receipt for a database that the new run has not dispatched to yet."
+invariant_added = "G03_NoFalseNotApplied: after an abandoned answer for a request in a run, no attempt of that run commits it."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

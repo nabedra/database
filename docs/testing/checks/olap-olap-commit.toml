@@ -1,0 +1,16 @@
+# Design spec of the OLAP commit protocol (specs/olap/OlapCommit.tla): private uploads, the
+# conditional catalog root, the run and term fence, ambiguous PUTs, CAS losers, receipts and
+# cold start at L2 bounds (3 writers, 2 requests, one of every fault), plus a reader with the
+# candidate collection rule, the candidate bounded decision window, and a liveness run.
+# Design review: wave-rv findings olap.md (the plan section waits for the queue reviewer).
+id = "olap-olap-commit"
+module = "olap"
+kinds = ["T"]
+guarantees = ["OLAP-G01", "OLAP-G02", "OLAP-G03", "OLAP-G04", "OLAP-G05"]
+scenarios = ["T01", "T02", "T03", "T04", "T05", "T06"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/olap", "OlapCommit"]
+cwd = "."
+timeout_s = 14400
+needs = ["tlc"]
+result_parser = "tlc"

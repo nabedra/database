@@ -38,12 +38,23 @@ use super::{Broker, Group, Node, TypeConfig};
 
 const CLUSTER_HEADER: &str = "x-nabedra-events-cluster";
 const TARGET_HEADER: &str = "x-nabedra-events-target";
-const RPC_PREFIX: &str = "/internal/raft/v1";
+// v2: brokers with guarded time (EVENTS-2) and the empty-volume rule (EVENTS-1). A v1
+// broker gets 404 on every peer request and cannot join a v2 cluster.
+const RPC_PREFIX: &str = "/internal/raft/v2";
 const PEER_REQUEST_BYTES: usize = 5 * 1024 * 1024;
 const PEER_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 const SNAPSHOT_FRAME_BYTES: usize = 64 * 1024;
 const SNAPSHOT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const PEER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// The clock sampling route of EVENTS-2.
+const CLOCK_PATH: &str = "/internal/raft/v2/clock";
+const CLOCK_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// A peer's wall clock, read while it serves a sampling request (EVENTS-2).
+#[derive(Serialize, Deserialize)]
+struct ClockReading {
+    wall_ms: i64,
+}
 
 #[derive(Clone)]
 pub struct PeerTransport {
@@ -174,6 +185,37 @@ impl PeerTransport {
         .context("peer application RPC timed out")?
     }
 
+    /// One clock sample from broker `target` at `base_url` (EVENTS-2, `raft::clock`): its
+    /// wall clock in Unix milliseconds, or `None` when it does not answer in time.
+    #[cfg(not(feature = "sim"))]
+    pub(super) async fn sample_clock(&self, target: u64, base_url: &str) -> Option<i64> {
+        let call = async {
+            let _permit = self.lanes.outgoing_control.acquire().await.ok()?;
+            let response = self
+                .request(base_url, CLOCK_PATH, Some(target))
+                .ok()?
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body("{}")
+                .send()
+                .await
+                .ok()?;
+            let body = response.error_for_status().ok()?.bytes().await.ok()?;
+            let reading = serde_json::from_slice::<ClockReading>(&body).ok()?;
+            Some(reading.wall_ms)
+        };
+        tokio::time::timeout(CLOCK_TIMEOUT, call).await.ok().flatten()
+    }
+
+    /// The simulated sample: the handler runs on the target node, so it reads that
+    /// node's wall clock.
+    #[cfg(feature = "sim")]
+    pub(super) async fn sample_clock(&self, target: u64, _base_url: &str) -> Option<i64> {
+        crate::sim::net::call(target, "clock", CLOCK_TIMEOUT, |_broker| async {
+            Some(crate::rt::unix_ms() as i64)
+        })
+        .await
+    }
+
     async fn exchange<T: Serialize, R: DeserializeOwned>(
         &self,
         base_url: &str,
@@ -239,8 +281,31 @@ impl PeerTransport {
 
 pub(super) fn router(broker: Arc<Broker>) -> Router {
     Router::new()
-        .route("/internal/raft/v1/{group}/{rpc}", post(handle))
+        .route(CLOCK_PATH, post(clock))
+        .route("/internal/raft/v2/{group}/{rpc}", post(handle))
         .with_state(broker)
+}
+
+/// Answers a clock sampling request with this broker's wall clock (EVENTS-2).
+async fn clock(State(broker): State<Arc<Broker>>, request: Request) -> Response {
+    if !broker.peers().authenticated(request.headers()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let target = request
+        .headers()
+        .get(TARGET_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if target != Some(broker.id()) {
+        return StatusCode::MISDIRECTED_REQUEST.into_response();
+    }
+    let Ok(_permit) = broker.peers().lanes.incoming_control.try_acquire() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    Json(ClockReading {
+        wall_ms: i64::try_from(crate::rt::unix_ms()).unwrap_or(i64::MAX),
+    })
+    .into_response()
 }
 
 async fn handle(

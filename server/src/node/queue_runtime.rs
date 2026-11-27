@@ -30,6 +30,28 @@ use uuid::Uuid;
 // The last possible cursor has no successor in a legacy queue snapshot.
 pub(super) const STREAM_CAPABILITY_CURSOR: u64 = u64::MAX;
 
+#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JoinBase {
+    cluster: Uuid,
+    revision: u64,
+    change_id: Uuid,
+}
+
+impl JoinBase {
+    pub(crate) fn of(root: &Control) -> Self {
+        Self {
+            cluster: root.cluster_id,
+            revision: root.revision,
+            change_id: root.change_id,
+        }
+    }
+
+    fn is_fenced_by(self, successor: Self) -> bool {
+        self.cluster == successor.cluster && self.revision < successor.revision
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Command {
@@ -58,6 +80,10 @@ pub(crate) enum Command {
     Join {
         node_id: Uuid,
     },
+    FencedJoin {
+        node_id: Uuid,
+        base: JoinBase,
+    },
     Unseal {
         token: Uuid,
     },
@@ -73,6 +99,7 @@ impl Command {
             Self::Stats => "stats",
             Self::Seal => "seal",
             Self::Join { .. } => "join",
+            Self::FencedJoin { .. } => "fenced_join",
             Self::Unseal { .. } => "unseal",
         }
     }
@@ -198,6 +225,9 @@ pub(crate) enum Reply {
     Joined {
         token: Uuid,
     },
+    FencedJoined {
+        base: JoinBase,
+    },
     Error {
         error: crate::protocol::ProtocolError,
     },
@@ -221,8 +251,14 @@ pub(super) struct QueueRuntime {
     progress: Arc<tokio::sync::Semaphore>,
 }
 
+#[derive(Clone, Copy)]
+enum SealRelease {
+    Deadline(tokio::time::Instant),
+    Successor { base: JoinBase, joiner: Uuid },
+}
+
 struct QueueSeal {
-    until: tokio::time::Instant,
+    release: SealRelease,
     _changes: tokio::sync::OwnedMutexGuard<()>,
     _stream_changes: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -268,12 +304,7 @@ impl QueueRuntime {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let nearest = {
-                let mut seals = self.seals.lock().unwrap();
-                let now = nabedra_rt::time::now();
-                seals.retain(|_, seal| seal.until > now);
-                seals.values().map(|seal| seal.until).min()
-            };
+            let nearest = self.reap_timed_seals();
             let expiration = async {
                 match nearest {
                     Some(until) => nabedra_rt::time::sleep_until(until).await,
@@ -292,11 +323,24 @@ impl QueueRuntime {
         changes: tokio::sync::OwnedMutexGuard<()>,
         stream_changes: tokio::sync::OwnedMutexGuard<()>,
     ) -> Uuid {
+        self.insert_seal(
+            changes,
+            stream_changes,
+            SealRelease::Deadline(nabedra_rt::time::now() + Duration::from_secs(30)),
+        )
+    }
+
+    fn insert_seal(
+        &self,
+        changes: tokio::sync::OwnedMutexGuard<()>,
+        stream_changes: tokio::sync::OwnedMutexGuard<()>,
+        release: SealRelease,
+    ) -> Uuid {
         let token = nabedra_rt::ids::uuid_v4();
         self.seals.lock().unwrap().insert(
             token,
             QueueSeal {
-                until: nabedra_rt::time::now() + Duration::from_secs(30),
+                release,
                 _changes: changes,
                 _stream_changes: stream_changes,
             },
@@ -304,6 +348,43 @@ impl QueueRuntime {
         self.changed.notify_waiters();
         token
     }
+
+    fn reap_timed_seals(&self) -> Option<tokio::time::Instant> {
+        let mut seals = self.seals.lock().unwrap();
+        let now = nabedra_rt::time::now();
+        seals.retain(
+            |_, seal| !matches!(seal.release, SealRelease::Deadline(until) if until <= now),
+        );
+        seals
+            .values()
+            .filter_map(|seal| match seal.release {
+                SealRelease::Deadline(until) => Some(until),
+                SealRelease::Successor { .. } => None,
+            })
+            .min()
+    }
+
+    fn fenced_join(&self) -> Option<(Uuid, JoinBase, Uuid)> {
+        self.seals
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|(token, seal)| match seal.release {
+                SealRelease::Successor { base, joiner } => Some((*token, base, joiner)),
+                SealRelease::Deadline(_) => None,
+            })
+    }
+
+    fn release_join(&self, token: Uuid, successor: JoinBase) {
+        let mut seals = self.seals.lock().unwrap();
+        if seals.get(&token).is_some_and(|seal| {
+            matches!(seal.release, SealRelease::Successor { base, .. } if base.is_fenced_by(successor))
+        }) {
+            seals.remove(&token);
+            self.changed.notify_waiters();
+        }
+    }
+
     pub(super) fn transport(&self, class: &str) -> Result<tokio::sync::OwnedSemaphorePermit> {
         match class {
             "ingress" => self.ingress.clone(),
@@ -1149,7 +1230,12 @@ impl Worker {
                 let token = self.queue.retain_seal(seal, stream_seal);
                 Ok(Reply::Joined { token })
             }
-            Command::Join { node_id } => {
+            Command::Join { node_id } | Command::FencedJoin { node_id, .. } => {
+                let join_base = match command {
+                    Command::FencedJoin { base, .. } if base == JoinBase::of(root) => Some(base),
+                    Command::FencedJoin { .. } => return Err(unavailable()),
+                    _ => None,
+                };
                 if sender.is_some()
                     || Some(scheduler(root)?.node_id) != self.signer.sender().node_id()
                 {
@@ -1223,32 +1309,42 @@ impl Worker {
                 }
                 self.copy_stream_replicas(root, node, self.queue.fence()?.run_id)
                     .await?;
-                let token = self.queue.retain_seal(seal, stream_seal);
-                Ok(Reply::Joined { token })
+                if let Some(base) = join_base {
+                    // An ownership or membership change while copying already
+                    // fenced this attempt. It cannot authorize a new-root CAS.
+                    if JoinBase::of(&self.root().await?) != base {
+                        return Err(unavailable());
+                    }
+                    self.queue.insert_seal(
+                        seal,
+                        stream_seal,
+                        SealRelease::Successor {
+                            base,
+                            joiner: node_id,
+                        },
+                    );
+                    Ok(Reply::FencedJoined { base })
+                } else {
+                    let token = self.queue.retain_seal(seal, stream_seal);
+                    Ok(Reply::Joined { token })
+                }
             }
             Command::Unseal { token } => {
                 if sender.is_some() {
                     return Err(http::failure(crate::protocol::ErrorCode::Unauthorized));
                 }
-                self.refresh_queue(root).await?;
-                let mut after = None;
-                loop {
-                    let (page, done) = self
-                        .queue
-                        .queue
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .ok_or_else(unavailable)?
-                        .snapshot_page(after);
-                    for record in page.records {
-                        after = Some(record.sequence);
-                        self.replicate_record_class(root, record, true).await?;
-                    }
-                    if done {
-                        break;
-                    }
+                if self
+                    .queue
+                    .seals
+                    .lock()
+                    .unwrap()
+                    .get(&token)
+                    .is_some_and(|seal| matches!(seal.release, SealRelease::Successor { .. }))
+                {
+                    return Err(invalid());
                 }
+                self.refresh_queue(root).await?;
+                self.refresh_join_records(root).await?;
                 self.queue
                     .seals
                     .lock()
@@ -1403,11 +1499,7 @@ impl Worker {
                 {
                     return Err(unavailable());
                 }
-                self.queue
-                    .seals
-                    .lock()
-                    .unwrap()
-                    .retain(|_, seal| seal.until > nabedra_rt::time::now());
+                let _ = self.queue.reap_timed_seals();
                 let fresh_grant = if let Some(context) = context.as_ref() {
                     let grant = self.open_database(context.clone()).await?;
                     let loaded = self.owned_catalog(root, &grant).await?;
@@ -1617,6 +1709,54 @@ impl Worker {
             }
         }
     }
+    async fn refresh_join_records(&self, root: &Control) -> Result<()> {
+        let mut after = None;
+        loop {
+            let (page, done) = self
+                .queue
+                .queue
+                .lock()
+                .unwrap()
+                .as_ref()
+                .ok_or_else(unavailable)?
+                .snapshot_page(after);
+            for record in page.records {
+                after = Some(record.sequence);
+                self.replicate_record_class(root, record, true).await?;
+            }
+            if done {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn resolve_fenced_join(&self, root: &Control) -> Result<()> {
+        let Some((token, base, joiner)) = self.queue.fenced_join() else {
+            return Ok(());
+        };
+        let successor = JoinBase::of(root);
+        if !base.is_fenced_by(successor) {
+            return Ok(());
+        }
+        if self.owns_queue_scheduler(root) {
+            self.refresh_queue(root).await?;
+            if members(root).contains(&joiner) {
+                self.refresh_join_records(root).await?;
+            }
+        }
+        self.queue.release_join(token, successor);
+        Ok(())
+    }
+
+    fn owns_queue_scheduler(&self, root: &Control) -> bool {
+        let sender = self.signer.sender();
+        scheduler(root).is_ok_and(|node| {
+            Some(node.node_id) == sender.node_id()
+                && node.incarnation == sender.incarnation()
+                && node.session.as_ref().map(|session| session.id) == sender.session_id()
+        })
+    }
+
     pub(super) async fn queue_pump(
         self: Arc<Self>,
         mut stop: tokio::sync::watch::Receiver<bool>,
@@ -1630,15 +1770,11 @@ impl Worker {
             if self.queue.has_pending() && super::stream::memory_pressure(&self.cpu) {
                 self.queue.streams.evict_speculation();
             }
-            self.queue
-                .seals
-                .lock()
-                .unwrap()
-                .retain(|_, seal| seal.until > nabedra_rt::time::now());
+            let _ = self.queue.reap_timed_seals();
             if let Ok(root) = self.root().await
-                && scheduler(&root)
-                    .ok()
-                    .is_some_and(|n| Some(n.node_id) == self.signer.sender().node_id())
+                && self.resolve_fenced_join(&root).await.is_ok()
+                && self.queue.fenced_join().is_none()
+                && self.owns_queue_scheduler(&root)
                 && self.refresh_queue(&root).await.is_ok()
             {
                 self.queue.streams.scheduler_owner(true);
@@ -1763,7 +1899,7 @@ impl Worker {
                         Ok::<(), crate::protocol::ProtocolError>(())
                     });
                 }
-            } else {
+            } else if self.queue.fenced_join().is_none() {
                 self.queue.streams.scheduler_owner(false);
             }
             tokio::select! {_=stop.changed()=>{},_=self.queue.changed.notified()=>{},_=tasks.join_next(),if !tasks.is_empty()=>{},_=nabedra_rt::time::sleep(Duration::from_millis(100))=>{}}
@@ -2191,6 +2327,67 @@ mod class_capacity_tests {
         assert!(queue.changes.try_lock().is_ok());
         assert!(queue.stream_changes.try_lock().is_ok());
     }
+    #[tokio::test(start_paused = true)]
+    async fn st04_r03_expiry_cannot_unseal_a_delayed_readiness_match() {
+        let queue = Arc::new(QueueRuntime::new());
+        let base = JoinBase {
+            cluster: Uuid::from_u128(1),
+            revision: 7,
+            change_id: Uuid::from_u128(2),
+        };
+        let stream_seal = queue.lock_stream_changes().await;
+        let seal = queue.lock_changes().await;
+        let token = queue.insert_seal(
+            seal,
+            stream_seal,
+            SealRelease::Successor {
+                base,
+                joiner: Uuid::from_u128(3),
+            },
+        );
+
+        let queue_waiter = {
+            let queue = queue.clone();
+            nabedra_rt::task::spawn(async move { queue.lock_changes().await })
+        };
+        let stream_waiter = {
+            let queue = queue.clone();
+            nabedra_rt::task::spawn(async move { queue.lock_stream_changes().await })
+        };
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let _ = queue.reap_timed_seals();
+        queue.release_join(token, base);
+        queue.release_join(
+            token,
+            JoinBase {
+                cluster: Uuid::from_u128(4),
+                revision: 8,
+                ..base
+            },
+        );
+        let still_sealed = queue.fenced_join().is_some();
+        let blocked = !queue_waiter.is_finished() && !stream_waiter.is_finished();
+
+        queue.release_join(
+            token,
+            JoinBase {
+                revision: 8,
+                change_id: Uuid::from_u128(5),
+                ..base
+            },
+        );
+        for waiter in [queue_waiter, stream_waiter] {
+            let guard = nabedra_rt::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("a successor must unblock both admission paths")
+                .unwrap();
+            drop(guard);
+        }
+        assert!(still_sealed && blocked);
+        assert!(queue.seals.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn m02_r03_working_memory_pressure_does_not_consume_bootstrap_or_small_control_bytes() {
         let data = crate::scheduling::ResourceScheduler::new(vec![(

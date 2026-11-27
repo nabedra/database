@@ -46,14 +46,17 @@ flowchart LR
    The [secret shape](#secret-shape) section lists the fields.
 4. Copy [the example inputs](terraform.tfvars.example) to a local tfvars file
    and replace the sample values. Set `format_blank_volume=true` only for disks
-   you mean to format. For the first deployment, set the genesis flag in the
-   secret of the broker with the lowest ID among the metadata voters, and leave
-   it false everywhere else.
+   you mean to format. For the first deployment, set `start_broker=false` for
+   the broker with the lowest ID among the metadata voters, the genesis broker.
 5. Run `terraform init`, review `terraform plan`, and apply the plan you
-   reviewed. Check that all three targets are healthy, then read the committed
-   metadata voter list from `/v1/admin/groups/metadata`. Once bootstrap is
-   done, clear the genesis flag and the formatting flags. When the genesis
-   broker's two peers are healthy, restart it with the updated secret.
+   reviewed. On the genesis broker, once cloud-init has mounted its empty disk,
+   run `nabedra-events init --config /etc/nabedra-events/current/broker.json`
+   as the broker's user, then enable and start `nabedra-events.service`. `init`
+   refuses a disk that already holds a store, and the broker consumes the
+   authorization when it creates the cluster, so it never forms a cluster on its
+   own again. Check that all three targets are healthy, then read the committed
+   metadata voter list from `/v1/admin/groups/metadata`, and clear the
+   formatting flags.
 
 Cloud-init installs the service and records which EBS volume ID the host
 should have. On every start, the host checks the disk serial, mounts the
@@ -89,7 +92,6 @@ breaks.
 | --- | --- |
 | `peer_token` | Random cluster token shared by every broker, 32 to 256 printable ASCII characters |
 | `keyring` | `cluster_id` and separate `grant` and `session` signing rings |
-| `initialize_new_cluster` | Boolean, true only for the broker that starts a brand-new cluster |
 | `public_cert`, `public_key` | PEM server chain and key for the listener the ALB connects to |
 | `peer_ca` | PEM root chain that verifies private client and server connections |
 | `peer_cert`, `peer_key` | PEM server chain and key for this broker's peer listener |
@@ -107,8 +109,8 @@ its own secret and the binary. A separate backup policy is exported as
 ## Scale and replace brokers
 
 **Adding a broker.** Give it a new ID, its own EBS volume and certificate, and
-a bootstrap config that points at the existing cluster. Keep its genesis flag
-false. If the live catalog doesn't know that ID yet, register it with
+a bootstrap config that points at the existing cluster. Never run `init` on
+it. If the live catalog doesn't know that ID yet, register it with
 `add_broker`. Then spread data onto it with `rebalance`, or place partitions
 yourself with `move_partition`, and check the published voters and applied
 indexes. Metadata voters move separately, with `move_metadata`. Partitions keep
@@ -135,6 +137,17 @@ broker out of traffic.
 If a group has lost quorum, first try to recover its original disks from their
 hosts or volumes. If that fails, restore a verified backup into a fresh
 cluster. Restarting an empty group can't bring back its committed history.
+
+## Total loss of the bootstrap disks
+
+A broker that starts on an empty volume asks its bootstrap peers what their
+disks hold, and it never votes, or creates a cluster, from an empty disk on its
+own. If every bootstrap broker lost its disk, nothing re-forms: the cluster
+stays unavailable. Recover with a backup restore. To start over without one,
+create a new cluster: a new `cluster_id` and keyring in every secret, and
+`init` on the genesis broker. The new identity makes the new cluster refuse old
+grants and delivery tokens, and refuse brokers that still hold groups of the
+old cluster.
 
 ## Back up and restore
 
@@ -172,7 +185,7 @@ broker IDs, zones and metadata voters must match the manifest, but private DNS
 can point at the new hosts. Set `start_broker=false` for each new EC2 instance,
 so that cloud-init mounts and configures the disk without starting the broker.
 Use a separate client hostname until you have verified the recovery. Leave the
-genesis flag false on the target, and run restore on every target broker:
+brokers uninitialized (no `init`), and run restore on every target broker:
 
 ```sh
 nabedra-events restore --config "$config" --backup "$downloaded_bundle"

@@ -564,12 +564,13 @@ impl Store {
 
         // Replay the journal above flushed_seq into the memtables.
         let sink: Arc<dyn JournalSink> = Arc::new(Sink(Arc::downgrade(&inner)));
-        let (journal, report) = Journal::open(
+        let (journal, report) = Journal::open_with_manifest_segments(
             fs.clone(),
             &dir.join(JOURNAL_DIR),
             options.journal.clone(),
             flushed_seq,
             sink,
+            &state.segments,
         )?;
         let journal = Arc::new(journal);
         journal.set_value_cache(options.cache.clone(), inner.table_cache.context().namespace);
@@ -591,21 +592,6 @@ impl Store {
             }
             if inner.quarantine.add(damage.clone()) {
                 new_damage.push(damage);
-            }
-        }
-
-        // The journal must still hold every segment the manifest recorded.
-        let live = journal.segments();
-        for &(segment, epoch) in &state.segments {
-            if !live
-                .iter()
-                .any(|s| s.segment == segment && s.epoch == epoch)
-            {
-                return Err(Error::Corruption {
-                    file: FileId::Journal { segment },
-                    offset: 0,
-                    what: "a journal segment the manifest records is missing",
-                });
             }
         }
 
