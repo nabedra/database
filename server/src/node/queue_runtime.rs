@@ -701,9 +701,9 @@ fn dispatch_candidates<'a>(
             r.accepted
                 && (!r.state.terminal() || !q.ready(r.identity()))
                 && !active.contains(&r.identity())
-                && !retries
+                && retries
                     .get(&r.identity())
-                    .is_some_and(|(_, until)| *until > now)
+                    .is_none_or(|(_, until)| *until <= now)
         })
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|r| r.sequence);
@@ -2894,7 +2894,7 @@ mod join_tests {
         for request in 1..=3 {
             accept(&mut q, request);
         }
-        let now = tokio::time::Instant::now();
+        let now = nabedra_rt::time::now();
         let mut retries = BTreeMap::new();
         // r1 failed three times and its backoff has elapsed: it must run
         // again, or an unknown mutation wedges until a takeover.
@@ -2940,7 +2940,7 @@ mod join_tests {
             &q,
             &BTreeSet::new(),
             &BTreeMap::new(),
-            tokio::time::Instant::now(),
+            nabedra_rt::time::now(),
         );
         assert_eq!(picked.first().map(|r| r.request_id), Some(id(1)));
         assert!(picked.windows(2).all(|w| w[0].sequence < w[1].sequence));
@@ -3064,6 +3064,7 @@ mod join_tests {
     /// Run with `--ignored --nocapture` in a release build.
     #[test]
     #[ignore]
+    #[allow(clippy::disallowed_methods)] // A wall-clock measurement, not product time.
     fn r03_measure_join_copy_order_cost() {
         let members: BTreeSet<Uuid> = [id(10)].into();
         let mut limits = limits();

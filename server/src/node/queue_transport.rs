@@ -254,6 +254,7 @@ impl ReplayCache {
         Self::default()
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.by_nonce.len()
     }
