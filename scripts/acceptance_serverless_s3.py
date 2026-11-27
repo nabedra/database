@@ -291,10 +291,11 @@ def run(args, report):
         check(version.returncode==0 and isinstance(json.loads(version.stdout),dict))
         report['versions']={key:json.loads(version.stdout)[key] for key in ('cli','binary','config','protocol')}
         check(cluster.command(['--help']).returncode==0)
-        native_help=subprocess.run([args.binary,'database','migrate','--help'],stdout=subprocess.PIPE,
+        # Catalog format 6 is the only format: the migrate command is gone and must be refused.
+        native_migrate=subprocess.run([args.binary,'database','migrate','--help'],stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,timeout=10)
-        check(native_help.returncode==0 and b'--cluster-id' in native_help.stdout)
-        passed('native_cli_version_help_migration_flag')
+        check(native_migrate.returncode!=0 and b'--cluster-id' not in native_migrate.stdout)
+        passed('native_cli_version_help_migrate_refused')
         if args.cli:
             phase('installed-isolated-core-import')
             code = """

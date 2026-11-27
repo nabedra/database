@@ -54,7 +54,8 @@ Provide a local Dockerfile with `docker build -t nabedra-database:local .`. Depl
 | `nabedra database doctor --config PATH` | Check versions, config, secret permissions and storage reads without changing data; identify unverified write permissions. |
 | `nabedra database cluster status --url URL --admin-token-file PATH` | Report run, workers, pending work and resources; support `--json`. |
 | `nabedra database cluster scale N --url URL --admin-token-file PATH` | Call the existing admin API; provisioning requires a configured provider. |
-| `nabedra database migrate --storage URI --region REGION --cluster-id UUID --confirm-writers-stopped` | Explicitly upgrade one catalog using authorized credentials and the intended owning cluster. |
+
+There is no `migrate` command: catalog format 6 is the only format (`plans/olap-commit.md`, "One format").
 
 Listeners default to loopback. External traffic and worker links use verified encrypted transports. Keep admin, worker and gateway-to-compute credentials separate. CLI exit codes are `0` success, `2` invalid arguments/config and `1` runtime failure; preserve signal termination status.
 
@@ -184,7 +185,7 @@ Use explicit AWS providers and separate [credential/identity caches](https://doc
 
 Replicate complete request/context snapshots in encrypted authenticated worker RAM before `202`. Persist no AWS keys, user bearers or pending requests in control history, bootstrap files or Redis queues. Charge SDK clients, registry entries, contexts, catalogs, replicas and retained results under shared memory limits. Bound idle handle caches and pending work per authenticated compute-data grant under global limits; gateway middleware enforces finer user quotas. Preserve approved scheduling policy. Never evict pending request context.
 
-Extend catalog fences with cluster identity through explicit migration. One storage key has one owning cluster. Fence each database before resumed dispatch after takeover/cold-start and keep authority checks in the same [conditional root write](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) as publication. An inaccessible database pauses its work/reconciliation without blocking unrelated databases. Idle handle recreation/credential rotation never starts a new run. Initialize new databases on demand; explicitly migrate existing catalogs after old writers stop. Live cross-cluster transfer is deferred.
+Catalog fences carry cluster identity. One storage key has one owning cluster. Fence each database before resumed dispatch after takeover/cold-start and keep authority checks in the same [conditional root write](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) as publication. An inaccessible database pauses its work/reconciliation without blocking unrelated databases. Idle handle recreation/credential rotation never starts a new run. Initialize new databases on demand; a catalog of an older format is refused, with no migration. Live cross-cluster transfer is deferred.
 
 Preserve [scheduling requirements](resource-aware-scheduling.md) and [the test contract](../docs/testing/scheduler-contract.md). Gateway/application/API loss does not discard accepted work. Credentials are snapshots; a refreshed gateway credential cannot renew an already queued snapshot. Reject known-expired credentials before admission; expiry during accepted work can fail it. Reconcile potentially committed writes and retain unknown outcomes. Fresh receipt credentials can read durable decisions. Automatic renewal inside accepted work requires a separate refresh design.
 
