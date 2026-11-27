@@ -12,6 +12,9 @@ use serde_json::{Value, json};
 
 use crate::bootstrap::{BOOTSTRAP_CLIENT, CLIENTS, GATEWAYS, WORKERS};
 
+/// Worker and gateway drift may change during a run within this bound.
+pub(crate) const CLOCK_DRIFT_BOUND_PPM: i64 = 200;
+
 const CLOCKS: &[(u64, &str, &str)] = &[
     (1, "n1.drift_ppm", "n1.wall_jump_ms"),
     (2, "n2.drift_ppm", "n2.wall_jump_ms"),
@@ -44,7 +47,11 @@ impl Config {
             Knob::IntRange("data.apply_reply_bytes", MIN_APPLY_REPLY_BYTES, 1 << 20),
         ];
         for &(_, drift, jump) in CLOCKS {
-            knobs.push(Knob::IntRange(drift, -200, 200));
+            knobs.push(Knob::IntRange(
+                drift,
+                -CLOCK_DRIFT_BOUND_PPM,
+                CLOCK_DRIFT_BOUND_PPM,
+            ));
             knobs.push(Knob::IntRange(jump, -2_000, 2_000));
         }
         let mut generator = Gen::from_seed(stream_seed(seed, "oltp-config"));
@@ -79,6 +86,10 @@ impl Config {
                     ..Default::default()
                 },
             );
+        }
+        // Only these clocks can slow down after arming a timer.
+        for node in WORKERS.into_iter().chain(GATEWAYS) {
+            world.set_timer_floor_ppm(node, Some(-CLOCK_DRIFT_BOUND_PPM));
         }
         let limit = |key| self.knobs[key].as_u64().unwrap() as usize;
         world.insert_ext(Limits {
@@ -116,6 +127,45 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nabedra_rt::{sim, time};
+    use tokio::sync::oneshot;
+
+    fn timer_earliness(node: u64, clear_floor: bool) -> Duration {
+        sim::run(1, move |world| async move {
+            Config::sample(1).setup(&world);
+            world.set_drift_ppm(node, 0);
+            if clear_floor {
+                world.set_timer_floor_ppm(node, None);
+            }
+
+            let (armed, wait_armed) = oneshot::channel();
+            let timer = world.spawn_node(node, async move {
+                let deadline = time::now() + Duration::from_secs(10);
+                let sleep = time::sleep_until(deadline);
+                armed.send(()).unwrap();
+                sleep.await;
+                deadline.saturating_duration_since(time::now())
+            });
+            wait_armed.await.unwrap();
+            world.set_drift_ppm(node, -CLOCK_DRIFT_BOUND_PPM);
+            timer.await.unwrap()
+        })
+    }
+
+    #[test]
+    fn setup_keeps_timers_from_firing_before_their_node_deadline() {
+        for node in WORKERS.into_iter().chain(GATEWAYS) {
+            assert_eq!(timer_earliness(node, false), Duration::ZERO, "node {node}");
+        }
+
+        // Revert only the setup floor. The same slowdown now fires early.
+        assert!(timer_earliness(WORKERS[0], true) > Duration::ZERO);
+        // Client clocks are fixed during the workload. The forced slowdown
+        // demonstrates that setup did not install a timer floor on them.
+        for node in [BOOTSTRAP_CLIENT].into_iter().chain(CLIENTS) {
+            assert!(timer_earliness(node, false) > Duration::ZERO, "node {node}");
+        }
+    }
 
     /// The production range is not raised to the number of peers (lead decision 12.4): the
     /// product fixes 256 slots and lets automatic growth reach 4,096 workers, so a worker can

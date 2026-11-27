@@ -9,7 +9,7 @@ integrations.
 ## Get started
 
 First start a database with the
-[server guide](https://github.com/zPy52/nabedra-database/blob/main/server/README.md).
+[server guide](https://github.com/nabedra/database/blob/main/server/README.md).
 Then install the client in a virtual environment and export the token you
 gave the server:
 
@@ -51,7 +51,7 @@ expect, since both modes use the same server API.
 The client never retries an operation on its own. If a write loses its
 response, you can't tell whether it was applied. Keep its request identity and
 follow the
-[guidance on uncertain writes](https://github.com/zPy52/nabedra-database/blob/main/orm/python/docs/reference.md#errors-and-uncertain-writes).
+[guidance on uncertain writes](https://github.com/nabedra/database/blob/main/orm/python/docs/reference.md#errors-and-uncertain-writes).
 
 ## Cache
 
@@ -74,7 +74,7 @@ unchanged, or `None` when the key is missing.
 For a cluster, pass `cluster=True` and a list of seed endpoints. If the cluster
 nodes have different hostnames from the seeds, list them in `allowed_nodes` or
 give their common DNS suffix in `allowed_node_suffix`. The
-[shared Cache contract](https://github.com/zPy52/nabedra-database/tree/main/orm/cache-contract)
+[shared Cache contract](https://github.com/nabedra/database/tree/main/orm/cache-contract)
 describes deadlines, routing and errors.
 
 ## Develop from this checkout
@@ -90,12 +90,12 @@ orm/python/.venv/bin/python -m unittest discover -s orm/python/tests -v
 The `gateway` extra installs HTTPX, which the application gateway tests need.
 Plain ORM use needs no extras. The package doesn't include the Rust server.
 To install both, use the
-[repository installer](https://github.com/zPy52/nabedra-database/blob/main/scripts/install_nabedra.py).
+[repository installer](https://github.com/nabedra/database/blob/main/scripts/install_nabedra.py).
 
 ## More documentation
 
-- [OLAP query streaming and PyTorch](https://github.com/zPy52/nabedra-database/blob/main/orm/python/docs/streaming.md)
-- [Python API, CLI, receipts and limits](https://github.com/zPy52/nabedra-database/blob/main/orm/python/docs/reference.md)
-- [Task tracker tutorial](https://github.com/zPy52/nabedra-database/blob/main/server/TUTORIAL.md)
-- [Application gateway setup](https://github.com/zPy52/nabedra-database/blob/main/server/docs/cli-and-serverless.md#host-an-application-endpoint)
-- [Contribution guide](https://github.com/zPy52/nabedra-database/blob/main/CONTRIBUTING.md)
+- [OLAP query streaming and PyTorch](https://github.com/nabedra/database/blob/main/orm/python/docs/streaming.md)
+- [Python API, CLI, receipts and limits](https://github.com/nabedra/database/blob/main/orm/python/docs/reference.md)
+- [Task tracker tutorial](https://github.com/nabedra/database/blob/main/server/TUTORIAL.md)
+- [Application gateway setup](https://github.com/nabedra/database/blob/main/server/docs/cli-and-serverless.md#host-an-application-endpoint)
+- [Contribution guide](https://github.com/nabedra/database/blob/main/CONTRIBUTING.md)

@@ -38,6 +38,13 @@ login that can administer the repository.
    | `NABEDRA_TEST_S3_BUCKET` | the bucket name |
    | `NABEDRA_TEST_S3_REGION` | the region; `us-east-1` when unset |
 
+## After the GitHub transfer
+
+For an existing test bucket, update the role's trust policy in place to use the
+two exact subjects below. Restore the repository's custom OIDC subject template
+with the final GitHub API command printed by the setup script. Check other
+OIDC consumers before changing the repository-wide template.
+
 ## What it creates
 
 | Resource | Settings |
@@ -50,8 +57,8 @@ login that can administer the repository.
 The template retains the immutable owner and repository IDs and adds the event
 name. The role trusts these two subjects.
 
-- `repo:zPy52@36101760/nabedra-database@1459052341:ref:refs/heads/main:event_name:workflow_dispatch`
-- `repo:zPy52@36101760/nabedra-database@1459052341:ref:refs/heads/main:event_name:schedule`
+- `repo:nabedra@361663474/database@1459052341:ref:refs/heads/main:event_name:workflow_dispatch`
+- `repo:nabedra@361663474/database@1459052341:ref:refs/heads/main:event_name:schedule`
 
 Pull-request runs have the context `pull_request`, so they never match and the
 pull-request gate never receives the role. Runs dispatched on another branch do not

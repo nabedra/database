@@ -1,11 +1,18 @@
-name = "Cache GET hit p99"
+name = "Cache GET hit and SET PX latency"
 module = "cache"
 command = [
     "sh", "-eu", "-c",
-    'exec python3.11 scripts/cache-benchmark/local_cluster.py --nabedra "$1" --valkey "$NABEDRA_PERF_VALKEY" --valkey-cli "$NABEDRA_PERF_VALKEY_CLI" --client-cpu "$NABEDRA_PERF_CLIENT_CPU" --drivers stock --output "$2"',
+    'export PYTHONPATH=orm/python/src; exec python3.11 scripts/cache-benchmark/local_cluster.py --nabedra "$1" --valkey "$NABEDRA_PERF_VALKEY" --valkey-cli "$NABEDRA_PERF_VALKEY_CLI" --client-cpu "$NABEDRA_PERF_CLIENT_CPU" --drivers stock --output "$2"',
     "cache-benchmark", "{bin}", "{work}",
 ]
 warmup = 1
-rounds = 6
-metric_file = "benchmark/3-stock-get-hit-64-24-r0-nabedra.json"
-metric = '"p99"\s*:\s*(\d+(?:\.\d+)?)'
+rounds = 16
+timeout_s = 600
+
+# One run measures both workloads, 24 requests each at 24 offered requests/s with the stock client.
+# With 24 samples a p99 is the largest sample, so the p99s are reported and the p50s gate.
+[metrics]
+get_hit_p50 = { pattern = '"p50"\s*:\s*(\d+(?:\.\d+)?)', file = "benchmark/3-stock-get-hit-64-24-r0-nabedra.json" }
+set_px_p50 = { pattern = '"p50"\s*:\s*(\d+(?:\.\d+)?)', file = "benchmark/3-stock-set-px-64-24-r0-nabedra.json" }
+get_hit_p99 = { pattern = '"p99"\s*:\s*(\d+(?:\.\d+)?)', file = "benchmark/3-stock-get-hit-64-24-r0-nabedra.json", gate = false }
+set_px_p99 = { pattern = '"p99"\s*:\s*(\d+(?:\.\d+)?)', file = "benchmark/3-stock-set-px-64-24-r0-nabedra.json", gate = false }
