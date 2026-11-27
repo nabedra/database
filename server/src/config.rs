@@ -18,9 +18,6 @@ use std::{
 /// Plain inputs for the future CLI parser.
 #[derive(Debug, Clone, clap::Args)]
 pub struct ServeOptions {
-    /// Confirm all previous catalog writers are stopped before migrating format 1/2/3.
-    #[arg(long, default_value_t = false)]
-    pub migrate_catalog: bool,
     /// Fence a previous stopped local run and abandon its pending memory queue.
     #[arg(long, default_value_t = false)]
     pub cold_start: bool,
@@ -56,7 +53,6 @@ pub struct ServeOptions {
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
-            migrate_catalog: false,
             cold_start: false,
             execution_config: None,
             resources_config: None,

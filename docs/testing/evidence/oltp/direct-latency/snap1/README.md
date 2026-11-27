@@ -18,7 +18,7 @@ SNAP1 makes a Raft snapshot a **cut**:
 
 ## Soak A/B on runners (relative numbers only)
 
-`[ci snap1]`, run [44959457181](https://github.com/zPy52/nabedra-database/actions/runs/44959457181):
+`[ci snap1]`, run [44959457181](https://github.com/nabedra/database/actions/runs/44959457181):
 - **Before:** `nabedra/hardening` bb6dc32 (main 70c4e7d merged). **After:** f04d14d.
 - ubuntu-24.04, 4 vCPU, NS11 caps, API uncapped.
 - NS11 soak: 80,000 rows with 2 KiB payloads, 300 s in five 60 s phases, 32 clients, 500 keys verified.

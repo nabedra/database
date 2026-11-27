@@ -1015,18 +1015,17 @@ fn supervisor() -> Result<UnixStream> {
     crate::supervisor::open().map_err(|_| invalid())
 }
 pub async fn run_api(path: PathBuf) -> std::result::Result<(), &'static str> {
-    run_api_configured(path, false, false).await
+    run_api_configured(path, false).await
 }
 pub async fn run_api_with_cold_start(
     path: PathBuf,
     cold_start: bool,
 ) -> std::result::Result<(), &'static str> {
-    run_api_configured(path, cold_start, false).await
+    run_api_configured(path, cold_start).await
 }
 pub async fn run_api_configured(
     path: PathBuf,
     cold_start: bool,
-    migrate_catalog: bool,
 ) -> std::result::Result<(), &'static str> {
     let mut channel = supervisor().map_err(|_| "protocol_error")?;
     let (pool, threads) = WorkerPool::start(
@@ -1034,7 +1033,7 @@ pub async fn run_api_configured(
         tokio::runtime::Handle::current(),
     )
     .map_err(|_| "startup_failed")?;
-    let result = api_process(path, &mut channel, pool, cold_start, migrate_catalog).await;
+    let result = api_process(path, &mut channel, pool, cold_start).await;
     if result.is_err() {
         let _ = send(
             &mut channel,
@@ -1051,13 +1050,7 @@ async fn api_process(
     channel: &mut UnixStream,
     pool: WorkerPool,
     cold_start: bool,
-    migrate_catalog: bool,
 ) -> Result<()> {
-    // Catalog format 6 is the only format, so there is nothing to migrate.
-    if migrate_catalog {
-        eprintln!("nabedra-db: --migrate-catalog is not supported: catalog format 6 is the only format");
-        return Err(invalid());
-    }
     let startup_end = time::now() + Duration::from_secs(30);
     let init: Init =
         serde_json::from_slice(&frame(channel, Some(startup_end)).await?).map_err(|_| invalid())?;

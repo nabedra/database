@@ -130,7 +130,7 @@ class CliTests(unittest.TestCase):
             status, out, err = self.finish(self.start(*args))
             self.assertEqual(status, 0)
             self.assertIn("worker", out)
-            self.assertIn("--bootstrap" if args[0] == "worker" else "migrate", out)
+            self.assertIn("--bootstrap" if args[0] == "worker" else "cluster", out)
             self.assertEqual(err, "")
         self.assertEqual(self.finish(self.start(code="import nabedra.cli, nabedra._binary")),
                          (0, "", ""))

@@ -1035,12 +1035,11 @@ async fn u01_q01_q02_cpu_saturated_local_router_retains_every_accepted_query() {
         ..ExecutionConfig::default()
     };
     let base = config.max_queue_bytes_per_replica + config.max_retained_result_bytes_per_worker;
-    let (app, tasks) = api::router_with_migration(
+    let (app, tasks) = api::router_configured(
         engine.clone(),
         ingress.clone(),
         "event-token".into(),
         config,
-        false,
         false,
     )
     .unwrap();

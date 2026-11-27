@@ -125,8 +125,8 @@ Catalog format 6 is the only root format (user decision 2026-11-27: no system us
 changes are allowed and no compatibility layer is kept). A root of any other format, including the fenced formats 4
 and 5 and the unfenced format 3, is refused with `UnsupportedCatalog` before its fields are read, and nothing is
 written; there is no migration. A brand new namespace gets an empty format 6 root, fenced in the same `Create`. The
-`--migrate-catalog` flag and the `database migrate` command now refuse with that reason; removing them from the CLI
-is left to the owners of those files.
+`--migrate-catalog` flag, the `database migrate` command and the ORM `migrate_catalog` and `migrate` options are
+removed.
 
 ### Index design review
 

@@ -7,7 +7,7 @@ pub mod model;
 pub mod prop;
 pub mod rng;
 
-pub use r#gen::Gen;
 pub use r#gen as generator;
+pub use r#gen::Gen;
 pub mod checker;
 pub mod history;

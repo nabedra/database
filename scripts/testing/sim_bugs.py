@@ -72,6 +72,8 @@ import tomllib
 from urllib.error import HTTPError
 import urllib.request
 
+from evidence import GITHUB_REPOSITORY, GITHUB_REPOSITORY_ID, PRE_TRANSFER_REPOSITORY
+
 REPO = Path(__file__).resolve().parents[2]
 BUGS_DIR = Path("server/sim-oltp/bugs")
 RECORDS_DIR = Path("docs/testing/bugs")
@@ -158,7 +160,7 @@ MERGE_SCHEMA = "nabedra.sim-bug-merge/1"
 MERGE_FIELDS = SEARCH_FIELDS - {"run", "attempt"} | {"mode", "review", "build", "defect", "binaries", "later", "shards"}
 SHARD_SCHEMA = "nabedra.sim-bug-shard/1"
 # Whose attested runs count, and where the counting run finds their records: in <id>/ of this branch.
-REPOSITORY = "zPy52/nabedra-database"
+REPOSITORY = GITHUB_REPOSITORY
 BUILD_WORKFLOW = ".github/workflows/nabedra-build.yml"
 EVIDENCE_REF = "refs/remotes/origin/evidence/sim-bugs"
 # GitHub's API, which needs no token for a public repository. A rate limit is waited out for at most API_WAIT seconds.
@@ -2661,23 +2663,29 @@ def verify_attestation(args, data, record, files):
                   None)
     if bundle is None:
         raise Failure("it has no attestation")
+    run = record["run"]
+    signer_repo = REPOSITORY
+    if run["url"].startswith(f"https://github.com/{PRE_TRANSFER_REPOSITORY}/actions/runs/"):
+        signer_repo = PRE_TRANSFER_REPOSITORY
     with tempfile.TemporaryDirectory(prefix="sim-bugs-evidence-", dir=SCRATCH_BASE) as tmp:
         subject, proof = Path(tmp) / "record.json", Path(tmp) / "bundle.jsonl"
         subject.write_bytes(data)
         proof.write_bytes(bundle)
         try:
             result = subprocess.run(
-                [*args.gh.split(), "attestation", "verify", str(subject), "--bundle", str(proof), "--repo", REPOSITORY,
-                 "--signer-workflow", f"{REPOSITORY}/{BUILD_WORKFLOW}", "--source-digest", record["sha"],
+                [*args.gh.split(), "attestation", "verify", str(subject), "--bundle", str(proof), "--repo", signer_repo,
+                 "--signer-workflow", f"{signer_repo}/{BUILD_WORKFLOW}", "--source-digest", record["sha"],
                  "--deny-self-hosted-runners", "--format", "json"],
                 env=machine_env(), capture_output=True, text=True, timeout=300)
         except (OSError, subprocess.SubprocessError) as error:
             raise Failure(f"its attestation could not be verified: {error}") from None
     if result.returncode:
         raise Failure(f"its attestation does not verify: {(result.stderr.strip() or 'no reason').splitlines()[-1]}")
-    home, run = f"https://github.com/{REPOSITORY}", record["run"]
+    home = f"https://github.com/{signer_repo}"
     wanted = {"sourceRepositoryURI": home, "sourceRepositoryDigest": record["sha"], "runnerEnvironment": "github-hosted",
               "buildTrigger": "workflow_dispatch", "runInvocationURI": f"{run['url']}/attempts/{run['attempt']}"}
+    if signer_repo != REPOSITORY:
+        wanted["sourceRepositoryIdentifier"] = GITHUB_REPOSITORY_ID
     try:
         certificates = [entry["verificationResult"]["signature"]["certificate"] for entry in strict_json(result.stdout)]
         good = any(all(c[name] == value for name, value in wanted.items())

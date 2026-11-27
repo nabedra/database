@@ -6,7 +6,7 @@ builds queries for a separately running Nabedra Database v0 server. It requires 
 does not start the server or need AWS credentials; the server owns S3 access.
 
 For shared compute, point this client at your application's endpoint. The
-[framework-independent gateway](https://github.com/zPy52/nabedra-database/blob/main/server/docs/cli-and-serverless.md#host-an-application-endpoint)
+[framework-independent gateway](https://github.com/nabedra/database/blob/main/server/docs/cli-and-serverless.md#host-an-application-endpoint)
 lets that endpoint authorize and forward the existing operation with storage
 credentials supplied by server middleware.
 
@@ -122,7 +122,6 @@ nabedra database init --help
 nabedra database serve --config nabedra-database.json
 nabedra database doctor --config nabedra-database.json
 nabedra database cluster --help
-nabedra database migrate --help
 nabedra --version
 ```
 
@@ -343,16 +342,15 @@ smaller configured target but never the cap; an impossible file fails the whole
 mutation. Empty tables have no files. A new target affects new or rewritten
 ranges without repacking unchanged files. Version 1 remains readable; version 2
 can mix Legacy and Partitioned tables. Only an actual data change migrates a
-legacy table. The shared request runtime uses catalog format 4. Upgrading an
-existing format 1/2/3 catalog requires `--migrate-catalog` after stopping every
-old writer. Old binaries must remain stopped after migration.
+legacy table. The shared request runtime uses catalog format 6, the only catalog
+format: a catalog of an older format is refused, never migrated.
 Historical objects remain in S3 with no garbage collection.
 
 The API provides no general transactions across calls, joins, import/export,
 schema migrations, model decorators, relationships, indexes, or
 data-frame adapters. The atomic batch remains a single operation.
 
-See the [server guide](https://github.com/zPy52/nabedra-database/blob/main/server/docs/reference.md#configuration)
+See the [server guide](https://github.com/nabedra/database/blob/main/server/docs/reference.md#configuration)
 for size syntax and worker configuration, and the
-[execution and recovery plan](https://github.com/zPy52/nabedra-database/blob/main/plans/resource-aware-scheduling.md)
+[execution and recovery plan](https://github.com/nabedra/database/blob/main/plans/resource-aware-scheduling.md)
 for storage and worker requirements.

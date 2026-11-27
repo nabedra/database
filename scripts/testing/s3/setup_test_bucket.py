@@ -21,8 +21,8 @@ import shlex
 import subprocess
 import sys
 
-REPOSITORY = 'zPy52/nabedra-database'
-REPOSITORY_SUBJECT = 'repo:zPy52@36101760/nabedra-database@1459052341'
+REPOSITORY = 'nabedra/database'
+REPOSITORY_SUBJECT = 'repo:nabedra@361663474/database@1459052341'
 BRANCH = 'main'
 EVENTS = ('workflow_dispatch', 'schedule')
 OIDC_HOST = 'token.actions.githubusercontent.com'

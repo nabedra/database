@@ -36,7 +36,7 @@ doesn't read `.env` files.
 
 Run only one `serve` process per bucket and prefix. If you need several APIs or
 workers, follow the
-[cluster deployment reference](https://github.com/zPy52/nabedra-database/blob/main/server/docs/reference.md#cluster-process-acceptance)
+[cluster deployment reference](https://github.com/nabedra/database/blob/main/server/docs/reference.md#cluster-process-acceptance)
 instead.
 
 Check that the server is ready from another terminal:
@@ -45,7 +45,7 @@ Check that the server is ready from another terminal:
 curl --fail --silent --show-error http://127.0.0.1:8000/health/ready
 ```
 
-Now connect with the [Python ORM](https://github.com/zPy52/nabedra-database/blob/main/orm/python/README.md),
+Now connect with the [Python ORM](https://github.com/nabedra/database/blob/main/orm/python/README.md),
 using the same token. Clients only need the server URL and the token. AWS
 credentials stay on the server. To serve HTTPS, add
 `--tls-cert /path/to/cert.pem --tls-key /path/to/key.pem`.
@@ -54,7 +54,7 @@ Press Ctrl-C to stop. The server finishes the work it has already admitted
 before it exits. Once every worker has stopped, restart the same database with
 `--cold-start`. That flag opens the committed data with a new, empty request
 queue and abandons any requests that were still outstanding. Read the
-[configuration reference](https://github.com/zPy52/nabedra-database/blob/main/server/docs/reference.md#configuration)
+[configuration reference](https://github.com/nabedra/database/blob/main/server/docs/reference.md#configuration)
 before you open a catalog written by an older version or deploy a cluster.
 
 ## Develop from this checkout
@@ -75,7 +75,7 @@ python3.11 scripts/install_nabedra.py --prefix .nabedra
 .nabedra/bin/nabedra --version --json
 ```
 
-The [CLI and application gateway guide](https://github.com/zPy52/nabedra-database/blob/main/server/docs/cli-and-serverless.md)
+The [CLI and application gateway guide](https://github.com/nabedra/database/blob/main/server/docs/cli-and-serverless.md)
 covers the installed commands, configuration files and shared compute.
 
 ## Choose an engine
@@ -91,7 +91,7 @@ cargo build --locked --manifest-path server/Cargo.toml --no-default-features --f
 ```
 
 The Cache engine has its own guides, linked from the
-[repository README](https://github.com/zPy52/nabedra-database/blob/main/README.md#cache).
+[repository README](https://github.com/nabedra/database/blob/main/README.md#cache).
 It can't be built with `s3`.
 
 The published 0.1.1 release predates this split. `nabedra-db --version` tells
@@ -101,9 +101,9 @@ you which engine a binary was built with.
 
 The OLTP engine stores data on a local or attached disk using `nabedra-kv`,
 the storage engine in
-[`kv/`](https://github.com/zPy52/nabedra-database/tree/main/server/kv). Its
+[`kv/`](https://github.com/nabedra/database/tree/main/server/kv). Its
 design is in the
-[native storage engine plan](https://github.com/zPy52/nabedra-database/blob/main/plans/native-storage-engine.md).
+[native storage engine plan](https://github.com/nabedra/database/blob/main/plans/native-storage-engine.md).
 OLTP doesn't need S3 or AWS credentials. Building it needs Rust and a C
 compiler, which `ring` (the TLS crypto library) uses. You don't need a C++
 compiler, CMake or libclang.
@@ -160,7 +160,7 @@ Once scoped admission is active, eligible primary-key `Get` and `Update`
 requests go through the RF3 queue of the Data range that owns the key. Every
 other operation keeps its old execution path, and so do requests that were
 accepted under the earlier all-ready replication policy. The
-[OLTP contract](https://github.com/zPy52/nabedra-database/blob/main/docs/testing/oltp-contract.md)
+[OLTP contract](https://github.com/nabedra/database/blob/main/docs/testing/oltp-contract.md)
 defines what acceptance, recovery and receipts guarantee on this path.
 
 ### Direct point operations (`data.direct.v1`)
@@ -219,12 +219,12 @@ doesn't build anything, so it can't show that the binaries work. Don't use
 
 ## More documentation
 
-- [Task tracker tutorial](https://github.com/zPy52/nabedra-database/blob/main/server/TUTORIAL.md)
-- [Configuration, HTTP API and storage reference](https://github.com/zPy52/nabedra-database/blob/main/server/docs/reference.md)
-- [Overview, limits and recorded benchmarks](https://github.com/zPy52/nabedra-database/blob/main/server/docs/overview.md)
-- [Scheduler test contract](https://github.com/zPy52/nabedra-database/blob/main/docs/testing/scheduler-contract.md)
-  and its [recorded results](https://github.com/zPy52/nabedra-database/blob/main/docs/testing/scheduler-evidence.md)
-- [Execution and recovery design](https://github.com/zPy52/nabedra-database/blob/main/plans/resource-aware-scheduling.md)
+- [Task tracker tutorial](https://github.com/nabedra/database/blob/main/server/TUTORIAL.md)
+- [Configuration, HTTP API and storage reference](https://github.com/nabedra/database/blob/main/server/docs/reference.md)
+- [Overview, limits and recorded benchmarks](https://github.com/nabedra/database/blob/main/server/docs/overview.md)
+- [Scheduler test contract](https://github.com/nabedra/database/blob/main/docs/testing/scheduler-contract.md)
+  and its [recorded results](https://github.com/nabedra/database/blob/main/docs/testing/scheduler-evidence.md)
+- [Execution and recovery design](https://github.com/nabedra/database/blob/main/plans/resource-aware-scheduling.md)
 
 Before you send a server change, run the formatting, Clippy and test commands
-in the [contribution guide](https://github.com/zPy52/nabedra-database/blob/main/CONTRIBUTING.md#development-checks).
+in the [contribution guide](https://github.com/nabedra/database/blob/main/CONTRIBUTING.md#development-checks).

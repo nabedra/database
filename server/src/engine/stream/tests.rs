@@ -689,7 +689,6 @@ async fn st01_st02_u01_local_serve_streams_over_one_connection() {
             },
             Default::default(),
             true,
-            false,
         ));
         let socket = TcpStream::connect(address).await.unwrap();
         let (mut conn, driver) = http1::handshake(TokioIo::new(socket)).await.unwrap();

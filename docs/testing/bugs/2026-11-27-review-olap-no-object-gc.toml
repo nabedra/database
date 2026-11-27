@@ -1,0 +1,23 @@
+# Evidence: wave-rv findings OLAP-4 (code reading). Every mutation rewrites whole partitions under new keys
+# (server/src/node/coordinator.rs, payload_owner.rs) and no production path deletes an object: superseded partitions,
+# CAS-loser uploads, decisions, index pages of losing attempts and dropped tables stay in the bucket. Steady one-row
+# inserts into a 10 MiB table leave a 10 MiB orphan per commit. Deferred by fx-olap: a reclaimer needs a listing call
+# on the ObjectStore trait and every backend, a process in the scheduler runtime and the cluster's live pins, and the
+# OlapCommit gc baseline does not yet finish within T1. Plan: plans/olap-commit.md, "Capacity plan".
+id = "REVIEW-olap-no-object-gc"
+title = "OLAP never deletes superseded partitions, CAS-loser uploads, decisions or dropped tables, so bucket size grows without bound"
+class = "other"
+module = "olap"
+guarantees = ["OLAP-G01"]
+scenarios = []
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "unknown"
+seed = "unknown"
+why_not_caught = "No test or workload measures bucket bytes against reachable bytes; the docs promise no collection."
+invariant_added = "Intended: bucket bytes over bytes reachable from the current and every pinned root stay bounded, and the reclaimer never deletes a pinned or in-flight object (OlapCommit gc_ignores_pins, gc_ignores_inflight)."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-26"

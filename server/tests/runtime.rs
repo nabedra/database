@@ -50,7 +50,6 @@ async fn shutdown_closes_listener_and_waits_for_detached_engine_work() {
                     },
                     Default::default(),
                     false,
-                    false,
                 )
                 .await;
                 workers.shutdown().await.unwrap();
@@ -241,7 +240,6 @@ async fn u01_startup_initializes_the_same_local_run_before_readiness() {
                     },
                     Default::default(),
                     cold,
-                    false,
                 )
                 .await
             });
@@ -314,7 +312,6 @@ async fn r04_startup_rejects_missing_migration_and_cold_confirmation_before_ingr
                 None,
                 std::future::pending::<std::io::Result<()>>(),
                 Default::default(),
-                false,
                 false,
             )
             .await

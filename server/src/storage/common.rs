@@ -56,8 +56,11 @@ pub(super) fn safe_path(path: &str) -> Result<(), StorageError> {
 }
 
 /// Attempts of one idempotent read, including the first (OLAP-9).
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 pub(crate) const READ_ATTEMPTS: u32 = 3;
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 const READ_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(50);
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 const READ_RETRY_CAP: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Full jitter: a delay drawn uniformly from `[0, min(cap, base * 2^(retry - 1))]`,
@@ -80,6 +83,7 @@ pub(crate) fn jitter(
 /// Run an idempotent read up to `READ_ATTEMPTS` times while it fails with an
 /// error that `transient` accepts, sleeping a jittered delay between tries.
 /// Writes are never retried here: a PUT that may have applied is `Ambiguous`.
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 pub(crate) async fn retry_reads<T, E, F, Fut>(
     mut read: F,
     transient: impl Fn(&E) -> bool,

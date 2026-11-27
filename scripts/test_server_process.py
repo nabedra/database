@@ -96,9 +96,7 @@ class ProcessGuard(unittest.TestCase):
                 parser.add_argument("--queue-size", type=int)
                 parser.add_argument("--partition_size")
                 parser.add_argument("--cold-start", action="store_true")
-                parser.add_argument("--migrate-catalog", action="store_true")
                 args = parser.parse_args()
-                assert not args.migrate_catalog
                 if args.workers in (2, 3):
                     assert args.cold_start
                 assert args.host == "127.0.0.1"

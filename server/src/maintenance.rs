@@ -50,8 +50,3 @@ pub async fn doctor(path: &Path, json: bool) -> Result<(), &'static str> {
     }
     Ok(())
 }
-/// Catalog format 6 is the only format: an older root is refused, never
-/// migrated, so this command only reports that.
-pub async fn migrate(_: &str, _: &str, _: uuid::Uuid, _: bool) -> Result<(), &'static str> {
-    Err("catalog migration is not supported: catalog format 6 is the only format")
-}

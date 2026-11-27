@@ -44,12 +44,7 @@ nabedra database cluster scale 2 --url https://compute.example.com \
 
 Scaling provisions only through a configured provider. `doctor` checks configuration, versions, secret permissions and storage reads. It never tests writes; a passing diagnosis does not establish write permissions. Exit codes are 0 for success, 2 for argument/configuration errors and 1 for runtime failures, with signal termination preserved.
 
-Before migrating an existing catalog, stop every old writer and choose the intended owning cluster UUID from the cluster configuration. Owner identity cannot be inferred safely:
-
-```sh
-nabedra database migrate --storage s3://app-a/nabedra/ --region eu-west-1 \
-  --cluster-id 11111111-1111-4111-8111-111111111111 --confirm-writers-stopped
-```
+A database catalog is created, owned by its cluster, on first use. Catalog format 6 is the only format; there is no migration command, and a catalog of an older format is refused.
 
 Do not perform live cross-cluster transfers. Complete worker shutdown abandons outstanding requests; committed mutations remain durable. Pending requests are replicated in worker RAM and are never replayed from object listings or Redis.
 
