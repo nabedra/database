@@ -1117,3 +1117,171 @@ fn held_ports_agree_with_a_scan_of_the_connections() {
         });
     }
 }
+
+fn fidelity(set: impl FnOnce(&mut crate::sim::Fidelity)) -> crate::sim::Fidelity {
+    let mut fidelity = crate::sim::Fidelity::default();
+    set(&mut fidelity);
+    fidelity
+}
+
+#[test]
+fn with_fidelity_a_dial_to_a_powered_off_host_hangs_until_it_restarts() {
+    run(31, |world| async move {
+        nodes(&world, &[1, 2]);
+        world.set_fidelity(fidelity(|f| f.power_off_dials_hang = true));
+        let listener = world.listen(1, any(7100)).unwrap();
+        let addr = listener.local_addr();
+        world.power_off(1);
+        drop(listener);
+        // No host answers the SYN: only the dialer's own timeout ends the dial.
+        let hung = in_node(2, time::timeout(ms(500), dial(Target::Addr(addr)))).await;
+        assert!(hung.is_err(), "a dial to a powered-off host must hang");
+        let waiting = world.spawn_node(2, async move { dial(Target::Addr(addr)).await });
+        tokio::time::sleep(ms(5)).await;
+        assert!(!waiting.is_finished());
+        // The host is back without a listener: its kernel refuses.
+        world.restart(1);
+        let refused = waiting.await.unwrap().unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+        let _again = world.listen(1, any(7100)).unwrap();
+        assert!(in_node(2, dial(Target::Addr(addr))).await.is_ok());
+        // A crashed process's host is up: refused at once, as without the fidelity.
+        world.crash(1);
+        let refused = in_node(2, dial(Target::Addr(addr))).await.unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+    });
+}
+
+#[test]
+fn with_fidelity_the_first_segment_after_a_reboot_resets_the_old_session() {
+    for reset_after_reboot in [false, true] {
+        run(32, move |world| async move {
+            nodes(&world, &[1, 2]);
+            world.set_fidelity(fidelity(|f| f.reset_after_reboot = reset_after_reboot));
+            let (mut old, _server) = streams(&world, 2, 1).await;
+            world.power_off(1);
+            world.restart(1);
+            // A reader alone learns nothing: no segment, no RST.
+            assert!(read_some(&mut old, ms(10)).await.is_none());
+            send(&mut old, b"hello?").await.unwrap();
+            let read = read_some(&mut old, ms(10)).await;
+            if reset_after_reboot {
+                let error = read.unwrap().unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+            } else {
+                assert!(
+                    read.is_none(),
+                    "the default black-holes the old session forever"
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn with_fidelity_a_killed_process_delivers_what_it_sent_then_fin() {
+    for per_mille in [0, 1_000] {
+        run(33, move |world| async move {
+            nodes(&world, &[1, 2]);
+            world.set_fidelity(fidelity(|f| f.kill_flush_per_mille = per_mille));
+            let (mut client, server) = streams(&world, 2, 1).await;
+            let mut server = server;
+            // Sent, but not yet read when the process dies.
+            send(&mut server, b"last words").await.unwrap();
+            world.crash(1);
+            let read = read_some(&mut client, ms(10)).await.unwrap();
+            if per_mille == 0 {
+                assert_eq!(read.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+                return;
+            }
+            assert_eq!(read.unwrap(), b"last words");
+            // Then FIN.
+            assert_eq!(read_some(&mut client, ms(10)).await.unwrap().unwrap(), b"");
+            // A segment to the dead process comes back as an RST.
+            send(&mut client, b"anyone?").await.unwrap();
+            let mut buf = [0; 8];
+            let error = client.read(&mut buf).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+            drop(server);
+        });
+    }
+}
+
+#[test]
+fn stream_faults_are_reported_in_order() {
+    run(34, |world| async move {
+        nodes(&world, &[1, 2]);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        world.observe(Arc::new(move |event| {
+            if let crate::sim::SimEvent::Net(fault) = event {
+                log.lock().unwrap().push(*fault);
+            }
+        }));
+        struct Rules;
+        impl Planner for Rules {
+            fn message(&mut self, envelope: &super::Envelope<'_>) -> Fate {
+                match envelope.bytes {
+                    b"drop" => Fate::Drop,
+                    b"reset" => Fate::Reset,
+                    _ => Fate::NOW,
+                }
+            }
+            fn dial(&mut self, _: Option<u64>, to: Option<u64>) -> Dial {
+                if to == Some(2) {
+                    Dial::Refuse
+                } else {
+                    Dial::Connect
+                }
+            }
+        }
+        let (mut a, _b) = streams(&world, 2, 1).await;
+        let (mut c, _d) = streams(&world, 2, 1).await;
+        world.set_net_planner(Rules);
+        send(&mut a, b"drop").await.unwrap();
+        assert!(send(&mut c, b"reset").await.is_err());
+        world.black_hole(Some(1), Some(2));
+        world.heal(Some(1), Some(2));
+        world.heal_all();
+        let _listener = world.listen(2, any(7200)).unwrap();
+        let refused = in_node(1, dial(Target::Addr(SocketAddr::new(node_ip(2), 7200)))).await;
+        assert!(refused.is_err());
+        world.reset_connection(a.id());
+        use super::{NetFault, ResetCause};
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                NetFault::Drop {
+                    conn: a.id(),
+                    from: Some(2),
+                    to: Some(1)
+                },
+                NetFault::Reset {
+                    conn: c.id(),
+                    from: Some(2),
+                    to: Some(1),
+                    cause: ResetCause::Planner
+                },
+                NetFault::BlackHole {
+                    from: Some(1),
+                    to: Some(2)
+                },
+                NetFault::Heal {
+                    from: Some(1),
+                    to: Some(2)
+                },
+                NetFault::HealAll,
+                NetFault::Refuse {
+                    from: Some(1),
+                    to: Some(2)
+                },
+                NetFault::Reset {
+                    conn: a.id(),
+                    from: Some(2),
+                    to: Some(1),
+                    cause: ResetCause::World
+                },
+            ]
+        );
+    });
+}

@@ -1,4 +1,4 @@
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import math
@@ -94,16 +94,17 @@ class PairedBenchmarkTests(unittest.TestCase):
 
     def test_wall_mode_measures_positive_time_and_alternates_all_pairs(self):
         spec = ab.Spec("Measured wall", "testing", ["{bin}"], 1, 2, "wall")
-        measured = [0.020, 0.020, 0.022, 0.020, 0.020, 0.022]
+        measured = [{"metric": value} for value in (0.020, 0.020, 0.022, 0.020, 0.020, 0.022)]
         with patch.object(ab, "measure", side_effect=measured) as run:
             result = ab.benchmark(spec, ["old"], ["new"])
-        self.assertEqual([call.args[-1] for call in run.call_args_list],
+        self.assertEqual([call.args[3] for call in run.call_args_list],
                          ["base", "head", "head", "base", "base", "head"])
         self.assertTrue(result["regression"])
-        self.assertGreater(ab.measure(spec, None, sleeper(.020), "base"), .020)
+        wall = [("metric", None, None, False)]
+        self.assertGreater(ab.measure(spec, wall, sleeper(.020), "base")["metric"], .020)
 
     def test_metric_file_and_existing_specs(self):
-        for module in ("cache", "events", "olap", "oltp"):
+        for module in ("cache", "events", "kv", "olap", "oltp", "sim"):
             with self.subTest(module=module):
                 paths = list((ab.ROOT / "docs/testing/perf" / module).glob("*.toml"))
                 self.assertTrue(paths)
@@ -118,3 +119,109 @@ class PairedBenchmarkTests(unittest.TestCase):
         spec = ab.Spec("Failed command", "testing", ["{bin}"], 0, 2, "wall")
         with self.assertRaisesRegex(ValueError, "base command exited 7"):
             ab.benchmark(spec, [sys.executable, "-c", "import sys; sys.exit(7)"], sleeper(.020))
+
+    def test_named_metrics_share_one_run_and_each_can_flag(self):
+        # One invocation feeds every metric: an output metric, a file metric and wall time.
+        spec = write_spec(
+            'command = ["{bin}", "{work}"]\nwarmup = 0\nrounds = 3\ntimeout_s = 30\n'
+            "[metrics]\n"
+            r"fast = 'fast=(\d+)'" "\n"
+            r"slow = { pattern = 'slow=(\d+)', file = 'out/slow.txt' }" "\n"
+            r"rate = { pattern = 'fast=(\d+)', higher_is_better = true }" "\n"
+            'total = "wall"\n'
+        )
+        self.assertEqual([row[0] for row in spec.measurements()], ["fast", "slow", "rate", "total"])
+        writer = ("import pathlib, sys; out = pathlib.Path(sys.argv[2]) / 'out'; out.mkdir(); "
+                  "(out / 'slow.txt').write_text(f'slow={sys.argv[1]}'); print('fast=10')")
+        result = ab.benchmark(spec, [sys.executable, "-c", writer, "100"],
+                              [sys.executable, "-c", writer, "120"])
+        fast, slow = result["metrics"]["fast"], result["metrics"]["slow"]
+        self.assertEqual((fast["median_ratio"], fast["regression"]), (1, False))
+        self.assertAlmostEqual(slow["median_ratio"], 1.2)
+        self.assertTrue(slow["regression"])
+        self.assertTrue(result["regression"])
+        # The primary metric keeps the single-metric fields.
+        self.assertEqual((result["median_ratio"], len(result["pairs"])), (1, 3))
+        self.assertEqual(fast["noise"]["ratio_range"], [1, 1])
+        self.assertEqual(fast["noise"]["ratio_mad_pct"], 0)
+        self.assertAlmostEqual(slow["noise"]["ci_halfwidth_pct"], 20)
+        # A rate is compared as its reciprocal, so it stays a cost.
+        self.assertEqual(result["metrics"]["rate"]["pairs"][0]["base"], 0.1)
+        self.assertGreater(result["metrics"]["total"]["pairs"][0]["base"], 0)
+        self.assertGreater(result["runtime_seconds"], 0)
+
+    def test_report_only_metric_cannot_decide_the_comparison(self):
+        spec = write_spec(
+            'command = ["{bin}"]\nwarmup = 0\nrounds = 3\n[metrics]\n'
+            r"steady = 'steady=(\d+)'" "\n"
+            r"noisy = { pattern = 'noisy=(\d+)', gate = false }" "\n"
+        )
+        side = lambda noisy: [sys.executable, "-c", f"print('steady=10 noisy={noisy}')"]
+        result = ab.benchmark(spec, side(10), side(20))
+        noisy = result["metrics"]["noisy"]
+        self.assertEqual((noisy["regression"], noisy["gate"]), (True, False))
+        self.assertFalse(result["regression"])
+        with self.assertRaisesRegex(ValueError, "at least one metric must gate"):
+            write_spec('command = ["{bin}"]\nwarmup = 0\nrounds = 2\n[metrics]\n'
+                       r"a = { pattern = 'a=(\d+)', gate = false }" "\n")
+        with self.assertRaisesRegex(ValueError, "boolean gate"):
+            write_spec('command = ["{bin}"]\nwarmup = 0\nrounds = 2\n[metrics]\n'
+                       r"a = { pattern = 'a=(\d+)', gate = 0 }" "\n")
+
+    def test_spec_validation_and_overrides(self):
+        for text, message in (
+            ("", "exactly one of metric and metrics"),
+            ("metric = 'wall'\n[metrics]\nb = 'wall'\n", "exactly one of metric and metrics"),
+            ("[metrics]\n" r"b = 'b=\d+'" "\n", "exactly one capturing group"),
+            ("[metrics]\n" r"b = { pattern = 'b=(\d+)', file = '../x' }" "\n", "relative to the scratch"),
+            ("[metrics]\n" r"b = { pattern = 'b=(\d+)', other = 1 }" "\n", "a table of pattern, file"),
+            ("[metrics]\nb = { pattern = 'wall', higher_is_better = true }\n", "wall time is a cost"),
+            ("timeout_s = -1\nmetric = 'wall'\n", "timeout_s"),
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, message):
+                write_spec('command = ["{bin}"]\nwarmup = 0\nrounds = 2\n' + text)
+        with TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            path = Path(directory) / "spec.toml"
+            path.write_text(SPEC_HEADER + 'command = ["{bin}"]\nwarmup = 3\nrounds = 9\nmetric = "wall"\n')
+            peer = join([sys.executable, "-c", "pass"])
+            status = ab.main([str(path), peer, peer, "--commands", "--rounds", "2", "--warmup", "0",
+                              "--output", directory])
+            self.assertIn(status, (0, 1))
+            data = json.loads((Path(directory) / "results.json").read_text())
+            self.assertEqual((data["spec"]["rounds"], data["spec"]["warmup"], len(data["pairs"])), (2, 0, 2))
+            self.assertIn("| metric | 2 |", (Path(directory) / "summary.md").read_text())
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(ab.main([str(path), peer, peer, "--commands", "--rounds", "1",
+                                          "--output", directory]), 2)
+
+    def test_each_side_can_run_from_its_own_tree(self):
+        # A head that changes config keys or drivers runs its own copy; each side reads only its tree.
+        with TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            for side, value in (("base", 10), ("head", 30)):
+                (root / side).mkdir()
+                (root / side / "driver.py").write_text(f"print('cost={value}')\n")
+            spec = root / "spec.toml"
+            spec.write_text(SPEC_HEADER + 'command = ["{bin}", "driver.py"]\nwarmup = 0\nrounds = 2\n'
+                            r"metric = 'cost=(\d+)'" "\n")
+            status = ab.main([str(spec), sys.executable, sys.executable, "--base-root", str(root / "base"),
+                              "--head-root", str(root / "head"), "--output", str(root / "out")])
+            data = json.loads((root / "out" / "results.json").read_text())
+        self.assertEqual(status, 1)
+        self.assertEqual([(pair["base"], pair["head"]) for pair in data["pairs"]], [(10, 30), (10, 30)])
+        self.assertEqual(data["roots"], {"base": str((root / "base").resolve()), "head": str((root / "head").resolve())})
+
+    def test_hung_command_times_out_as_an_error(self):
+        spec = ab.Spec("Hung", "testing", ["{bin}"], 0, 2, "wall", timeout_s=0.5)
+        with self.assertRaisesRegex(ValueError, "base command timed out"):
+            ab.benchmark(spec, sleeper(5), sleeper(.01))
+
+
+SPEC_HEADER = 'name = "S"\nmodule = "testing"\n'
+
+
+def write_spec(text):
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "spec.toml"
+        path.write_text(SPEC_HEADER + text)
+        return ab.load_spec(path)

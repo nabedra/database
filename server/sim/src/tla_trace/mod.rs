@@ -3,7 +3,9 @@
 //! A workload of a specced module installs a [`TlaTrace`] for one spec. It writes one JSON
 //! line per protocol step, at the point where the step takes effect, through [`TlaSteps`],
 //! and the fault steps come from the simulation itself ([`faults`]). The file is
-//! `$NABEDRA_TRACE_DIR/<Spec>-<seed>.ndjson`. With the variable unset nothing is installed:
+//! `$NABEDRA_TRACE_DIR/<Spec>-<seed>.ndjson`, or `<Spec>-<seed>-<label>.ndjson` for one of
+//! several traces a seed writes ([`Builder::label`], such as one per cut of a crash
+//! campaign). With the variable unset nothing is installed:
 //! no file, no observer. `scripts/testing/tla_trace.py` lints the file and checks it with
 //! TLC against `<Spec>Trace.tla`.
 //!
@@ -49,6 +51,15 @@
 //! same time, the second to finish must have the same bytes, or it fails and the first one's
 //! file stays. A process that starts after the other has finished moves its file aside, and
 //! if it then fails, neither file has the name.
+//!
+//! # Workloads without a World of their own
+//!
+//! The writer reads virtual time and node state from a `nabedra_rt::sim::World`. A test
+//! that has none (the OLAP commit tests, a harness with a `World` type of its own) runs its
+//! body inside `crate::runtime::run(seed, ..)` and installs the trace on that World: steps
+//! of `NodeRef::Named` nodes need no World node, and `t` stays 0 unless the body moves the
+//! paused clock, which is allowed (time never goes backward). No World fault reaches such a
+//! trace, so the harness logs its own faults with [`TlaSteps::fault`].
 //!
 //! # Determinism
 //!
@@ -233,9 +244,19 @@ pub struct Builder {
     wide: BTreeSet<String>,
     faults: FaultMap,
     delays: bool,
+    label: Option<String>,
 }
 
 impl Builder {
+    /// Names this one of several traces of the same seed: the file is
+    /// `<Spec>-<seed>-<label>.ndjson`. A label is letters, digits, `_` and `-`, and does not
+    /// start with `at-`, which `tla_trace.py` reads as an expected rejection.
+    #[must_use]
+    pub fn label(mut self, label: &str) -> Self {
+        self.label = Some(label.to_owned());
+        self
+    }
+
     /// The constants the trace spec reads, under their spec names.
     #[must_use]
     pub fn params(mut self, params: Value) -> Self {
@@ -327,6 +348,14 @@ impl Builder {
         if self.params.as_object().is_none_or(Map::is_empty) {
             return Err("params must name the spec's constants".into());
         }
+        if let Some(label) = &self.label {
+            let plain = label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+            if label.is_empty() || !plain || label.starts_with("at-") {
+                return Err(format!("{label:?} is not a trace label"));
+            }
+        }
         let mut names = BTreeSet::new();
         for action in &self.actions {
             let name = &action.name;
@@ -348,7 +377,7 @@ impl Builder {
                 _ => {}
             }
         }
-        let mut names = BTreeSet::from([faults::WORLD.to_owned()]);
+        let mut names = BTreeSet::from([faults::WORLD.to_owned(), faults::EXTERNAL.to_owned()]);
         for (id, name) in &self.nodes {
             let other = name.parse::<u64>().is_ok_and(|named| named != *id);
             if name.trim().is_empty() || other || !names.insert(name.clone()) {
@@ -523,6 +552,7 @@ impl TlaTrace {
             wide: BTreeSet::new(),
             faults: Box::new(Some),
             delays: false,
+            label: None,
         }
     }
 
@@ -531,9 +561,11 @@ impl TlaTrace {
         let seed = world.seed();
         let header = builder.header(seed, commit).map_err(invalid)?;
         fs::create_dir_all(dir)?;
-        let path = dir
-            .canonicalize()?
-            .join(format!("{}-{seed}.ndjson", builder.spec));
+        let name = match &builder.label {
+            Some(label) => format!("{}-{seed}-{label}.ndjson", builder.spec),
+            None => format!("{}-{seed}.ndjson", builder.spec),
+        };
+        let path = dir.canonicalize()?.join(name);
         let run = runs::open(world, &path).map_err(invalid)?;
         // Owns the registered run from here on.
         let trace = Self {

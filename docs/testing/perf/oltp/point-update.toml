@@ -1,11 +1,16 @@
-name = "OLTP direct point update p99"
+name = "OLTP direct point update latency"
 module = "oltp"
 command = [
     "sh", "-eu", "-c",
-    'exec python3.11 scripts/benchmark_oltp_nabedra.py --image "$NABEDRA_PERF_OLTP_IMAGE" --binary "$1" --output "$2" --direct-oltp on --rates 20 --seconds 3 --warmup-seconds 1 --repetitions 3 --clients 8 --rows 500',
+    'exec python3.11 scripts/benchmark_oltp_nabedra.py --image "$NABEDRA_PERF_OLTP_IMAGE" --binary "$1" --output "$2" --direct-oltp on --rates 20 --seconds 10 --warmup-seconds 2 --repetitions 3 --clients 8 --rows 500',
     "oltp-benchmark", "{bin}", "{work}",
 ]
-warmup = 1
-rounds = 6
+warmup = 2
+rounds = 24
+timeout_s = 1200
 metric_file = "results.json"
-metric = '"success_latency_ms"\s*:\s*\{[^}]*"p99"\s*:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+
+# Medians of the per-phase percentiles; 200 updates per phase, so p99 is the second largest.
+[metrics]
+p99_ms = '"success_latency_ms"\s*:\s*\{[^}]*"p99"\s*:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+p50_ms = '"success_latency_ms"\s*:\s*\{[^}]*"p50"\s*:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
