@@ -1,0 +1,25 @@
+# Phase 2 of the 2026-11-26 review (fx-direct-fix), side effect of the OD-2 fix 37139fd9, candidate by code reading.
+# To keep its answer on retry, a direct row conflict (insert of a present row) commits every key it read unchanged,
+# each as a new version at its own commit timestamp, and a missed update or delete commits a tombstone over the head it
+# read (direct/executor.rs compute; plan section 4). The row's value does not change, but its head does. A queued
+# transaction whose snapshot read that key before the rewrite then fails PreparePage with Fault::Conflict ("transaction
+# preparation conflicted with an existing version", oltp_runtime/transaction.rs) and must recompute or answer 409. So a
+# loop of refused inserts or missed deletes on a hot key, which before OD-2 wrote nothing, now aborts the concurrent
+# queued writers of that key, and adds versions that are never reclaimed (design-data-no-version-gc).
+id = "design-direct-refusal-rewrite-aborts-readers"
+title = "A refused direct insert or a missed delete writes a new version of an unchanged key, which aborts concurrent queued transactions that read it"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G13"]
+scenarios = ["O08", "D08"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "oltp_runtime::direct::tests::fxod::d02_od2_cost_a_missed_delete_writes_no_more_than_a_delete"
+seed = "unknown"
+why_not_caught = "The OD-2 tests check the answer and the entry count of a refusal, not its effect on other transactions; D08 mixes direct and queued writers but has no refused insert or missed delete on a key a queued transaction reads."
+invariant_added = "Recording a definite no-op or refusal never changes the version a reader of the key validates against: the record is kept in the dedup entry under the key's latch with the head it read as a precondition, and the row's head and versions stay as they were."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-27"

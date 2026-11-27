@@ -1,0 +1,22 @@
+# Phase 2 of the 2026-11-26 review (fx-oltp-direct, OD-9), confirmed by code reading and the OD-2 cost test.
+# Data groups keep every committed version as its own 'v' key (store/direct.rs write, store.rs intent
+# resolution); nothing deletes 'v' keys except index reclamation of a dropped index (store/index_reclaim.rs).
+# gc_floor is checked, never acted on (store.rs, lineage.rs, direct.rs). plans/oltp-engine.md "MVCC garbage
+# collection" is not implemented. Every update, delete, recorded miss and recorded refusal keeps a version forever.
+id = "design-data-no-version-gc"
+title = "Data groups never reclaim old row versions or tombstones, so storage grows with every write of a key"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G13"]
+scenarios = ["O16", "O26", "O24"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "oltp_runtime::direct::tests::fxod::d02_od2_cost_a_missed_delete_writes_no_more_than_a_delete"
+seed = "unknown"
+why_not_caught = "Growth checks (O16, O26) count entries and bytes per request, not the number of versions a key keeps; no test rewrites one key many times and asserts a bound on its versions."
+invariant_added = "Below the safe point, a key keeps at most its newest version (or nothing, after a tombstone with no older version), so storage is bounded by live rows plus versions newer than gc_floor."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-27"

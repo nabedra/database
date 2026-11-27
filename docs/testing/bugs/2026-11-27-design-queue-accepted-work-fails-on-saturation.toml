@@ -1,0 +1,21 @@
+# Design review (rv-oltp-direct, OQ-4; #108 second review, medium 2), executed locally by the second review: held
+# 8 s, the accepted request answered 429 overloaded/not_applied at 5.07 s. Code: participant_full.rs
+# SERVICE_CONVERGENCE deadline on the queued read and on the QLANE Prepare; service_rpc.rs returns the refusal at
+# the deadline. Model: OltpQueue QueueRetention, mutant o07_lane_fails.
+id = "design-queue-accepted-work-fails-on-saturation"
+title = "Accepted queued work ends with a terminal 429 after 5 s of local lane saturation"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G07", "OLTP-G09"]
+scenarios = ["O07", "Q01"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/oltp/queue/mutants/o07_lane_fails.cfg"
+seed = "unknown"
+why_not_caught = "The #108 regression releases the lane within the 5 s bound; nothing holds it longer and asserts that accepted work keeps its attempt."
+invariant_added = "Accepted work is never failed for local saturation: after the bounded wait the attempt is kept and retried under the same charged command."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-27"

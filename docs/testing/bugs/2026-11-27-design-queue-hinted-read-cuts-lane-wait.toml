@@ -1,0 +1,21 @@
+# Design review (rv-oltp-direct, OQ-3; #108 second review, medium 1), executed locally by the second review
+# (wave-p8/reports/second-review.md item 1). Code: service_rpc.rs HINTED_READ_TIMEOUT = 1 s wraps the whole hinted
+# call (call_hinted), lane wait included; accepted queued Catalog reads wait up to SERVICE_CONVERGENCE = 5 s
+# (participant_full.rs). The cut records the call Unreachable and invalidates the Catalog routes.
+id = "design-queue-hinted-read-cuts-lane-wait"
+title = "A 1 s hinted-read timeout cuts the 5 s lane wait of an accepted queued read and invalidates healthy routes"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G07", "OLTP-G09"]
+scenarios = ["O07", "Q01"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "oltp_runtime::worker_runtime::direct_gateway::tests::o07_q01_accepted_query_waits_for_catalog_storage_lane"
+seed = "unknown"
+why_not_caught = "The #108 regression holds the lane for less than 1 s and counts no route reads, so a timeout inside the lane wait and the route invalidation it causes are not observed."
+invariant_added = "A local lane wait is not a peer failure: the hinted timeout covers only the transport round trip after a lane slot is reserved, and no route is invalidated for local saturation."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-27"
