@@ -541,6 +541,33 @@ pub struct Index<C: Codec = ExactCodec> {
     checkpoint: Option<Running>,
     /// Where `maintain` goes on.
     cursor: PartId,
+    /// Shared by the copies of a test index: the last one that goes gives the store back.
+    owner: Arc<()>,
+}
+
+/// An index that goes gives back what it holds of the extension store and the code memory, which
+/// outlive it (L8), so that a recovery over the same configuration is charged only what it holds.
+impl<C: Codec> Drop for Index<C> {
+    fn drop(&mut self) {
+        let Some(store) = &self.cfg.codes else {
+            return;
+        };
+        if Arc::strong_count(&self.owner) > 1 {
+            return;
+        }
+        for shard in &self.shards {
+            for (part, p) in &shard.parts {
+                for b in &p.bands {
+                    store.memory().release_codes(self.codec.held(&b.codes));
+                    if p.centroid.is_some() {
+                        for e in &b.entries {
+                            store.release(&shard::ext_key(*part, e.id));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl<C: Codec> Index<C> {
@@ -581,6 +608,7 @@ impl<C: Codec> Index<C> {
             store,
             checkpoint: None,
             cursor: PartId(0),
+            owner: Arc::new(()),
         })
     }
 

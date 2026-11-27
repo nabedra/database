@@ -159,8 +159,10 @@ impl<C: Codec> Shard<C> {
                 // 1-bit codes first: the extension takes what they leave.
                 let grown = codec.held(&band.codes).saturating_sub(before);
                 store.memory().charge_codes(grown);
-                // A store that cannot take it fails the range after this step.
-                if detached && store.put(ext_key(part, e.id), &ext).is_err() {
+                // Codes that grew take their room back from extensions in RAM. A store that cannot
+                // take one fails the range of this entry after this step.
+                let demoted = store.demote();
+                if demoted.is_err() || (detached && store.put(ext_key(part, e.id), &ext).is_err()) {
                     sh.rows.log_damage(e.generation);
                 }
             }

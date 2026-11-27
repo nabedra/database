@@ -1,9 +1,10 @@
 //! 4-bit code extensions: in RAM while the worker's code memory lasts, otherwise on NVMe. 1-bit
 //! codes are charged to the same [`Memory`] and always stay in RAM, so they come first and
-//! extensions take what is left. An extension stays where it was put until [`Extensions::promote`]
-//! brings it back to RAM, which the index's maintenance does once memory is free again.
+//! extensions take what is left: when codes grow, [`Extensions::demote`] moves extensions to NVMe
+//! until both fit again, and [`Extensions::promote`] brings them back to RAM, which the index's
+//! maintenance does once memory is free again.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::disk::Disk;
@@ -22,7 +23,7 @@ pub struct ExtKey {
 pub struct Extensions {
     bytes: usize,
     memory: Arc<Memory>,
-    ram: Mutex<HashMap<ExtKey, Arc<[u8]>>>,
+    ram: Mutex<BTreeMap<ExtKey, Arc<[u8]>>>,
     /// One per core; the key's partition picks it.
     files: Vec<RecordFile<ExtKey>>,
 }
@@ -41,7 +42,7 @@ impl Extensions {
         Ok(Extensions {
             bytes,
             memory,
-            ram: Mutex::new(HashMap::new()),
+            ram: Mutex::new(BTreeMap::new()),
             files,
         })
     }
@@ -56,7 +57,7 @@ impl Extensions {
         &self.memory
     }
 
-    fn ram(&self) -> std::sync::MutexGuard<'_, HashMap<ExtKey, Arc<[u8]>>> {
+    fn ram(&self) -> std::sync::MutexGuard<'_, BTreeMap<ExtKey, Arc<[u8]>>> {
         self.ram.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -113,6 +114,27 @@ impl Extensions {
                 self.memory.release_extension(self.bytes as u64);
                 Err(e)
             }
+        }
+    }
+
+    /// Moves extensions from RAM to NVMe, smallest key first, while the code memory holds more than
+    /// its limit: 1-bit codes that grew take their room back. Returns how many moved. One that
+    /// cannot be written stays in RAM, and the error says why.
+    pub fn demote(&self) -> Result<usize> {
+        let mut moved = 0;
+        loop {
+            let (codes, ext) = self.memory.used();
+            if ext == 0 || codes.saturating_add(ext) <= self.memory.limit() {
+                return Ok(moved);
+            }
+            let Some((key, value)) = self.ram().first_key_value().map(|(k, v)| (*k, v.clone()))
+            else {
+                return Ok(moved);
+            };
+            self.file(&key).put(key, &value)?;
+            self.ram().remove(&key);
+            self.memory.release_extension(self.bytes as u64);
+            moved += 1;
         }
     }
 

@@ -163,7 +163,12 @@ fn vs17_extensions_spill_to_nvme_when_the_code_memory_is_gone_and_come_back() {
     };
     let limit = 100 * probe + 40 * ext;
     let (_d, store) = codes("spill", &codec, 3, limit);
-    let mut ix = serving(config(dim, Some(store.clone())), codec, None);
+    // Partitions that do not split, so that no split puts the extensions again (review rv-b2b).
+    let cfg = Config {
+        part_max: 512,
+        ..config(dim, Some(store.clone()))
+    };
+    let mut ix = serving(cfg, codec, None);
     let g = &mut Gen::from_seed(3);
     let first: Vec<(u64, Vec<f32>)> = (0..100).map(|k| (k, vector(g, dim))).collect();
     feed(&mut ix, RANGE, &upserts(0, &first));
@@ -202,7 +207,8 @@ fn vs07_extensions_in_ram_or_on_nvme_give_the_same_results() {
     let codec = DirectionCodec::new(dim, 9).unwrap();
     let mut stores = Vec::new();
     let mut ixs = vec![serving(config(dim, None), codec.clone(), None)];
-    for limit in [u64::MAX, 0, 4000] {
+    // The last limit leaves room for some extensions beside the 1-bit codes (4,536 B at the end).
+    for limit in [u64::MAX, 0, 6000] {
         let (d, store) = codes("same", &codec, 3, limit);
         ixs.push(serving(config(dim, Some(store)), codec.clone(), None));
         stores.push(d);
@@ -516,7 +522,6 @@ fn vs19_direction_codes_measure_recall_at_the_default_target() {
 /// extensions already in RAM go to NVMe: the code memory never holds more than its limit beyond
 /// what the 1-bit codes alone need.
 #[test]
-#[ignore = "VEC-BUG-ext-ram-beyond-code-memory"]
 fn vs17_extensions_in_ram_leave_when_1_bit_codes_grow_into_the_code_memory() {
     let dim = 64;
     let codec = DirectionCodec::new(dim, 5).unwrap();
@@ -560,7 +565,6 @@ fn vs17_extensions_in_ram_leave_when_1_bit_codes_grow_into_the_code_memory() {
 /// as long as its process), so an index that goes gives back what it holds. A recovery handed the
 /// same configuration is then charged exactly what it holds, and stays brute force.
 #[test]
-#[ignore = "VEC-BUG-ext-charges-outlive-index"]
 fn vs17_an_index_recovered_over_the_same_extension_store_is_charged_only_what_it_holds() {
     use nabedra_rt::fs::FaultFs;
     let dim = 8;
@@ -596,4 +600,220 @@ fn vs17_an_index_recovered_over_the_same_extension_store_is_charged_only_what_it
     let got = keys(&back.search(&pin, &q).unwrap());
     assert_eq!(got, brute(&model, &q));
     charges(&back).unwrap();
+}
+
+// ----- Review rv-b2b: the rules its surviving mutants showed untested (task perf1).
+
+/// A disk whose reads fail while `fail` is set.
+#[derive(Debug)]
+struct Faulty {
+    inner: Arc<dyn Disk>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Disk for Faulty {
+    fn kind(&self) -> &'static str {
+        self.inner.kind()
+    }
+    fn read(&self, reqs: &mut [crate::store::Req]) {
+        if self.fail.load(Ordering::SeqCst) {
+            for r in reqs {
+                r.result = Err(std::io::Error::from_raw_os_error(5));
+            }
+            return;
+        }
+        self.inner.read(reqs);
+    }
+    fn write(&self, offset: u64, buf: &[u8]) -> std::io::Result<()> {
+        self.inner.write(offset, buf)
+    }
+}
+
+/// An extension store on one faulty file whose code memory is `limit` bytes.
+fn faulty(name: &str, codec: &DirectionCodec, limit: u64) -> (Disks, Arc<Extensions>, Arc<std::sync::atomic::AtomicBool>) {
+    let d = disks(name, 1);
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let disk: Arc<dyn Disk> = Arc::new(Faulty { inner: d.disks[0].clone(), fail: fail.clone() });
+    let ext = Extensions::new(codec.ext_bytes(), Arc::new(Memory::new(limit)), vec![disk]).unwrap();
+    (d, Arc::new(ext), fail)
+}
+
+/// Partitions that do not split, so every entry is put once.
+fn whole(dim: usize, store: Arc<Extensions>) -> Config {
+    Config {
+        part_max: 512,
+        ..config(dim, Some(store))
+    }
+}
+
+fn rows_of(g: &mut Gen, n: usize, dim: usize) -> Vec<(u64, Vec<f32>)> {
+    (0..n as u64).zip(clustered(g, n, dim, true)).collect()
+}
+
+/// VEC-G10: an extension that NVMe cannot read fails the scan, and its range, as a raw vector would.
+#[test]
+fn vs17_an_extension_that_cannot_be_read_fails_its_range() {
+    let dim = 32;
+    let codec = DirectionCodec::new(dim, 7).unwrap();
+    let (_d, store, fail) = faulty("readfail", &codec, 0);
+    let mut ix = serving(whole(dim, store.clone()), codec, None);
+    let rows = rows_of(&mut Gen::from_seed(40), 200, dim);
+    feed(&mut ix, RANGE, &upserts(0, &rows));
+    settle(&mut ix);
+    assert_eq!(held(&ix).ram, 0, "every extension on NVMe");
+    store.flush().unwrap();
+    fail.store(true, Ordering::SeqCst);
+    let pin = latest(&mut ix, None);
+    let q = Query {
+        exact: false,
+        recall: 1.0,
+        ..query(Op::Cosine, &rows[0].1, 10)
+    };
+    assert!(matches!(ix.search(&pin, &q), Err(Error::Store(_))), "the read failed");
+    ix.run();
+    assert!(ix.status(RANGE).unwrap().damage.is_some(), "the range fails");
+}
+
+/// VEC-G10: an extension that NVMe cannot take fails the range of its entry.
+#[test]
+fn vs17_an_extension_that_cannot_be_written_fails_its_range() {
+    let dim = 32;
+    let codec = DirectionCodec::new(dim, 7).unwrap();
+    let (_d, store, fail) = faulty("putfail", &codec, 0);
+    let mut ix = serving(whole(dim, store.clone()), codec, None);
+    let rows = rows_of(&mut Gen::from_seed(41), 40, dim);
+    feed(&mut ix, RANGE, &upserts(0, &rows));
+    settle(&mut ix);
+    assert_eq!(ix.status(RANGE).unwrap().damage, None);
+    // The last page is on disk and partly full: the next record reads it first, and that fails.
+    store.flush().unwrap();
+    fail.store(true, Ordering::SeqCst);
+    let more = rows_of(&mut Gen::from_seed(42), 1, dim);
+    let one: Vec<(u64, Vec<f32>)> = more.into_iter().map(|(_, v)| (1000, v)).collect();
+    let _ = ix.apply(RANGE, &upserts(40, &one));
+    ix.run();
+    assert!(ix.status(RANGE).unwrap().damage.is_some(), "the range fails");
+}
+
+/// VEC-G11: reading an extension from NVMe costs its bytes of I/O, and one in RAM none.
+#[test]
+fn vs19_extension_reads_are_charged_by_their_tier() {
+    let dim = 64;
+    let codec = DirectionCodec::new(dim, 8).unwrap();
+    let rows = rows_of(&mut Gen::from_seed(43), 300, dim);
+    let queries = clustered(&mut Gen::from_seed(44), 20, dim, true);
+    for (name, limit) in [("ram", u64::MAX / 4), ("nvme", 0)] {
+        let (_d, store) = codes(name, &codec, 3, limit);
+        let mut ix = serving(whole(dim, store.clone()), codec.clone(), None);
+        feed(&mut ix, RANGE, &upserts(0, &rows));
+        settle(&mut ix);
+        let h = held(&ix);
+        assert_eq!(if limit == 0 { h.ram } else { h.nvme }, 0, "{name}: {h:?}");
+        let pin = latest(&mut ix, None);
+        let mut io = 0;
+        for v in &queries {
+            let q = Query {
+                exact: false,
+                ..query(Op::Dot, v, 10)
+            };
+            let mut scan = ix.scan_within(&pin, &q, Box::new(RecallEstimate), Budget::UNLIMITED).unwrap();
+            while ix.visit(&mut scan).unwrap() {}
+            io += scan.usage().unwrap().io;
+        }
+        if limit == 0 {
+            assert!(io > 0 && io % codec.ext_bytes() as u64 == 0, "{name}: {io}");
+        } else {
+            assert_eq!(io, 0, "{name}: extensions in RAM cost no I/O");
+        }
+    }
+}
+
+/// The code memory is charged what the codes take: per entry, 64 dimensions of 1 bit, the squared
+/// residual, the 1-bit scale and 12 bytes of factors, and the extension when it is in RAM. Counted
+/// here by hand, not by the blocks' own `held`.
+#[test]
+fn vs17_code_charges_are_the_sizes_of_the_codes() {
+    let dim = 64;
+    let codec = DirectionCodec::new(dim, 9).unwrap();
+    let (_d, store) = codes("sizes", &codec, 3, u64::MAX / 4);
+    let mut ix = serving(whole(dim, store.clone()), codec, None);
+    let n = 150;
+    feed(&mut ix, RANGE, &upserts(0, &rows_of(&mut Gen::from_seed(45), n, dim)));
+    settle(&mut ix);
+    assert_eq!(ix.stats().entries, n);
+    assert_eq!(store.memory().used(), ((n * (8 + 4 + 4 + 12)) as u64, (n * 32) as u64));
+}
+
+/// Maintenance brings at most `copies` extensions of a partition back to RAM per call, and the
+/// rest in later calls.
+#[test]
+fn vs17_promotion_brings_back_at_most_copies_per_partition_and_call() {
+    let dim = 64;
+    let codec = DirectionCodec::new(dim, 10).unwrap();
+    let (_d, store) = codes("promote", &codec, 3, 1 << 20);
+    // Another user of the code memory leaves no room while the rows arrive.
+    store.memory().charge_codes(1 << 20);
+    let cfg = Config {
+        copies: 7,
+        ..whole(dim, store.clone())
+    };
+    let mut ix = serving(cfg, codec, None);
+    feed(&mut ix, RANGE, &upserts(0, &rows_of(&mut Gen::from_seed(46), 100, dim)));
+    settle(&mut ix);
+    assert_eq!(held(&ix).ram, 0, "{:?}", held(&ix));
+    store.memory().release_codes(1 << 20);
+    let parts = ix.listed().len();
+    ix.maintain(parts);
+    let ram = held(&ix).ram;
+    assert!(ram > 0 && ram <= 7 * parts, "{ram} promoted over {parts} partitions");
+    settle(&mut ix);
+    assert_eq!(held(&ix).nvme, 0, "the rest came back");
+    charges(&ix).unwrap();
+}
+
+/// An index refuses an extension store whose extensions have another size than its codes.
+#[test]
+fn vs17_an_index_refuses_an_extension_store_of_another_size() {
+    let codec = DirectionCodec::new(64, 11).unwrap();
+    let d = disks("size", 1);
+    let other = Extensions::new(codec.ext_bytes() + 1, Arc::new(Memory::new(1 << 20)), d.disks.clone()).unwrap();
+    assert!(Index::new(config(64, Some(Arc::new(other))), codec.clone(), None).is_err());
+    let (_d, same) = codes("size-ok", &codec, 1, 1 << 20);
+    assert!(Index::new(config(64, Some(same)), codec, None).is_ok());
+}
+
+/// VEC-BUG-ext-ram-beyond-code-memory within one batch: rows that arrive together still leave
+/// extensions only what the codes of all of them leave.
+#[test]
+fn vs17_extensions_of_one_batch_leave_room_for_the_codes_of_the_batch() {
+    let dim = 64;
+    let codec = DirectionCodec::new(dim, 5).unwrap();
+    let ext = codec.ext_bytes() as u64;
+    let per = (8 + 4 + 4 + 12) as u64;
+    let limit = 100 * per + 40 * ext;
+    let (_d, store) = codes("batch", &codec, 3, limit);
+    let mut ix = serving(whole(dim, store.clone()), codec, None);
+    feed(&mut ix, RANGE, &upserts(0, &rows_of(&mut Gen::from_seed(47), 100, dim)));
+    let (c, e) = store.memory().used();
+    assert!(c + e <= limit, "codes {c} and extensions {e}, limit {limit}");
+    settle(&mut ix);
+    charges(&ix).unwrap();
+    assert_eq!(held(&ix).ram, 40, "{:?}", held(&ix));
+}
+
+/// VEC-BUG-ext-charges-outlive-index without a checkpoint: a dropped index gives back every byte
+/// and record it held in the shared store.
+#[test]
+fn vs17_a_dropped_index_gives_back_its_codes_and_extensions() {
+    let dim = 64;
+    let codec = DirectionCodec::new(dim, 12).unwrap();
+    let (_d, store) = codes("drop", &codec, 3, 100 * 28 + 30 * 32);
+    let mut ix = serving(config(dim, Some(store.clone())), codec, None);
+    feed(&mut ix, RANGE, &upserts(0, &rows_of(&mut Gen::from_seed(48), 100, dim)));
+    settle(&mut ix);
+    let h = held(&ix);
+    assert!(h.ram > 0 && h.nvme > 0, "{h:?}");
+    drop(ix);
+    assert_eq!(store.memory().used(), (0, 0));
+    assert_eq!(store.counts(), (0, 0));
 }
