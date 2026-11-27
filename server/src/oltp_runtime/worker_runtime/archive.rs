@@ -1062,10 +1062,18 @@ impl WorkerRuntime {
 }
 fn ensure_private_directory(path: &Path) -> Result<(), ProtocolError> {
     match fs::create_dir_with_mode(path, 0o700) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(_) => Err(unknown()),
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(unknown()),
     }
+    // The destination holds the locator and, for a filesystem repository, every
+    // object. Its entry is synced on every call, also when a crashed earlier backup
+    // created it (DUR-4).
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    fs::sync_dir(parent).map_err(|_| unknown())
 }
 struct TemporaryArchiveFile(PathBuf);
 impl Drop for TemporaryArchiveFile {
@@ -1267,6 +1275,8 @@ pub(crate) fn read_native_locator(path: &Path) -> Result<NativeBackupManifest, P
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "sim", target_os = "linux"))]
+mod sim_tests;
 
 async fn install_native_maintenance(
     pool: &crate::oltp::pool::OltpPool,
