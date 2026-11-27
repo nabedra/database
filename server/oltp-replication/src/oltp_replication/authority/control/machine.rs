@@ -922,7 +922,9 @@ fn apply_initialized(
             next_owner,
             authorization,
         } => {
-            if state.pending.is_some() {
+            // OQ-2: an owner fence supersedes a join interrupted before its
+            // seal, as a removal does (`begin_ready`).
+            if state.pending.as_ref().is_some_and(|pending| !interrupted_join(pending)) {
                 return fault(Fault::Busy);
             }
             if *expected != state.ready
@@ -1152,6 +1154,14 @@ fn apply_initialized(
     }
 }
 
+/// OQ-2: a pending join that has not sealed changed only its own staged ready
+/// pages (under its generation id), so another view change may replace it. A
+/// sealed join may already have fenced Timestamps to its `next` view.
+fn interrupted_join(pending: &Pending) -> bool {
+    matches!(pending, Pending::Ready(pending)
+        if pending.change == ReadyChange::Join && pending.phase == ReadyPhase::Building)
+}
+
 fn begin_ready(
     tx: &mut GroupTransaction<'_>,
     state: &mut State,
@@ -1162,8 +1172,12 @@ fn begin_ready(
     removed: Option<&ExclusionStamp>,
     logical_fence: bool,
 ) -> Result<ControlReply, ProtocolError> {
-    if state.pending.is_some() {
-        return fault(Fault::Busy);
+    if let Some(pending) = &state.pending {
+        // OQ-2: a removal supersedes a join interrupted before its seal, so a
+        // crashed owner or joiner cannot stop every admission and recovery.
+        if !(change == ReadyChange::Remove && interrupted_join(pending)) {
+            return fault(Fault::Busy);
+        }
     }
     if state.ready.view != expected || target.validate().is_err() {
         return fault(Fault::Stale);

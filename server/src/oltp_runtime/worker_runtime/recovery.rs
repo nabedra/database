@@ -106,21 +106,27 @@ impl WorkerRuntime {
             probe.next_turn = Some(now + std::time::Duration::from_secs(1));
         }
         let state = self.services.control.inspect().await?.ok_or_else(unknown)?;
-        if let Some(pending) = state.pending {
-            return match pending {
+        if let Some(pending) = &state.pending {
+            match pending {
                 Pending::Fence(fence)
                     if !fence.cold && fence.next_owner == Some(self.services.local) =>
                 {
-                    self.advance_owner_fence(&fence).await
+                    return self.advance_owner_fence(fence).await;
                 }
                 Pending::Ready(pending)
                     if pending.change == ReadyChange::Remove
                         && state.owner == Some(self.services.local) =>
                 {
-                    self.advance_removal(&pending).await
+                    return self.advance_removal(pending).await;
                 }
-                _ => Ok(()),
-            };
+                // OQ-2: a join that has not sealed does not stop the probes. If
+                // a member (the owner included) is lost meanwhile, its removal
+                // or the owner fence supersedes the join, which Control allows.
+                Pending::Ready(pending)
+                    if pending.change == ReadyChange::Join
+                        && pending.phase == ReadyPhase::Building => {}
+                _ => return Ok(()),
+            }
         }
         if state.owner == Some(self.services.local) {
             let control = &self.services.control;
