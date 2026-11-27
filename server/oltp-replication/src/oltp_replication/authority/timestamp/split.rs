@@ -304,6 +304,15 @@ impl SplitTimestampCommand {
 pub(super) fn key(id: Uuid) -> Vec<u8> {
     [JOB, id.as_bytes()].concat()
 }
+/// RANGES-2: one key per split attempt that is open (written by Open,
+/// deleted by Close), so the run owner lists the open attempts in time
+/// proportional to their number, not to the cluster's groups or its history.
+const OPEN: &[u8] = b"ts/shard-split-open/v1/";
+pub(super) fn open_key(id: Uuid) -> Vec<u8> {
+    [OPEN, id.as_bytes()].concat()
+}
+/// At most this many open attempts per listing page.
+pub const OPEN_PAGE: usize = 64;
 pub(super) fn apply(
     tx: &mut GroupTransaction<'_>,
     state: Option<State>,
@@ -405,6 +414,7 @@ pub(super) fn apply(
                 closed: None,
             },
         )?;
+        tx.put(&open_key(intent.split_id), &[])?;
         put_state(tx, &state)?;
         return commit(tx, &TimestampReply::Snapshot(snapshot));
     }
@@ -527,6 +537,7 @@ pub(super) fn apply(
             };
             put(tx, &key_for_pin, &pin)?;
             tx.delete(&active_key(attempt.snapshot))?;
+            tx.delete(&open_key(attempt.intent.split_id))?;
             attempt.closed = Some(decision);
             put(tx, &key, &attempt)?;
             commit(tx, &TimestampReply::Released)
@@ -593,6 +604,28 @@ fn active_nonce(tx: &mut GroupTransaction<'_>, pin: StoragePin) -> Result<Uuid, 
 }
 
 impl TimestampHandle {
+    /// RANGES-2: the ids of open split attempts after `after`, one page.
+    pub(crate) async fn open_split_attempts(
+        &self,
+        after: Option<Uuid>,
+    ) -> Result<Vec<Uuid>, ProtocolError> {
+        self.consensus.ensure_linearizable().await?;
+        let raw = self
+            .machine
+            .store()
+            .read_metadata(BUDGET, move |view| {
+                let after = after.map(open_key);
+                let mut ids = Vec::new();
+                view.scan_page(OPEN, after.as_deref(), OPEN_PAGE, |key, _| {
+                    let id = key.get(OPEN.len()..).ok_or_else(unknown)?;
+                    ids.push(Uuid::from_slice(id).map_err(|_| unknown())?);
+                    Ok(())
+                })?;
+                view.encode(&ids)
+            })
+            .await?;
+        serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())
+    }
     pub(crate) async fn split_attempt_raw(&self, id: Uuid) -> Result<ChargedBytes, ProtocolError> {
         self.consensus.ensure_linearizable().await?;
         self.machine

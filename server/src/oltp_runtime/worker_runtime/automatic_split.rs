@@ -136,7 +136,14 @@ struct OwnerLoop {
     scan: Option<(GroupRecord, UsageResume)>,
     active: Option<Work>,
     blocked: BTreeSet<Uuid>,
+    /// RANGES-2: observations since the last listing of open attempts, and
+    /// the listing's cursor.
+    since_open_check: u32,
+    open_after: Option<Uuid>,
 }
+/// RANGES-2: list the open split attempts every this many observations
+/// (about 5 s), independently of the group sweep.
+const OPEN_CHECK_EVERY: u32 = 10;
 
 impl WorkerRuntime {
     pub(in crate::oltp_runtime) fn spawn_automatic_split(
@@ -318,6 +325,13 @@ impl OwnerLoop {
         ready: ReadyMembership,
     ) -> Result<(), ProtocolError> {
         let authority = ready.view.authority();
+        self.since_open_check += 1;
+        if self.since_open_check >= OPEN_CHECK_EVERY {
+            self.since_open_check = 0;
+            if self.resume_open(client, authority).await? {
+                return Ok(());
+            }
+        }
         if self.blocked.len() >= runtime.services.shared.config().max_resident_groups {
             return Ok(());
         }
@@ -416,6 +430,38 @@ impl OwnerLoop {
             }
         }
         Ok(())
+    }
+
+    /// RANGES-2: resume the next open attempt from Timestamps' index of open
+    /// attempts, whatever started it and whether or not it holds its source
+    /// yet. Recovery of a lost coordinator then takes about
+    /// `OPEN_CHECK_EVERY` observations per open attempt, not one sweep of
+    /// every group. Returns whether it found one.
+    async fn resume_open(
+        &mut self,
+        client: &SplitClient,
+        authority: Authority,
+    ) -> Result<bool, ProtocolError> {
+        let ids = client.open_jobs(self.open_after).await?;
+        let Some(&id) = ids.first() else {
+            self.open_after = None;
+            return Ok(false);
+        };
+        self.open_after = Some(id);
+        let Some(attempt) = client.job(id).await? else {
+            return Ok(false);
+        };
+        if attempt.closed.is_some() || self.blocked.contains(&attempt.intent.source.group_id) {
+            return Ok(false);
+        }
+        let automatic = attempt.intent.automatic.is_some();
+        self.active = Some(Work {
+            intent: attempt.intent.clone(),
+            placement: attempt.placement().cloned(),
+            failures: 0,
+            cancel: automatic && attempt.authority != authority,
+        });
+        Ok(true)
     }
 
     async fn drive(

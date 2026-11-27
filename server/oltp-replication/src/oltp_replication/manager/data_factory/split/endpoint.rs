@@ -205,6 +205,7 @@ impl SplitEndpoint {
             header.operation,
             Operation::Timestamp
                 | Operation::Job
+                | Operation::OpenJobs
                 | Operation::Publication
                 | Operation::FailureSettlement
         );
@@ -672,6 +673,16 @@ impl SplitEndpoint {
                 drop(membership);
                 let machine = ParticipantMachine::new(running.state.store().clone())?;
                 output!(LocalUsageScan::observe(&self.usage, request, machine).await?)
+            }
+            Operation::OpenJobs => {
+                let Host::System {
+                    timestamps: Some(timestamps),
+                    ..
+                } = &self.host
+                else {
+                    return Err(unauthorized());
+                };
+                output!(timestamps.open_split_attempts(input!(Option<Uuid>)).await?)
             }
             Operation::Job | Operation::FailureSettlement => {
                 let Host::System {

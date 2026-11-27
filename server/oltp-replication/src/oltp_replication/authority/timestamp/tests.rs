@@ -1148,6 +1148,17 @@ async fn o16_o21_o26_o27_o28_automatic_split_keeps_bound_placement_on_exact_retr
         }).await.unwrap();
         serde_json::from_slice::<SplitAttempt>(raw.as_slice()).unwrap()
     };
+    // RANGES-2: an opened attempt is in Timestamps' index of open attempts.
+    let listed = fixture
+        .machine
+        .store()
+        .read_metadata(split::BUDGET, move |view| {
+            let present = view.get(&split::open_key(split_id))?.is_some();
+            view.encode(&present)
+        })
+        .await
+        .unwrap();
+    assert!(serde_json::from_slice::<bool>(listed.as_slice()).unwrap());
     let attempt = read(fixture.machine.store().clone()).await;
     let guard = VerifiedLifecycleGuard::model_for_test(
         LifecycleBinding {
