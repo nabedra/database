@@ -632,15 +632,20 @@ impl StartupGateEndpoint {
         if !self.fresh_pool {
             return StartAnswer::Starting;
         }
-        // No replica yet, or one that never voted or appended: nothing this
-        // worker could have acknowledged in Control.
+        // No replica yet, or one whose log holds at most the seed's initial
+        // membership entry: no Control entry this worker could have helped
+        // commit exists here. A vote alone does not count: with no entry past
+        // the membership, a second vote in a term elects a leader that has
+        // nothing to overwrite. Waiting for an untouched log instead would
+        // deadlock a first bootstrap whose seed opened before the others.
         match self.manager.local_control(&self.control) {
             Err(_) => StartAnswer::Fresh,
             Ok(running) => {
                 use openraft::type_config::async_runtime::watch::WatchReceiver;
                 let metrics = running.raft.metrics();
                 let metrics = metrics.borrow_watched();
-                if metrics.current_term == 0 && metrics.last_log_index.is_none() {
+                let membership = metrics.membership_config.log_id().as_ref().map(|id| id.index);
+                if metrics.last_log_index.is_none() || metrics.last_log_index == membership {
                     StartAnswer::Fresh
                 } else {
                     StartAnswer::Starting
@@ -657,7 +662,9 @@ impl Endpoint for StartupGateEndpoint {
         header: &'a [u8],
     ) -> EndpointFuture<'a, ReceivePlan> {
         Box::pin(async move {
-            if let Some(inner) = self.inner.get() {
+            if let Some(inner) = self.inner.get()
+                && !self.is_start_check(header)
+            {
                 return inner.preflight(session, header).await;
             }
             self.parse(session, header)?;
@@ -676,14 +683,31 @@ impl Endpoint for StartupGateEndpoint {
         sections: ChargedSections,
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
-            if let Some(inner) = self.inner.get() {
+            if let Some(inner) = self.inner.get()
+                && !self.is_start_check(header.as_slice())
+            {
                 return inner.handle(session, header, sections).await;
             }
             self.parse(&session, header.as_slice())?;
             if (0..3).any(|index| sections.section(index).is_some()) {
                 return Err(invalid());
             }
-            let answer: Result<StartAnswer, ProtocolError> = Ok(self.local_answer());
+            // An untouched local Control replica answers Fresh whether or not
+            // Control is open here: a peer in its first bootstrap may be the
+            // seed that every other voter's groups wait for. Otherwise the
+            // Control leader answers from committed state, bounded so that a
+            // Control without a leader yet answers Starting at once.
+            let answer = match (self.local_answer(), self.inner.get()) {
+                (StartAnswer::Fresh, _) => StartAnswer::Fresh,
+                (_, Some(inner)) => nabedra_rt::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    inner.start_check(session.remote().worker_id),
+                )
+                .await
+                .unwrap_or(Ok(StartAnswer::Starting))?,
+                (answer, None) => answer,
+            };
+            let answer: Result<StartAnswer, ProtocolError> = Ok(answer);
             Ok(ChargedReply {
                 header: self
                     .manager
@@ -696,6 +720,9 @@ impl Endpoint for StartupGateEndpoint {
 }
 
 impl StartupGateEndpoint {
+    fn is_start_check(&self, header: &[u8]) -> bool {
+        matches!(serde_json::from_slice::<Request>(header), Ok(Request::StartCheck))
+    }
     fn parse(&self, session: &AuthenticatedSession, header: &[u8]) -> Result<(), ProtocolError> {
         if session.group() != &self.control
             || session.purpose() != Purpose::SystemRecovery
