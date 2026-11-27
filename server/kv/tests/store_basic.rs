@@ -143,7 +143,8 @@ fn ns22_foreign_directories_are_refused_untouched() {
     }
     let unknown = tmp.path().join("unknown");
     std::fs::create_dir_all(&unknown).unwrap();
-    std::fs::write(unknown.join("FORMAT"), b"nabedra-kv 2\n").unwrap();
+    // Format 2 exists since LSM-1 (authenticated journal frames): use a later number.
+    std::fs::write(unknown.join("FORMAT"), b"nabedra-kv 9\n").unwrap();
     let legacy = tmp.path().join("legacy");
     std::fs::create_dir_all(legacy.join("rocksdb")).unwrap();
     std::fs::write(

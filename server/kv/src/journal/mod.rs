@@ -76,6 +76,7 @@ use crate::cache::{BlockCache, CacheKey};
 use crate::crc;
 use crate::error::{Damage, Error, FileId, Result};
 use crate::fs::{Fs, FsFile};
+use crate::mac::JournalKey;
 use crate::types::{Locator, MAX_SEQ, Seq};
 
 pub mod format;
@@ -123,6 +124,11 @@ pub struct JournalOptions {
     /// Write zeros over a new segment file once when it is created, so later overwrites
     /// change no file metadata. Default true.
     pub zero_fill: bool,
+    /// The store's journal key (format 2, LSM-1): segments created from now on use the
+    /// authenticated frame, and existing ones are read in their own frame. `None` (the
+    /// default, a format 1 store) writes the CRC frame and refuses an authenticated
+    /// segment. [`crate::Store`] sets it from the store's `JOURNAL_KEY`.
+    pub auth_key: Option<JournalKey>,
 }
 
 impl Default for JournalOptions {
@@ -131,6 +137,7 @@ impl Default for JournalOptions {
             segment_bytes: 64 << 20,
             max_group_bytes: 4 << 20,
             zero_fill: true,
+            auth_key: None,
         }
     }
 }
@@ -696,6 +703,7 @@ impl Journal {
             file: seg.file,
             path: seg.path,
             len: seg.len,
+            auth: false,
         };
         let fs = &*self.shared.fs;
         let free = segment::release(

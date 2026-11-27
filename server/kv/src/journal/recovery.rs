@@ -56,6 +56,7 @@ use crate::batch::WriteBatch;
 use crate::crc;
 use crate::error::{Damage, DamageReason, Error, FileId, Result};
 use crate::fs::FsFile;
+use crate::mac::JournalKey;
 use crate::types::{Locator, Seq};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -194,13 +195,25 @@ enum At {
     Valid(RecordHeader),
 }
 
-fn header_at(r: &mut SegReader, segment: u64, pos: u64, scope: &mut Vec<u8>) -> Result<At> {
+/// The key to check `seg`'s record headers with: the journal key for a segment in the
+/// authenticated frame, none (the CRC frame) otherwise.
+fn frame_key<'a>(seg: &LiveSeg, key: Option<&'a JournalKey>) -> Option<&'a JournalKey> {
+    if seg.auth { key } else { None }
+}
+
+fn header_at(
+    r: &mut SegReader,
+    segment: u64,
+    pos: u64,
+    scope: &mut Vec<u8>,
+    key: Option<&JournalKey>,
+) -> Result<At> {
     if pos + RECORD_HEADER_LEN as u64 > r.len {
         return Ok(At::End);
     }
     let avail = MAX_HEADER_AND_SCOPE.min(r.len - pos);
     let bytes = r.get(pos, avail)?.expect("within the segment");
-    match format::check_header(bytes) {
+    match format::check_header(bytes, key) {
         HeaderCheck::Zero => Ok(At::Zero),
         HeaderCheck::Bad => Ok(At::Bad),
         HeaderCheck::Valid(h) => {
@@ -230,15 +243,27 @@ struct Scan {
     valid_bytes: u64,
 }
 
-fn evidence_scan(live: &[LiveSeg], idx: usize, from: u64) -> Result<Scan> {
+/// Only a record with `durable_seq < first_seq` counts, as evidence or as a resync point:
+/// the journal never writes another (the last completed sync covers only earlier records),
+/// so a header with a larger `durable_seq` is not one of its records. In the CRC frame
+/// that rejects one class of forged headers (LSM-1, mitigation b); in the authenticated
+/// frame client bytes cannot carry a valid header at all.
+fn evidence_scan(
+    live: &[LiveSeg],
+    idx: usize,
+    from: u64,
+    key: Option<&JournalKey>,
+) -> Result<Scan> {
     let mut scan = Scan::default();
     let mut scope = Vec::new();
     for (i, seg) in live.iter().enumerate().skip(idx) {
         let mut r = SegReader::new(seg);
         let mut pos = if i == idx { from } else { RECORDS_START };
+        let seg_key = frame_key(seg, key);
         while pos + RECORD_HEADER_LEN as u64 <= seg.len {
-            if let At::Valid(h) = header_at(&mut r, seg.number, pos, &mut scope)?
+            if let At::Valid(h) = header_at(&mut r, seg.number, pos, &mut scope, seg_key)?
                 && h.epoch == seg.epoch
+                && h.durable_seq < h.first_seq
                 && h.record_type().is_some()
                 && payload_ok(&mut r, pos, &h)?
             {
@@ -276,7 +301,8 @@ pub(super) fn recover(
     replay_after: Seq,
     sink: &dyn JournalSink,
 ) -> Result<Recovered> {
-    let mut inventory = segment::inventory(fs, dir, options.segment_bytes)?;
+    let key = options.auth_key.as_ref();
+    let mut inventory = segment::inventory(fs, dir, options.segment_bytes, key)?;
     // A header-less live name below the newest valid segment sits inside the chain: R3.
     // At most one, the newest, may turn out to be an unused segment (checked at the end).
     let newest_valid = inventory.live.last().map(|s| s.number);
@@ -306,7 +332,7 @@ pub(super) fn recover(
     let live = inventory.live;
     if live.is_empty() {
         let next_seq = replay_after + 1;
-        discard.extend(check_headerless(candidate, next_seq)?);
+        discard.extend(check_headerless(candidate, next_seq, key)?);
         return Ok(Recovered {
             report,
             live,
@@ -342,7 +368,13 @@ pub(super) fn recover(
 
     let end = loop {
         let seg = &live[idx];
-        let non_valid = match header_at(&mut reader, seg.number, pos, &mut scope)? {
+        let non_valid = match header_at(
+            &mut reader,
+            seg.number,
+            pos,
+            &mut scope,
+            frame_key(seg, key),
+        )? {
             At::End => {
                 // Fewer than a header's bytes left: the segment is full.
                 if idx + 1 < live.len() {
@@ -499,7 +531,7 @@ pub(super) fn recover(
             NonValid::Damaged(h) => pos + h.record_len(),
             _ => format::align_up(pos + 1),
         };
-        let scan = evidence_scan(&live, idx, resume)?;
+        let scan = evidence_scan(&live, idx, resume, key)?;
         // A validated boundary inside the flushed prefix or at its end is safe to use
         // even when no later record carries a journal sync certificate.
         let flush_covers_gap = covered
@@ -601,7 +633,7 @@ pub(super) fn recover(
         }
     };
 
-    discard.extend(check_headerless(candidate, next_seq)?);
+    discard.extend(check_headerless(candidate, next_seq, key)?);
     Ok(Recovered {
         report,
         live,
@@ -617,8 +649,13 @@ pub(super) fn recover(
 /// The newest live name has no intact header. It is unused (L4) when no record in it has
 /// a valid header and a sequence at or after `next_seq`, the sequence the log continues
 /// with: nothing then chains into it, and older records in it are leftovers of an earlier
-/// use. Otherwise it may hold records the log needs: R3.
-fn check_headerless(candidate: Option<Headerless>, next_seq: Seq) -> Result<Vec<PathBuf>> {
+/// use. Otherwise it may hold records the log needs: R3. Its frame is unknown without a
+/// header, so in a store with a journal key a record checks in either frame.
+fn check_headerless(
+    candidate: Option<Headerless>,
+    next_seq: Seq,
+    key: Option<&JournalKey>,
+) -> Result<Vec<PathBuf>> {
     let Some(h) = candidate else {
         return Ok(Vec::new());
     };
@@ -627,7 +664,12 @@ fn check_headerless(candidate: Option<Headerless>, next_seq: Seq) -> Result<Vec<
     while pos + RECORD_HEADER_LEN as u64 <= h.len {
         let avail = MAX_HEADER_AND_SCOPE.min(h.len - pos);
         let bytes = r.get(pos, avail)?.expect("within the segment");
-        if let HeaderCheck::Valid(header) = format::check_header(bytes)
+        let check = match format::check_header(bytes, None) {
+            HeaderCheck::Valid(header) => HeaderCheck::Valid(header),
+            _ if key.is_some() => format::check_header(bytes, key),
+            other => other,
+        };
+        if let HeaderCheck::Valid(header) = check
             && pos + header.record_len() <= h.len
         {
             if header.record_type().is_some() && header.end_seq() > next_seq {

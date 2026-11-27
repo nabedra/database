@@ -2,8 +2,16 @@
 //!
 //! # Files
 //!
-//! - `FORMAT` holds `nabedra-kv 1\n`, written once (temp file, rename, directory sync).
-//!   Anything else, or a non-empty directory without it, is [`Error::UnsupportedFormat`].
+//! - `FORMAT` holds `nabedra-kv 1\n` (format 1: journal records in the CRC frame) or
+//!   `nabedra-kv 2\n` (format 2: journal segments created from then on use the
+//!   authenticated frame, LSM-1). It is written by a temp file, a sync, a rename and a
+//!   directory sync, once at creation and once more by the upgrade from format 1 to 2.
+//!   Anything else, or a non-empty directory without it, is [`Error::UnsupportedFormat`]:
+//!   a release that knows only format 1 refuses a format 2 store this way, before it
+//!   changes any file.
+//! - `JOURNAL_KEY` (format 2 only) holds the 128-bit journal key with a CRC
+//!   ([`crate::mac`]). It is durable before `FORMAT` names format 2 and never rewritten
+//!   after that.
 //! - `CURRENT` names the live manifest: `MANIFEST-<n> <crc>\n`, where `<crc>` is the masked
 //!   CRC32C of `MANIFEST-<n>` in hex. It is replaced by writing `CURRENT.tmp`, syncing it,
 //!   renaming it over `CURRENT` and syncing the directory. Any other content is R3.
@@ -33,10 +41,15 @@ use crate::coding::{get_length_prefixed, get_varint32, put_length_prefixed, put_
 use crate::crc;
 use crate::error::{Damage, DamageReason, Error, FileId, Result};
 use crate::fs::{Fs, FsFile, OpenMode};
+use crate::mac::JournalKey;
 use crate::types::Seq;
 
 pub const FORMAT_FILE: &str = "FORMAT";
 pub const FORMAT_CONTENT: &[u8] = b"nabedra-kv 1\n";
+/// `FORMAT` of a store whose journal uses authenticated frames (LSM-1).
+pub const FORMAT_CONTENT_V2: &[u8] = b"nabedra-kv 2\n";
+pub const JOURNAL_KEY_FILE: &str = "JOURNAL_KEY";
+pub(crate) const JOURNAL_KEY_TMP: &str = "JOURNAL_KEY.tmp";
 pub const CURRENT_FILE: &str = "CURRENT";
 pub const LOCK_FILE: &str = "LOCK";
 pub const JOURNAL_DIR: &str = "journal";
@@ -574,17 +587,34 @@ pub fn switch_current(
     fs.sync_dir(dir).map_err(after)
 }
 
-/// Writes `FORMAT` once: temp file, sync, rename, directory sync.
-pub fn write_format(fs: &dyn Fs, dir: &Path) -> Result<()> {
-    let tmp = dir.join(FORMAT_TMP);
+/// Writes `FORMAT` (`content` is [`FORMAT_CONTENT`] or [`FORMAT_CONTENT_V2`]): temp
+/// file, sync, rename (over an older `FORMAT`), directory sync.
+pub fn write_format(fs: &dyn Fs, dir: &Path, content: &[u8]) -> Result<()> {
+    replace_file(fs, dir, FORMAT_TMP, FORMAT_FILE, content)
+}
+
+/// Writes `JOURNAL_KEY` the same way. Called only while `FORMAT` still names format 1
+/// (or does not exist), so nothing depends on an earlier key file it replaces.
+pub(crate) fn write_journal_key(fs: &dyn Fs, dir: &Path, key: &JournalKey) -> Result<()> {
+    replace_file(
+        fs,
+        dir,
+        JOURNAL_KEY_TMP,
+        JOURNAL_KEY_FILE,
+        &key.encode_file(),
+    )
+}
+
+fn replace_file(fs: &dyn Fs, dir: &Path, tmp: &str, name: &str, content: &[u8]) -> Result<()> {
+    let tmp = dir.join(tmp);
     if fs.exists(&tmp).map_err(io)? {
         fs.remove(&tmp).map_err(io)?;
     }
     let file = fs.open(&tmp, OpenMode::CreateNew).map_err(io)?;
-    file.write_all_at(FORMAT_CONTENT, 0).map_err(io)?;
+    file.write_all_at(content, 0).map_err(io)?;
     file.sync_all().map_err(io)?;
     drop(file);
-    fs.rename(&tmp, &dir.join(FORMAT_FILE)).map_err(io)?;
+    fs.rename(&tmp, &dir.join(name)).map_err(io)?;
     fs.sync_dir(dir).map_err(io)
 }
 

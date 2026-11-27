@@ -16,7 +16,8 @@ use crate::error::{Error, Result};
 use crate::fs::{Fs, FsFile, OpenMode};
 use crate::types::Seq;
 
-use super::format::{BLOCK, HeaderCopy, RECORDS_START, SegmentHeader};
+use super::format::{self, BLOCK, HeaderCopy, RECORDS_START, SegmentHeader};
+use crate::mac::JournalKey;
 
 pub(super) const LIVE_EXT: &str = "jnl";
 pub(super) const FREE_EXT: &str = "free";
@@ -49,6 +50,8 @@ pub(super) struct LiveSeg {
     pub file: Arc<dyn FsFile>,
     pub path: PathBuf,
     pub len: u64,
+    /// Records use the authenticated frame (segment version 2).
+    pub auth: bool,
 }
 
 pub(super) struct FreeSeg {
@@ -84,7 +87,14 @@ pub(super) fn io(error: std::io::Error) -> Error {
 }
 
 /// Lists and classifies the segment files of `dir` (plan section 3: L4 and R3 for headers).
-pub(super) fn inventory(fs: &dyn Fs, dir: &Path, segment_bytes: u64) -> Result<Inventory> {
+/// `key`: the store's journal key, without which a segment in the authenticated frame is
+/// refused; a header written under another key is refused too.
+pub(super) fn inventory(
+    fs: &dyn Fs,
+    dir: &Path,
+    segment_bytes: u64,
+    key: Option<&JournalKey>,
+) -> Result<Inventory> {
     let mut live = Vec::new();
     let mut free = Vec::new();
     let mut headerless = Vec::new();
@@ -109,6 +119,25 @@ pub(super) fn inventory(fs: &dyn Fs, dir: &Path, segment_bytes: u64) -> Result<I
                     ),
                 });
             }
+            if let HeaderCopy::Valid(h) = copy
+                && h.auth
+            {
+                let Some(key) = key else {
+                    return Err(Error::UnsupportedFormat {
+                        found: format!(
+                            "journal segment {} uses authenticated frames but the store has no journal key",
+                            path.display()
+                        ),
+                    });
+                };
+                if h.key_check != format::key_check(key, h.segment, h.epoch) {
+                    return Err(Error::Corruption {
+                        file: crate::error::FileId::Journal { segment: number },
+                        offset: 0,
+                        what: "journal segment written under another journal key",
+                    });
+                }
+            }
         }
         let valid = || {
             copies.iter().filter_map(|c| match c {
@@ -127,6 +156,7 @@ pub(super) fn inventory(fs: &dyn Fs, dir: &Path, segment_bytes: u64) -> Result<I
                 file,
                 path,
                 len: len / BLOCK * BLOCK,
+                auth: header.auth,
             });
         } else if let Some(header) = valid().max_by_key(|h| h.epoch) {
             if len == segment_bytes {
@@ -209,6 +239,8 @@ pub(super) fn create_free(
             segment: number,
             epoch: 0,
             first_seq: 0,
+            auth: false,
+            key_check: 0,
         };
         // A new file: nothing is synced yet, so both copies go in one write.
         file.write_all_at(&header.encode_blocks(), 0)?;
@@ -230,22 +262,27 @@ pub(super) fn create_free(
     })
 }
 
-/// Turns a free file into live segment `number` whose first record takes `first_seq`.
-/// When this returns, the header is durable and records may be written.
+/// Turns a free file into live segment `number` whose first record takes `first_seq`,
+/// in the authenticated frame under `key` when given. When this returns, the header is durable and
+/// records may be written.
 pub(super) fn activate(
     fs: &dyn Fs,
     dir: &Path,
     free: FreeSeg,
     number: u64,
     first_seq: Seq,
+    key: Option<&JournalKey>,
 ) -> Result<LiveSeg> {
     let path = path_of(dir, number, LIVE_EXT);
     let epoch = free.epoch + 1;
     fs.rename(&free.path, &path).map_err(io)?;
+    let auth = key.is_some();
     let header = SegmentHeader {
         segment: number,
         epoch,
         first_seq,
+        auth,
+        key_check: key.map_or(0, |k| format::key_check(k, number, epoch)),
     };
     write_header(&*free.file, &header)?;
     fs.sync_dir(dir).map_err(io)?;
@@ -257,19 +294,25 @@ pub(super) fn activate(
         file: free.file,
         path,
         len,
+        auth,
     })
 }
 
 /// Gives a live segment that holds no valid record a new epoch, so anything a lost
-/// write left in it reads as leftover data.
-pub(super) fn reepoch(seg: &mut LiveSeg) -> Result<()> {
+/// write left in it reads as leftover data. Its new records use the authenticated frame
+/// under `key` when given.
+pub(super) fn reepoch(seg: &mut LiveSeg, key: Option<&JournalKey>) -> Result<()> {
+    let auth = key.is_some();
     let header = SegmentHeader {
         segment: seg.number,
         epoch: seg.epoch + 1,
         first_seq: seg.first_seq,
+        auth,
+        key_check: key.map_or(0, |k| format::key_check(k, seg.number, seg.epoch + 1)),
     };
     write_header(&*seg.file, &header)?;
     seg.epoch += 1;
+    seg.auth = auth;
     Ok(())
 }
 

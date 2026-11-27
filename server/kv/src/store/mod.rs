@@ -56,6 +56,7 @@ use crate::iter::MergingIterator;
 use crate::journal::service::Condvar;
 pub use crate::journal::{Commit, Durability, JournalOptions};
 use crate::journal::{Journal, JournalSink, RecordKind};
+use crate::mac::JournalKey;
 use crate::manifest::{
     self, AppendError, JOURNAL_DIR, ManifestState, ManifestWriter, RUNS_DIR, RunDesc, VersionEdit,
 };
@@ -88,6 +89,21 @@ pub fn store_wide(_: &[u8]) -> usize {
     0
 }
 
+/// Which journal frame a store writes (LSM-1; plan section 2, "Journal format", and
+/// section 9).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JournalIntegrity {
+    /// Create format 1 stores and keep format 1 stores in format 1, so a release that
+    /// knows only format 1 can still open them. A format 2 store stays in format 2.
+    #[default]
+    Legacy,
+    /// Create format 2 stores and upgrade format 1 stores at open: journal segments
+    /// created from then on use the authenticated frame. A release that knows only
+    /// format 1 refuses the store afterwards, before it changes any file.
+    Authenticated,
+}
+
+#[derive(Clone)]
 pub struct Options {
     pub fs: Arc<dyn Fs>,
     /// Worker-shared block cache (`cache_bytes`).
@@ -113,6 +129,8 @@ pub struct Options {
     /// journal's live segments exceed this (plan section 2, "Journal values").
     pub max_journal_bytes: u64,
     pub run_writer: RunWriterOptions,
+    /// The journal frame of new stores, and whether open upgrades a format 1 store.
+    pub journal_integrity: JournalIntegrity,
 }
 
 impl Options {
@@ -138,6 +156,7 @@ impl Options {
             max_replay_bytes: 64 << 20,
             max_journal_bytes: 512 << 20,
             run_writer: RunWriterOptions::default(),
+            journal_integrity: JournalIntegrity::Legacy,
         }
     }
 }
@@ -248,8 +267,6 @@ struct VersionSet {
     manifest: Option<ManifestWriter>,
     state: ManifestState,
     current: Arc<Version>,
-    /// Next file number to hand out (at least `state.next_file`).
-    next_file: u64,
     /// Round-robin compaction position per level.
     cursor: Vec<Bytes>,
 }
@@ -308,6 +325,8 @@ pub(crate) struct Inner {
     active: Mutex<()>,
     replaying: AtomicBool,
     vs: Mutex<VersionSet>,
+    /// Next file number to hand out (at least the recorded `next_file`), see `alloc_file`.
+    next_file: AtomicU64,
     flush_lock: Mutex<()>,
     compaction_lock: Mutex<()>,
     snapshots: Snapshots,
@@ -409,10 +428,49 @@ enum Stall {
 
 impl Store {
     /// Opens or creates the store in `dir` and recovers it (plan section 3).
-    pub fn open(dir: &Path, options: Options) -> Result<Opened> {
+    ///
+    /// With [`JournalIntegrity::Authenticated`], a new store is created in format 2 and a
+    /// format 1 store is upgraded (LSM-1, plan section 9): a complete format 1 open first
+    /// validates it, then, while that open still holds the lock, `JOURNAL_KEY` and then
+    /// `FORMAT` 2 are made durable, the store closes cleanly and opens again in format 2.
+    /// A crash anywhere in between leaves a store that opens: format 1, or format 2 with
+    /// only format 1 segments, which the next open fences. The returned `quarantined_now`
+    /// and `recovery` are those of the validating open.
+    pub fn open(dir: &Path, mut options: Options) -> Result<Opened> {
+        if options.journal_integrity == JournalIntegrity::Authenticated
+            && recovery::is_format1_store(&*options.fs, dir)?
+        {
+            let fs = options.fs.clone();
+            options.journal_integrity = JournalIntegrity::Legacy;
+            let first = Store::open_once(dir, options.clone())?;
+            let key = JournalKey::generate()?;
+            manifest::write_journal_key(&*fs, dir, &key)?;
+            manifest::write_format(&*fs, dir, manifest::FORMAT_CONTENT_V2)?;
+            let Opened {
+                store,
+                quarantined_now,
+                recovery,
+                ..
+            } = first;
+            store.close()?;
+            options.journal_integrity = JournalIntegrity::Authenticated;
+            let mut second = Store::open_once(dir, options)?;
+            second.quarantined_now = quarantined_now;
+            second.recovery = recovery;
+            return Ok(second);
+        }
+        Store::open_once(dir, options)
+    }
+
+    fn open_once(dir: &Path, mut options: Options) -> Result<Opened> {
         let started = time::now_std();
         let fs = options.fs.clone();
-        let opened = recovery::prepare(&*fs, dir, options.scope_of)?;
+        let opened = recovery::prepare(
+            &*fs,
+            dir,
+            options.journal_integrity == JournalIntegrity::Authenticated,
+        )?;
+        options.journal.auth_key = opened.key;
         let runs_dir = dir.join(RUNS_DIR);
         let ctx = RunReadContext::new(options.cache.clone());
         let run_stats = ctx.stats.clone();
@@ -518,9 +576,9 @@ impl Store {
                 manifest: None,
                 state: state.clone(),
                 current: Arc::new(Version::default()),
-                next_file: state.next_file,
                 cursor: vec![Bytes::new(); crate::version::NUM_LEVELS],
             }),
+            next_file: AtomicU64::new(state.next_file),
             flush_lock: Mutex::new(()),
             compaction_lock: Mutex::new(()),
             snapshots: Snapshots::default(),
@@ -627,11 +685,12 @@ impl Store {
                     ..VersionEdit::default()
                 })
                 .expect("consistent");
-            let number = snapshot.next_file;
-            snapshot.next_file += 1;
+            let number = inner.next_file.fetch_add(1, Ordering::AcqRel);
+            snapshot.next_file = snapshot
+                .next_file
+                .max(inner.next_file.load(Ordering::Acquire));
             let writer = ManifestWriter::create(&*fs, dir, number, &snapshot)?;
             manifest::set_current(&*fs, dir, number)?;
-            vs.next_file = snapshot.next_file;
             vs.state = snapshot;
             vs.manifest = Some(writer);
             orphans += recovery::cleanup(&*fs, dir, number, &vs.state)?;
@@ -745,6 +804,51 @@ impl Store {
             }
         }
         Ok(false)
+    }
+
+    /// Quarantines `scope` again from a record the caller keeps (LSM-5): a run-time
+    /// quarantine whose manifest edit failed is lost by a crash, but the pool also writes
+    /// its quarantined groups into a synced journal record, so the next open can restore
+    /// the quarantine before the group starts. Persists the quarantine with its own
+    /// manifest edit before it returns `true`. Returns `false` when the scope is already
+    /// quarantined or was released (its bytes are gone, and a released scope that the
+    /// caller still lists is a crash between the release and the caller's update).
+    /// `reason` is the caller's best knowledge: the original one was not recorded.
+    pub fn restore_quarantine(&self, scope: &[u8], reason: DamageReason) -> Result<bool> {
+        self.inner.check_usable()?;
+        if scope.is_empty() {
+            return Err(Error::InvalidArgument("a quarantine needs a scope"));
+        }
+        if self
+            .inner
+            .quarantine
+            .list()
+            .iter()
+            .any(|d| d.scope == scope)
+        {
+            return Ok(false);
+        }
+        let damage = Damage {
+            scope: Bytes::copy_from_slice(scope),
+            reason,
+            file: FileId::Other,
+            first_bad_seq: None,
+        };
+        {
+            let mut vs = lock(&self.inner.vs);
+            if vs.state.released.iter().any(|(s, _)| s == scope) {
+                return Ok(false);
+            }
+            self.inner.log_edit(
+                &mut vs,
+                VersionEdit {
+                    quarantined: vec![damage.clone()],
+                    ..VersionEdit::default()
+                },
+            )?;
+        }
+        self.inner.quarantine.add(damage);
+        Ok(true)
     }
 
     /// Deletes everything under `prefix`, makes that durable, flushes past it, records the
@@ -1406,11 +1510,13 @@ impl Inner {
         self.snapshots.sequences()
     }
 
+    /// A new file number. It takes no lock (LSM-9): a flush or compaction allocating
+    /// outputs never waits for another job's manifest sync under `vs`. Every edit records
+    /// a `next_file` read after the numbers its runs took, so the manifest never names a
+    /// run at or above its `next_file`; a number taken but never recorded belongs to an
+    /// orphan file that the next open deletes before it allocates again.
     fn alloc_file(&self) -> u64 {
-        let mut vs = lock(&self.vs);
-        let id = vs.next_file;
-        vs.next_file += 1;
-        id
+        self.next_file.fetch_add(1, Ordering::AcqRel)
     }
 
     fn spec<'a>(&'a self, snapshots: &'a [Seq], target: u64, bottommost: bool) -> OutputSpec<'a> {
@@ -1652,7 +1758,7 @@ impl Inner {
         if self.latched.load(Ordering::Acquire) {
             return Err(Error::RecoveryRequired);
         }
-        edit.next_file = Some(vs.next_file);
+        edit.next_file = Some(self.next_file.load(Ordering::Acquire));
         let mut next = vs.state.clone();
         next.apply(&edit).ok_or(Error::Corruption {
             file: FileId::Other,
@@ -1661,9 +1767,8 @@ impl Inner {
         })?;
         let roll = vs.manifest.as_ref().is_none_or(ManifestWriter::wants_roll);
         if roll {
-            let number = vs.next_file;
-            vs.next_file += 1;
-            next.next_file = vs.next_file;
+            let number = self.next_file.fetch_add(1, Ordering::AcqRel);
+            next.next_file = next.next_file.max(self.next_file.load(Ordering::Acquire));
             let writer = match ManifestWriter::create(&*self.fs, &self.dir, number, &next) {
                 Ok(w) => w,
                 Err(e) => return Err(self.latch_on(e)),
