@@ -31,17 +31,19 @@ pub(super) fn transition_id<T: serde::Serialize>(
     Uuid::parse_str(&raw[..32]).map_err(|_| unknown())
 }
 
+/// CONTROL-4: concurrent group fences per inventory page. Tests keep one at a
+/// time, so their checkpoints between groups stay ordered.
+#[cfg(not(test))]
+const FENCE_FAN_OUT: usize = 16;
+#[cfg(test)]
+const FENCE_FAN_OUT: usize = 1;
+
 pub(super) async fn fence_groups(
     control: &ControlHandle,
     manager: &HostedGroupManager,
     rpc: &Arc<ControlClient>,
     fence: &FencePending,
 ) -> Result<(), ProtocolError> {
-    let action = ServiceAction::ControlFence {
-        transition_id: fence.transition_id,
-    };
-    let old = fence.expected.view.authority();
-    let next = fence.next.view.authority();
     let shared = manager.resources();
     let mut after = None;
     loop {
@@ -56,14 +58,51 @@ pub(super) async fn fence_groups(
         if page.revision != fence.group_inventory_revision || (!page.done && page.after <= after) {
             return Err(unknown());
         }
-        for group in page.items.iter() {
+        // CONTROL-4: fence the groups of a page concurrently, at most
+        // `FENCE_FAN_OUT` at a time, instead of one round trip and one Control
+        // commit after another. Each group's fence and record stay ordered.
+        {
+            use futures_util::StreamExt as _;
+            let mut groups = page.items.iter();
+            let mut running = futures_util::stream::FuturesUnordered::new();
+            loop {
+                while running.len() < FENCE_FAN_OUT {
+                    let Some(group) = groups.next() else { break };
+                    running.push(fence_group(control, manager, rpc, fence, group));
+                }
+                match running.next().await {
+                    Some(result) => result?,
+                    None => break,
+                }
+            }
+        }
+        if page.done {
+            return Ok(());
+        }
+        after = page.after;
+    }
+}
+
+async fn fence_group(
+    control: &ControlHandle,
+    manager: &HostedGroupManager,
+    rpc: &Arc<ControlClient>,
+    fence: &FencePending,
+    group: &GroupRecord,
+) -> Result<(), ProtocolError> {
+    let action = ServiceAction::ControlFence {
+        transition_id: fence.transition_id,
+    };
+    let old = fence.expected.view.authority();
+    let next = fence.next.view.authority();
+    let shared = &manager.resources();
             let identity = &group.identity;
             let receipt = match &identity.kind {
-                GroupKind::Control => continue,
+                GroupKind::Control => return Ok(()),
                 GroupKind::Timestamps => {
                     let client = TimestampClient::new(
                         identity.clone(),
-                        shared.clone(),
+                        Arc::clone(shared),
                         manager.client(),
                         rpc.clone(),
                         action,
@@ -79,7 +118,7 @@ pub(super) async fn fence_groups(
                 GroupKind::Status { .. } => {
                     let client = StatusClient::new(
                         identity.clone(),
-                        shared.clone(),
+                        Arc::clone(shared),
                         manager.client(),
                         rpc.clone(),
                         action,
@@ -93,13 +132,13 @@ pub(super) async fn fence_groups(
                 GroupKind::Catalog | GroupKind::Data { .. } => {
                     let client = ParticipantClient::new(
                         identity.clone(),
-                        shared.clone(),
+                        Arc::clone(shared),
                         manager.client(),
                         rpc.clone(),
                         action,
                     )?;
                     let participant =
-                        ParticipantHandle::remote(identity.clone(), shared.clone(), client)?;
+                        ParticipantHandle::remote(identity.clone(), Arc::clone(shared), client)?;
                     participant
                         .fence_current(fence.transition_id, old, next)
                         .await?
@@ -115,12 +154,7 @@ pub(super) async fn fence_groups(
                 super::recovery_tests::cold_fence_checkpoint(&observed_fence).await;
                 super::recovery_tests::pause("cold_group_fenced", fence.transition_id).await;
             }
-        }
-        if page.done {
-            return Ok(());
-        }
-        after = page.after;
-    }
+    Ok(())
 }
 
 pub(super) async fn publish_fence(
