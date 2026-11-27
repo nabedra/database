@@ -1,12 +1,7 @@
 use super::*;
 use crate::oltp::pool::ExecutionClass;
-#[cfg(unix)]
-use std::os::{
-    fd::{AsRawFd, FromRawFd},
-    unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-};
+use nabedra_rt::fs::os::{self as fs, File, OpenOptions};
 use std::{
-    fs::{File, OpenOptions},
     io::{Read, Write},
     path::Path,
 };
@@ -26,7 +21,7 @@ impl FilesystemRepository {
         {
             if !root.is_absolute()
                 || root.as_os_str().len() > 4096
-                || std::fs::canonicalize(root).map_err(|_| invalid())? != root
+                || fs::canonicalize(root).map_err(|_| invalid())? != root
             {
                 return Err(invalid());
             }
@@ -36,7 +31,7 @@ impl FilesystemRepository {
                 .open(root)
                 .map_err(|_| invalid())?;
             let metadata = root.metadata().map_err(|_| invalid())?;
-            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            if metadata.uid() != fs::euid() || metadata.mode() & 0o077 != 0 {
                 return Err(invalid());
             }
             Ok(Arc::new(Self {
@@ -112,27 +107,25 @@ impl Repository for FilesystemRepository {
 }
 #[cfg(unix)]
 fn directory_at(parent: &File, name: &str, create: bool) -> Result<File, ProtocolError> {
-    let name = std::ffi::CString::new(name).map_err(|_| invalid())?;
+    if name.contains(char::from(0)) {
+        return Err(invalid());
+    }
     if create {
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
-            parent.sync_all().map_err(|_| unavailable())?;
-        } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
-            return Err(unavailable());
+        match parent.create_dir_at(name, 0o700) {
+            Ok(()) => parent.sync_all().map_err(|_| unavailable())?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(unavailable()),
         }
     }
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
+    let directory = parent
+        .open_at(
+            name,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
         )
-    };
-    if fd < 0 {
-        return Err(unavailable());
-    }
-    let directory = unsafe { File::from_raw_fd(fd) };
+        .map_err(|_| unavailable())?;
     let metadata = directory.metadata().map_err(|_| unavailable())?;
-    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+    if metadata.uid() != fs::euid() || metadata.mode() & 0o077 != 0 {
         return Err(corrupt());
     }
     Ok(directory)
@@ -144,22 +137,19 @@ fn archive_directory(root: &File, key: ArchiveKey, create: bool) -> Result<File,
 }
 #[cfg(unix)]
 fn file_at(directory: &File, name: &str, flags: i32) -> Result<File, ProtocolError> {
-    let name = std::ffi::CString::new(name).map_err(|_| invalid())?;
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
+    if name.contains(char::from(0)) {
+        return Err(invalid());
+    }
+    let file = directory
+        .open_at(
+            name,
             flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             0o600,
         )
-    };
-    if fd < 0 {
-        return Err(unavailable());
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
+        .map_err(|_| unavailable())?;
     let metadata = file.metadata().map_err(|_| unavailable())?;
     if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != fs::euid()
         || metadata.mode() & 0o077 != 0
     {
         return Err(corrupt());
@@ -209,22 +199,13 @@ fn put_native(
     // Cancelling its awaiter cannot release them while fsync is still live.
     let written = (|| {
         file.write_all(body.as_ref()).map_err(|_| unavailable())?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o400))
-            .map_err(|_| unavailable())?;
+        file.set_mode(0o400).map_err(|_| unavailable())?;
         file.sync_all().map_err(|_| unavailable())?;
-        let from = std::ffi::CString::new(temporary.as_str()).map_err(|_| invalid())?;
-        let to = std::ffi::CString::new(name).map_err(|_| invalid())?;
-        if unsafe {
-            libc::linkat(
-                directory.as_raw_fd(),
-                from.as_ptr(),
-                directory.as_raw_fd(),
-                to.as_ptr(),
-                0,
-            )
-        } != 0
-        {
-            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+        if name.contains(char::from(0)) {
+            return Err(invalid());
+        }
+        if let Err(error) = directory.hard_link_at(&temporary, name) {
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(unavailable());
             }
             // Existing objects and lost acknowledgements reconcile by actual
@@ -254,10 +235,9 @@ fn put_native(
         }
         Ok(expected)
     })();
-    let temporary = std::ffi::CString::new(temporary).map_err(|_| invalid())?;
-    if unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) } != 0 {
-        return Err(unavailable());
-    }
+    directory
+        .remove_file_at(&temporary)
+        .map_err(|_| unavailable())?;
     directory.sync_all().map_err(|_| unavailable())?;
     written
 }

@@ -28,11 +28,9 @@ use crate::{
         owned::{OwnedCommand, serialized_digest},
     },
 };
+use nabedra_rt::fs::os::{self as fs, File, OpenOptions};
 use serde::{Deserialize, Serialize};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::{
-    fs::{File, OpenOptions},
     io::{Read, Seek, Write},
     path::PathBuf,
 };
@@ -124,7 +122,7 @@ impl WorkerRuntime {
             ensure_private_directory(&destination)?;
             let destination = match &runtime.services.archive_repository {
                 Some(_) => destination,
-                None => std::fs::canonicalize(&destination).map_err(|_| unknown())?,
+                None => fs::canonicalize(&destination).map_err(|_| unknown())?,
             };
             let repository = match &runtime.services.archive_repository {
                 Some(configured) => configured.repository(&destination)?,
@@ -363,7 +361,7 @@ impl WorkerRuntime {
             .as_ref()
             .is_none_or(|config| config.retain_local_history());
         if !retain_history {
-            std::fs::remove_file(&staging.0).map_err(|_| unknown())?;
+            fs::remove_file(&staging.0).map_err(|_| unknown())?;
         }
         let mut export = Export {
             writer: HistoryWriter::new(identity_metadata_step, file)?,
@@ -483,7 +481,7 @@ impl WorkerRuntime {
         split_graph.verify_split_inventory(false)?;
         let verified = validator.verified()?;
         if retain_history {
-            std::fs::rename(
+            fs::rename(
                 &staging.0,
                 destination.join(format!(".history-{archive_id}.partial")),
             )
@@ -1063,13 +1061,7 @@ impl WorkerRuntime {
     }
 }
 fn ensure_private_directory(path: &Path) -> Result<(), ProtocolError> {
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    match builder.create(path) {
+    match fs::create_dir_with_mode(path, 0o700) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(_) => Err(unknown()),
@@ -1078,7 +1070,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), ProtocolError> {
 struct TemporaryArchiveFile(PathBuf);
 impl Drop for TemporaryArchiveFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -1099,7 +1091,7 @@ fn write_local_record(
     file.write_all(bytes)
         .and_then(|_| file.sync_all())
         .map_err(|_| unknown())?;
-    match std::fs::hard_link(&temporary.0, &path) {
+    match fs::hard_link(&temporary.0, &path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             if read_local_record(&path, limit)? != bytes {
@@ -1245,7 +1237,6 @@ fn map_native_group(source: &GroupIdentity, target_cluster: Uuid) -> GroupIdenti
     target
 }
 fn read_local_record(path: &Path, limit: usize) -> Result<Vec<u8>, ProtocolError> {
-    use std::os::unix::fs::MetadataExt;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -1253,7 +1244,7 @@ fn read_local_record(path: &Path, limit: usize) -> Result<Vec<u8>, ProtocolError
         .map_err(|_| unknown())?;
     let metadata = file.metadata().map_err(|_| unknown())?;
     if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != fs::euid()
         || metadata.mode() & 0o077 != 0
     {
         return Err(unknown());
