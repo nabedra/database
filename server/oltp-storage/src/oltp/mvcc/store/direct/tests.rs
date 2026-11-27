@@ -2508,6 +2508,81 @@ async fn o16_the_split_barrier_belongs_to_one_split() {
     assert_rejected_without_writes(&mut f, &blocked, Fault::SplitInProgress).await;
 }
 
+/// RANGES-1 (`specs/oltp/split`, mutants `pause_leak_unbound_abort` and
+/// `pause_leak_late`): an attempt aborted before its children were bound
+/// releases the barrier with its FinishSource, and a late or repeated pause
+/// of that settled attempt is refused, so it cannot hold the range again.
+#[tokio::test]
+async fn o16_ranges1_a_settled_split_never_takes_the_barrier_again() {
+    use nabedra_oltp_types::authority::{SealedSettlement, SettlementStatement};
+    use nabedra_oltp_types::types::{AbortReason, DecisionStatement, TxnDecision};
+    let mut f = Fixture::new().await;
+    let split_id = nabedra_rt::ids::uuid_v4();
+    let paused = |paused| ParticipantReply::DirectPaused { split_id, paused };
+    assert_eq!(f.submit(pause(&f, split_id, true)).await, paused(true));
+    let blocked = f.put(1, None, 10);
+    assert_rejected_without_writes(&mut f, &blocked, Fault::SplitInProgress).await;
+    // The abort of an unbound attempt: a failure settlement with no participant.
+    let txn = TxnId {
+        request_id: split_id,
+        attempt: 1,
+    };
+    let request = RequestBinding {
+        run_id: f.authority.run_id,
+        request_id: split_id,
+        digest: digest(1),
+        accepted_context: digest(2),
+    };
+    let manifest = ManifestRef {
+        status_group_id: nabedra_rt::ids::uuid_v4(),
+        digest: digest(3),
+        participant_count: 0,
+    };
+    let position = AppliedPosition {
+        term: 1,
+        node_id: 1,
+        index: 9,
+    };
+    let aborted = TxnDecision::Abort {
+        reason: AbortReason::ResourceLimit,
+    };
+    let settled = SealedSettlement::seal(SettlementStatement {
+        txn,
+        request,
+        manifest,
+        resolved_count: 0,
+        settled_at: position,
+        decision: DecisionStatement {
+            txn,
+            request,
+            manifest,
+            decided_at: position,
+            decision: aborted,
+        },
+    })
+    .unwrap();
+    assert_eq!(
+        f.submit(ParticipantCommand::SplitFinishSource {
+            authority: f.authority,
+            split_id,
+            settled,
+        })
+        .await,
+        ParticipantReply::SplitSourceFinished(aborted)
+    );
+    // Released: direct commits resume.
+    assert_eq!(f.direct(&f.put(1, None, 11)).await, applied(11));
+    // A late copy of the pause, or a retry of it, is refused; a release is a no-op.
+    let state = f.dump().await;
+    assert_eq!(
+        f.submit(pause(&f, split_id, true)).await,
+        ParticipantReply::Rejected(Fault::AlreadyDecided)
+    );
+    assert_eq!(f.submit(pause(&f, split_id, false)).await, paused(false));
+    assert_eq!(f.dump().await, state);
+    assert_eq!(f.direct(&f.put(2, None, 12)).await, applied(12));
+}
+
 /// F7: stamps never go below the group high-water, and an expire cutoff
 /// never goes above `high-water - retention`, so neither a clock behind
 /// nor a clock ahead deletes a record inside the retention window.

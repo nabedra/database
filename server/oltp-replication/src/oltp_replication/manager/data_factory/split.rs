@@ -57,6 +57,9 @@ enum Operation {
     Imported,
     Publication,
     Finish,
+    /// RANGES-1: the direct-write barrier in the source before the cut.
+    /// Appended last; an older worker cannot decode it (see `pause`).
+    Pause,
 }
 impl Operation {
     fn routes_data(self) -> bool {
@@ -70,6 +73,7 @@ impl Operation {
                 | Self::Images
                 | Self::Imported
                 | Self::Finish
+                | Self::Pause
         )
     }
     fn purpose(self) -> Purpose {
@@ -364,6 +368,14 @@ impl SplitClient {
             ))),
             reply => Ok(reply),
         }
+    }
+    /// RANGES-1: stop direct commits in the source before the cut is taken,
+    /// so that the freeze finds no direct commit above it. The barrier is
+    /// released by the freeze (taken over) or by an abort's FinishSource.
+    #[doc(hidden)]
+    pub async fn pause(&self, attempt: &SplitAttempt) -> Result<(), ProtocolError> {
+        self.typed(&attempt.intent.source, Operation::Pause, &source(attempt))
+            .await
     }
     #[doc(hidden)]
     pub async fn freeze(&self, attempt: &SplitAttempt) -> Result<(), ProtocolError> {

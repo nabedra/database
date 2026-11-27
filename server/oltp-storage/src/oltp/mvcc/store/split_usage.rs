@@ -124,6 +124,11 @@ impl ParticipantMachine {
                         split_id: source.statement.split_id,
                     });
                 }
+                // RANGES-2: a source held by a split's direct barrier is held as
+                // much as a frozen one; the owner's sweep resumes that split.
+                if let Some(split_id) = config.direct_pause {
+                    return Ok(ShardUsage::Frozen { epoch, split_id });
+                }
                 let mut scan = match scan {
                     Some(scan) if scan.generation == generation && scan.epoch == epoch => scan,
                     _ => ShardUsageScan {

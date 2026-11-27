@@ -141,20 +141,27 @@ struct OwnerLoop {
 impl WorkerRuntime {
     pub(in crate::oltp_runtime) fn spawn_automatic_split(
         self: &Arc<Self>,
-        policy: AutomaticSplitPolicy,
-    ) -> Result<tokio::task::JoinHandle<()>, ProtocolError> {
-        policy.validate()?;
-        let client = self.services.split.clone().ok_or_else(unavailable)?;
+        policy: Option<AutomaticSplitPolicy>,
+    ) -> Result<Option<tokio::task::JoinHandle<()>>, ProtocolError> {
+        if let Some(policy) = policy {
+            policy.validate()?;
+        }
+        let Some(client) = self.services.split.clone() else {
+            // Without registered placement there is no split at all.
+            return if policy.is_some() { Err(unavailable()) } else { Ok(None) };
+        };
         let owner = self
             .services
             .shared
             .reserve_scratch(ByteClass::Data, 128 << 10)?;
-        self.automatic_split
-            .lock()
-            .map_err(|_| unknown())?
-            .target_bytes = Some(policy.shard_target_bytes);
+        if let Some(policy) = policy {
+            self.automatic_split
+                .lock()
+                .map_err(|_| unknown())?
+                .target_bytes = Some(policy.shard_target_bytes);
+        }
         let weak = Arc::downgrade(self);
-        Ok(nabedra_rt::task::spawn(async move {
+        Ok(Some(nabedra_rt::task::spawn(async move {
             let _owner = owner;
             let mut authority = None;
             let mut state = OwnerLoop::default();
@@ -214,7 +221,7 @@ impl WorkerRuntime {
                     }
                 }
             }
-        }))
+        })))
     }
 
     pub(in crate::oltp_runtime) fn automatic_split_status(
@@ -307,7 +314,7 @@ impl OwnerLoop {
         &mut self,
         runtime: &WorkerRuntime,
         client: &SplitClient,
-        policy: AutomaticSplitPolicy,
+        policy: Option<AutomaticSplitPolicy>,
         ready: ReadyMembership,
     ) -> Result<(), ProtocolError> {
         let authority = ready.view.authority();
@@ -341,29 +348,35 @@ impl OwnerLoop {
                 return Ok(());
             }
         };
+        let target_bytes = policy.map_or(u64::MAX, |policy| policy.shard_target_bytes);
         match client
-            .observe_usage(&placement, authority, policy.shard_target_bytes, previous)
+            .observe_usage(&placement, authority, target_bytes, previous)
             .await?
         {
             Usage::Inactive => runtime.clear_split_deficit(source.group_id),
+            // Without a policy only a held source matters: the first page tells.
+            Usage::Scanning(_) if policy.is_none() => {}
             Usage::Scanning(scan) => self.scan = Some((record, scan)),
             Usage::Frozen { epoch, split_id } => {
+                // RANGES-2: a source frozen, or holding the direct barrier, by
+                // an open attempt is resumed here, whatever started it, until
+                // the attempt publishes or aborts.
                 runtime.clear_split_deficit(source.group_id);
-                if (1..=AUTOMATIC_ATTEMPTS)
-                    .any(|slot| AutomaticSplitOrigin { epoch, slot }.id(source) == split_id)
+                let automatic = (1..=AUTOMATIC_ATTEMPTS)
+                    .any(|slot| AutomaticSplitOrigin { epoch, slot }.id(source) == split_id);
+                if let Some(attempt) = client.job(split_id).await?
+                    && attempt.closed.is_none()
+                    && attempt.intent.source == *source
+                    && attempt.intent.automatic.is_some() == automatic
                 {
-                    let attempt = client.job(split_id).await?.ok_or_else(unknown)?;
-                    if attempt.closed.is_none()
-                        && attempt.intent.source == *source
-                        && attempt.intent.automatic.is_some()
-                    {
-                        self.active = Some(Work {
-                            intent: attempt.intent.clone(),
-                            placement: attempt.placement().cloned(),
-                            failures: 0,
-                            cancel: attempt.authority != authority,
-                        });
-                    }
+                    self.active = Some(Work {
+                        intent: attempt.intent.clone(),
+                        placement: attempt.placement().cloned(),
+                        failures: 0,
+                        // A manual attempt of an older owner term is settled by
+                        // the split itself (interrupted by worker recovery).
+                        cancel: automatic && attempt.authority != authority,
+                    });
                 }
             }
             Usage::Observed {
@@ -372,6 +385,9 @@ impl OwnerLoop {
                 largest_image,
                 pivot,
             } => {
+                let Some(policy) = policy else {
+                    return Ok(());
+                };
                 runtime
                     .automatic_split
                     .lock()
@@ -443,6 +459,13 @@ impl OwnerLoop {
             Ok(Err(error)) => error,
             Err(_) => unknown(),
         };
+        if work.intent.automatic.is_none() {
+            // A manual attempt is never cancelled here: the next sweep that
+            // finds its source held resumes it again, and an operator retry
+            // of the same id still works.
+            runtime.split_observation(source, id, "retry_pending", Some(error.code));
+            return;
+        }
         work.failures += 1;
         work.cancel = work.failures >= MAX_CONSECUTIVE_FAILURES
             || !matches!(
