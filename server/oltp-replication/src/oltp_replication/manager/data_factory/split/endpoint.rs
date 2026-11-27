@@ -205,6 +205,7 @@ impl SplitEndpoint {
             header.operation,
             Operation::Timestamp
                 | Operation::Job
+                | Operation::OpenJobs
                 | Operation::Publication
                 | Operation::FailureSettlement
         );
@@ -673,6 +674,16 @@ impl SplitEndpoint {
                 let machine = ParticipantMachine::new(running.state.store().clone())?;
                 output!(LocalUsageScan::observe(&self.usage, request, machine).await?)
             }
+            Operation::OpenJobs => {
+                let Host::System {
+                    timestamps: Some(timestamps),
+                    ..
+                } = &self.host
+                else {
+                    return Err(unauthorized());
+                };
+                output!(timestamps.open_split_attempts(input!(Option<Uuid>)).await?)
+            }
             Operation::Job | Operation::FailureSettlement => {
                 let Host::System {
                     timestamps: Some(timestamps),
@@ -741,6 +752,41 @@ impl SplitEndpoint {
                         Err(unavailable())
                     }
                     _ => Err(conflict("source refused the exact split freeze")),
+                }
+            }
+            Operation::Pause => {
+                let request = input!(SourceRequest);
+                let attempt = self.job(request.split_id).await?;
+                let participant = self.open_source(&attempt, &request, node).await?;
+                if attempt.closed.is_some()
+                    || attempt.image.is_some()
+                    || attempt.authority != self.current().await?
+                {
+                    return Err(invalid());
+                }
+                let applied = participant
+                    .propose(OwnedCommand::new_owned(
+                        ParticipantCommand::DirectPause(
+                            crate::oltp::mvcc::store::direct::DirectPause {
+                                authority: attempt.authority,
+                                split_id: attempt.intent.split_id,
+                                paused: true,
+                            },
+                        ),
+                        shared,
+                        ByteClass::Progress,
+                    )?)
+                    .await?;
+                match applied.reply {
+                    ParticipantReply::DirectPaused { .. } => output!(()),
+                    // Before `data.direct.v1` no direct commit exists to stop.
+                    ParticipantReply::Rejected(
+                        crate::oltp::mvcc::store::Fault::DirectInactive,
+                    ) => output!(()),
+                    ParticipantReply::Rejected(crate::oltp::mvcc::store::Fault::Incomplete) => {
+                        Err(unavailable())
+                    }
+                    _ => Err(conflict("source refused the split barrier")),
                 }
             }
             Operation::Source => {

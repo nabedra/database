@@ -1117,8 +1117,9 @@ where
             unavailable()
         };
         let raft: &HostRaft<C, M> = &self.raft;
+        let option = lease_read_option(policy, raft.config().election_timeout_max);
         let linearizer = raft
-            .get_local_read_linearizer(policy)
+            .get_local_read_linearizer(option)
             .await
             .map_err(|error| failed(&error))?;
         linearizer
@@ -1227,6 +1228,56 @@ where
         }
     }
 }
+/// RANGES-3: the stated bound on the rate error of each node's monotonic clock
+/// (`CLOCK_MONOTONIC`, which NTP slewing moves), in parts per million.
+pub const LEASE_DRIFT_PPM: u64 = 1_000;
+/// RANGES-3: timer granularity and rounding allowance subtracted from the lease.
+pub const LEASE_EPSILON: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// RANGES-3: how long after the send time of a quorum-acknowledged RPC a
+/// leader may still serve a lease read, for `election_timeout_max` in ms.
+///
+/// openraft 0.10.0 gives the lease the length `election_timeout_max`
+/// (`engine/engine_config.rs:59`). A voter that accepts the leader's RPC
+/// renews the leader's lease on its own vote from its receive time
+/// (`engine/handler/vote_handler/mod.rs:129-142`) and refuses every vote
+/// request until that lease ends (`engine/engine_impl.rs:421-424`,
+/// `utime.rs:147-149`); it campaigns itself only after the lease plus its
+/// election timeout (`core/raft_core.rs:2323`), and restarts renew it
+/// (`engine/engine_impl.rs:196-200`). The randomized `election_timeout_min`
+/// therefore never shortens the refusal window: it is the full lease `L`.
+///
+/// The voter counts `L` on its clock from a receive time no earlier than the
+/// leader's send time, the leader counts from the send time on its own. With
+/// both rates within `rho` of true time the leader's window ends no later in
+/// true time than every voter's refusal iff it is at most `L (1 - rho) / (1 +
+/// rho)`, so the leader uses `L (1 - 2 rho) - epsilon`, which is below that.
+/// openraft also refuses votes on the leader itself while its full lease is
+/// valid (`engine/engine_impl.rs:439`), which only makes that node stricter.
+pub fn lease_read_window(election_timeout_max_ms: u64) -> std::time::Duration {
+    let lease_us = u128::from(election_timeout_max_ms) * 1_000;
+    let drift_us = lease_us * 2 * u128::from(LEASE_DRIFT_PPM) / 1_000_000;
+    let window_us = u64::try_from(lease_us - drift_us).unwrap_or(u64::MAX);
+    std::time::Duration::from_micros(window_us).saturating_sub(LEASE_EPSILON)
+}
+
+/// RANGES-3: the linearizer option every read of `policy` uses. A lease
+/// read never uses the bare lease: its acknowledgement age is capped at
+/// [`lease_read_window`]. ReadIndex keeps openraft's fresh quorum round.
+pub fn lease_read_option(
+    policy: ReadPolicy,
+    election_timeout_max_ms: u64,
+) -> openraft::LinearizerOption {
+    match policy {
+        ReadPolicy::LeaseRead => openraft::LinearizerOption::new(
+            Some(lease_read_window(election_timeout_max_ms)),
+            false,
+        )
+        .with_wait_timeout(std::time::Duration::ZERO),
+        ReadPolicy::ReadIndex => policy.into(),
+    }
+}
+
 pub(crate) fn position(id: LogId) -> AppliedPosition {
     AppliedPosition {
         term: id.leader_id.term,

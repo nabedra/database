@@ -1,0 +1,17 @@
+id = "OLTP-review-lease-option-call-site-untested"
+title = "The lease read path's use of lease_read_option is not tested end to end: restoring the bare LeaseRead at the call site in linearized() passes every test"
+class = "other"
+module = "oltp"
+guarantees = ["OLTP-G02"]
+scenarios = ["D06"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/oltp-replication/src/oltp_replication/hosted.rs linearized(): `let option = lease_read_option(policy, raft.config().election_timeout_max)` replaced by `policy.into()`; o18_ranges3 (2 tests), hosted::tests (24) and authority::timestamp (40) all pass (land-oltp-ranges, local, at fc896b3d)"
+seed = "unknown"
+why_not_caught = "The RANGES-3 tests pin lease_read_window and lease_read_option as functions; no test drives a lease read through a running group with a clock, and the crate has no paused-clock three-voter harness."
+invariant_added = "None yet. Planned: the SIM-10 follow-up, a simulator twin that isolates the Timestamp leader, reads through AllocateDirect and catches a planted long-lease bug; or a paused-clock hosted test that refuses a lease read 2,994 ms after the last quorum acknowledgement at election_timeout_max = 3,000 ms."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-27"

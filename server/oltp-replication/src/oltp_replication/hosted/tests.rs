@@ -1185,6 +1185,8 @@ mod replicated;
 
 mod kv_crash;
 #[cfg(test)]
+mod lease_margin;
+#[cfg(test)]
 mod transient;
 
 /// PERF2b: the inline digest of a small entry hashes the same bytes as the

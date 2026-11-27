@@ -1,3 +1,4 @@
+# Evidence: PR #175. The owner loop resumes every open attempt from the Timestamps index (ts/shard-split-open/v1/); ..._automatic_split_keeps_bound_placement_on_exact_retry fails with Close's index delete removed (land-oltp-ranges, local). OltpSplit.live.cfg (ResumeSweep) passes and prefix_no_resume_sweep is caught (oltp-split-spec, run 45999196612). No runtime test kills a manual coordinator after the freeze.
 id = "OLTP-design-split-coordinator-loss"
 title = "A manual split whose coordinator is lost after the freeze leaves the source refusing writes and the table's lifecycle guard held until an operator retries"
 class = "fence-lifecycle-order"
@@ -10,8 +11,5 @@ lowest_regression = "specs/oltp/split/mutants/prefix_no_resume_sweep.cfg"
 seed = "unknown"
 why_not_caught = "Only the owner loop resumes automatic splits; no test loses the coordinator of a manual split after its freeze."
 invariant_added = "OltpSplit G06_FreezeEnds: a sweep on the run owner resumes every opened split attempt until it publishes or aborts."
-fix_commits = []
-revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-26"
+fix_commits = ["6c14e55dbc36b9cabee833361e9056af125c5382", "6a2f896a9074aa85254afe71b8e208d9f6e544d9", "c8847b42db75d3db119ea23d81c3f1edcf97348d", "1703ff793e925247b74e382160524278c0e66d8a"]
+revert_patch_ok = true

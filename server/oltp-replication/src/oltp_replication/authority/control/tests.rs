@@ -692,6 +692,94 @@ async fn o31_r01_r03_installed_scoped_transfer_rebases_after_ready_removal() {
     );
 }
 
+/// OQ-2 (`specs/oltp/queue`, mutant `prefix_join_never_aborted`): a join
+/// interrupted before its seal no longer blocks the ready set. A removal of a
+/// lost member, or an owner fence, supersedes it and completes; a stale page
+/// of the superseded join is refused. A sealed join still holds the slot.
+#[tokio::test]
+async fn r05_o14_oq2_a_removal_or_owner_fence_supersedes_an_unsealed_join() {
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope, pool).await;
+    fixture.initialize().await;
+    let owner = fixture.enroll(1).await;
+    let lost = fixture.enroll(2).await;
+    let peer = fixture.enroll(3).await;
+    let joiner = fixture.enroll(4).await;
+    let mut members = Vec::new();
+    for worker in [owner, lost, peer] {
+        fixture.add_ready(worker, &mut members).await;
+    }
+    let state = fixture.state().await;
+    let join = nabedra_rt::ids::uuid_v4();
+    let ControlReply::JoinBegun { .. } = fixture
+        .apply(ControlCommand::BeginJoin {
+            operation_id: join,
+            expected: state.ready.view,
+            target: joiner,
+        })
+        .await
+    else {
+        panic!("expected a pending join");
+    };
+    // The joiner, or the owner that would copy to it, is lost here.
+    let removal = |operation_id| ControlCommand::BeginRemoval {
+        operation_id,
+        expected: state.ready.view,
+        target: lost,
+        exclusion: ExclusionStamp {
+            worker: lost,
+            authorization: authorization(),
+            ownership_fence: hash(b"lost worker"),
+        },
+    };
+    let ControlReply::JoinBegun { ticket, .. } = fixture.apply(removal(nabedra_rt::ids::uuid_v4())).await
+    else {
+        panic!("the removal must supersede the unsealed join");
+    };
+    assert_eq!(
+        fixture
+            .apply(ControlCommand::ReadyPage {
+                operation_id: nabedra_rt::ids::uuid_v4(),
+                transition_id: join,
+                members: Page::new(vec![joiner]).unwrap(),
+            })
+            .await,
+        ControlReply::Rejected(Fault::Stale),
+        "a late page of the superseded join"
+    );
+    let mut remaining = vec![owner, peer];
+    remaining.sort_by_key(|worker| worker.worker_id);
+    let published = fixture.publish_ready_members(ticket, &remaining, owner).await;
+    assert_eq!(published.ready_count, 2);
+
+    // An owner fence supersedes an unsealed join too.
+    let state = fixture.state().await;
+    let ControlReply::JoinBegun { .. } = fixture
+        .apply(ControlCommand::BeginJoin {
+            operation_id: nabedra_rt::ids::uuid_v4(),
+            expected: state.ready.view,
+            target: joiner,
+        })
+        .await
+    else {
+        panic!("expected a pending join");
+    };
+    let fence = fixture
+        .apply(ControlCommand::BeginOwnerFence {
+            operation_id: nabedra_rt::ids::uuid_v4(),
+            expected: state.ready,
+            next_owner: peer,
+            authorization: authorization(),
+        })
+        .await;
+    assert!(
+        !matches!(fence, ControlReply::Rejected(Fault::Busy)),
+        "the owner fence must supersede the unsealed join: {fence:?}"
+    );
+    assert!(matches!(fixture.state().await.pending, Some(super::Pending::Fence(_))));
+}
+
 #[tokio::test]
 async fn r03_control_pending_timestamp_fence_and_publication_survive_each_reopen() {
     let directory = Directory::new();

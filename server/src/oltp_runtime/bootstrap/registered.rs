@@ -22,6 +22,7 @@ mod cold;
 mod data_worker;
 mod initial;
 mod restart;
+mod start_gate;
 mod system_replacement;
 
 impl LocalServices {
@@ -125,7 +126,42 @@ impl LocalServices {
                 })
                 .await
         });
+        // RANGES-0 and RANGES-0b: peers can ask this worker before its groups
+        // open, and it asks them before it opens any. A replacement opens fresh
+        // learners under a new identity and keeps its own checks.
+        let first_bootstrap = !replacing
+            && worker.cold.is_none()
+            && !rolling
+            && worker.previous_process.is_none()
+            && worker.restored.is_none();
+        let start_gate = if replacing {
+            None
+        } else {
+            let gate = Arc::new(
+                crate::oltp_replication::manager::system_recovery::StartupGateEndpoint::new(
+                    manager.clone(),
+                    placements.control.identity.clone(),
+                    first_bootstrap,
+                ),
+            );
+            manager
+                .registry()
+                .reserve(placements.control.identity.clone())?
+                .bind(Purpose::SystemRecovery, gate.clone())?;
+            Some(gate)
+        };
         let result = nabedra_rt::time::timeout_at(deadline, async {
+            if start_gate.is_some() && worker.cold.is_none() && worker.restored.is_none() {
+                start_gate::wait(
+                    &manager,
+                    &placements.control.identity,
+                    local,
+                    &enrollments,
+                    first_bootstrap,
+                    deadline,
+                )
+                .await?;
+            }
             let groups = worker.start_system_groups(registered_raft_config()).await?;
             let raw_control = groups.control.ok_or_else(unavailable)?;
             let raw_timestamps = groups.timestamps;
@@ -149,14 +185,15 @@ impl LocalServices {
             let registration = manager
                 .registry()
                 .reserve(placements.control.identity.clone())?;
-            registration.bind(
-                Purpose::SystemRecovery,
-                Arc::new(crate::oltp_replication::manager::system_recovery::QuorumEndpoint {
-                    manager: manager.clone(),
-                    control: control.clone(),
-                    probe_queue_peer: super::super::worker_endpoint::probe_queue_peer,
-                }),
-            )?;
+            let recovery = Arc::new(crate::oltp_replication::manager::system_recovery::QuorumEndpoint {
+                manager: manager.clone(),
+                control: control.clone(),
+                probe_queue_peer: super::super::worker_endpoint::probe_queue_peer,
+            });
+            match &start_gate {
+                Some(gate) => gate.install(recovery)?,
+                None => registration.bind(Purpose::SystemRecovery, recovery)?,
+            }
             let control_endpoint = ControlEndpoint::new(control.clone(), shared.clone())?;
             let hosted_control = HostedControlEndpoint::registered(
                 control_endpoint.clone(),

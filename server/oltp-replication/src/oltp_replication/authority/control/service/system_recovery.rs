@@ -13,6 +13,32 @@ use crate::oltp_replication::{
 };
 
 impl ControlHandle {
+    /// RANGES-0 and RANGES-0b: what committed Control state says about
+    /// `worker` before it opens a system group: whether a replacement
+    /// revoked the identity, and the enrollment Control holds for it.
+    pub(crate) async fn start_check(
+        &self,
+        worker: Uuid,
+    ) -> Result<crate::oltp_replication::manager::system_recovery::StartAnswer, ProtocolError>
+    {
+        use crate::oltp_replication::manager::system_recovery::StartAnswer;
+        let raw = self
+            .read(move |view| {
+                let answer = if view.get(&revoked_id(worker))?.is_some() {
+                    StartAnswer::Revoked
+                } else {
+                    let record: Option<WorkerRecord> =
+                        load(view, &machine::key(WORKERS, worker))?;
+                    StartAnswer::Enrolled(
+                        record.map(|record| WorkerIdentity::from(&record.enrollment)),
+                    )
+                };
+                view.encode(&answer)
+            })
+            .await?;
+        machine::decode(raw.as_ref())
+    }
+
     pub(crate) async fn system_replacement_activation(
         &self,
     ) -> Result<Option<AppliedPosition>, ProtocolError> {

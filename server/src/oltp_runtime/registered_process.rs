@@ -74,8 +74,10 @@ pub async fn run(path: PathBuf) -> Result<(), &'static str> {
     )
     .await
     .map_err(report_startup_error)?;
-    let automatic_split = config.automatic_split
-        .map(|policy| runtime.spawn_automatic_split(policy)).transpose()
+    // RANGES-2: the owner loop runs without an automatic policy too. It then
+    // sweeps no group and only resumes the open split attempts that Timestamps
+    // lists (manual ones included).
+    let automatic_split = runtime.spawn_automatic_split(config.automatic_split)
         .map_err(|_| "automatic shard split startup failed")?;
     #[cfg(test)]
     if let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_ARCHIVE_SPLIT_INDEX") {

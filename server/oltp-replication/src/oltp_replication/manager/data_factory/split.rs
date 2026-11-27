@@ -57,6 +57,10 @@ enum Operation {
     Imported,
     Publication,
     Finish,
+    /// RANGES-1: the direct-write barrier in the source before the cut.
+    Pause,
+    /// RANGES-2: a page of the open split attempts (Timestamps).
+    OpenJobs,
 }
 impl Operation {
     fn routes_data(self) -> bool {
@@ -70,13 +74,16 @@ impl Operation {
                 | Self::Images
                 | Self::Imported
                 | Self::Finish
+                | Self::Pause
         )
     }
     fn purpose(self) -> Purpose {
         match self {
-            Self::Job | Self::Source | Self::Publication | Self::FailureSettlement => {
-                Purpose::ShardSplitProof
-            }
+            Self::Job
+            | Self::OpenJobs
+            | Self::Source
+            | Self::Publication
+            | Self::FailureSettlement => Purpose::ShardSplitProof,
             Self::Images => Purpose::ShardSplitImage,
             _ => Purpose::ShardSplit,
         }
@@ -350,6 +357,15 @@ impl SplitClient {
         let (job, owner): (Option<SplitAttempt>, _) = self.decode(reply).await?;
         Ok(job.map(|job| OwnedSplitAttempt { job, _owner: owner }))
     }
+    /// RANGES-2: one page of open split attempt ids after `after`.
+    #[doc(hidden)]
+    pub async fn open_jobs(&self, after: Option<Uuid>) -> Result<Vec<Uuid>, ProtocolError> {
+        let (reply, _) = self
+            .route(&self.timestamps, Operation::OpenJobs, &after)
+            .await?;
+        let (ids, _owner): (Vec<Uuid>, _) = self.decode(reply).await?;
+        Ok(ids)
+    }
     #[doc(hidden)]
     pub async fn timestamp(
         &self,
@@ -364,6 +380,14 @@ impl SplitClient {
             ))),
             reply => Ok(reply),
         }
+    }
+    /// RANGES-1: stop direct commits in the source before the cut is taken,
+    /// so that the freeze finds no direct commit above it. The barrier is
+    /// released by the freeze (taken over) or by an abort's FinishSource.
+    #[doc(hidden)]
+    pub async fn pause(&self, attempt: &SplitAttempt) -> Result<(), ProtocolError> {
+        self.typed(&attempt.intent.source, Operation::Pause, &source(attempt))
+            .await
     }
     #[doc(hidden)]
     pub async fn freeze(&self, attempt: &SplitAttempt) -> Result<(), ProtocolError> {

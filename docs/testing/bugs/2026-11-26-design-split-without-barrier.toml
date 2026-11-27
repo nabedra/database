@@ -1,3 +1,4 @@
+# Evidence: PR #175. o16_ranges1_a_settled_split_never_takes_the_barrier_again fails with the settled-split refusal removed (land-oltp-ranges, local). oltp-sim-topology-splits split-under-load at 55ea09df (45981753661): seeds 6, 7, 9, 11 'source refused the exact split freeze'; at f3c57eee and fc896b3d those seeds publish (the other 7 seeds stay red on 2026-11-25-oltp-sim-split-pinned-to-index-build).
 id = "OLTP-design-split-without-barrier"
 title = "Without the replicated DirectPause barrier a split is refused under sustained direct writes, and the automatic splitter gives the range up after three attempts"
 class = "fence-lifecycle-order"
@@ -10,8 +11,5 @@ lowest_regression = "specs/oltp/split/mutants/prefix_split_refused_under_load.cf
 seed = "unknown"
 why_not_caught = "D07 retries the same split id after a refused freeze and checks only that writes are not lost, not that the split publishes."
 invariant_added = "OltpSplit G06_NoRefusalForLoad, G06_SplitNotExhausted and G06_SplitPublishes: the source applies DirectPause before the cut, every decided attempt releases it, and a pause of a settled attempt is refused."
-fix_commits = []
-revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-26"
+fix_commits = ["6c14e55dbc36b9cabee833361e9056af125c5382", "8b33053f2ee36a9b0d4bd493dff05d384299c6ff"]
+revert_patch_ok = true

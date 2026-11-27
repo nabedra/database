@@ -1,0 +1,17 @@
+id = "OLTP-design-split-guard-table-wide"
+title = "A split holds its table's Exclusive lifecycle guard for its whole duration, so writes that take the queued path anywhere in the table, including direct writes that fall back during the split barrier, are refused with Conflict"
+class = "stale-route-topology-schema"
+module = "oltp"
+guarantees = ["OLTP-G06"]
+scenarios = ["D07", "O16"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "Fault model oltp-sim-2 (NABEDRA_SIM_WORKLOAD=mixed, 240 seeds): at fc896b3d (Actions run 46006671473) and f3c57eee (45999196612), 61 writes in 27 seeds answered conflict 'captured schema or lifecycle changed' (not_applied), against 17 in 8 seeds at 55ea09df (46004154139); seed 3 shows a nemesis split at 10.38 s and two writes invoked at 9.7 s refused at 11.7 s. Code: server/oltp-storage/src/oltp/mvcc/planner/split.rs:144, planner.rs:321-330, store/lifecycle.rs:332-334"
+seed = 3
+why_not_caught = "Confirmed by citation in phase 2 (fx-oltp-ranges, SPLIT-GUARD under SPLIT-COST). It became frequent once splits ran with the DirectPause barrier (RANGES-1): direct writes fall back to the queued path while the barrier holds and meet the guard. The direct checker reads every conflict as a body or key conflict, so the refusals surface as non-linearizable and request-id-reuse-misdetected (24 of the 27 flagged seeds have no other conflict; sim-oltp/src/workloads/topology.rs:3226-3240 documents the reading). No workload counts these refusals as such, and the guard duration against range size is not measured (the vector session estimates about 83 s for a 1 GiB manual split and about 8 min for an automatic one, code reading)."
+invariant_added = "None yet. Needed: a split-under-load workload that counts queued and fallback write refusals on the splitting table, and a measurement of the guard duration against range size. The fix (a guard scoped to the source range, or SPLIT-COST's pinned snapshot plus delta) changes the replicated Catalog guard keys."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-27"

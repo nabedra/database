@@ -1,3 +1,4 @@
+# Evidence: PR #175. o18_ranges3_lease_window_is_inside_the_voter_refusal_at_the_drift_bound and o18_ranges3_lease_reads_use_the_margin_option fail on the bare lease (land-oltp-ranges, local); the call site itself is covered only end to end, see 2026-11-27-review-lease-option-call-site-untested.
 id = "OLTP-design-lease-no-drift-margin"
 title = "Lease reads (table.get, AllocateDirect) use openraft's lease with no clock-rate margin, so a drifting deposed leader can serve a stale read"
 class = "other"
@@ -10,8 +11,5 @@ lowest_regression = "specs/oltp/ranges/mutants/prefix_no_lease_margin.cfg"
 seed = "unknown"
 why_not_caught = "The simulator clock freezes but has no rate drift, and the leader lease equals the follower's vote-refusal window."
 invariant_added = "OltpRanges G02_LeaseReadFresh with clock drift: the leader uses its lease minus a margin that covers both clocks' drift over one lease."
-fix_commits = []
-revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-26"
+fix_commits = ["3371371b63f1c3b58b2d570337c1b9c9ba492976", "c308d4dbe6faa92b2a31a194497403925d73d624", "fa53a3100a709b5f3629092eb917e59944558a9a"]
+revert_patch_ok = true

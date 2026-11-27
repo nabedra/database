@@ -1,0 +1,15 @@
+# Evidence: review of PR #175 (land-oltp-ranges); unit test o16_o21_review_f4_an_unbound_automatic_attempt_whose_source_shrank_is_aborted.
+id = "OLTP-review-unbound-automatic-split-orphan"
+title = "An unbound automatic split attempt of the current owner term whose source shrank below the split threshold was resumed by nothing and stayed in the open-attempt index"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G06"]
+scenarios = ["D07", "O16"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/src/oltp_runtime/worker_runtime/automatic_split.rs tests::o16_o21_review_f4_an_unbound_automatic_attempt_whose_source_shrank_is_aborted"
+seed = "unknown"
+why_not_caught = "Introduced and found in review of the F4 fix (fc896b3d): resume_open left such an attempt to select_work, which only runs for a source above shard_target_bytes at the current epoch. Reaching it needs the owner loop's 10 s observe timeout between select_work's Open and its return, then a shrink or an epoch change; no workload does that."
+invariant_added = "The owner loop records each unbound automatic attempt it leaves to select_work (at most 512) and aborts it through drive's cancel path (settle, FinishSource, Close with Abort, which removes the index key) when the next observation of its source is below the threshold or at another epoch; without a policy it aborts it at once. Residual: an orphan whose source group no longer exists (a dropped table) is never observed by the sweep and lingers in the index until the next owner change aborts it."
+fix_commits = ["b07033b933abf5f63a5ed4659eb483810487dcf3"]
+revert_patch_ok = true

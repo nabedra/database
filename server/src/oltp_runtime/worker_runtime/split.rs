@@ -243,6 +243,9 @@ impl WorkerRuntime {
             }
             image.pin
         } else {
+            // RANGES-1: the barrier comes before the cut, so no direct commit
+            // stamped after the cut applies before the freeze.
+            client.pause(&attempt).await?;
             snapshot(
                 client
                     .timestamp(SplitTimestampCommand::Cut {
@@ -434,6 +437,19 @@ impl WorkerRuntime {
         let statement = sealed.statement();
         if statement.txn != attempt.txn || statement.request != attempt.request {
             return Err(unknown());
+        }
+        let aborted = matches!(statement.decision.decision, TxnDecision::Abort { .. });
+        if aborted && attempt.image.as_ref().is_none_or(|cut| cut.children.is_none()) {
+            // RANGES-1: an attempt aborted before its children were bound may
+            // hold the source's direct barrier. The abort's FinishSource
+            // releases it and records the settlement, so a late pause of this
+            // attempt is refused. A source group that no longer exists holds
+            // none; every other failure is retried with the settlement.
+            match client.finish(attempt, statement.manifest).await {
+                Ok(()) => {}
+                Err(error) if error.code == ErrorCode::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
         if let Some(cut) = &attempt.image {
             if cut.children.is_some() {

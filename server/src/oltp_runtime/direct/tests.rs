@@ -2150,9 +2150,7 @@ async fn o12_d11_ddl_fences_stop_direct_writers_until_the_descriptor_is_publishe
     let published = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         handle
-            .change_direct_schema(DirectSchemaChange::Fence {
-                lifecycle: Some(published)
-            })
+            .fence_direct_schema(Some(published))
             .await
             .unwrap(),
         GroupSchema {
@@ -2182,7 +2180,7 @@ async fn o12_d11_ddl_fences_stop_direct_writers_until_the_descriptor_is_publishe
     assert!(cluster.latest(leader, cluster.row_key(2)).await.0.is_some());
     // A drop fence: no direct write applies to the table again.
     handle
-        .change_direct_schema(DirectSchemaChange::Fence { lifecycle: None })
+        .fence_direct_schema(None)
         .await
         .unwrap();
     let dropped = cluster.op(leader, "table.insert", row(3)).await;
@@ -2755,9 +2753,7 @@ async fn o12_d11_rd1_a_fence_after_the_descriptor_lookup_restarts_the_mutation()
     // The DDL coordinator fences before the Catalog publishes `published`.
     let published = nabedra_rt::ids::uuid_v4();
     handle
-        .change_direct_schema(DirectSchemaChange::Fence {
-            lifecycle: Some(published),
-        })
+        .fence_direct_schema(Some(published))
         .await
         .unwrap();
     let update = serde_json::json!({"key": 1, "values": {"tag": "b"}});

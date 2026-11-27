@@ -210,9 +210,21 @@ pub enum DirectSchemaChange {
     /// The DDL coordinator commits this before the Catalog publishes the
     /// table's next lifecycle (`Some`, index publication) or its drop
     /// (`None`). It bumps the epoch, so a `DirectCommit` computed from the
-    /// previous descriptor fails at apply. Repeating the same lifecycle is
-    /// a no-op.
-    Fence { lifecycle: Option<Uuid> },
+    /// previous descriptor fails at apply.
+    ///
+    /// DDL-FENCE: a compare-and-set on the group's direct schema epoch. With
+    /// `expected_epoch: None` it only reports the current epoch (the
+    /// coordinator's probe, through the log so a remote group answers it
+    /// linearizably). With `Some(epoch)` it applies only while the group is
+    /// at that epoch (the group's `schema_epoch` before any direct schema),
+    /// so a late or repeated copy of an earlier DDL's fence is refused and
+    /// never reinstalls an older lifecycle. Repeating the fence that is
+    /// already installed is a no-op. More expected fields (a search epoch)
+    /// extend this one variant.
+    Fence {
+        lifecycle: Option<Uuid>,
+        expected_epoch: Option<u64>,
+    },
 }
 
 /// The cutoff a leader proposes at `now_unix_ms` for `retention_ms`.
@@ -962,6 +974,16 @@ pub(super) fn pause(
         split_id: command.split_id,
         paused: command.paused,
     };
+    // RANGES-1: a settled split never takes the barrier again. A late or
+    // repeated pause of it would hold the range with nobody left to release
+    // it; its release is already done (`finish_source` clears the barrier).
+    if tx.pinned(&super::lineage::source_receipt(command.split_id))?.is_some() {
+        return if command.paused {
+            reject(tx, Fault::AlreadyDecided)
+        } else {
+            commit(tx, &done)
+        };
+    }
     let frozen_by = config
         .split_source
         .as_ref()
@@ -1290,17 +1312,29 @@ pub(super) fn schema(
             epoch: config.schema_epoch,
             lifecycle: Some(lifecycle),
         },
-        (Some(current), DirectSchemaChange::Fence { lifecycle })
-            if current.lifecycle == lifecycle =>
-        {
-            current
-        }
-        (current, DirectSchemaChange::Fence { lifecycle }) => {
+        (current, DirectSchemaChange::Fence { lifecycle, expected_epoch }) => {
             let base = current.map_or(config.schema_epoch, |current| current.epoch);
-            let Some(epoch) = base.checked_add(1) else {
-                return reject(tx, Fault::ResourceLimit);
-            };
-            DirectSchema { epoch, lifecycle }
+            match expected_epoch {
+                None => {
+                    return commit(
+                        tx,
+                        &ParticipantReply::DirectSchema(DirectSchema {
+                            epoch: base,
+                            lifecycle: current.and_then(|current| current.lifecycle),
+                        }),
+                    );
+                }
+                Some(_) if current.is_some_and(|current| current.lifecycle == lifecycle) => {
+                    current.ok_or_else(recovery_unknown)?
+                }
+                Some(expected) if expected != base => return reject(tx, Fault::Conflict),
+                Some(_) => {
+                    let Some(epoch) = base.checked_add(1) else {
+                        return reject(tx, Fault::ResourceLimit);
+                    };
+                    DirectSchema { epoch, lifecycle }
+                }
+            }
         }
     };
     if config.direct_schema != Some(next) {

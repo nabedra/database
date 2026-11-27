@@ -61,6 +61,26 @@ enum Request {
     },
     Mount(ReplacementMountProof),
     Reconcile { id: Uuid, group: Uuid },
+    /// RANGES-0b: the caller, about to open its system groups, asks what
+    /// this peer knows about its identity. An older peer cannot decode it,
+    /// and the caller then keeps waiting: the gate fails closed.
+    StartCheck,
+}
+
+/// RANGES-0 and RANGES-0b: a Control voter's answer to [`Request::StartCheck`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[doc(hidden)]
+pub enum StartAnswer {
+    /// This peer is in its first bootstrap on a pool it created, and its own
+    /// Control replica has no vote and no log entry yet.
+    Fresh,
+    /// This peer holds Control state but cannot read it linearizably yet.
+    Starting,
+    /// The Control leader's committed record of the caller's worker id.
+    Enrolled(Option<WorkerIdentity>),
+    /// A replacement revoked the caller's worker id.
+    Revoked,
 }
 
 pub(super) type PositionFuture<'a> =
@@ -351,6 +371,17 @@ impl HostedGroupManager {
         .await
     }
 
+    /// RANGES-0b: ask Control voter `target` about this worker's identity
+    /// before the local system groups open.
+    #[doc(hidden)]
+    pub async fn start_check(
+        &self,
+        scope: &GroupIdentity,
+        target: WorkerIdentity,
+    ) -> Result<StartAnswer, ProtocolError> {
+        self.recovery_call(scope, target, &Request::StartCheck).await
+    }
+
     #[doc(hidden)]
     pub async fn send_mount_proof(
         &self,
@@ -550,9 +581,161 @@ impl QuorumEndpoint {
                 request.validate(self.control.identity())?;
             }
             Request::Reconcile { .. } if self.control.is_operator(&session.remote()) => {}
+            Request::StartCheck => {}
             _ => return Err(invalid()),
         }
         Ok(request)
+    }
+
+    /// The Control leader answers from committed state; any other replica
+    /// answers [`StartAnswer::Starting`], so the caller asks the next voter.
+    async fn start_check(&self, worker: Uuid) -> Result<StartAnswer, ProtocolError> {
+        match self.control.start_check(worker).await {
+            Ok(answer) => Ok(answer),
+            Err(_) => Ok(StartAnswer::Starting),
+        }
+    }
+}
+
+/// RANGES-0b: the system recovery endpoint of a registered worker, bound
+/// before its system groups start so that peers in their own startup can
+/// ask it. Until [`Self::install`] it answers only [`Request::StartCheck`],
+/// from the local Control replica.
+#[doc(hidden)]
+pub struct StartupGateEndpoint {
+    manager: Arc<HostedGroupManager>,
+    control: GroupIdentity,
+    /// The worker opened a pool it created in this process, in its first
+    /// bootstrap (no retained identity, no restore, no replacement).
+    fresh_pool: bool,
+    inner: std::sync::OnceLock<Arc<QuorumEndpoint>>,
+}
+
+impl StartupGateEndpoint {
+    #[doc(hidden)]
+    pub fn new(manager: Arc<HostedGroupManager>, control: GroupIdentity, fresh_pool: bool) -> Self {
+        Self {
+            manager,
+            control,
+            fresh_pool,
+            inner: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Hands every request to the full endpoint once Control is open.
+    #[doc(hidden)]
+    pub fn install(&self, endpoint: Arc<QuorumEndpoint>) -> Result<(), ProtocolError> {
+        self.inner.set(endpoint).map_err(|_| invalid())
+    }
+
+    fn local_answer(&self) -> StartAnswer {
+        if !self.fresh_pool {
+            return StartAnswer::Starting;
+        }
+        // No replica yet, or one whose log holds at most the seed's initial
+        // membership entry: no Control entry this worker could have helped
+        // commit exists here. A vote alone does not count: with no entry past
+        // the membership, a second vote in a term elects a leader that has
+        // nothing to overwrite. Waiting for an untouched log instead would
+        // deadlock a first bootstrap whose seed opened before the others.
+        match self.manager.local_control(&self.control) {
+            Err(_) => StartAnswer::Fresh,
+            Ok(running) => {
+                use openraft::type_config::async_runtime::watch::WatchReceiver;
+                let metrics = running.raft.metrics();
+                let metrics = metrics.borrow_watched();
+                let membership = metrics.membership_config.log_id().as_ref().map(|id| id.index);
+                if metrics.last_log_index.is_none() || metrics.last_log_index == membership {
+                    StartAnswer::Fresh
+                } else {
+                    StartAnswer::Starting
+                }
+            }
+        }
+    }
+}
+
+impl Endpoint for StartupGateEndpoint {
+    fn preflight<'a>(
+        &'a self,
+        session: &'a AuthenticatedSession,
+        header: &'a [u8],
+    ) -> EndpointFuture<'a, ReceivePlan> {
+        Box::pin(async move {
+            if let Some(inner) = self.inner.get()
+                && !self.is_start_check(header)
+            {
+                return inner.preflight(session, header).await;
+            }
+            self.parse(session, header)?;
+            Ok(ReceivePlan {
+                class: TrafficClass::Settlement,
+                section_lengths: [0; 3],
+                decode_budget_bytes: 0,
+            })
+        })
+    }
+
+    fn handle<'a>(
+        &'a self,
+        session: AuthenticatedSession,
+        header: ChargedBytes,
+        sections: ChargedSections,
+    ) -> EndpointFuture<'a, ChargedReply> {
+        Box::pin(async move {
+            if let Some(inner) = self.inner.get()
+                && !self.is_start_check(header.as_slice())
+            {
+                return inner.handle(session, header, sections).await;
+            }
+            self.parse(&session, header.as_slice())?;
+            if (0..3).any(|index| sections.section(index).is_some()) {
+                return Err(invalid());
+            }
+            // An untouched local Control replica answers Fresh whether or not
+            // Control is open here: a peer in its first bootstrap may be the
+            // seed that every other voter's groups wait for. Otherwise the
+            // Control leader answers from committed state, bounded so that a
+            // Control without a leader yet answers Starting at once.
+            let answer = match (self.local_answer(), self.inner.get()) {
+                (StartAnswer::Fresh, _) => StartAnswer::Fresh,
+                (_, Some(inner)) => nabedra_rt::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    inner.start_check(session.remote().worker_id),
+                )
+                .await
+                .unwrap_or(Ok(StartAnswer::Starting))?,
+                (answer, None) => answer,
+            };
+            let answer: Result<StartAnswer, ProtocolError> = Ok(answer);
+            Ok(ChargedReply {
+                header: self
+                    .manager
+                    .shared
+                    .encode_in(ByteClass::Progress, &answer, HEADER)?,
+                sections: [None, None, None],
+            })
+        })
+    }
+}
+
+impl StartupGateEndpoint {
+    fn is_start_check(&self, header: &[u8]) -> bool {
+        matches!(serde_json::from_slice::<Request>(header), Ok(Request::StartCheck))
+    }
+    fn parse(&self, session: &AuthenticatedSession, header: &[u8]) -> Result<(), ProtocolError> {
+        if session.group() != &self.control
+            || session.purpose() != Purpose::SystemRecovery
+            || session.recovery_only()
+        {
+            return Err(unavailable());
+        }
+        crate::protocol::json_input(header, HEADER).map_err(|_| invalid())?;
+        match serde_json::from_slice::<Request>(header).map_err(|_| invalid())? {
+            Request::StartCheck => Ok(()),
+            // Control is not open on this worker yet.
+            _ => Err(unavailable()),
+        }
     }
 }
 impl QuorumEndpoint {
@@ -726,6 +909,11 @@ impl Endpoint for QuorumEndpoint {
                 Request::CheckMount { proof, retained } => self.manager.shared.encode_in(
                     ByteClass::Progress,
                     &self.check_mount(proof, retained).await,
+                    HEADER,
+                )?,
+                Request::StartCheck => self.manager.shared.encode_in(
+                    ByteClass::Progress,
+                    &self.start_check(session.remote().worker_id).await,
                     HEADER,
                 )?,
                 Request::Advertise | Request::AdvertiseExecution | Request::AdvertiseHardening => {
