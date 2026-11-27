@@ -63,10 +63,7 @@ pub fn validate_archive_scope(scope: &GroupImageScope) -> Result<(), ProtocolErr
     Ok(())
 }
 
-pub fn validate_archive_image(
-    scope: &GroupImageScope,
-    key: &MvccKey,
-) -> Result<(), ProtocolError> {
+pub fn validate_archive_image(scope: &GroupImageScope, key: &MvccKey) -> Result<(), ProtocolError> {
     if !owns_image(&scope.group, &scope.span, key) {
         return Err(invalid());
     }

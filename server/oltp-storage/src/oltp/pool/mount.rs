@@ -4,16 +4,16 @@
 use super::{Digest, PoolIdentity, ProtocolError};
 #[cfg(not(target_os = "linux"))]
 use crate::{oltp::failure, protocol::ErrorCode};
-use nabedra_oltp_types::types::WorkerIdentity;
+#[cfg(target_os = "linux")]
+use nabedra_oltp_types::authority::docker_volume_name;
+use nabedra_oltp_types::authority::mount_unavailable as invalid;
 #[doc(hidden)]
 pub use nabedra_oltp_types::authority::{
     MountedPoolObservation, PoolMountExpectation, PoolMountProfile,
 };
-use nabedra_oltp_types::authority::mount_unavailable as invalid;
+use nabedra_oltp_types::types::WorkerIdentity;
 #[cfg(target_os = "linux")]
-use nabedra_oltp_types::authority::docker_volume_name;
-#[cfg(target_os = "linux")]
-use nabedra_rt::fs::os::{File, OpenOptions, self as fs};
+use nabedra_rt::fs::os::{self as fs, File, OpenOptions};
 use std::path::{Path, PathBuf};
 mod closed;
 #[cfg(target_os = "linux")]
@@ -60,9 +60,7 @@ impl VerifiedMountAnchor {
         &self.observation
     }
 
-    pub fn retained_worker_if_initialized(
-        &self,
-    ) -> Result<Option<WorkerIdentity>, ProtocolError> {
+    pub fn retained_worker_if_initialized(&self) -> Result<Option<WorkerIdentity>, ProtocolError> {
         #[cfg(target_os = "linux")]
         {
             linux::retained_worker(self)
@@ -192,8 +190,7 @@ mod linux {
     fn read_data_worker_key<K: RestartMountKeyProof>(
         mount: &VerifiedPoolMount,
     ) -> Result<K, ProtocolError> {
-        let path = mount.directory.fd_path()
-            .join(".nabedra-data-worker-key");
+        let path = mount.directory.fd_path().join(".nabedra-data-worker-key");
         let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -205,14 +202,16 @@ mod linux {
             || metadata.len() != 32
             || metadata.uid() != fs::euid()
             || metadata.mode() & 0o077 != 0
-            || mount_id(&file, &mount.observation.expected.mount_path)? != mount.observation.mount_id
+            || mount_id(&file, &mount.observation.expected.mount_path)?
+                != mount.observation.mount_id
         {
             return Err(invalid());
         }
         let mut seed = [0u8; 32];
-        let result = file.read_exact(&mut seed).map_err(|_| invalid()).and_then(|()| {
-            K::from_mount_seed(&seed)
-        });
+        let result = file
+            .read_exact(&mut seed)
+            .map_err(|_| invalid())
+            .and_then(|()| K::from_mount_seed(&seed));
         seed.fill(0);
         result
     }
@@ -232,8 +231,7 @@ mod linux {
         anchor: &VerifiedMountAnchor,
     ) -> Result<Option<WorkerIdentity>, ProtocolError> {
         revalidate(&anchor.directory, &anchor.observation)?;
-        let path =
-            anchor.directory.fd_path().join(MANIFEST);
+        let path = anchor.directory.fd_path().join(MANIFEST);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -279,8 +277,9 @@ mod linux {
     pub(super) fn pool_path(mount: &VerifiedPoolMount) -> Result<PathBuf, ProtocolError> {
         let path = mount.directory.fd_path().join("pool");
         match fs::symlink_metadata(&path) {
-            Ok(_) if mount_id(&directory(&path)?, &mount.observation.expected.mount_path)?
-                == mount.observation.mount_id => {}
+            Ok(_)
+                if mount_id(&directory(&path)?, &mount.observation.expected.mount_path)?
+                    == mount.observation.mount_id => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             _ => return Err(invalid()),
         }
@@ -498,8 +497,10 @@ mod linux {
                     {
                         return Err(invalid());
                     }
-                    let temporary =
-                        base.join(format!(".nabedra-volume-{}.tmp", nabedra_rt::ids::uuid_v4()));
+                    let temporary = base.join(format!(
+                        ".nabedra-volume-{}.tmp",
+                        nabedra_rt::ids::uuid_v4()
+                    ));
                     write_manifest(&temporary, &expected)?;
                     fs::rename(&temporary, &path).map_err(|_| invalid())?;
                     directory.sync_all().map_err(|_| invalid())?;
@@ -581,13 +582,20 @@ mod linux {
         {
             return Err(invalid());
         }
-        let VerifiedMountAnchor { observation, directory } = inspect_for_close(next.clone())?;
+        let VerifiedMountAnchor {
+            observation,
+            directory,
+        } = inspect_for_close(next.clone())?;
         if observation.root_inode != permit.previous_root_inode() {
             return Err(invalid());
         }
         let base = directory.fd_path();
         let lock = lock_mount(&base, false)?;
-        let mount = VerifiedPoolMount { observation, directory, _lock: VolumeLock(lock) };
+        let mount = VerifiedPoolMount {
+            observation,
+            directory,
+            _lock: VolumeLock(lock),
+        };
         revalidate(&mount.directory, &mount.observation)?;
         if read_data_worker_key::<P::Key>(&mount)?.public_key() != permit.next_mount_public_key() {
             return Err(invalid());
@@ -597,17 +605,23 @@ mod linux {
         if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.nlink() != 1 {
             return Err(invalid());
         }
-        let current: PoolMountExpectation = serde_json::from_slice(&bounded(&manifest, LIMIT)?).map_err(|_| invalid())?;
+        let current: PoolMountExpectation =
+            serde_json::from_slice(&bounded(&manifest, LIMIT)?).map_err(|_| invalid())?;
         let closed = base.join(super::closed::CLOSED);
         let receipt = base.join(format!(".nabedra-reopened-{}.json", drain_id));
         let still_closed = super::closed::read_marker(&closed, previous, drain_id)?;
         let reopened = super::closed::read_marker(&receipt, previous, drain_id)?;
-        if still_closed == reopened || (&current != next && (!still_closed || &current != previous)) {
+        if still_closed == reopened || (&current != next && (!still_closed || &current != previous))
+        {
             return Err(invalid());
         }
         if &current == previous {
-            let temporary = base.join(format!(".nabedra-volume-{}.tmp", nabedra_rt::ids::uuid_v4()));
-            let result = write_manifest(&temporary, next).and_then(|()| fs::rename(&temporary, &manifest).map_err(|_| invalid()));
+            let temporary = base.join(format!(
+                ".nabedra-volume-{}.tmp",
+                nabedra_rt::ids::uuid_v4()
+            ));
+            let result = write_manifest(&temporary, next)
+                .and_then(|()| fs::rename(&temporary, &manifest).map_err(|_| invalid()));
             let _ = fs::remove_file(&temporary);
             result?;
         }
@@ -766,8 +780,10 @@ pub(super) mod tests {
     }
     #[test]
     fn o26_unmounted_directory_is_rejected_without_creating_pool_files() {
-        let path =
-            std::env::temp_dir().join(format!("nabedra-unmounted-pool-{}", nabedra_rt::ids::uuid_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "nabedra-unmounted-pool-{}",
+            nabedra_rt::ids::uuid_v4()
+        ));
         std::fs::create_dir(&path).unwrap();
         let worker_id = nabedra_rt::ids::uuid_v4();
         let expected = PoolMountExpectation {

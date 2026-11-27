@@ -13,9 +13,7 @@ pub struct VerifiedBackupCancelled {
 }
 impl VerifiedBackupCancelled {
     /// The owner has awaited all writes and authoritatively observed no root.
-    pub fn after_settlement(
-        statement: BackupCancelledStatement,
-    ) -> Result<Self, ProtocolError> {
+    pub fn after_settlement(statement: BackupCancelledStatement) -> Result<Self, ProtocolError> {
         if statement.owner.backup_id.is_nil()
             || statement.owner.attempt == 0
             || statement.archive_id.is_nil()

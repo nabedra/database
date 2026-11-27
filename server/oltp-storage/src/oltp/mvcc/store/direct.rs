@@ -61,7 +61,8 @@ const UNIX_HIGH: &[u8] = b"mvcc/direct-unix-high/v1";
 
 /// `direct_dedup_retention_ms` default: 24 hours. `result_retention_ms` is
 /// bounded against it at startup (RV-FINAL M2).
-pub const DEFAULT_DIRECT_DEDUP_RETENTION_MS: u64 = nabedra_resources::config::DIRECT_MARKER_RETENTION_MS;
+pub const DEFAULT_DIRECT_DEDUP_RETENTION_MS: u64 =
+    nabedra_resources::config::DIRECT_MARKER_RETENTION_MS;
 /// Dedup records deleted per `DirectExpire` entry at most.
 pub const MAX_DIRECT_EXPIRE_ITEMS: u16 = 128;
 /// Rows per command. `insert_many` above this uses the queued path.

@@ -3,8 +3,8 @@
 use super::{
     CanonicalJson, Change, MvccKey, PreparedWrite,
     catalog::{
-        CatalogHandle, CatalogRead, IntentRef, NameRecord, OwnedRecord, PinnedCatalog, PointCatalog, RouteRead,
-        RoutingPage, RoutingRoot, ShardRoute, TableRecord, decode_record,
+        CatalogHandle, CatalogRead, IntentRef, NameRecord, OwnedRecord, PinnedCatalog,
+        PointCatalog, RouteRead, RoutingPage, RoutingRoot, ShardRoute, TableRecord, decode_record,
     },
     store::{
         ParticipantHandle,
@@ -40,8 +40,7 @@ use query::schedule::QueryScheduler;
 mod query_metrics;
 #[doc(hidden)]
 pub mod split;
-pub type ResolveFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, ProtocolError>> + Send + 'a>>;
+pub type ResolveFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ProtocolError>> + Send + 'a>>;
 pub trait ParticipantResolver: Send + Sync {
     fn participant<'a>(
         &'a self,
@@ -406,8 +405,9 @@ impl NativePlanner {
                     Vec::new()
                 }
                 Operation::Delete(p) => {
-                    let (participant, group) =
-                        self.mutation_route(pin, id, &p.key, &mut metadata, None).await?;
+                    let (participant, group) = self
+                        .mutation_route(pin, id, &p.key, &mut metadata, None)
+                        .await?;
                     let (expected, row) = self.row_on(pin, id, &p.key, &participant).await?;
                     let found = row.is_some();
                     result = serde_json::Value::Bool(found);
@@ -473,8 +473,9 @@ impl NativePlanner {
                         failure(ErrorCode::Conflict, "duplicate primary key in batch").into(),
                     );
                 }
-                let (participant, group) =
-                    self.mutation_route(pin, id, &key, &mut metadata, None).await?;
+                let (participant, group) = self
+                    .mutation_route(pin, id, &key, &mut metadata, None)
+                    .await?;
                 // Bound both native request ownership and its escaped JSON wire
                 // encoding. Oversized individual keys retain the scalar path.
                 let cost = match &key {
@@ -689,9 +690,8 @@ impl NativePlanner {
             .await?;
         let planned = async {
             let epochs = self.catalog.participant().epochs().await?;
-            let name =
-                nabedra_oltp_types::types::Text::try_from(table.descriptor.name.as_str())
-                    .map_err(|_| not_found())?;
+            let name = nabedra_oltp_types::types::Text::try_from(table.descriptor.name.as_str())
+                .map_err(|_| not_found())?;
             let (name_version, name_record) = value(
                 self.catalog
                     .read::<NameRecord>(pin, MvccKey::CatalogName { name: name.clone() })
@@ -809,8 +809,17 @@ impl NativePlanner {
             )
             .into());
         }
-        self.guard_at(pin, txn, request, table_id, lifecycle_version, schema_epoch, mode, current)
-            .await
+        self.guard_at(
+            pin,
+            txn,
+            request,
+            table_id,
+            lifecycle_version,
+            schema_epoch,
+            mode,
+            current,
+        )
+        .await
     }
 
     async fn guard_at(
@@ -824,7 +833,15 @@ impl NativePlanner {
         mode: GuardMode,
         authority: nabedra_oltp_types::types::Authority,
     ) -> Result<VerifiedLifecycleGuard, PlanError> {
-        let binding = self.lifecycle_binding(pin, txn, request, table_id, lifecycle_version, schema_epoch, authority);
+        let binding = self.lifecycle_binding(
+            pin,
+            txn,
+            request,
+            table_id,
+            lifecycle_version,
+            schema_epoch,
+            authority,
+        );
         #[cfg(any(test, feature = "test-hooks"))]
         crate::oltp::test_hooks::index_faults::observe_lifecycle(&binding);
         self.catalog
@@ -885,7 +902,10 @@ impl NativePlanner {
                     && point.table.descriptor.id == table_id
                     && page.shards[*index].contains_key(key)
                 {
-                    return Ok(RouteRead::Route { page: page.clone(), index: *index });
+                    return Ok(RouteRead::Route {
+                        page: page.clone(),
+                        index: *index,
+                    });
                 }
                 self.catalog
                     .route_pages(pin, table_id, key, point.first_page)

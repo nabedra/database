@@ -470,3 +470,48 @@ async fn ns24_o26_o06_a_refused_pool_leaves_the_other_pool_serving() {
     assert_eq!(resources.storage_stats().pools, 2);
     drop((serving, healthy, extra));
 }
+
+/// LSM-5: a run-time quarantine whose kv manifest edit failed (ENOSPC on the
+/// manifest, say) lives in kv's memory only; the pool's synced record of its
+/// accepted groups, a journal write that needs no new file, still names the
+/// group. This is the state a crash then leaves. The next open restores the
+/// quarantine from that record before any group starts, persists it in kv, and
+/// a later open still has it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ns23_lsm5_a_quarantine_kv_lost_is_restored_from_the_pool_record() {
+    let dir = Dir::new();
+    let fault = FaultFs::new();
+    let identity = pool_identity();
+    let resources = shared(SharedResourceConfig::default());
+    let pool = fault_pool(&dir, &fault, identity.clone(), resources.clone());
+    let a = pool.group(group_identity(&pool)).await.unwrap();
+    a.log_transaction(budget(), put_entry(0, b"entry", b"lsm5".to_vec()))
+        .await
+        .unwrap();
+    let a_id = a.identity().clone();
+    drop(a);
+    let mut batch = nabedra_kv::WriteBatch::new();
+    batch.put(
+        b"\0typed-pool-quarantine-v1",
+        &serde_json::to_vec(&std::collections::BTreeSet::from([a_id.group_id])).unwrap(),
+    );
+    pool.kv_store()
+        .submit(batch, nabedra_kv::Durability::Sync, Box::new(()))
+        .unwrap()
+        .done()
+        .await
+        .unwrap();
+    assert!(!pool.is_group_quarantined(a_id.group_id));
+    drop(pool);
+
+    let fault = fault.kill();
+    let pool = reopen(&dir, &fault, identity.clone(), resources.clone()).unwrap();
+    assert!(
+        pool.is_group_quarantined(a_id.group_id),
+        "the group kv forgot must not start"
+    );
+    assert_eq!(pool.quarantined_groups(), vec![a_id.group_id]);
+    drop(pool);
+    let pool = reopen(&dir, &fault.crash(), identity, resources).unwrap();
+    assert!(pool.is_group_quarantined(a_id.group_id), "kv persisted it");
+}

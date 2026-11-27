@@ -144,18 +144,19 @@ impl NativePlanner {
                             crate::oltp::test_hooks::index_holds::Checkpoint::Validation,
                             || None,
                         )
-                        .await || crate::oltp::test_hooks::index_faults::checkpoint(
-                            "validation",
-                            maintenance.index_id,
-                            &serde_json::json!({
-                                "record": &*record,
-                                "verified_shard": shard,
-                                "txn": txn,
-                                "request": request,
-                                "guard": guard.binding(),
-                            }),
-                        )
                         .await
+                            || crate::oltp::test_hooks::index_faults::checkpoint(
+                                "validation",
+                                maintenance.index_id,
+                                &serde_json::json!({
+                                    "record": &*record,
+                                    "verified_shard": shard,
+                                    "txn": txn,
+                                    "request": request,
+                                    "guard": guard.binding(),
+                                }),
+                            )
+                            .await
                         {
                             return Err(failure(
                                 ErrorCode::StorageUnavailable,
@@ -223,35 +224,36 @@ impl NativePlanner {
                 )
                 .await;
             }
-            let plan = self.catalog_index_plan(
-                vec![
-                    PreparedWrite {
-                        key: MvccKey::CatalogTable {
-                            table_id: maintenance.table_id,
+            let plan = self
+                .catalog_index_plan(
+                    vec![
+                        PreparedWrite {
+                            key: MvccKey::CatalogTable {
+                                table_id: maintenance.table_id,
+                            },
+                            expected_version: table_version,
+                            change: self.index_put(&table.with_lifecycle(txn.request_id))?,
                         },
-                        expected_version: table_version,
-                        change: self.index_put(&table.with_lifecycle(txn.request_id))?,
-                    },
-                    PreparedWrite {
-                        key,
-                        expected_version: version,
-                        change: self.index_put(&updated)?,
-                    },
-                    PreparedWrite {
-                        key: closed_key,
-                        expected_version: closed_version,
-                        change: self.index_put(&IndexAttemptClosedRecord {
-                            owner: maintenance,
-                            pin: source_pin,
-                            closed_by: txn,
-                            kind,
-                        })?,
-                    },
-                ],
-                guard.clone(),
-                owner,
-            )
-            .await?;
+                        PreparedWrite {
+                            key,
+                            expected_version: version,
+                            change: self.index_put(&updated)?,
+                        },
+                        PreparedWrite {
+                            key: closed_key,
+                            expected_version: closed_version,
+                            change: self.index_put(&IndexAttemptClosedRecord {
+                                owner: maintenance,
+                                pin: source_pin,
+                                closed_by: txn,
+                                kind,
+                            })?,
+                        },
+                    ],
+                    guard.clone(),
+                    owner,
+                )
+                .await?;
             // Fence before publishing the new lifecycle. A rejected
             // validation must leave Data on the current Catalog lifecycle.
             self.fence_direct_writers(pin, maintenance.table_id, Some(txn.request_id))

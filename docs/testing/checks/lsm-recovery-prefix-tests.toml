@@ -1,8 +1,8 @@
 # NS07 regressions and adjacent journal-behind-manifest recovery checks.
 id = "lsm-recovery-prefix-tests"
 module = "lsm"
-kinds = ["S"]
-guarantees = []
+kinds = ["U"]
+guarantees = ["LSM-G03"]
 scenarios = ["NS06", "NS07"]
 tiers = ["T1"]
 command = ["cargo", "test", "--locked", "-p", "nabedra-kv", "--test", "store_damage", "--test", "store_ns5b", "--", "--test-threads=1"]

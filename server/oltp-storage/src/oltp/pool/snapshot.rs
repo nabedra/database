@@ -1279,7 +1279,8 @@ pub(super) fn retire_group_files(root: &Path, id: Uuid) -> Result<(), ProtocolEr
 fn cleanup_files(root: &Path, id: Uuid, keep: Option<&str>) -> Result<(), ProtocolError> {
     let directory = root.join("snapshots").join(id.to_string());
     if let Some(name) = keep
-        && (!valid_snapshot_name(name) || !fs::metadata(directory.join(name)).is_ok_and(|meta| meta.is_file()))
+        && (!valid_snapshot_name(name)
+            || !fs::metadata(directory.join(name)).is_ok_and(|meta| meta.is_file()))
     {
         return Err(recovery_unknown());
     }

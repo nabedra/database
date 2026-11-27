@@ -295,8 +295,7 @@ pub(super) fn decode_logical(bytes: &[u8]) -> Result<MvccKey, ProtocolError> {
         let name = super::scan::decode_text(&bytes[33..])?;
         return Ok(MvccKey::CatalogIndexName {
             table_id,
-            name: nabedra_oltp_types::types::Text::new(name)
-                .map_err(|_| recovery_unknown())?,
+            name: nabedra_oltp_types::types::Text::new(name).map_err(|_| recovery_unknown())?,
         });
     }
     if bytes.len() != 33 {

@@ -185,7 +185,8 @@ impl Fixture {
     /// Another worker's replica with only the first fence applied.
     #[cfg(test)]
     async fn replica_of_inactive(&self) -> OtherReplica {
-        let dir = Dir(std::env::temp_dir().join(format!("mvcc-direct-{}", nabedra_rt::ids::uuid_v4())));
+        let dir =
+            Dir(std::env::temp_dir().join(format!("mvcc-direct-{}", nabedra_rt::ids::uuid_v4())));
         let mut identity = self.pool_identity.clone();
         identity.worker_id = nabedra_rt::ids::uuid_v4();
         identity.pool_id = nabedra_rt::ids::uuid_v4();
@@ -223,7 +224,8 @@ impl Fixture {
     /// A fenced group that `data.direct.v1` has not reached yet.
     async fn inactive(table: Uuid, span: KeySpan) -> Self {
         let shared = shared();
-        let dir = Dir(std::env::temp_dir().join(format!("mvcc-direct-{}", nabedra_rt::ids::uuid_v4())));
+        let dir =
+            Dir(std::env::temp_dir().join(format!("mvcc-direct-{}", nabedra_rt::ids::uuid_v4())));
         let pool_identity = PoolIdentity {
             engine: "oltp".into(),
             pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
@@ -811,7 +813,12 @@ async fn o07_direct_rejects_a_stale_expected_version() {
     let older = f.put(1, Some(9), 11);
     assert_rejected_without_writes(&mut f, &older, Fault::Conflict).await;
     // A deleted row keeps its tombstone's timestamp as its head version.
-    let delete = f.commit(nabedra_rt::ids::uuid_v4(), 1, 11, vec![f.write(1, Some(10), None)]);
+    let delete = f.commit(
+        nabedra_rt::ids::uuid_v4(),
+        1,
+        11,
+        vec![f.write(1, Some(10), None)],
+    );
     assert_eq!(f.direct(&delete).await, applied(11));
     assert_eq!(
         f.read(12, 1).await["value"]["value"],
@@ -842,7 +849,12 @@ async fn o07_direct_validation_follows_the_plan_order() {
     f.prepare(&plan, vec![write]).await;
     // Key 1 has an intent; key 2 has head 10. Each command breaks several
     // rules and must report the earliest one.
-    let mut all = f.commit(nabedra_rt::ids::uuid_v4(), 1, 5, vec![f.write(1, Some(3), None)]);
+    let mut all = f.commit(
+        nabedra_rt::ids::uuid_v4(),
+        1,
+        5,
+        vec![f.write(1, Some(3), None)],
+    );
     all.authority.owner_term += 1;
     all.schema_epoch = 9;
     assert_rejected_without_writes(&mut f, &all, Fault::StaleAuthority).await;
@@ -1149,7 +1161,8 @@ async fn d03_o16_dedup_records_follow_their_anchor_row_through_a_split() {
         replayed(&left)
     );
     assert_eq!(
-        f.forward(&f.forward_of(6, nabedra_rt::ids::uuid_v4(), 1)).await,
+        f.forward(&f.forward_of(6, nabedra_rt::ids::uuid_v4(), 1))
+            .await,
         rejected(Fault::SplitInProgress)
     );
     assert_eq!(f.dump().await, before);
@@ -2209,7 +2222,8 @@ async fn d03_a_forward_after_a_direct_commit_returns_the_committed_result() {
             .is_err()
     );
     assert_eq!(
-        f.forward(&f.forward_of(100, nabedra_rt::ids::uuid_v4(), 1)).await,
+        f.forward(&f.forward_of(100, nabedra_rt::ids::uuid_v4(), 1))
+            .await,
         rejected(Fault::InvalidBinding)
     );
 }
@@ -2358,7 +2372,11 @@ async fn o16_d06_a_split_barrier_lets_the_freeze_succeed_under_steady_direct_loa
     };
     nabedra_rt::time::sleep(Duration::from_millis(100)).await;
     // Without the barrier, a cut allocated before more commits apply fails.
-    let early = split_bindings(&f, nabedra_rt::ids::uuid_v4(), source.load(AtomicOrdering::SeqCst));
+    let early = split_bindings(
+        &f,
+        nabedra_rt::ids::uuid_v4(),
+        source.load(AtomicOrdering::SeqCst),
+    );
     // At most one commit per writer took its timestamp before the cut was read,
     // so once four more entries apply at least one of them is above the cut.
     // Wait for that instead of sleeping, which fails on a loaded host.
@@ -2462,7 +2480,8 @@ async fn o16_the_split_barrier_belongs_to_one_split() {
     let blocked = f.put(1, None, 10);
     assert_rejected_without_writes(&mut f, &blocked, Fault::SplitInProgress).await;
     assert_eq!(
-        f.forward(&f.forward_of(1, nabedra_rt::ids::uuid_v4(), 1)).await,
+        f.forward(&f.forward_of(1, nabedra_rt::ids::uuid_v4(), 1))
+            .await,
         forwarded_reply()
     );
     // A fence (new run) keeps the barrier.

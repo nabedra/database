@@ -1,0 +1,13 @@
+# LSM-1 regressions: format 2 stores, the upgrade from format 1 with a crash at every step, key
+# refusals, backup and restore, and the journal-level forged-evidence cases in both frames.
+id = "lsm-integrity-tests"
+module = "lsm"
+kinds = ["U"]
+guarantees = ["LSM-G02", "LSM-G03"]
+scenarios = ["NS05", "NS22", "NS25"]
+tiers = ["T1"]
+command = ["cargo", "test", "--locked", "-p", "nabedra-kv", "--test", "store_integrity", "--lib", "--", "lsm1", "--test-threads=1"]
+cwd = "server"
+timeout_s = 600
+needs = []
+result_parser = "cargo-test"

@@ -307,10 +307,7 @@ pub(super) fn apply(
         let same_run = old.binding.authority.run_id == binding.authority.run_id
             && old.binding.authority.owner_term <= binding.authority.owner_term;
         adopted.authority = binding.authority;
-        if !same_run
-            || adopted != *binding
-            || old.mode != *mode
-            || old.scoped_queue != scoped_queue
+        if !same_run || adopted != *binding || old.mode != *mode || old.scoped_queue != scoped_queue
         {
             return reject(tx, Fault::Conflict);
         }
@@ -719,7 +716,10 @@ impl ParticipantHandle {
         scope: nabedra_oltp_types::authority::ScopedCatalogRead,
         txn: TxnId,
     ) -> Result<Option<VerifiedLifecycleGuard>, ProtocolError> {
-        if self.identity().kind != GroupKind::Catalog || txn.request_id != scope.request.request_id || txn.attempt != 1 {
+        if self.identity().kind != GroupKind::Catalog
+            || txn.request_id != scope.request.request_id
+            || txn.attempt != 1
+        {
             return Err(invalid());
         }
         if let Some(remote) = &self.remote {
@@ -727,29 +727,47 @@ impl ParticipantHandle {
         }
         self.local_consensus().ensure_linearizable().await?;
         let group_id = self.identity().group_id;
-        let raw = self.local_machine().store.read_metadata(
-            TransactionBudget { scratch_bytes: 64 << 10, batch_bytes: 0, output_bytes: 16 << 10 },
-            move |view| {
-                let Some(bytes) = view.pinned(&table_holder_key(scope.table_id, txn))? else {
-                    return view.encode(&Option::<SealedLifecycleGuard>::None);
-                };
-                if bytes.len() > METADATA_BYTES {
-                    return Err(recovery_unknown());
-                }
-                let record: GuardRecord = serde_json::from_slice(&bytes).map_err(|_| recovery_unknown())?;
-                let binding = record.binding;
-                if record.mode != GuardMode::Shared
-                    || binding.catalog_group_id != group_id || binding.table_id != scope.table_id
-                    || binding.txn != txn || binding.request != scope.request || binding.read_ts != scope.read_ts
-                    || record.scoped_queue != Some(scoped_queue::QueueBinding::from_scope(scope))
-                {
-                    return Err(invalid());
-                }
-                let guard = SealedLifecycleGuard::new(binding, record.mode, record.granted_at.ok_or_else(recovery_unknown)?)?;
-                view.encode(&Some(guard))
-            },
-        ).await?;
-        let guard: Option<SealedLifecycleGuard> = serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())?;
+        let raw = self
+            .local_machine()
+            .store
+            .read_metadata(
+                TransactionBudget {
+                    scratch_bytes: 64 << 10,
+                    batch_bytes: 0,
+                    output_bytes: 16 << 10,
+                },
+                move |view| {
+                    let Some(bytes) = view.pinned(&table_holder_key(scope.table_id, txn))? else {
+                        return view.encode(&Option::<SealedLifecycleGuard>::None);
+                    };
+                    if bytes.len() > METADATA_BYTES {
+                        return Err(recovery_unknown());
+                    }
+                    let record: GuardRecord =
+                        serde_json::from_slice(&bytes).map_err(|_| recovery_unknown())?;
+                    let binding = record.binding;
+                    if record.mode != GuardMode::Shared
+                        || binding.catalog_group_id != group_id
+                        || binding.table_id != scope.table_id
+                        || binding.txn != txn
+                        || binding.request != scope.request
+                        || binding.read_ts != scope.read_ts
+                        || record.scoped_queue
+                            != Some(scoped_queue::QueueBinding::from_scope(scope))
+                    {
+                        return Err(invalid());
+                    }
+                    let guard = SealedLifecycleGuard::new(
+                        binding,
+                        record.mode,
+                        record.granted_at.ok_or_else(recovery_unknown)?,
+                    )?;
+                    view.encode(&Some(guard))
+                },
+            )
+            .await?;
+        let guard: Option<SealedLifecycleGuard> =
+            serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())?;
         Ok(guard.map(|guard| VerifiedLifecycleGuard { guard }))
     }
 
@@ -988,7 +1006,10 @@ mod index_recovery_tests {
 
     #[tokio::test]
     async fn o08_o12_t06_recover_exact_settled_ready_guard() {
-        let path = std::env::temp_dir().join(format!("nabedra-ready-guard-{}", nabedra_rt::ids::uuid_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "nabedra-ready-guard-{}",
+            nabedra_rt::ids::uuid_v4()
+        ));
         struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {

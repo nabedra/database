@@ -125,19 +125,27 @@ impl HistoryScope {
     }
 
     pub fn system_groups(&self) -> impl Iterator<Item = Uuid> + '_ {
-        [self.control_group, self.timestamp_group].into_iter()
+        [self.control_group, self.timestamp_group]
+            .into_iter()
             .chain(self.status_groups())
             .chain(std::iter::once(self.catalog_group))
     }
 
     fn status_topology(&self) -> Result<StatusTopology, ProtocolError> {
-        StatusTopology::new(self.status_groups().enumerate().map(|(index, group_id)| GroupIdentity {
-            cluster_id: self.logical_cluster,
-            database: self.database.clone(),
-            group_id,
-            kind: GroupKind::Status { bucket: index as u32 },
-            group_format_version: GROUP_FORMAT_VERSION,
-        }).collect())
+        StatusTopology::new(
+            self.status_groups()
+                .enumerate()
+                .map(|(index, group_id)| GroupIdentity {
+                    cluster_id: self.logical_cluster,
+                    database: self.database.clone(),
+                    group_id,
+                    kind: GroupKind::Status {
+                        bucket: index as u32,
+                    },
+                    group_format_version: GROUP_FORMAT_VERSION,
+                })
+                .collect(),
+        )
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -575,7 +583,10 @@ impl Chain {
             HistoryFrame::Scope(scope) => {
                 if self.scope.is_some()
                     || self.frames != 0
-                    || !matches!((scope.format_version, scope.status_partitions.is_empty()), (1, true) | (2, false))
+                    || !matches!(
+                        (scope.format_version, scope.status_partitions.is_empty()),
+                        (1, true) | (2, false)
+                    )
                     || scope.archive_id.is_nil()
                     || scope.logical_cluster.is_nil()
                     || scope.system_groups().any(|group| group.is_nil())
@@ -586,7 +597,9 @@ impl Chain {
                     return Err(invalid());
                 }
                 let topology = scope.status_topology()?;
-                let unique = scope.system_groups().collect::<std::collections::BTreeSet<_>>();
+                let unique = scope
+                    .system_groups()
+                    .collect::<std::collections::BTreeSet<_>>();
                 if unique.len() != scope.system_groups().count() {
                     return Err(invalid());
                 }
@@ -615,7 +628,10 @@ impl Chain {
                     || closure.timestamps.database != scope.database
                     || closure.status.cluster_id != scope.logical_cluster
                     || closure.status.database != scope.database
-                    || !self.status_topology.as_ref().is_some_and(|topology| topology.contains(&closure.status))
+                    || !self
+                        .status_topology
+                        .as_ref()
+                        .is_some_and(|topology| topology.contains(&closure.status))
                 {
                     return Err(invalid());
                 }
@@ -803,13 +819,19 @@ impl Chain {
                         (self.identity_metadata_step)(shared, self.identity_root, image)?
                     {
                         if self.previous_identity.is_some_and(|old| old >= id)
-                            || self.status_topology.as_ref().ok_or_else(invalid)?.request(id) != &closure.status
+                            || self
+                                .status_topology
+                                .as_ref()
+                                .ok_or_else(invalid)?
+                                .request(id)
+                                != &closure.status
                         {
                             return Err(invalid());
                         }
                         self.previous_identity = Some(id);
                         self.identity_root = root;
-                        self.identity_count = self.identity_count.checked_add(1).ok_or_else(invalid)?;
+                        self.identity_count =
+                            self.identity_count.checked_add(1).ok_or_else(invalid)?;
                     }
                 } else if image.group.group_id != scope.timestamp_group {
                     return Err(invalid());
@@ -828,7 +850,12 @@ impl Chain {
                     || *applied_at != closure.status_applied_at
                     || identity.reservation.request_id.is_nil()
                     || identity.reservation.original_run.is_nil()
-                    || self.status_topology.as_ref().ok_or_else(invalid)?.request(identity.reservation.request_id) != status
+                    || self
+                        .status_topology
+                        .as_ref()
+                        .ok_or_else(invalid)?
+                        .request(identity.reservation.request_id)
+                        != status
                     || identity.origin.as_ref().is_some_and(|origin| {
                         origin.source_cluster.is_nil() || origin.through_cut > scope.cut
                     })
@@ -846,8 +873,12 @@ impl Chain {
                     || self.group.is_some()
                     || commit_ts > scope.cut
                     || scope.base_exclusive.is_some_and(|base| commit_ts <= base)
-                    || self.status_topology.as_ref().ok_or_else(invalid)?
-                        .manifest(decision.statement.txn, decision.statement.manifest)? != &status.status
+                    || self
+                        .status_topology
+                        .as_ref()
+                        .ok_or_else(invalid)?
+                        .manifest(decision.statement.txn, decision.statement.manifest)?
+                        != &status.status
                     || decision.statement.manifest.participant_count == 0
                     || decision.reservation.request_id != decision.statement.txn.request_id
                     || decision.reservation.digest != decision.statement.request.digest
@@ -988,7 +1019,10 @@ impl Chain {
                 }
             }
             HistoryFrame::EndArchive { frames, root } => {
-                if self.status_topology.as_ref().is_none_or(|topology| topology.groups().len() != self.status_count)
+                if self
+                    .status_topology
+                    .as_ref()
+                    .is_none_or(|topology| topology.groups().len() != self.status_count)
                     || self.status.as_ref().is_none_or(|closure| {
                         closure.committed_count != self.committed_count
                             || closure.decision_root != self.decision_root
@@ -1066,10 +1100,7 @@ impl<W: Write> HistoryWriter<W> {
             .and_then(|_| self.output.write_all(encoded.as_slice()))
             .map_err(|_| invalid())
     }
-    pub fn finish(
-        mut self,
-        shared: &WorkerSharedResources,
-    ) -> Result<(W, Digest), ProtocolError> {
+    pub fn finish(mut self, shared: &WorkerSharedResources) -> Result<(W, Digest), ProtocolError> {
         let root = self.chain.root;
         self.write(
             &HistoryFrame::EndArchive {

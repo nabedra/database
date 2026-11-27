@@ -3,9 +3,9 @@ use crate::oltp::{
     mvcc::CanonicalJson,
     pool::{ByteClass, OltpPool, PoolIdentity, SharedResourceConfig, WorkerSharedResources},
 };
-use nabedra_oltp_types::types::{DecisionStatement, Text, Timestamp};
 #[cfg(test)]
 use nabedra_oltp_types::types::AbortReason;
+use nabedra_oltp_types::types::{DecisionStatement, Text, Timestamp};
 use nabedra_resources::config::WorkerResources;
 use std::path::PathBuf;
 struct Dir(PathBuf);
@@ -36,7 +36,9 @@ impl Fixture {
             SharedResourceConfig::default(),
         )
         .unwrap();
-        let dir = Dir(std::env::temp_dir().join(format!("mvcc-participant-{}", nabedra_rt::ids::uuid_v4())));
+        let dir =
+            Dir(std::env::temp_dir()
+                .join(format!("mvcc-participant-{}", nabedra_rt::ids::uuid_v4())));
         let identity = PoolIdentity {
             engine: "oltp".into(),
             pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
@@ -1551,9 +1553,7 @@ async fn o06_o07_o10_partial_resolution_witness_requires_exact_decision_and_curr
         },
         decision: committed(11),
     };
-    let as_proof = |statement| {
-        SealedStatusDecision::seal(statement).unwrap()
-    };
+    let as_proof = |statement| SealedStatusDecision::seal(statement).unwrap();
     let proof = as_proof(statement.clone());
     let quorum = Arc::new(ModeledQuorum(AtomicBool::new(true)));
     let handle = ParticipantHandle::new(f.machine.clone(), quorum.clone());

@@ -1,7 +1,7 @@
 //! Strong participant capabilities. These wrappers cannot be deserialized by
 //! callers; only the leader's quorum barrier plus durable snapshot creates one.
-use super::*;
 use super::consensus::{Applied, Consensus, ConsensusFuture};
+use super::*;
 use crate::oltp::{
     pool::{ExecutionClass, ScratchLease},
     read_attempt::ScheduledReadError,
@@ -30,9 +30,7 @@ pub type ParticipantFuture<'a, T> = ConsensusFuture<'a, T>;
 pub type ScheduledReadFuture<'a> = std::pin::Pin<
     Box<
         dyn std::future::Future<
-                Output = Result<
-                    OwnedCommand<super::scan::ScanPage>, ScheduledReadError,
-                >,
+                Output = Result<OwnedCommand<super::scan::ScanPage>, ScheduledReadError>,
             > + Send
             + 'a,
     >,
@@ -184,10 +182,7 @@ impl VerifiedParticipantSeal {
         {
             return Err(invalid());
         }
-        context.verify_payload(
-            ParticipantProofKind::Seal,
-            &evidence,
-        )?;
+        context.verify_payload(ParticipantProofKind::Seal, &evidence)?;
         Ok(Self {
             evidence,
             _owner: context.owner(),
@@ -219,10 +214,7 @@ impl VerifiedParticipantResolution {
         {
             return Err(invalid());
         }
-        context.verify_payload(
-            ParticipantProofKind::Resolution,
-            &evidence,
-        )?;
+        context.verify_payload(ParticipantProofKind::Resolution, &evidence)?;
         Ok(Self {
             evidence,
             _owner: context.owner(),
@@ -423,10 +415,7 @@ impl ParticipantHandle {
         self.local_consensus().ensure_linearizable().await?;
         self.local_machine().read_at(read_ts, key).await
     }
-    pub fn with_scoped_execution(
-        &self,
-        scope: ScopedCatalogRead,
-    ) -> Result<Self, ProtocolError> {
+    pub fn with_scoped_execution(&self, scope: ScopedCatalogRead) -> Result<Self, ProtocolError> {
         let remote = self
             .remote
             .as_ref()

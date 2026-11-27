@@ -2,7 +2,9 @@
 use super::*;
 use crate::oltp::pool::ByteClass;
 use nabedra_oltp_types::{
-    authority::{ScopedCatalogRead, ScopedQueueInventory, ScopedQueuePlacement, ScopedQueueTransition},
+    authority::{
+        ScopedCatalogRead, ScopedQueueInventory, ScopedQueuePlacement, ScopedQueueTransition,
+    },
     types::AuthorityView,
 };
 
@@ -180,7 +182,10 @@ struct QueueState {
 impl QueueState {
     fn matches(self, epoch: QueueEpoch, require_fence: bool) -> bool {
         self.epoch == epoch
-            && (!require_fence || self.fence.is_some_and(|receipt| receipt.fence.next == epoch))
+            && (!require_fence
+                || self
+                    .fence
+                    .is_some_and(|receipt| receipt.fence.next == epoch))
     }
 }
 

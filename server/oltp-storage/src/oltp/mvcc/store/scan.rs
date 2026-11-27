@@ -374,8 +374,7 @@ impl ParticipantHandle {
         &self,
         scope: nabedra_oltp_types::authority::ReadScope,
         request: ScanRequest,
-    ) -> Result<OwnedCommand<ScanPage>, crate::oltp::read_attempt::ScheduledReadError>
-    {
+    ) -> Result<OwnedCommand<ScanPage>, crate::oltp::read_attempt::ScheduledReadError> {
         if let Some(remote) = &self.remote {
             return remote.scheduled_scan_page(scope, request).await;
         }

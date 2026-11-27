@@ -4,8 +4,6 @@ mod activation;
 mod closed;
 mod damage;
 mod disk;
-#[cfg(feature = "sim")]
-pub use disk::registries_empty;
 #[doc(hidden)]
 pub use activation::{
     ActivationMembershipProof, ReplicaActivationStatement, VerifiedReplicaActivation,
@@ -14,6 +12,8 @@ pub use damage::ACCEPT_DAMAGE_FILE;
 use damage::group_of_scope;
 #[doc(hidden)]
 pub use damage::{DamageCause, DamagedReplicaRemoved, ReleaseOutcome, quarantined_group};
+#[cfg(feature = "sim")]
+pub use disk::registries_empty;
 #[doc(hidden)]
 pub use disk::{DiskReservation, is_disk_reservation_refusal};
 #[doc(hidden)]
@@ -33,14 +33,14 @@ mod sim_tests;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub mod tests;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use resources::RAFT_REPLICA_BYTES;
 pub use resources::{
     ByteClass, ChargedBuffer, ChargedBytes, ExecutionClass, NativeComputeGuard, PreparedNative,
     QueueLease, ScratchLease, SharedResourceConfig, WorkerSharedResources,
 };
 use resources::{ByteReservation, capacity};
-#[cfg(any(test, feature = "test-hooks"))]
-#[doc(hidden)]
-pub use resources::RAFT_REPLICA_BYTES;
 pub(crate) use resources::{DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease};
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
@@ -52,7 +52,7 @@ use bytes::Bytes;
 use nabedra_kv::{Durability, Snapshot, Store, WriteBatch};
 use nabedra_oltp_types::types::{Digest, GroupIdentity};
 use nabedra_resources::scheduling::MemoryCharge;
-use nabedra_rt::fs::os::{File, OpenOptions, self as fs};
+use nabedra_rt::fs::os::{self as fs, File, OpenOptions};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -433,9 +433,7 @@ impl OltpPool {
         &self.inner.shared
     }
     #[doc(hidden)]
-    pub fn observe_registered_mount(
-        &self,
-    ) -> Result<mount::MountedPoolObservation, ProtocolError> {
+    pub fn observe_registered_mount(&self) -> Result<mount::MountedPoolObservation, ProtocolError> {
         self.healthy()?;
         let observed = self
             .inner
@@ -1517,8 +1515,7 @@ impl GroupStore {
         work: impl FnOnce(
             &mut GroupRead<'_>,
             Arc<ScratchLease>,
-        )
-            -> Result<nabedra_oltp_types::owned::OwnedCommand<D>, ProtocolError>
+        ) -> Result<nabedra_oltp_types::owned::OwnedCommand<D>, ProtocolError>
         + Send
         + 'static,
     ) -> Result<nabedra_oltp_types::owned::OwnedCommand<D>, ProtocolError> {
@@ -1545,8 +1542,7 @@ impl GroupStore {
         work: impl FnOnce(
             &mut GroupRead<'_>,
             Arc<ScratchLease>,
-        )
-            -> Result<nabedra_oltp_types::owned::OwnedCommand<D>, ProtocolError>
+        ) -> Result<nabedra_oltp_types::owned::OwnedCommand<D>, ProtocolError>
         + Send
         + 'static,
     ) -> Result<nabedra_oltp_types::owned::OwnedCommand<D>, ProtocolError> {

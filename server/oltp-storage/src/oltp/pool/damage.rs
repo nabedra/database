@@ -136,8 +136,10 @@ impl DamageState {
         let Some(pool) = self.pool.get().cloned() else {
             return;
         };
-        let spawned =
-            nabedra_rt::task::spawn_oneshot("oltp-damage", nabedra_kv::THREAD_STACK_BYTES, move || {
+        let spawned = nabedra_rt::task::spawn_oneshot(
+            "oltp-damage",
+            nabedra_kv::THREAD_STACK_BYTES,
+            move || {
                 let Some(inner) = pool.upgrade() else {
                     return;
                 };
@@ -147,7 +149,8 @@ impl DamageState {
                     // only make R6 stricter.
                     tracing::warn!(%group, %error, "could not record run-time quarantine");
                 }
-            });
+            },
+        );
         if spawned.is_err() {
             tracing::warn!(%group, "could not record run-time quarantine: no thread");
         }
@@ -163,11 +166,29 @@ pub(super) fn admit(
     quarantined: &[Damage],
     healthy_groups: usize,
 ) -> Result<Option<BTreeSet<Uuid>>, ProtocolError> {
-    let current: BTreeSet<Uuid> = quarantined
+    let mut current: BTreeSet<Uuid> = quarantined
         .iter()
         .filter_map(|damage| group_of_scope(&damage.scope))
         .collect();
     let accepted = read_accepted(store)?.unwrap_or_default();
+    // LSM-5: a run-time quarantine whose manifest edit failed lives in kv's memory
+    // only, and a crash forgets it. This record is a second, synced copy (a journal
+    // write, which needs no new file). Restore every accepted group kv no longer
+    // quarantines, unless kv released it (a crash between the release and the
+    // rewrite of this record), before any group starts.
+    for &group in accepted.difference(&current.clone()) {
+        if store
+            .restore_quarantine(&group_scope(group), DamageReason::RunBlock)
+            .map_err(storage_error)?
+        {
+            tracing::error!(
+                path = %path.display(),
+                %group,
+                "restored a run-time quarantine that the storage engine lost in a crash"
+            );
+            current.insert(group);
+        }
+    }
     let override_file = path.join(ACCEPT_DAMAGE_FILE);
     let operator_accepts = fs::try_exists(&override_file).unwrap_or(false);
     let new: BTreeSet<Uuid> = if operator_accepts {

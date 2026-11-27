@@ -49,9 +49,12 @@ impl VerifiedSplitSource {
         let [left, right] = children;
         let (statement, published_at) = &value;
         let guard = left.guard.binding();
-        if statement.group != left.source || statement.split_id != left.split_id
-            || statement.txn != guard.txn || statement.request != guard.request
-            || statement.read_ts != left.read_ts || statement.frozen_at.index == 0
+        if statement.group != left.source
+            || statement.split_id != left.split_id
+            || statement.txn != guard.txn
+            || statement.request != guard.request
+            || statement.read_ts != left.read_ts
+            || statement.frozen_at.index == 0
             || statement.children != [child_digest(left)?, child_digest(right)?]
             || published_at.is_some_and(|timestamp| timestamp <= statement.read_ts)
         {
@@ -59,7 +62,15 @@ impl VerifiedSplitSource {
         }
         let owner = context.verify(true, &left.source, &value)?;
         let (statement, published_at) = value;
-        Ok(Self { proof: OwnedCommand::new_with_owner(SplitSourceState { statement, published_at }, owner)? })
+        Ok(Self {
+            proof: OwnedCommand::new_with_owner(
+                SplitSourceState {
+                    statement,
+                    published_at,
+                },
+                owner,
+            )?,
+        })
     }
     fn state(&self) -> &SplitSourceState {
         self.proof
@@ -183,13 +194,17 @@ impl VerifiedSplitImported {
         statement: SplitImportedStatement,
         binding: &SplitBinding,
     ) -> Result<Self, ProtocolError> {
-        if statement.binding != *binding || statement.completed_at.index == 0 || statement.pages == 0
+        if statement.binding != *binding
+            || statement.completed_at.index == 0
+            || statement.pages == 0
             || statement.images > statement.source_images
         {
             return Err(invalid());
         }
         let owner = context.verify(false, &binding.target, &statement)?;
-        Ok(Self { statement: OwnedCommand::new_with_owner(statement, owner)? })
+        Ok(Self {
+            statement: OwnedCommand::new_with_owner(statement, owner)?,
+        })
     }
     pub fn statement(&self) -> &SplitImportedStatement {
         self.statement
@@ -414,9 +429,11 @@ pub(super) fn validate_read(config: &Config, read_ts: ReadTs) -> Result<(), Prot
     if read_ts.get() < config.gc_floor {
         return Err(invalid());
     }
-    if config.split_source.as_ref().is_some_and(|source| {
-        source.published_at.is_none() && read_ts > source.statement.read_ts
-    }) {
+    if config
+        .split_source
+        .as_ref()
+        .is_some_and(|source| source.published_at.is_none() && read_ts > source.statement.read_ts)
+    {
         return Err(failure(
             ErrorCode::SplitPublicationPending,
             "split source awaits routing publication",
@@ -546,15 +563,20 @@ pub(super) fn finish_source(
             reject(tx, Fault::InvalidBinding)
         };
     }
-    let source = config.split_source.as_mut()
+    let source = config
+        .split_source
+        .as_mut()
         .filter(|source| source.statement.split_id == split_id);
     let Some(source) = source else {
         // A durable abort can race a delayed Freeze after the children were
         // bound. Persist its receipt even when Freeze never reached this source.
         // The exact split endpoint verifies the attempt and quorum settlement.
         if matches!(decision, TxnDecision::Abort { .. })
-            && proof.txn.request_id == split_id && proof.request.request_id == split_id
-            && settled.validate_for(proof.txn, &proof.request, &proof.manifest).is_ok()
+            && proof.txn.request_id == split_id
+            && proof.request.request_id == split_id
+            && settled
+                .validate_for(proof.txn, &proof.request, &proof.manifest)
+                .is_ok()
         {
             // An aborted split releases its direct barrier.
             if config.direct_pause == Some(split_id) {
