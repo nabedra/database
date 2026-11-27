@@ -1,0 +1,21 @@
+# Design review (rv-oltp-direct, queue; old dr-queue F1). TLC counterexample, local and unattested:
+# Receipt_Monotone breaks in 12 states with no fault (specs/oltp/queue/mutants/prefix_f1_receipt_regress.cfg).
+# Code: receipt_owned answers the local record state, or committing until the terminal copy is confirmed,
+# while a same-ID POST already answers the durable Status terminal.
+id = "design-queue-receipt-regress"
+title = "A same-run receipt answers running or committing after the client was told the mutation succeeded"
+class = "uncertain-outcome"
+module = "oltp"
+guarantees = ["OLTP-G04", "OLTP-G07"]
+scenarios = ["Q04", "Q06", "T04"]
+found_by = "review"
+found_date = "2026-11-24"
+lowest_regression = "specs/oltp/queue/mutants/prefix_f1_receipt_regress.cfg"
+seed = "unknown"
+why_not_caught = "The Q06/T04 receipt-race regression checks the owner's own lookup race only; nothing compares a POST replay with a later GET receipt or checks monotonic receipts across a view change."
+invariant_added = "A same-run mutation receipt answers from the durable decision whenever one exists, so no lookup reports a nonterminal state after a terminal one."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

@@ -1089,8 +1089,11 @@ impl DirectExecutor {
         let committed = match proposed {
             Ok(committed) => committed,
             Err(error) => {
-                // T4: the proposal no longer holds its local pending slot.
-                clock.settle(commit_ts);
+                // A submitted entry may still apply after its reply is lost.
+                // Keep it visible to readers until apply or a leadership change.
+                if error.outcome == Outcome::NotApplied {
+                    clock.settle(commit_ts);
+                }
                 self.proposal_failed(handle, clock, token, deadline, error)?;
                 return Ok(Attempt::Retry(RetryCause::Unavailable));
             }

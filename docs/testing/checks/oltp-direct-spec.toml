@@ -1,0 +1,14 @@
+# Design check of the OLTP direct path (plans/oltp-direct-path.md, Design review): the OltpDirect baselines
+# (exhaustive, with coverage), the liveness baseline and every mutant, through the pinned TLC image.
+# See specs/README.md and specs/oltp/direct/.
+id = "oltp-direct-spec"
+module = "oltp"
+kinds = ["T"]
+guarantees = ["OLTP-G01", "OLTP-G02", "OLTP-G03", "OLTP-G04", "OLTP-G10"]
+scenarios = ["D02", "D03", "D04", "D05", "D06", "D08", "O07", "O08", "O09", "O10"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/oltp/direct", "OltpDirect", "--module", "oltp"]
+cwd = "."
+timeout_s = 20400
+needs = ["tlc"]
+result_parser = "tlc"

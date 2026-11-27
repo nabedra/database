@@ -1,0 +1,16 @@
+# The design spec of the OLTP request queue on the queued path (all-ready policy): the baseline at L3
+# bounds (4 workers, 2 requests, every fault kind once, 2 overlapping), the liveness baseline, coverage
+# and every mutant with its control. See plans/resource-aware-scheduling.md, "Design review".
+# OLTP-G03 and OLTP-G04 are modelled here for the queued path only; the direct path is OltpDirect's,
+# so they are listed by the direct-path check, not here.
+id = "oltp-queue-spec"
+module = "oltp"
+kinds = ["T"]
+guarantees = ["OLTP-G07", "OLTP-G08", "OLTP-G09"]
+scenarios = ["Q03", "Q04", "Q05", "Q06", "R01", "R02", "R03", "R04", "R05", "O14", "O15", "O17", "T04", "T05"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/oltp/queue", "OltpQueue", "--module", "oltp"]
+cwd = "."
+timeout_s = 14400
+needs = ["tlc"]
+result_parser = "tlc"

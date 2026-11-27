@@ -144,11 +144,11 @@ dedup value = { digest, commit_ts, result, applied_unix_ms }
 
 An existing dedup record with the same digest returns `Replayed`. A different digest returns the existing `conflict` error. Dedup records sort with their anchor row, so splits, snapshots and backups must carry the `'D'` namespace. A background task deletes records older than `direct_dedup_retention_ms`, default 24 h.
 
-**Retry results (lead decision 2026-11-24, at the user's request).** On the direct path, a retry of a mutation with the same request ID and body returns the first definite result of that identity while its dedup record is retained. That includes a no-op (`update` or `delete` of a missing row) and a row conflict (`insert` of a present row). Unknown outcomes, unavailable or overloaded answers and validation errors are not results and are not recorded. Reads have no identity. The cost is a Data log entry for outcomes that commit none today, so no-ops and refused inserts get slower. Recomputing lets a later answer contradict an earlier one. Status: the shipped executor recomputes no-ops and row conflicts on retry today, which is a known gap (DR-1, draft PR #118, reproduced locally on one seed in a simulation fault model, not independently reviewed), and the implementation waits for a design review.
+**Retry results (lead decision 2026-11-24, at the user's request).** On the direct path, a retry of a mutation with the same request ID and body returns the first definite result of that identity while its dedup record is retained. That includes a no-op (`update` or `delete` of a missing row) and a row conflict (`insert` of a present row). Unknown outcomes, unavailable or overloaded answers and validation errors are not results and are not recorded. Reads have no identity. A recorded outcome is a `DirectCommit` member with no row write: it carries the dedup record, and an `expected_version` for every key its result read, and it takes no row version. Apply checks the dedup record first, then intents and `expected_version` for those keys as for written ones, so a stale read is `Rejected(Conflict)` and the leader recomputes from step 3. A digest mismatch never writes a record. The member registers its keys in `pending` so that `wait_latest` of a later attempt sees it, and leaves on apply like any other. Leaders propose recorded outcomes only once the cluster feature `data.direct.record-outcomes` is enabled; until then they recompute them, as an older replica would apply such a member differently. The cost is a Data log entry for outcomes that commit none today, so no-ops and refused inserts get slower. Recomputing lets a later answer contradict an earlier one. Status: the shipped executor recomputes no-ops and row conflicts on retry today, which is a known gap (DR-1, draft PR #118, reproduced locally on one seed in a simulation fault model, not independently reviewed), and the implementation waits for a design review.
 
 **Batched commits (GC2, user decision 2026-11-21).** While a proposal for a range is in flight, the range leader queues further `DirectCommit`s for that range and proposes them together as one `DirectBatch` entry, at most 64 members and 1 MiB encoded. A lone commit is proposed at once, with zero linger, as a one-entry `Direct` commit. Each member keeps its own request ID, digest, `commit_ts`, result and dedup record. Apply validates each member in the order above against the state left by the members before it. A rejected member writes nothing and the others apply. The entry's reply lists one outcome per member; a replayed member's result is read from its dedup record, so the reply stays within the participant reply bound. Members never share a key: the leader's key latches are held from the read to the apply, and apply refuses a member that shares a key with an earlier one. A proposal error reaches every member, and each retries through its dedup record. Split barrier, frozen source, forward markers, backups and snapshots apply per member, unchanged. The leader proposes `DirectBatch` only while the cluster feature `data.direct.batch` is enabled; otherwise it proposes one `Direct` entry per commit.
 
-**Cluster features (GC2).** As with ScyllaDB's cluster features, every worker advertises the features its build supports, and Control enables a feature once every enrolled worker advertised it with its current identity. Every Control voter and learner is an enrolled worker, so it then runs a build that knows the feature. The enablement is a durable Control fact that never reverts, and afterwards a worker identity that did not advertise it cannot join a Data group or the ready set. The advert is an ordinary `data.direct.v1` `Advertise { version: 1 }` whose operation ID is derived from the feature name and the exact worker identity, so Control replicas of the previous build apply it byte for byte alike; the feature-aware build reads the advert from its operation receipt. Downgrading a worker below a build that knows an enabled feature is unsupported, as for `data.direct.v1`. The features form one registry (CAP1): `data.direct.batch`, `status.queued-snapshot-retry` and `data.index.reclaim`. Data leaders propose `ReclaimIndex` entries, and workers send the index reclamation service calls, only once `data.index.reclaim` is enabled. A per-connection ALPN capability is kept only for transport behaviour that changes no frame, entry or log format (`nabedra-otp/4`, direct admission); the former `nabedra-otp/3` gate for index reclamation is retired.
+**Cluster features (GC2).** As with ScyllaDB's cluster features, every worker advertises the features its build supports, and Control enables a feature once every enrolled worker advertised it with its current identity. Every Control voter and learner is an enrolled worker, so it then runs a build that knows the feature. The enablement is a durable Control fact that never reverts, and afterwards a worker identity that did not advertise it cannot join a Data group or the ready set. The advert is an ordinary `data.direct.v1` `Advertise { version: 1 }` whose operation ID is derived from the feature name and the exact worker identity, so Control replicas of the previous build apply it byte for byte alike; the feature-aware build reads the advert from its operation receipt. Downgrading a worker below a build that knows an enabled feature is unsupported, as for `data.direct.v1`. The features form one registry (CAP1): `data.direct.batch`, `status.queued-snapshot-retry`, `data.index.reclaim` and `data.direct.record-outcomes`. Data leaders propose `ReclaimIndex` entries, and workers send the index reclamation service calls, only once `data.index.reclaim` is enabled. A per-connection ALPN capability is kept only for transport behaviour that changes no frame, entry or log format (`nabedra-otp/4`, direct admission); the former `nabedra-otp/3` gate for index reclamation is retired.
 
 **Mixed versions.** Add a Control capability `data.direct.v1` next to the existing [scoped-queue capability](../server/oltp-replication/src/oltp_replication/authority/control/machine/scoped_queue/capability.rs). Control activates it automatically when every voter and learner advertises it. No leader proposes `Direct` before activation, since an older replica cannot decode the variant.
 
@@ -168,7 +168,7 @@ Each range leader keeps this state in memory.
 struct RangeClock { max_read_ts: ReadTs, pending: BTreeMap<CommitTs, PendingKeys> }
 ```
 
-1. A direct commit takes its timestamp after latching its keys. If `commit_ts <= max_read_ts`, it fetches a new one. It registers in `pending` before proposing and leaves on apply or rejection.
+1. A direct commit takes its timestamp after latching its keys. If `commit_ts <= max_read_ts`, it fetches a new one. It registers in `pending` before proposing and leaves on apply or rejection. A proposal error whose outcome is unknown, such as the executor's deadline, is neither: the entry stays pending until it applies or leadership changes.
 2. Every snapshot read at `s` on the leader, direct or queued, raises `max_read_ts` to `s` and waits until no `pending` entry is at or below `s`. Add this to `read_at`, `read_page` and the scan path in [`store/handle.rs`](../server/oltp-storage/src/oltp/mvcc/store/handle.rs).
 3. A new leader serves nothing until its first entry of the new term applies. That empties `pending`.
 
@@ -185,16 +185,18 @@ enum DirectResponse { Done(RawValue), Failed(ProtocolError), Fallback, StaleRout
 
 Mutation steps on the leader:
 
-1. Charge the body bytes and one in-flight slot against the worker's existing budgets. When full, return `429 overloaded` with `not_applied`.
+1. Charge the body bytes and one in-flight slot against the worker's existing budgets. A refusal marks the current attempt as overloaded. The gateway applies the mutation outcome rule below before answering the client.
 2. Check leadership and both epochs. Latch the keys in sorted order in a striped `KeyLatches` table, bounded by the deadline.
-3. Look up the dedup record. Read each row head and newest version from local applied state.
+3. Look up the dedup record. Replay a retained result for the same body, or answer the digest conflict, before validating against the current descriptor. On a miss, read each row head and newest version from local applied state.
 4. Validate the row against the cached table descriptor. Compute the new row, the index changes and the exact result, reusing the planner's row and index functions from [`planner.rs`](../server/oltp-storage/src/oltp/mvcc/planner.rs).
 5. Allocate `commit_ts`, register in `pending`, propose `DirectCommit` and await apply.
 6. On `Rejected(Conflict)` from a leadership race, go back to step 3 while the deadline allows. Release the latches and reply.
 
-`table.get` runs steps 1 and 2 without latches, then `ensure_linearizable(ReadPolicy::LeaseRead)`, falling back to `ReadIndex` when the lease is stale. It reads the newest version and returns `Fallback` on an intent. It needs no timestamp. It waits for any `pending` commit on its key.
+`table.get` runs step 1 without latches, then `ensure_linearizable(ReadPolicy::LeaseRead)`, falling back to `ReadIndex` when the lease is stale, and then checks leadership and both epochs on the applied state at or after that read index. It reads the newest version and returns `Fallback` on an intent. It needs no timestamp. It waits for any `pending` commit on its key.
 
-The gateway retries `NotLeader` and `StaleRoute` against the refreshed route. After a lost reply it resends the same `request_id` and body, and the dedup record makes the retry exactly-once. When the deadline expires, it returns `outcome_unknown`. Reduce the ingress charge in [`http.rs`](../server/src/oltp_runtime/http.rs) to twice the body length for direct requests.
+The gateway retries `NotLeader` and `StaleRoute` against the refreshed route. After a lost reply it resends the same `request_id` and body, and the dedup record makes the retry exactly-once. Reduce the ingress charge in [`http.rs`](../server/src/oltp_runtime/http.rs) to twice the body length for direct requests.
+
+**Mutation outcome (OD-3 and OD-7).** A mutation identity spans gateway calls. Return `outcome_unknown` if a deadline, unreachable route, admission refusal or latch timeout leaves its outcome unsettled at the authoritative anchor. An early descriptor validation failure follows the same rule when it prevents the lookup for an otherwise identified mutation. Replay a retained result for the same identity and body before returning any current descriptor validation error. A `not_applied` response for a mutation requires durable proof at the authoritative anchor that all attempts for the identity are settled and cannot commit a write. The proof covers prior calls as well as the current call. The client retries an unknown outcome with the same request ID and body. Reads retain their existing `not_applied` refusals.
 
 ## 7. Schema changes
 
@@ -221,7 +223,7 @@ A point operation touches three voters regardless of cluster size. Throughput gr
 | Gateway or client dies mid-request | The entry commits or it does not. A retry with the same ID and body returns the one result. |
 | Leader dies before quorum | The gateway retries on the new leader. The dedup record decides whether the first attempt committed. |
 | One follower slow or down | Commits continue on the leader and the other follower. |
-| Two voters down | No commit. The gateway returns `outcome_unknown` or unavailable at the deadline. |
+| Two voters down | No new commit while quorum is unavailable. A mutation still unsettled at the deadline returns `outcome_unknown`. |
 | All workers stop | Committed rows and dedup records recover from disk. Nothing pending exists to abandon. |
 | Split or leader move | `StaleRoute` or `NotLeader`, one cache refresh, retry within the deadline. |
 | Queued transaction holds an intent on the key | `Fallback` to the queued path. |
@@ -254,14 +256,14 @@ Add these to [the OLTP contract](../docs/testing/oltp-contract.md) under "Direct
 | D02 | Kill the gateway after the leader proposes, then retry the same ID and body through another gateway | One committed version, the original result, one dedup record. |
 | D03 | Same ID with a different body on the same key, then on a different key | The first is a conflict. The second executes, as decided above. |
 | D04 | Kill the leader before quorum and after quorum | No acknowledged write is lost and none applies twice. The retry completes on the new leader. |
-| D05 | Pause one follower, then two | One paused: writes succeed within the deadline. Two paused: no success response and the row is unchanged. |
+| D05 | Pause one follower, then two. Retry the same mutation while its anchor is unreachable or its latch times out. | One paused: writes succeed within the deadline. Two paused: no success and no write while quorum is unavailable. An unsettled retry returns `outcome_unknown` and the same ID and body resolve to one outcome after quorum returns. |
 | D06 | A snapshot scan at `s` races direct commits, including across a Timestamp leader change | The scan sees every commit at or below `s` and none above. No commit appears below a snapshot that already read the range. |
 | D07 | Split a range and move its leader during a write load | Each request gets one outcome, with no lost or duplicate rows. Stale routes refresh once. |
 | D08 | Direct and queued writers on the same keys, including an intent held open | Histories match a serial order. Direct requests fall back while the intent exists. |
 | D09 | Kill all workers under write load, then cold start | Every acknowledged write is present. Dedup records replay acknowledged IDs. |
 | D10 | Drop sessions mid-stream, exhaust a lane, offer an old one-shot peer | Callers see unknown-outcome or overload errors, Raft progress continues, and the old peer still interoperates. |
-| D11 | Drop a table and publish an index during direct writes | No row lands in a dropped table and no write uses a retired schema epoch. |
-| D12 | Offer more load than the leader's in-flight budget | Explicit `429` before execution, bounded memory, and every acknowledged ID verified afterwards. |
+| D11 | Drop a table and publish an index during direct writes. Replay an acknowledged ID after the descriptor changes. | No row lands in a dropped table and no write uses a retired schema epoch. A retained result takes precedence over validation against the new descriptor. |
+| D12 | Exceed the leader's in-flight budget, including a mutation retry after a lost reply. | Admission refuses before execution and memory stays bounded. A refusal for an unsettled mutation returns `outcome_unknown`. Verify every acknowledged ID and the retried identity after the load ends. |
 
 Also run the existing OLTP library suite, the four OLTP integration tests, `scripts/acceptance_oltp.py`, both ORM suites and the scoped acceptance runners with `direct_oltp` on and off. The five native failures recorded in [the scoped evidence](../docs/testing/evidence/oltp/scoped-queues/README.md) are the known baseline.
 
@@ -338,3 +340,73 @@ Found in review of T4 (`RV-T4`). These refine section 4 and 6 without changing t
 ## Out of scope
 
 Removing the queued point path or the scoped queue from PR #19. Both stay in the tree, and the scoped queue stays off by default. A thread-per-core runtime. Hash partitioning. Follower reads. Cross-range one-phase commit.
+
+## Design review
+
+### Recorded-outcome rollout review
+
+`OltpDirectRollout` checks the `data.direct.record-outcomes` extension to `data.direct.v1`. The two builds apply the existing
+advertisement command and differ in how they interpret a recorded-outcome member. The new build advertises under its current
+worker identity. Control enables the feature once all admitted replicas have done so. A replacement must establish its own
+advertisement before serving when the feature is enabled. The per-worker `direct_oltp` flag changes request routing while the
+durable capability and any proposed or committed outcome record survive the change.
+
+```mermaid
+flowchart LR
+    C1[Client 1] --> G[Gateways with per-worker direct_oltp]
+    C2[Client 2] --> G
+    subgraph W[Three co-located worker slots]
+        C[Control quorum and current identity advertisements]
+        R1[Data range 1]
+        R2[Data range 2]
+    end
+    C -->|Durable capability enables recorded members| R1
+    C -->|Durable capability enables recorded members| R2
+    G --> R1
+    G --> R2
+```
+
+**Approved rollout rule.** After its current incarnation advertises, keep a worker on a build that understands the feature,
+including while Control is still collecting advertisements. A return to a down-level build before activation requires
+retiring the advertised identity and enrolling afresh. Once the feature is enabled, every new identity also needs a capable
+build to gain admission. This model treats same-disk downgrade as an operator-controlled restriction. Startup enforcement and
+the on-disk downgrade protection considered in OD-6 are outside this change.
+
+The pre-activation failure uses eight states. Two workers upgrade. The third slot retires, and the two upgraded members advertise.
+One of those replicas downgrades on the same disk and keeps its receipt. Control reads both receipts and enables a feature
+one of its replicas cannot interpret. The post-activation failure uses ten states. Control enables the feature, a Data range
+commits a new-format record, and an admitted replica downgrades against that history. Both traces fail
+`G03_EnabledMembersUnderstand`.
+
+| Part | Content |
+| --- | --- |
+| Guarantees | OLTP-G03 maps to `G03_EnabledMembersUnderstand`, `G03_ProposalHasFeature`, `G03_FeatureStaysEnabled` and `G03_RecordedOutcomeStable`. The rollout progress constraint is `G10_EligibleClusterEnables`. |
+| Bounds and mechanisms | Three worker slots, two Data ranges, two concurrent client identities and two resets that may overlap. Symmetry only in the safety baseline. Control's processing of authenticated advertisements drives the weakly fair enablement step while a quorum and all current advertisements remain available. Both Data ranges share Control's abstract admission set. |
+| Results | Local, unattested TLC 1.8.0. Safety exhausted 5,538 states at depth 21. Liveness exhausted 28,400 states at depth 22. All 11 actions ran, with at least 639 states generated by each. T check `oltp-outcome-rollout-spec` still needs Actions evidence on the reviewed SHA. |
+| Mutants | `allow_stale_advert` (10), `downgrade_before_enable` (8), `downgrade_after_enable` (10) and `enable_early` (4) break member compatibility. `propose_before_gate` (3) proposes before enablement. `flag_clears_feature` (8) clears enablement. `recompute_on_rollback` (11) changes a retained result. `skip_activation` (15-state lasso) prevents enablement. Their controls pass. |
+| Cost | One Control advertisement per worker identity. The durable feature fact is written as part of the Control apply. One Data log member per newly recorded no-op or row conflict, with the same replicated append as a write. Flag flips add zero Control log entries. |
+| Independent read | R-04 in `wave-rv/reads/oltp-direct.md` supplies the mixed-build incompatibility. The two downgrade traces identify the required operational restriction. The user accepted the restriction. Independent review of the abstraction remains pending. |
+
+Admission and Data commit are atomic abstractions here. The model covers two overlapping incarnation resets and gateway flag
+changes. It abstracts Raft election, membership transfer, binary decoding, offline disks, transport, and the base
+`data.direct.v1` activation. It assumes the authoritative replay at the retained record, abstracts queue forwarding, and
+leaves forward-marker history, retention expiry, schema validation and inherited pre-feature no-op results to their own checks.
+The approved OLTP-G04 uncertain-outcome policy belongs to `OltpDirect` and the direct-path acceptance cases.
+
+### Direct request path review
+
+Reviewed 2026-11-26 (wave-rv, rv-oltp-direct) against `origin/main` `e6b4040b`. Spec: `specs/oltp/direct/OltpDirect.tla`,
+T check `oltp-direct-spec`. The queued path's spec is in [the scheduling plan](resource-aware-scheduling.md#design-review).
+Findings with code locations: `wave-rv/findings/oltp-direct.md` (OD-1 to OD-n) in the review wave's files.
+
+| Part | Content |
+| --- | --- |
+| Guarantees | OLTP-G01: `G01_AckedDurable`. OLTP-G02: `G02_SnapshotStable` (rule 2) and `G03_RecordedPrecondition`. OLTP-G03: `G03_OncePerKey`, `G03_SameResult`, `G03_DigestConflict`, `G03_RecordedPrecondition`. OLTP-G04: `G04_NotAppliedHasProof`. OLTP-G10: `G10_ProposalsResolve`, `G10_CallsAnswered` (liveness). Not modelled here: OLTP-G06 (epochs, DDL fence, splits: the stopped draft modelled the fence; splits are OltpRanges'), OLTP-G05 (cross-range batches are queued), OLTP-G12 (client encoding), OLTP-G13 (timing). The activation boundary, forward markers, the history window and the `direct_oltp` flip (O15) are not modelled in this spec; see Open gaps. |
+| Topology | Clients, each through its own gateway; 3 workers, each a voter of 2 ranges; a range leader with executors and a RangeClock; the Timestamp authority as one counter; a queued writer without direct latches. Channels: gateway to leader (attempts, with the reply on the same stream), leader to followers (Raft, abstracted as a committed state plus the leader's proposals; a new leader holds a prefix). Stores: each range's committed state (rows, versions, dedup records). Modelled faults: node crash and restart with disk, partition of one node from the other workers, leader move, a lost reply, a typed 429 refusal, a gateway crash, and the timers: the PEER_ATTEMPT resend, the leader's deadline (`by`), the gateway deadline. Out of scope: restart without disk and membership (OltpRanges), torn unsynced writes (storage engine, O11), the Timestamp window, coalescing and failover (independent read R-08, R-09), clock drift (dedup expiry, R-06), Byzantine faults. |
+| Spec | `specs/oltp/direct/OltpDirect.tla`, `MCOltpDirect.tla`. Baselines: `OltpDirect.cfg` (S1: update races an insert of its row, one snapshot read), `.s1d.cfg` (S1 with a delete of the missing row), `.s2.cfg` (one id, two bodies), `.s3.cfg` (one id on two ranges), `.s5.cfg` (insert refused on a present row races its delete, with a repeat after the answer), `.sq.cfg` (update races a queued insert), `.live.cfg` (liveness, S1, no symmetry). Bounds: 3 nodes, 2 ranges, 2 concurrent clients; c1 has 2 attempts per call and one retry after an unknown; every fault kind once, at most 2 per behavior, so two faults overlap. No constraint, no VIEW; symmetry of the two followers in the safety baselines only. Fairness: the PEER_ATTEMPT timer, the gateway deadline, the executor task and its deadline, AppendEntries and heartbeats, OpenRaft's leader no-op, the election timer, the process supervisor, partition repair. T check: `oltp-direct-spec`. |
+| Results | T check `oltp-direct-spec`, run https://github.com/zPy52/nabedra-database/actions/runs/45826147978 on `f3c244bb`: pass. Every baseline exhaustive with 0 states left: S1 3,457,706 distinct states, depth 26, 228 s; S2 408,280, depth 24; S3 961,842, depth 26; S5 1,098,036, depth 28; SQ 7,672,038, depth 30, 575 s; liveness 1,200,995, depth 24, 986 s. Coverage: every action of `Next`, minimum count 416,461. Every mutant caught on its property. The baseline `OltpDirect.s1d.cfg` (a delete of a missing row racing an insert, the vector session's DR-1 trace) and its mutant `prefix_dr1_delete_unrecorded` were added after that run and are checked in the PR's final run. Earlier run 45811091969 on `a73045d0`: SQ stopped at the budget with a snapshot read, so SQ now has none (S1 checks rule 2). |
+| Mutants | Shortest counterexamples (breadth first): `ack_before_commit` breaks `G01_AckedDurable` (3 states); `prefix_settle_unknown` (6) and `no_rule3` (7) break `G02_SnapshotStable`; `dedup_ignored` breaks `G03_OncePerKey` (10); `prefix_dr1_readonly_unrecorded` (9), `prefix_dr1_refusal_unrecorded` (9) and `reexecute_on_retry` (9) break `G03_SameResult`; `record_no_precondition` breaks `G03_RecordedPrecondition` (6); `digest_ignored` breaks `G03_DigestConflict` (6); `prefix_dr2_not_applied_per_call` breaks `G04_NotAppliedHasProof` (10); `first_entry_needs_traffic` breaks `G10_ProposalsResolve` and `no_gateway_deadline` breaks `G10_CallsAnswered` (liveness baseline). `TypeOK` is exempt. Lengths are from local runs; the Actions summary records them per run. |
+| Counterexamples | OD-1 (`prefix_settle_unknown`, 6 states): a commit whose proposal the deadline cut leaves `pending`, a snapshot read at a later timestamp passes, the entry commits below it. Fix in section 5 rule 1 (plan fixed, code pending). OD-2 (`prefix_dr1_readonly_unrecorded`, 9 states): a resend overtakes the first attempt, answers a no-op, and the first attempt later applies. Section 4 already requires the record; its mechanism is added there now (plan fixed, code pending). OD-3 (`prefix_dr2_not_applied_per_call`, 10 states): a retry call answers `not_applied` while an earlier call's attempt still commits. The approved outcome rule is in section 6 (plan fixed, code pending). OD-7 is the same risk when schema validation runs before the dedup lookup. D05, D11 and D12 cover the implementation cases. Bug records (open): `docs/testing/bugs/2026-11-26-design-direct-settle-unknown-proposal.toml` (OD-1), `2026-11-24-design-direct-readonly-outcome-unrecorded.toml` (OD-2), and the simulator's `2026-11-24-oltp-sim-retry-not-applied-after-commit.toml` (OD-3). Coverage gaps that let them through: no property for snapshot repeatability (added: `G02_SnapshotStable`), D02 and D03 lost their no-op assertions, and `not_applied` was checked per attempt only. |
+| Cost | Per mutation, from the spec's actions: 1 gateway-to-leader RPC; 0 or 1 coalesced `AllocateDirect`, overlapped with the read; a lease check (a quorum round trip only when the lease is stale); 1 native read job (read-before-write); 1 Data entry; 1 AppendEntries round trip; 1 synced log write per replica (3 per write; measured 2.98 to 3.04 at 1 to 20/s). Targets: 1 Data entry, 0 or 1 Timestamp RPC, one group-committed fsync per replica: met at these rates. A recorded no-op or row conflict adds 1 entry and 3 fsyncs where there are none today. Not met: throughput (about 100 updates/s at 3 workers, ScyllaDB 440/s), because one leader and one proposal in flight per range serialize a one-range table. |
+| Independent read | Fresh read `wave-rv/reads/oltp-direct.md` (R-01 to R-24): R-01 is `G03_RecordedPrecondition` with `record_no_precondition`; R-02 and R-18 are apply's dedup check and rule 3 (`dedup_ignored`, `no_rule3`); R-03 and R-13 are `RefuseRequest`, `ExecGiveUp` (latch and pending-key deadline), `ExecTimeout`, `GwUnreachable`, `GwDeadline` and `prefix_dr2_not_applied_per_call`; R-05 and R-17 are modelled in `ApplyDirect` and the executor's latch; R-04, R-06, R-07, R-15, R-22 and R-23 are plan text fixed or recorded here as gaps; R-08 to R-12, R-14, R-16, R-19 to R-21 and R-24 are not modelled, each with its reason in the review report. The 2026-11-24 read's forward-marker, activation and rollback scenarios are not modelled by this spec (open gap). |
+| Open gaps | Not modelled: the activation boundary, forward markers, the history window, rollback mode and the `direct_oltp` flip (O15), mixed builds and downgrade, the DDL fence, `DirectBatch` as one entry, gets, and the Timestamp group. These need a second spec (`OltpDirectRollout`). `OltpDirect` checks the public outcome of admission refusal and a wait beyond the latch deadline. D11 covers the new-descriptor replay ordering in OD-7 because the model abstracts schemas. |

@@ -264,3 +264,264 @@ async fn d04_fixa_shutdown_refuses_a_batch_that_never_reached_raft() {
         "{response:?}"
     );
 }
+
+struct ApplyAfterTimeout {
+    inner: Arc<RaftConsensus<DataConfig, ParticipantMachine>>,
+    release: Arc<Notify>,
+    applied: Arc<Notify>,
+}
+
+impl Consensus<ParticipantCommand, ParticipantReply> for ApplyAfterTimeout {
+    fn propose(
+        &self,
+        command: OwnedCommand<ParticipantCommand>,
+    ) -> ConsensusFuture<'_, Applied<ParticipantReply>> {
+        let inner = self.inner.clone();
+        let release = self.release.clone();
+        let applied = self.applied.clone();
+        Box::pin(async move {
+            // Dropping the wait for a submitted proposal does not cancel Raft's work.
+            let submitted = tokio::spawn(async move {
+                release.notified().await;
+                let result = inner.propose(command).await;
+                applied.notify_one();
+                result
+            });
+            submitted.await.expect("submitted proposal task")
+        })
+    }
+
+    fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {
+        self.inner.ensure_linearizable()
+    }
+
+    fn lease_read_index(&self) -> ConsensusFuture<'_, u64> {
+        self.inner.lease_read_index()
+    }
+
+    fn current_leader(&self) -> Option<u64> {
+        self.inner.current_leader()
+    }
+
+    fn local_node(&self) -> Option<u64> {
+        self.inner.local_node()
+    }
+}
+
+#[tokio::test]
+async fn d05_unknown_proposal_keeps_range_clock_pending_until_apply() {
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    let voter = &cluster.voters[leader];
+    let clock = cluster.clock(leader);
+    let consensus = Arc::new(ApplyAfterTimeout {
+        inner: voter.consensus.clone(),
+        release: Arc::new(Notify::new()),
+        applied: Arc::new(Notify::new()),
+    });
+    let handle = Arc::new(ParticipantHandle::new(
+        ParticipantMachine::new(voter.store.clone()).unwrap(),
+        consensus.clone(),
+    ));
+    let request = timed_insert(&cluster, leader, 1);
+    let deadline = request.deadline;
+    let mut response = Box::pin(voter.executor.execute(&handle, request));
+    at_proposal(voter, response.as_mut(), 1).await;
+    assert_eq!(clock.pending_len(), 1);
+    let token = clock.leader_token().unwrap();
+
+    pause();
+    advance(deadline + Duration::from_millis(1)).await;
+    let response = response.await;
+    resume();
+    assert_eq!(
+        code(&response).map(|(_, outcome)| outcome),
+        Some(Outcome::Unknown)
+    );
+    assert_eq!(clock.leader_token(), Some(token));
+    assert_eq!(
+        clock.pending_len(),
+        1,
+        "an unknown proposal can still apply"
+    );
+
+    consensus.release.notify_one();
+    nabedra_rt::time::timeout(Duration::from_secs(5), consensus.applied.notified())
+        .await
+        .expect("submitted proposal finishes");
+    assert!(cluster.latest(leader, cluster.row_key(1)).await.0.is_some());
+    assert_eq!(
+        clock.pending_len(),
+        0,
+        "apply settled the pending timestamp"
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn d05_deadline_before_raft_enqueue_settles_range_clock() {
+    use crate::oltp::test_hooks::index_holds::{Checkpoint, register_checkpoint};
+
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    let voter = &cluster.voters[leader];
+    let clock = cluster.clock(leader);
+    let request = timed_insert(&cluster, leader, 1);
+    let reached = register_checkpoint(request.request_id, Checkpoint::StorageReserved);
+    let deadline = request.deadline;
+    let mut response = Box::pin(voter.executor.execute(&voter.handle, request));
+    let held = nabedra_rt::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            held = reached => held.expect("storage reservation reached"),
+            reply = &mut response => panic!("proposal ended before the reservation: {reply:?}"),
+        }
+    })
+    .await
+    .expect("proposal reaches the pre-enqueue checkpoint");
+    assert_eq!(clock.pending_len(), 1);
+    let token = clock.leader_token().unwrap();
+
+    pause();
+    advance(deadline + Duration::from_millis(1)).await;
+    let response = response.await;
+    resume();
+
+    assert_eq!(
+        code(&response).map(|(_, outcome)| outcome),
+        Some(Outcome::Unknown)
+    );
+    assert!(
+        held.release.send(true).is_err(),
+        "pre-enqueue wait was cancelled"
+    );
+    assert_eq!(clock.leader_token(), Some(token));
+    assert_eq!(
+        clock.pending_len(),
+        0,
+        "an unsubmitted command cannot apply"
+    );
+    assert_eq!(
+        cluster.latest(leader, cluster.row_key(1)).await,
+        (None, None)
+    );
+    cluster.shutdown().await;
+}
+
+struct RefuseQueuedProposal {
+    inner: Arc<RaftConsensus<DataConfig, ParticipantMachine>>,
+    first: Uuid,
+    release_first: Notify,
+    queued_taken: Notify,
+    refuse_queued: Notify,
+    refused: Notify,
+}
+
+impl Consensus<ParticipantCommand, ParticipantReply> for RefuseQueuedProposal {
+    fn propose(
+        &self,
+        command: OwnedCommand<ParticipantCommand>,
+    ) -> ConsensusFuture<'_, Applied<ParticipantReply>> {
+        Box::pin(async move {
+            if matches!(command.payload()?, ParticipantCommand::Direct(commit)
+                if commit.request_id == self.first)
+            {
+                self.release_first.notified().await;
+                self.inner.propose(command).await
+            } else {
+                assert!(matches!(
+                    command.payload()?,
+                    ParticipantCommand::DirectBatch(batch) if batch.members.len() == 2
+                ));
+                self.queued_taken.notify_one();
+                self.refuse_queued.notified().await;
+                self.refused.notify_one();
+                Err(ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    "proposal refused before append",
+                    Outcome::NotApplied,
+                ))
+            }
+        })
+    }
+
+    fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {
+        self.inner.ensure_linearizable()
+    }
+
+    fn lease_read_index(&self) -> ConsensusFuture<'_, u64> {
+        self.inner.lease_read_index()
+    }
+
+    fn current_leader(&self) -> Option<u64> {
+        self.inner.current_leader()
+    }
+
+    fn local_node(&self) -> Option<u64> {
+        self.inner.local_node()
+    }
+}
+
+#[tokio::test]
+async fn d05_batch_driver_settles_late_definitive_refusal() {
+    let cluster = Cluster::new(Options {
+        batch: true,
+        ..Default::default()
+    })
+    .await;
+    let leader = cluster.leader().await;
+    let voter = &cluster.voters[leader];
+    let clock = cluster.clock(leader);
+    let keys = distinct_keys(&cluster, 3);
+    let first = timed_insert(&cluster, leader, keys[0]);
+    let consensus = Arc::new(RefuseQueuedProposal {
+        inner: voter.consensus.clone(),
+        first: first.request_id,
+        release_first: Notify::new(),
+        queued_taken: Notify::new(),
+        refuse_queued: Notify::new(),
+        refused: Notify::new(),
+    });
+    let handle = Arc::new(ParticipantHandle::new(
+        ParticipantMachine::new(voter.store.clone()).unwrap(),
+        consensus.clone(),
+    ));
+    let mut lone = Box::pin(voter.executor.execute(&handle, first));
+    at_proposal(voter, lone.as_mut(), 1).await;
+    let request = timed_insert(&cluster, leader, keys[1]);
+    let deadline = request.deadline;
+    let mut queued = Box::pin(voter.executor.execute(&handle, request));
+    at_proposal(voter, queued.as_mut(), 2).await;
+    let mut companion = timed_insert(&cluster, leader, keys[2]);
+    companion.deadline += Duration::from_secs(5);
+    let mut companion = Box::pin(voter.executor.execute(&handle, companion));
+    at_proposal(voter, companion.as_mut(), 3).await;
+
+    consensus.release_first.notify_one();
+    assert_eq!(lone.await, done("null"));
+    nabedra_rt::time::timeout(Duration::from_secs(5), consensus.queued_taken.notified())
+        .await
+        .expect("batch driver takes the queued member");
+
+    pause();
+    advance(deadline + Duration::from_millis(1)).await;
+    let response = queued.await;
+    assert_eq!(
+        code(&response).map(|(_, outcome)| outcome),
+        Some(Outcome::Unknown)
+    );
+    assert_eq!(clock.pending_len(), 2);
+    consensus.refuse_queued.notify_one();
+    // The driver's deadline follows the later companion, so it can still
+    // receive the refusal after the first member's caller timed out.
+    nabedra_rt::time::timeout(Duration::from_secs(5), consensus.refused.notified())
+        .await
+        .expect("driver observes a definitive rejection");
+    resume();
+    drop(companion);
+    assert_eq!(clock.pending_len(), 0);
+    assert_eq!(
+        cluster.latest(leader, cluster.row_key(keys[1])).await,
+        (None, None)
+    );
+    cluster.shutdown().await;
+}
