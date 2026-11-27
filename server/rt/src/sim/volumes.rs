@@ -14,6 +14,11 @@
 //! old image and fail. Old node contexts and `NodeFs` handles cannot reopen paths on
 //! the replacement image. [`World::wipe`] replaces one volume of a crashed node by an empty
 //! one: the RV-REP #3 condition, a wiped data volume next to a surviving key volume, is one call.
+//! [`World::snapshot_volume`] and [`World::restore_volume`] put an older image of the same disk
+//! back under the same identity, as an in-place backup restore or a VM rollback does (SIM-5).
+//! [`World::set_volume_capacity`] gives a volume a size: growth past it fails with `ENOSPC`, and
+//! `statvfs` reports it (SIM-17). A power-loss restart reports what each volume kept and tore
+//! ([`SimEvent::TornWrite`], SIM-6).
 
 #[cfg(unix)]
 use std::borrow::Cow;
@@ -27,7 +32,7 @@ use uuid::Uuid;
 use super::{NodeContext, SimEvent, World, current_node_context, lock, world};
 #[cfg(unix)]
 use crate::fs::DescriptorInode;
-use crate::fs::{FaultFs, Fs, FsFile, FsLock, OpenMode, PowerLoss};
+use crate::fs::{FaultFs, Fs, FsFile, FsLock, OpenMode, PowerLoss, PowerLossReport};
 
 /// The identity of a simulated volume, as the mount code reads it from the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +91,23 @@ struct Volume {
     fs: FaultFs,
 }
 
+/// An image of a volume as a block-level snapshot takes it: crash consistent, so what a
+/// sync covered when it was taken ([`World::snapshot_volume`]).
+#[derive(Clone, Debug)]
+pub struct VolumeSnapshot {
+    node: u64,
+    mount: PathBuf,
+    image: FaultFs,
+    taken: std::time::Duration,
+}
+
+impl VolumeSnapshot {
+    /// The virtual time it was taken at ([`World::elapsed`]).
+    pub fn taken(&self) -> std::time::Duration {
+        self.taken
+    }
+}
+
 #[derive(Debug, Default)]
 struct TableState {
     /// Per node, in mount order.
@@ -93,6 +115,8 @@ struct TableState {
     next_minor: u32,
     next_mount_id: u64,
     mkfs_inodes: bool,
+    /// The world seed, when volumes list in a seeded order.
+    seeded_listing: Option<u64>,
     unmounted_errors: u64,
     #[cfg(unix)]
     next_descriptor: u64,
@@ -146,6 +170,17 @@ impl Table {
         }
     }
 
+    /// Seeded listing order on every volume, present and future, or sorted again.
+    pub(crate) fn set_seeded_listing(&self, seed: u64, on: bool) {
+        let mut state = lock(&self.state);
+        state.seeded_listing = on.then_some(seed);
+        for volume in state.volumes.values().flatten() {
+            volume
+                .fs
+                .set_list_seed(list_seed(state.seeded_listing, &volume.info));
+        }
+    }
+
     fn find<T>(&self, node: u64, path: &Path, f: impl FnOnce(&mut Volume) -> T) -> Option<T> {
         let mut state = lock(&self.state);
         state
@@ -155,6 +190,12 @@ impl Table {
             .find(|volume| volume.info.mount_path == path)
             .map(f)
     }
+}
+
+/// A volume's listing seed: the world's, mixed with its identity, so drawing it takes
+/// nothing from any stream.
+fn list_seed(world_seed: Option<u64>, info: &VolumeInfo) -> Option<u64> {
+    world_seed.map(|seed| seed ^ info.dev.rotate_left(17) ^ info.mount_id.rotate_left(41))
 }
 
 /// The namespace reserved for descriptor paths in the ambient simulation.
@@ -460,6 +501,7 @@ impl World {
     fn new_volume(&self, node: u64, info: VolumeInfo, ino_base: u64) -> Volume {
         let fs = FaultFs::with_device(info.dev, ino_base);
         fs.create_dir_all_durable(&info.mount_path);
+        fs.set_list_seed(list_seed(lock(&self.volumes.state).seeded_listing, &info));
         self.attach(node, &info.mount_path, &fs);
         Volume { info, fs }
     }
@@ -531,7 +573,7 @@ impl World {
         if self.is_up(node) {
             self.crash(node);
         }
-        let images: Vec<(PathBuf, FaultFs)> = {
+        let images: Vec<(PathBuf, FaultFs, Option<PowerLossReport>)> = {
             let state = lock(&self.volumes.state);
             state
                 .volumes
@@ -539,24 +581,110 @@ impl World {
                 .into_iter()
                 .flatten()
                 .map(|volume| {
-                    let image = match cut {
-                        Cut::Kill => volume.fs.kill(),
-                        Cut::Crash => volume.fs.crash(),
-                        Cut::PowerLoss { seed } => volume.fs.power_loss(seed),
+                    let (image, report) = match cut {
+                        Cut::Kill => (volume.fs.kill(), None),
+                        Cut::Crash => (volume.fs.crash(), None),
+                        Cut::PowerLoss { seed } => {
+                            let (image, report) =
+                                volume.fs.power_loss_report(seed, PowerLoss::default());
+                            (image, Some(report))
+                        }
                         Cut::PowerLoss4k { seed } => {
-                            volume.fs.power_loss_with(seed, PowerLoss::destroy_4k())
+                            let (image, report) =
+                                volume.fs.power_loss_report(seed, PowerLoss::destroy_4k());
+                            (image, Some(report))
                         }
                     };
-                    (volume.info.mount_path.clone(), image)
+                    (volume.info.mount_path.clone(), image, report)
                 })
                 .collect()
         };
-        for (path, image) in images {
+        let mut reports = Vec::new();
+        for (path, image, report) in images {
             self.attach(node, &path, &image);
             self.volumes.find(node, &path, |volume| volume.fs = image);
+            reports.extend(report.map(|report| (path, report)));
         }
         self.emit(&SimEvent::Cut { node, cut });
         self.restart(node);
+        for (mount, report) in &reports {
+            self.emit(&SimEvent::TornWrite {
+                node,
+                mount,
+                report,
+            });
+        }
+    }
+
+    /// A crash-consistent image of the volume mounted at `path` on `node` as it is now: what
+    /// a sync covered, as a block-level snapshot of a live disk holds. The node may be up.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such volume.
+    pub fn snapshot_volume(&self, node: u64, path: &Path) -> VolumeSnapshot {
+        let image = self
+            .volumes
+            .find(node, path, |volume| volume.fs.crash())
+            .unwrap_or_else(|| panic!("node {node} has no volume at {}", path.display()));
+        VolumeSnapshot {
+            node,
+            mount: path.to_path_buf(),
+            image,
+            taken: self.elapsed(),
+        }
+    }
+
+    /// Puts `snapshot` back as the volume it was taken of, on its crashed node, under the
+    /// same identity (device, filesystem uuid, mount id): the disk is rolled back, and
+    /// nothing at the mount tells the node so. The old image is halted. One snapshot can be
+    /// restored many times; each restore is a copy. Then restart the node with
+    /// [`World::restart_with`], which also brings its other volumes back from the cut (a
+    /// plain [`World::restart`] leaves them halted).
+    ///
+    /// # Panics
+    ///
+    /// If the node is up, or no longer has that volume.
+    pub fn restore_volume(&self, snapshot: &VolumeSnapshot) {
+        let (node, path) = (snapshot.node, snapshot.mount.as_path());
+        assert!(
+            !self.is_up(node),
+            "node {node} is up: crash it before restoring {}",
+            path.display()
+        );
+        let image = snapshot.image.kill();
+        let old = self
+            .volumes
+            .find(node, path, |volume| {
+                std::mem::replace(&mut volume.fs, image.clone())
+            })
+            .unwrap_or_else(|| panic!("node {node} has no volume at {}", path.display()));
+        old.halt();
+        // The capacity and listing order are the device's, as of now.
+        image.set_capacity(old.capacity());
+        if let Some(info) = self.volume_info(node, path) {
+            image.set_list_seed(list_seed(lock(&self.volumes.state).seeded_listing, &info));
+        }
+        self.attach(node, path, &image);
+        self.emit(&SimEvent::StaleRestore {
+            node,
+            mount: path,
+            taken: snapshot.taken,
+        });
+    }
+
+    /// Gives the volume mounted at `path` on `node` a capacity of `bytes`: growth past it
+    /// fails with `ENOSPC` ([`FaultFs::set_capacity`]) and `statvfs` reports it. `None` is
+    /// the default, unbounded, reported as [`CAPACITY_BYTES`]. Images after a restart keep it;
+    /// a replaced or reformatted volume ([`World::wipe`]) keeps it too.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such volume.
+    pub fn set_volume_capacity(&self, node: u64, path: &Path, bytes: Option<u64>) {
+        self.volumes
+            .find(node, path, |volume| volume.fs.set_capacity(bytes))
+            .unwrap_or_else(|| panic!("node {node} has no volume at {}", path.display()));
     }
 
     /// Replaces the volume mounted at `path` on a crashed `node` with an empty one. The old
@@ -580,6 +708,7 @@ impl World {
             })
             .unwrap_or_else(|| panic!("node {node} has no volume at {}", path.display()));
         old_fs.halt();
+        let capacity = old_fs.capacity();
         let minor = match how {
             Wipe::Reformat => Some(old_info.minor),
             Wipe::Replace => None,
@@ -589,11 +718,14 @@ impl World {
             base += 1 << 20;
         }
         let volume = self.new_volume(node, info, base);
+        volume.fs.set_capacity(capacity);
         self.volumes.find(node, path, |slot| *slot = volume);
+        let mkfs = lock(&self.volumes.state).mkfs_inodes;
         self.emit(&SimEvent::Wipe {
             node,
             mount: path,
             how,
+            mkfs,
         });
     }
 

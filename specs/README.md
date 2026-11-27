@@ -201,5 +201,9 @@ prove the pipeline end to end.
 | Module | Spec | Guarantees | T checks | Plan |
 | --- | --- | --- | --- | --- |
 | testing | `selftest/TwoPhase.tla` | none: the tooling self-test | `specs-selftest`, `specs-selftest-trace`, `specs-selftest-large` | none |
+| sim | `sim/disk/SimDisk.tla` | Disk fault model | `sim-sim-disk` | [Simulator design review](sim/README.md) |
+| sim | `sim/net/SimNet.tla` | Stream fault model | `sim-sim-net` | [Simulator design review](sim/README.md) |
+| sim | `sim/net-rpc/SimNetRpc.tla` | RPC fault model | `sim-sim-net-rpc` | [Simulator design review](sim/README.md) |
+| sim | `sim/clock/SimClock.tla` | Clock fault model | `sim-sim-clock` | [Simulator design review](sim/README.md) |
 
-No product spec exists yet. Existing protocols get one on next touch.
+Existing product protocols get a spec on next touch.

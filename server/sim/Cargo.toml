@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94.1"
 description = "Nabedra's deterministic simulation core: trace hash, network plan, nemesis, Raft observer, seed sweep and shrinking"
 license = "MIT"
-repository = "https://github.com/zPy52/nabedra-database"
+repository = "https://github.com/nabedra/database"
 # Dev-only. No product crate depends on it, and it depends on no product crate.
 publish = false
 

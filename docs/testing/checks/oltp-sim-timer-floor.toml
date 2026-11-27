@@ -1,0 +1,20 @@
+id = "oltp-sim-timer-floor"
+module = "oltp"
+kinds = ["S"]
+guarantees = []
+scenarios = ["O09"]
+tiers = ["T1"]
+# Setup coverage for clocks whose drift can change while their timers are armed.
+# Removing the configured floor is the fail-before control in the same test.
+command = ["bash", "-euo", "pipefail", "-c", '''
+export CARGO_TARGET_DIR="$PWD/$CARGO_TARGET_DIR"
+cargo test --locked -p nabedra-sim-oltp --lib config::tests::setup_keeps_timers_from_firing_before_their_node_deadline -- --exact --test-threads=1
+python3 ../scripts/testing/repeat_gate.py <<'JSON'
+[{"id": "config::tests::setup_keeps_timers_from_firing_before_their_node_deadline", "file": "server/sim-oltp/src/config.rs", "lang": "rust"}]
+JSON
+''']
+cwd = "server"
+timeout_s = 2400
+needs = []
+result_parser = "cargo-test"
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim" }

@@ -83,7 +83,7 @@ affected check as not run and give the reason.
 ### 1. Clone and check the tools
 
 ```sh
-git clone https://github.com/zPy52/nabedra-database.git
+git clone https://github.com/nabedra/database.git nabedra-database
 cd nabedra-database
 python3 --version        # 3.11 or later
 ```

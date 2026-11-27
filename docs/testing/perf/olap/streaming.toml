@@ -1,4 +1,4 @@
-name = "OLAP streaming batch p99"
+name = "OLAP streaming batch latency"
 module = "olap"
 command = [
     "sh", "-eu", "-c",
@@ -15,5 +15,10 @@ exec python3.11 scripts/benchmark_olap_streaming.py --binary "$1" --commit "$com
 ]
 warmup = 1
 rounds = 6
+timeout_s = 900
 metric_file = "streaming.json"
-metric = '"steady_next_ms"\s*:\s*\{[^}]*"p99"\s*:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+
+# Medians across the three prefetch depths of the dense profile.
+[metrics]
+steady_next_p99_ms = '"steady_next_ms"\s*:\s*\{[^}]*"p99"\s*:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+first_batch_p99_ms = '"first_batch_ms"\s*:\s*\{[^}]*"p99"\s*:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'

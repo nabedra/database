@@ -238,6 +238,15 @@ pub(crate) struct ExpiryInput {
     pub(crate) last_advance: Option<Instant>,
     pub(crate) sampled_at: Instant,
 }
+/// Fence a possible readiness write without changing the current membership.
+pub(crate) fn fence_readiness(
+    root: &Control,
+    owner: Owner,
+    proposal: Uuid,
+) -> Result<MembershipCandidate, StorageError> {
+    candidate(root, owner, base(root, owner)?, proposal, root.clone())
+}
+
 #[allow(dead_code)] // Later runtime uses this pure calculation.
 pub(crate) fn ready_candidate(
     root: &Control,

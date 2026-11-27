@@ -1,0 +1,16 @@
+# T2 form of lsm-lsm: specs/lsm/Lsm.large.cfg (every fault kind in one run, three writes) as a
+# seeded TLC simulation, labelled as simulation. It never replaces the exhaustive T1 baselines.
+id = "lsm-lsm-large"
+module = "lsm"
+kinds = ["T"]
+guarantees = ["LSM-G01", "LSM-G02", "LSM-G03"]
+scenarios = ["LSM01", "NS04", "NS05", "NS07"]
+tiers = ["T2"]
+command = [
+  "python3", "scripts/testing/tla_check.py", "specs/lsm", "Lsm",
+  "--tier", "T2", "--simulate", "--seed", "1", "--num", "200000", "--depth", "80",
+]
+cwd = "."
+timeout_s = 5400
+needs = ["tlc"]
+result_parser = "tlc"

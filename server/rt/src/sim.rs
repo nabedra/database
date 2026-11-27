@@ -87,10 +87,22 @@
 //! A crash marks the node's services dead before it aborts any task, so destructors that
 //! run during the abort never wait for a live service.
 //!
+//! # Fidelity
+//!
+//! Some behaviours of the simulated machine are kinder than a real one, and the sweeps of
+//! the cluster harnesses were tuned against them. [`World::set_fidelity`] turns the closer
+//! ones on, each on its own ([`Fidelity`]); a run that sets none takes the same steps as
+//! before. They are meant to be turned on per workload by its owner, each with a planted
+//! bug that only it catches (`server/sim/tests/fault_classes.rs`).
+//!
 //! # Observing a run
 //!
-//! [`World::observe`] reports every service step, crash, restart and pause, in order, so
-//! a harness can hash the run's trace and compare two runs of one seed.
+//! [`World::observe`] reports every service step, crash, restart and pause, every clock
+//! fault (drift changes, wall jumps, monotonic advances, freezes and thaws), every fault of
+//! the stream network, every disk cut with what a power loss tore, every wipe and stale
+//! restore, and every filesystem call (with the injected error it returned, if any), in
+//! order, so a harness can hash the run's trace and compare two runs of one seed.
+//! [`World::global_pauses`] counts the stop-the-world pauses.
 
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
@@ -320,16 +332,64 @@ struct Node {
 struct State {
     rng: SplitMix64,
     nodes: BTreeMap<u64, Node>,
+    /// See [`World::set_drift_bound_ppm`].
+    drift_bound_ppm: Option<i64>,
+    fidelity: Fidelity,
+}
+
+/// Closer-to-reality behaviours of the simulated machine, all off by default
+/// ([`World::set_fidelity`]). Each is a fault class of its own: a workload turns one on
+/// when its owner has a clean twin and a planted bug that only it catches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Fidelity {
+    /// A dial to a powered-off host hangs until the host restarts, instead of being refused
+    /// at once (SIM-16). See `sim/net.rs`.
+    pub power_off_dials_hang: bool,
+    /// After a powered-off host restarts, a peer's next segment on an old session resets
+    /// it (SIM-16). See `sim/net.rs`.
+    pub reset_after_reboot: bool,
+    /// With this probability per connection, a killed process's connection delivers what
+    /// it already sent, then FIN, instead of resetting (SIM-20). See `sim/net.rs`.
+    pub kill_flush_per_mille: u32,
+    /// A clock read inside [`World::with_ext`] (the Cache's ClockBound sample, say) counts
+    /// for the clock freezes, and the freeze lands right after the outermost `with_ext`
+    /// returns, between the sample and its use (SIM-7). Without it such reads never stop.
+    pub freeze_after_ext_reads: bool,
+    /// A [`crate::time::thread_sleep`] in blocking work suspends the job for the sleep,
+    /// while the rest of the world runs on, instead of pausing every node's clock (SIM-18).
+    /// A sleep on the simulation thread itself still pauses the world.
+    pub sleep_suspends_job: bool,
+    /// Simulated volumes list directories in a seeded order, not sorted (SIM-19).
+    pub seeded_listing: bool,
+}
+
+impl Fidelity {
+    /// Every behaviour on; a killed process flushes half of its connections.
+    pub fn realistic() -> Fidelity {
+        Fidelity {
+            power_off_dials_hang: true,
+            reset_after_reboot: true,
+            kill_flush_per_mille: 500,
+            freeze_after_ext_reads: true,
+            sleep_suspends_job: true,
+            seeded_listing: true,
+        }
+    }
 }
 
 type Observer = Arc<dyn Fn(&SimEvent<'_>) + Send + Sync>;
+
+/// A product registry tracked by [`World::track_registry`]: its name, and whether its
+/// owner is still alive.
+type Registry = (&'static str, Box<dyn Fn() -> bool + Send>);
 
 /// The run's observers and type-keyed extension slots.
 #[derive(Default)]
 struct Hooks {
     observers: Mutex<Vec<Observer>>,
     ext: Mutex<BTreeMap<TypeId, Box<dyn Any + Send>>>,
-    registries: Mutex<Vec<(&'static str, Box<dyn Fn() -> bool + Send>)>>,
+    registries: Mutex<Vec<Registry>>,
 }
 
 impl std::fmt::Debug for Hooks {
@@ -350,6 +410,8 @@ pub struct World {
     /// Stop-the-world pauses so far, in nanoseconds: virtual time the runtime clock never
     /// ran ([`World::pause_all`]).
     paused_nanos: AtomicU64,
+    /// Stop-the-world pauses so far ([`World::global_pauses`]).
+    pauses: AtomicU64,
     #[cfg(target_os = "linux")]
     blocking_cpu_nanos: AtomicU64,
     services: services::Registry,
@@ -381,8 +443,11 @@ impl World {
             state: Mutex::new(State {
                 rng: SplitMix64::new(seed),
                 nodes: BTreeMap::new(),
+                drift_bound_ppm: None,
+                fidelity: Fidelity::default(),
             }),
             paused_nanos: AtomicU64::new(0),
+            pauses: AtomicU64::new(0),
             #[cfg(target_os = "linux")]
             blocking_cpu_nanos: AtomicU64::new(0),
             services: services::Registry::new(seed),
@@ -409,6 +474,33 @@ impl World {
     /// stop-the-world pauses ([`World::pause_all`]), which the runtime clock never ran.
     pub fn elapsed(&self) -> Duration {
         virtual_now().saturating_duration_since(self.start) + self.paused()
+    }
+
+    /// Turns the behaviours of `fidelity` on, and the others off, from now on.
+    pub fn set_fidelity(self: &Arc<Self>, fidelity: Fidelity) {
+        self.lock().fidelity = fidelity;
+        self.set_net_fidelity(net::Fidelity {
+            power_off_dials_hang: fidelity.power_off_dials_hang,
+            reset_after_reboot: fidelity.reset_after_reboot,
+            kill_flush_per_mille: fidelity.kill_flush_per_mille.min(1_000),
+        });
+        self.volumes
+            .set_seeded_listing(self.seed, fidelity.seeded_listing);
+        if fidelity.freeze_after_ext_reads || fidelity.sleep_suspends_job {
+            self.faults.arm();
+        }
+    }
+
+    /// See [`World::set_fidelity`].
+    pub fn fidelity(&self) -> Fidelity {
+        self.lock().fidelity
+    }
+
+    /// How many stop-the-world pauses ([`World::pause_all`]) the run took so far: each
+    /// moved every node's clock at once, so a run that counts on one slow node should see
+    /// few.
+    pub fn global_pauses(&self) -> u64 {
+        self.pauses.load(Ordering::SeqCst)
     }
 
     /// Stop-the-world pauses so far.
@@ -441,8 +533,18 @@ impl World {
     ///
     /// If the node exists, or the drift is at or below -1,000,000 ppm.
     pub fn add_node(&self, node: u64, clock: NodeClock) {
+        let mut clock = Clock::new(clock);
+        let bound = self.lock().drift_bound_ppm;
+        if let Some(bound) = bound {
+            assert!(
+                clock.drift_ppm.abs() <= bound,
+                "node {node} drifts {} ppm, beyond the world's declared bound of {bound} ppm",
+                clock.drift_ppm
+            );
+            clock.timer_floor_ppm = Some(-bound);
+        }
         let entry = Node {
-            clock: Clock::new(clock),
+            clock,
             rng: SplitMix64::new(node_seed(self.seed, node)),
             up: true,
             incarnation: 0,
@@ -464,11 +566,54 @@ impl World {
     pub fn set_drift_ppm(&self, node: u64, drift_ppm: i64) {
         assert_drift(drift_ppm);
         let elapsed = self.elapsed();
+        let bound = self.lock().drift_bound_ppm;
+        if let Some(bound) = bound {
+            assert!(
+                drift_ppm.abs() <= bound,
+                "a drift of {drift_ppm} ppm is beyond the world's declared bound of {bound} ppm"
+            );
+        }
         self.with_node(node, |entry| {
             assert_floor(drift_ppm, entry.clock.timer_floor_ppm);
             entry.clock.reanchor(elapsed);
             entry.clock.drift_ppm = drift_ppm;
         });
+        self.emit(&SimEvent::Drift {
+            node,
+            ppm: drift_ppm,
+        });
+    }
+
+    /// Declares that no node's drift leaves `[-bound_ppm, bound_ppm]`, now or later, and
+    /// gives every node, present and added later, a timer floor of `-bound_ppm`
+    /// ([`World::set_timer_floor_ppm`]), so no drift change inside the bound makes a timer
+    /// fire before its node clock reaches the deadline (SIM-13). A drift outside the bound
+    /// panics, at [`World::add_node`] or [`World::set_drift_ppm`]. A harness that drives a
+    /// drift beyond its design's assumption on purpose (a beyond-bound twin) declares no
+    /// bound, or a wider one. Off (`None`) by default.
+    ///
+    /// # Panics
+    ///
+    /// If the bound is negative or at least 1,000,000, or a node's present drift is outside it.
+    pub fn set_drift_bound_ppm(&self, bound_ppm: Option<i64>) {
+        if let Some(bound) = bound_ppm {
+            assert!(
+                (0..1_000_000).contains(&bound),
+                "a drift bound of {bound} ppm is not in [0, 1,000,000)"
+            );
+        }
+        let mut state = self.lock();
+        state.drift_bound_ppm = bound_ppm;
+        for (id, entry) in &mut state.nodes {
+            if let Some(bound) = bound_ppm {
+                assert!(
+                    entry.clock.drift_ppm.abs() <= bound,
+                    "node {id} drifts {} ppm, beyond the bound of {bound} ppm",
+                    entry.clock.drift_ppm
+                );
+            }
+            entry.clock.timer_floor_ppm = bound_ppm.map(|bound| -bound);
+        }
     }
 
     /// Declares that `node`'s drift never goes below `floor_ppm`, and maps the timers it
@@ -499,6 +644,7 @@ impl World {
             entry.clock.reanchor(elapsed);
             entry.clock.anchor_local = entry.clock.anchor_local.saturating_add(by);
         });
+        self.emit(&SimEvent::MonoAdvance { node, by });
     }
 
     /// Steps `node`'s wall clock forward by `by` (O09). The monotonic clock does not move.
@@ -506,12 +652,20 @@ impl World {
         self.with_node(node, |entry| {
             entry.clock.wall_offset_nanos += by.as_nanos() as i128;
         });
+        self.emit(&SimEvent::WallJump {
+            node,
+            nanos: by.as_nanos() as i128,
+        });
     }
 
     /// Steps `node`'s wall clock backward by `by` (O09). The monotonic clock does not move.
     pub fn jump_wall_backward(&self, node: u64, by: Duration) {
         self.with_node(node, |entry| {
             entry.clock.wall_offset_nanos -= by.as_nanos() as i128;
+        });
+        self.emit(&SimEvent::WallJump {
+            node,
+            nanos: -(by.as_nanos() as i128),
         });
     }
 
@@ -599,6 +753,7 @@ impl World {
     /// Powers off `node`: black-holes existing sessions and refuses new dials,
     /// then halts its volumes and aborts its tasks.
     pub fn power_off(&self, node: u64) {
+        self.emit(&SimEvent::PowerOff { node });
         self.cut_node(node, true);
     }
 
@@ -649,6 +804,7 @@ impl World {
             }
         });
         self.services.forget_finished(node);
+        net::restarted(self, node);
         self.emit(&SimEvent::Restart { node });
     }
 
@@ -680,6 +836,12 @@ impl World {
     /// stepped services stop with their driver tasks. Code outside the node that drives
     /// its services inline ([`crate::task::drive_until`]) is not stopped.
     pub fn freeze(&self, node: u64) {
+        self.freeze_node(node);
+        self.emit(&SimEvent::Freeze { node });
+    }
+
+    /// [`World::freeze`] without its event: a clock freeze reports `ClockFrozen` instead.
+    fn freeze_node(&self, node: u64) {
         self.with_node(node, |entry| {
             entry.frozen = true;
             entry.freezes += 1;
@@ -692,10 +854,13 @@ impl World {
 
     /// Resumes a frozen `node`'s tasks.
     pub fn thaw(&self, node: u64) {
-        let parked = self.with_node(node, |entry| {
-            entry.frozen = false;
-            std::mem::take(&mut entry.parked)
+        let (was_frozen, parked) = self.with_node(node, |entry| {
+            let was_frozen = std::mem::replace(&mut entry.frozen, false);
+            (was_frozen, std::mem::take(&mut entry.parked))
         });
+        if was_frozen {
+            self.emit(&SimEvent::Thaw { node });
+        }
         for waker in parked {
             waker.wake();
         }
@@ -747,7 +912,13 @@ impl World {
             entry.insert(slot);
         }
         match result {
-            Ok(value) => Some(value),
+            Ok(value) => {
+                // A clock read inside may stop here, with every slot back in place.
+                if !in_ext() {
+                    suspend::deferred_clock_point();
+                }
+                Some(value)
+            }
             Err(panic) => resume_unwind(panic),
         }
     }
@@ -761,6 +932,7 @@ impl World {
         }
         let nanos = u64::try_from(by.as_nanos()).unwrap_or(u64::MAX);
         self.paused_nanos.fetch_add(nanos, Ordering::SeqCst);
+        self.pauses.fetch_add(1, Ordering::SeqCst);
         self.emit(&SimEvent::Pause { by });
     }
 
@@ -879,11 +1051,57 @@ pub enum SimEvent<'a> {
         node: u64,
         cut: Cut,
     },
-    /// [`World::wipe`] replaced a volume by an empty one.
+    /// [`World::wipe`] replaced a volume by an empty one. `mkfs`: its inode numbers start
+    /// over ([`World::set_mkfs_inodes`]).
     Wipe {
         node: u64,
         mount: &'a std::path::Path,
         how: Wipe,
+        mkfs: bool,
+    },
+    /// [`World::power_off`] is about to cut `node`; its `Crash` follows. A `Crash` without
+    /// one is a process kill ([`World::crash`]).
+    PowerOff {
+        node: u64,
+    },
+    /// [`World::set_drift_ppm`].
+    Drift {
+        node: u64,
+        ppm: i64,
+    },
+    /// [`World::jump_wall_forward`] (positive) or [`World::jump_wall_backward`].
+    WallJump {
+        node: u64,
+        nanos: i128,
+    },
+    /// [`World::advance_mono`].
+    MonoAdvance {
+        node: u64,
+        by: Duration,
+    },
+    /// [`World::freeze`]. A freeze right after a clock read reports `ClockFrozen` instead.
+    Freeze {
+        node: u64,
+    },
+    /// A frozen node goes on: [`World::thaw`], or the end of a seeded clock freeze.
+    Thaw {
+        node: u64,
+    },
+    /// The stream network did something to a message, a connection or a link.
+    Net(net::NetFault),
+    /// A power-loss cut ([`World::restart_with`]) replaced the volume at `mount`: what it
+    /// kept, lost and tore of the state no sync covered. Follows the `Cut`.
+    TornWrite {
+        node: u64,
+        mount: &'a std::path::Path,
+        report: &'a crate::fs::PowerLossReport,
+    },
+    /// [`World::restore_volume`] put an older image of the same disk under `mount`.
+    /// `taken` is the virtual time [`World::snapshot_volume`] took it at.
+    StaleRestore {
+        node: u64,
+        mount: &'a std::path::Path,
+        taken: Duration,
     },
 }
 
@@ -1227,7 +1445,10 @@ pub(crate) fn thread_sleep(duration: Duration) {
     let context = current_node_context();
     if world.context_active(context) {
         services::settle(&world, context);
-        world.pause_all(to_runtime_duration(duration));
+        let by = to_runtime_duration(duration);
+        if !suspend::sleep_point(&world, by) {
+            world.pause_all(by);
+        }
     }
 }
 
@@ -1462,7 +1683,9 @@ pub(crate) mod suspend;
 pub mod volumes;
 
 pub use suspend::{ClockRead, PausedCall, Side, StoragePause, clock_read};
-pub use volumes::{Cut, VolumeInfo, Wipe, volume_for};
+pub use volumes::{Cut, VolumeInfo, VolumeSnapshot, Wipe, volume_for};
 
+#[cfg(test)]
+mod fault_classes;
 #[cfg(test)]
 mod tests;

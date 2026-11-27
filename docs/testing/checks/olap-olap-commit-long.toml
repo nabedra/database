@@ -1,0 +1,14 @@
+# The OLAP commit protocol spec (specs/olap/OlapCommit.tla) with a 5-hour budget per run, for baselines at the L2
+# bounds (3 writers, 2 requests, one of every fault) that do not finish within the 15-minute T1 budget. It runs the
+# same baselines and mutants exhaustively with more time and never makes the T1 cell green.
+id = "olap-olap-commit-long"
+module = "olap"
+kinds = ["T"]
+guarantees = ["OLAP-G01", "OLAP-G02", "OLAP-G03", "OLAP-G04", "OLAP-G05"]
+scenarios = ["T01", "T02", "T03", "T04", "T05", "T06"]
+tiers = ["T2"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/olap", "OlapCommit", "--budget-s", "18000"]
+cwd = "."
+timeout_s = 21000
+needs = ["tlc"]
+result_parser = "tlc"

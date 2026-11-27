@@ -73,6 +73,8 @@ pub(super) struct Inventory {
     pub free: Vec<FreeSeg>,
     /// Sorted by number.
     pub headerless: Vec<Headerless>,
+    /// Unusable free files, removed only after recovery validates the manifest identities.
+    pub discard: Vec<PathBuf>,
     /// Highest number in any file name.
     pub max_number: u64,
 }
@@ -87,7 +89,7 @@ pub(super) fn inventory(fs: &dyn Fs, dir: &Path, segment_bytes: u64) -> Result<I
     let mut free = Vec::new();
     let mut headerless = Vec::new();
     let mut max_number = 0;
-    let mut removed = false;
+    let mut discard = Vec::new();
     for path in fs.list(dir).map_err(io)? {
         let Some((number, is_live_name)) = parse_name(&path) else {
             continue;
@@ -134,10 +136,8 @@ pub(super) fn inventory(fs: &dyn Fs, dir: &Path, segment_bytes: u64) -> Result<I
                     epoch: header.epoch,
                 });
             } else {
-                // A free file of another size (an older option): drop it, new ones are created.
-                drop(file);
-                fs.remove(&path).map_err(io)?;
-                removed = true;
+                // A free file of another size (an older option).
+                discard.push(path);
             }
         } else if is_live_name {
             // No intact header copy on a live name. The protocol never produces this (a
@@ -152,13 +152,8 @@ pub(super) fn inventory(fs: &dyn Fs, dir: &Path, segment_bytes: u64) -> Result<I
             });
         } else {
             // A free file whose creation never finished: L4.
-            drop(file);
-            fs.remove(&path).map_err(io)?;
-            removed = true;
+            discard.push(path);
         }
-    }
-    if removed {
-        fs.sync_dir(dir).map_err(io)?;
     }
     live.sort_by_key(|s| s.number);
     headerless.sort_by_key(|s| s.number);
@@ -166,6 +161,7 @@ pub(super) fn inventory(fs: &dyn Fs, dir: &Path, segment_bytes: u64) -> Result<I
         live,
         free,
         headerless,
+        discard,
         max_number,
     })
 }

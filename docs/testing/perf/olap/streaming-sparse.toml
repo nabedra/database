@@ -1,0 +1,29 @@
+name = "OLAP sparse streaming batch latency"
+module = "olap"
+command = [
+    "sh", "-eu", "-c",
+    '''
+if [ "$3" = base ]; then
+    commit="$NABEDRA_PERF_BASE_SHA"
+else
+    commit="$NABEDRA_PERF_HEAD_SHA"
+fi
+export PYTHONPATH=orm/python/src
+exec python3.11 scripts/benchmark_olap_streaming.py --binary "$1" --commit "$commit" --fixture-commit "$NABEDRA_PERF_FIXTURE_SHA" --profile sparse_wide --evidence "$2"
+''',
+    "olap-benchmark", "{bin}", "{work}/streaming.json", "{side}",
+]
+warmup = 1
+rounds = 20
+timeout_s = 900
+metric_file = "streaming.json"
+
+# The sparse/wide profile: 160 of 640 rows, a 35 ms training delay per batch, storage jitter and
+# ordinary requests during the stream. It skips the dense profile's oracle collect.
+# Medians across the three prefetch depths.
+# The steady-state p99 swings with the storage jitter (A/A sd 55% at 10 rounds), so it is reported and
+# the steady-state p50 gates.
+[metrics]
+steady_next_p50_ms = '"steady_next_ms"\s*:\s*\{[^}]*"p50"\s*:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+first_batch_p99_ms = '"first_batch_ms"\s*:\s*\{[^}]*"p99"\s*:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+steady_next_p99_ms = { pattern = '"steady_next_ms"\s*:\s*\{[^}]*"p99"\s*:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)', gate = false }
