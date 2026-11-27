@@ -2,6 +2,8 @@
 # the shipped timer mapping). Not reproduced in a running simulator. First found by dr-sim on 2026-11-24 (main 7dadd41d);
 # still present on main e6b4040b: the timer floor (eb82a2e3) defaults to None and no harness sets it, and the OLTP
 # nemesis now changes drift mid-run (Action::Clock), as the Cache nemesis does on workers.
+# 2026-11-27 (fx-sim): 62fc6d5b floors OLTP worker and gateway timers; afc5bd8d adds World::set_drift_bound_ppm,
+# which floors every node of a world. Open until the Cache and Events harnesses declare their bound.
 id = "SIM-EARLY-TIMER"
 title = "A simulated timer armed before a drift change fires before its node clock reaches the deadline"
 class = "other"
@@ -14,7 +16,7 @@ lowest_regression = "specs/sim/clock/mutants/prefix_early_timer.cfg"
 seed = "unknown"
 why_not_caught = "drift_scales_the_node_clock_and_its_timers arms timers only after the drift is set, and no harness calls World::set_timer_floor_ppm, while the Cache and OLTP nemeses change drift with timers armed."
 invariant_added = "TimerNeverEarly: when a simulated timer completes, its node clock has reached the deadline (specs/sim/clock/SimClock.tla)."
-fix_commits = []
+fix_commits = ["62fc6d5b", "afc5bd8d"]
 revert_patch_ok = false
 status = "open"
 owner = "zPy52"
