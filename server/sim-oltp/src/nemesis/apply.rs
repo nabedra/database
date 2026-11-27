@@ -594,7 +594,7 @@ impl Chaos {
                 let node = *g.pick(&nodes);
                 let drift = g.range_i64(-CLOCK_DRIFT_BOUND_PPM, CLOCK_DRIFT_BOUND_PPM);
                 let jump = g.range_i64(-2_000, 2_000);
-                cluster.world.set_drift_ppm(node, drift);
+                crate::config::set_drift(&cluster.world, node, drift);
                 let by = Duration::from_millis(jump.unsigned_abs());
                 if jump < 0 {
                     cluster.world.jump_wall_backward(node, by);

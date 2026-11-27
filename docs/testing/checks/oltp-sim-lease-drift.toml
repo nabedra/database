@@ -1,0 +1,26 @@
+id = "oltp-sim-lease-drift"
+module = "oltp"
+kinds = ["S"]
+# Component fault model (SIM-10). The stated drift bound of the OLTP leader lease, rho = 1,000 ppm
+# (sim-oltp config.rs LEASE_DRIFT_BOUND_PPM), and its beyond-bound twin. A drift past the bound is
+# refused in any run not marked beyond-bound. The twin (leader -5,000 ppm, voters +5,000 ppm) must
+# report a stale lease read as non-linearizable on every build; the in-bound run (leader at minus
+# the bound, voters at plus it) must be clean. The in-bound run is red while RANGES-3 (no drift
+# margin in the lease) is open. It proves no product guarantee by itself.
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euo", "pipefail", "-c", '''
+build=(cargo test --locked --release -p nabedra-sim-oltp --lib)
+"${build[@]}" --no-run
+"${build[@]}" -- --exact --test-threads=1 \
+    scripted::lease_drift::drift_past_the_bound_needs_a_beyond_bound_run \
+    config::tests::setup_keeps_timers_from_firing_before_their_node_deadline
+timeout 1200s "${build[@]}" -- --exact --ignored --nocapture --test-threads=1 \
+    scripted::lease_drift::lease_beyond_bound scripted::lease_drift::lease_in_bound
+''']
+cwd = "server"
+timeout_s = 3600
+needs = []
+result_parser = "cargo-test"
+env = { RUST_MIN_STACK = "16777216", RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SEED = "1", NABEDRA_SEEDS = "4" }

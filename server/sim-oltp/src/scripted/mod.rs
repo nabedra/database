@@ -6,6 +6,7 @@
 //! record open findings and no check runs them.
 #![cfg(test)]
 
+mod lease_drift;
 mod oltp_direct;
 
 use std::{
