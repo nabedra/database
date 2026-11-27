@@ -626,10 +626,13 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
             "{stats:?}"
         );
         // Gets and mutations that reached the leader answered directly; the
-        // utf8 key went queued, typed failures came back exact.
+        // utf8 key went queued, typed failures came back exact. The row
+        // conflict (the duplicate insert) is settled at its anchor and
+        // answered by the queued path, and the two misses record their
+        // answers as entries (OD-2).
         assert!(stats.direct_done >= 12, "{stats:?}");
-        assert_eq!(stats.forwards, 0, "{stats:?}");
-        assert_eq!(leader()["entries_applied"], json!(6));
+        assert_eq!(stats.forwards, 1, "{stats:?}");
+        assert_eq!(leader()["entries_applied"], json!(8));
 
         // A body without a declared length still takes the queued path with
         // the full parsing charge. Both the gateway and queue owner settle
@@ -724,13 +727,66 @@ async fn d03_o08_insert_conflict_texts_are_the_ones_the_history_checker_knows() 
                 }
             }
             let after = gateway.stats();
-            // Only the queued path settles the request at its anchor first.
-            assert_eq!(after.forwards > before.forwards, !direct, "{after:?}");
+            // Both paths settle a row conflict at its anchor first: the
+            // queued path for every mutation, the direct path because the
+            // leader hands a row conflict to the queued path (OD-2).
+            assert!(after.forwards > before.forwards, "{after:?}");
         }
         runtime.drain().await.unwrap();
     })
     .await
     .expect("conflict text watchdog");
+}
+
+/// OD-2 end to end: a row conflict is answered by the queued path under the
+/// identity's forward marker, so a retry of the same id and body gets the
+/// same 409 after the row is gone, whether it arrives with a declared length
+/// (direct) or without one (queued), and it never inserts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d03_od2_a_row_conflict_keeps_its_answer_on_both_paths() {
+    nabedra_rt::time::timeout(Duration::from_secs(120), async {
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "nabedra-od2-conflict-{}",
+            nabedra_rt::ids::uuid_v4()
+        )));
+        let runtime = open(&directory.0, true).await;
+        activated(&runtime).await;
+        let app = runtime.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
+        let insert = |id, value| {
+            let row = json!({"id": 5, "value": value, "tag": "t"});
+            body(id, "table.insert", json!({"table_id": table, "row": row}))
+        };
+        let (status, reply) = call(&app, insert(nabedra_rt::ids::uuid_v4(), 1), true).await;
+        assert_eq!(status, 200, "{reply}");
+        let id = nabedra_rt::ids::uuid_v4();
+        let (status, conflict) = call(&app, insert(id, 2), true).await;
+        assert_eq!(status, 409, "{conflict}");
+        assert_eq!(conflict["error"]["outcome"], "not_applied", "{conflict}");
+        let delete = body(
+            nabedra_rt::ids::uuid_v4(),
+            "table.delete",
+            json!({"table_id": table, "key": 5}),
+        );
+        assert_eq!(call(&app, delete, true).await.0, 200);
+        for declared in [true, false] {
+            assert_eq!(
+                call(&app, insert(id, 2), declared).await,
+                (409, conflict.clone()),
+                "declared {declared}: the identity's first answer"
+            );
+        }
+        let get = body(
+            nabedra_rt::ids::uuid_v4(),
+            "table.get",
+            json!({"table_id": table, "key": 5}),
+        );
+        let (status, row) = call(&app, get, true).await;
+        assert_eq!((status, &row["data"]), (200, &Value::Null), "{row}");
+        runtime.drain().await.unwrap();
+    })
+    .await
+    .expect("row conflict watchdog");
 }
 
 /// T7b items 2 and 4 on one worker over mTLS: the executor's Catalog reader
