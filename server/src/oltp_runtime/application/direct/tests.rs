@@ -977,8 +977,8 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
         latencies.push((*operation, nabedra_rt::time::elapsed(started)));
         assert_eq!(got, Answer::Data(expected.clone()), "{operation} {payload}");
     }
-    // OD-2: a row conflict is not answered directly. The id is settled at
-    // its anchor and the queued path, which records its answer, decides.
+    // Definite errors pass through with the leader's code and outcome. A
+    // row conflict is recorded at its anchor (OD-2).
     let id = nabedra_rt::ids::uuid_v4();
     let conflict = answer(
         &gateway,
@@ -986,7 +986,10 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
         id,
     )
     .await;
-    assert_eq!(conflict, Answer::Queued);
+    assert_eq!(
+        conflict,
+        Answer::Error(ErrorCode::Conflict, Outcome::NotApplied)
+    );
     assert!(cluster.settled(group, 1, id).await);
     // A key of the wrong type never reaches a leader: the queued path gives
     // the exact validation error.
@@ -1399,7 +1402,10 @@ async fn d02_q05_rv_final_l2_uncertain_resend_never_reports_a_definite_failure()
     );
     let stats = gateway.stats();
     assert_eq!(stats.resends, 1, "{stats:?}");
-    assert_eq!(stats.forward_replayed, 1, "{stats:?}");
+    // OD-7: the leader replays the retained result before it validates the
+    // resend against the changed descriptor, so no anchor settlement runs.
+    assert_eq!(stats.forward_replayed, 0, "{stats:?}");
+    assert_eq!(stats.direct_done, 1, "{stats:?}");
     // One committed version of the row.
     let (version, row) = cluster.latest(group, 0, 7).await;
     assert!(version.is_some());
@@ -2190,12 +2196,11 @@ fn o28_topology_cache_is_a_byte_bounded_range_lru() {
     assert_eq!(mode(true, true), DirectMode::Direct);
 }
 
-/// OD-2 through the gateway: an insert of a present row goes queued after a
-/// forward marker settles its id. A later attempt of the same id, after the
-/// row is deleted, still goes queued and never inserts directly, so the
-/// queued path's answer is the identity's only answer.
+/// OD-2 through the gateway: an insert of a present row answers a recorded
+/// conflict. A later call of the same id, after the row is deleted, answers
+/// the same conflict and never inserts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn d02_od2_row_conflict_is_settled_before_the_queued_path() {
+async fn d02_od2_row_conflict_keeps_its_answer_through_the_gateway() {
     let mut cluster = Cluster::new().await;
     let group = cluster.add_group(span(None, None), 1, &[1]).await;
     let source = Source::new(vec![cluster.fill(&[group])], cluster.voters());
@@ -2209,14 +2214,15 @@ async fn d02_od2_row_conflict_is_settled_before_the_queued_path() {
     );
     let id = nabedra_rt::ids::uuid_v4();
     let conflict = cluster.body(id, "table.insert", json!({"row": {"id": 1, "value": 2}}));
-    assert_eq!(answer(&gateway, &conflict, id).await, Answer::Queued);
+    let refused = Answer::Error(ErrorCode::Conflict, Outcome::NotApplied);
+    assert_eq!(answer(&gateway, &conflict, id).await, refused);
     assert!(cluster.settled(group, 1, id).await);
     let delete = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         answer(&gateway, &cluster.body(delete, "table.delete", json!({"key": 1})), delete).await,
         Answer::Data(json!(true))
     );
-    assert_eq!(answer(&gateway, &conflict, id).await, Answer::Queued);
-    assert_eq!(cluster.latest(group, 0, 1).await.1, None, "no direct insert after the marker");
+    assert_eq!(answer(&gateway, &conflict, id).await, refused);
+    assert_eq!(cluster.latest(group, 0, 1).await.1, None, "the retry never inserted");
     cluster.shutdown().await;
 }
