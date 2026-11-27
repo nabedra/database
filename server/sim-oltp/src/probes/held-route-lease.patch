@@ -1,0 +1,39 @@
+diff --git a/server/oltp-storage/src/oltp/mvcc/store.rs b/server/oltp-storage/src/oltp/mvcc/store.rs
+index 84ec8f87..b61164b4 100644
+--- a/server/oltp-storage/src/oltp/mvcc/store.rs
++++ b/server/oltp-storage/src/oltp/mvcc/store.rs
+@@ -408,6 +408,9 @@ impl ParticipantMachine {
+         // The entry applied (or was rejected) durably: its pending entry, if
+         // this node proposed it, leaves the range clock.
+         self.clock.observe_applied(position);
++        if !direct.is_empty() {
++            planted_lease(self.store.resources());
++        }
+         for commit_ts in direct {
+             self.clock.settle(commit_ts);
+         }
+@@ -530,6 +533,24 @@ impl ParticipantMachine {
+     }
+ }
+ 
++/// Planted defect: from its first direct entry on, the worker holds one working-memory lease
++/// of the size of a cached Control route (692 B), and never releases it. A baseline that let a
++/// route cache excuse its own size would hide it.
++fn planted_lease(resources: &Arc<crate::oltp::pool::WorkerSharedResources>) {
++    use crate::oltp::pool::{ByteClass, WorkerSharedResources};
++    use std::sync::{Mutex, Weak};
++    type Held = (Weak<WorkerSharedResources>, Box<dyn std::any::Any + Send>);
++    static PLANTED: Mutex<Vec<Held>> = Mutex::new(Vec::new());
++    let worker = Arc::downgrade(resources);
++    let mut planted = PLANTED.lock().expect("planted leases");
++    if planted.iter().any(|(of, _)| of.ptr_eq(&worker)) {
++        return;
++    }
++    if let Ok(lease) = resources.reserve_scratch(ByteClass::Data, 692) {
++        planted.push((worker, Box::new(lease)));
++    }
++}
++
+ fn apply(
+     tx: &mut GroupTransaction<'_>,
+     group: &GroupIdentity,

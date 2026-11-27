@@ -60,6 +60,13 @@ pub enum Ledger {
     },
     /// `RangeClock` commits registered and not yet settled, per group.
     RangeClockPending,
+    /// Control client replica route caches: one each.
+    RouteCaches,
+    /// Routes that those caches hold.
+    RouteCacheEntries,
+    /// The working-memory bytes of those routes. They are part of [`Ledger::ScratchBytes`]
+    /// and [`Ledger::SchedulerBytes`] as well. The cache's own metadata is not.
+    RouteCacheBytes,
 }
 
 /// What a guard that [`Probe::GuardAcquired`] reports holds.
