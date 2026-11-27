@@ -27,6 +27,16 @@
 //! does. Code that waits for a service inline ([`crate::task::drive_until`]) and finds
 //! nothing else to do resumes its node's suspended jobs, as it would have waited for them.
 //!
+//! [`World::set_storage_pause_ops`] chooses which calls seeded pauses stop at: syncs by
+//! default; writes and renames too when asked, so an acknowledgement sent between a write
+//! and its sync can leave before a crash lands.
+//!
+//! # Sleeps
+//!
+//! With [`super::Fidelity::sleep_suspends_job`], a [`crate::time::thread_sleep`] in a
+//! node's blocking work suspends the job the same way, for the length of the sleep on the
+//! node's clock: only that node's job waits, and the rest of the world runs on.
+//!
 //! # Clock freezes
 //!
 //! [`World::freeze`] stops a node's tasks at their next poll, so never between a clock
@@ -181,6 +191,8 @@ impl ClockRead {
 enum At {
     Call(PausedCall),
     Clock,
+    /// A `thread_sleep` of the job ([`super::Fidelity::sleep_suspends_job`]).
+    Sleep,
 }
 
 /// Where a helper thread stopped, and for how long at most.
@@ -238,6 +250,8 @@ pub(super) struct Faults {
 struct Rules {
     rng: SplitMix64,
     storage: Vec<(u64, StoragePause)>,
+    /// The calls seeded storage pauses stop at.
+    storage_ops: Vec<FsOp>,
     storage_per_mille: u64,
     storage_max: Duration,
     clock: Vec<(u64, ClockRead)>,
@@ -276,9 +290,8 @@ impl Rules {
         if let Some(index) = fired {
             hold = self.storage.remove(index).1.hold;
         } else {
-            let sync = matches!(op, FsOp::SyncData | FsOp::SyncAll | FsOp::SyncDir);
             if self.storage_per_mille == 0
-                || !sync
+                || !self.storage_ops.contains(&op)
                 || self.rng.below(1_000) >= self.storage_per_mille
             {
                 return None;
@@ -325,6 +338,7 @@ impl Faults {
                 // A stream of its own, so these draws never shift the nodes' id streams.
                 rng: SplitMix64::new(seed ^ 0xFA17_5EED_0000_0A0B),
                 storage: Vec::new(),
+                storage_ops: vec![FsOp::SyncData, FsOp::SyncAll, FsOp::SyncDir],
                 storage_per_mille: 0,
                 storage_max: Duration::ZERO,
                 clock: Vec::new(),
@@ -344,6 +358,11 @@ impl Faults {
 
     fn armed(&self) -> bool {
         self.armed.load(Ordering::Relaxed)
+    }
+
+    /// Lets jobs stop from now on, with no rule set: a sleep or a deferred clock read may.
+    pub(super) fn arm(&self) {
+        self.armed.store(true, Ordering::Relaxed);
     }
 
     /// The seeded freeze of a job about to start.
@@ -475,7 +494,7 @@ impl Ends {
     fn set(&mut self, stop: Stop) {
         // Code stopped at a clock read has no time of its own: it goes on at the thaw.
         let hold = match stop.at {
-            At::Call(_) => stop.hold,
+            At::Call(_) | At::Sleep => stop.hold,
             At::Clock => Some(Duration::ZERO),
         };
         self.until = hold.map(|hold| Instant::now() + hold);
@@ -772,9 +791,10 @@ impl Stoppable {
         match &stop.at {
             At::Call(call) => world.emit(&SimEvent::StoragePaused { node, call }),
             At::Clock => {
-                world.freeze(node);
+                world.freeze_node(node);
                 world.emit(&SimEvent::ClockFrozen { node });
             }
+            At::Sleep => {}
         }
         let paused = matches!(stop.at, At::Call(_));
         let _ = self.events.send(Event::Suspended(stop));
@@ -824,8 +844,22 @@ pub(crate) fn storage_point(op: FsOp, side: Side, path: &Path) {
     }
 }
 
+thread_local! {
+    /// The first clock read inside the running `with_ext`, under
+    /// [`super::Fidelity::freeze_after_ext_reads`].
+    static DEFERRED: Cell<Option<&'static Location<'static>>> = const { Cell::new(None) };
+}
+
 /// A freeze point of the clock seam, after a read.
-pub(crate) fn clock_point(at: &Location<'_>) {
+pub(crate) fn clock_point(at: &'static Location<'static>) {
+    if super::in_ext() {
+        let defer = DEFERRED.get().is_none()
+            && world().is_some_and(|world| world.lock().fidelity.freeze_after_ext_reads);
+        if defer {
+            DEFERRED.set(Some(at));
+        }
+        return;
+    }
     let Some((job, world)) = Stoppable::here() else {
         return;
     };
@@ -840,6 +874,35 @@ pub(crate) fn clock_point(at: &Location<'_>) {
         let at = At::Clock;
         job.suspend(&world, Stop { at, hold });
     }
+}
+
+/// The freeze point of a clock read that the outermost [`World::with_ext`] deferred.
+pub(super) fn deferred_clock_point() {
+    if let Some(at) = DEFERRED.take() {
+        clock_point(at);
+    }
+}
+
+/// Suspends the current job for `by` of virtual time, if it is a node's blocking work and
+/// [`super::Fidelity::sleep_suspends_job`] is on. False when the caller must pause the world.
+pub(super) fn sleep_point(world: &World, by: Duration) -> bool {
+    if by.is_zero() || !world.lock().fidelity.sleep_suspends_job {
+        return false;
+    }
+    let Some((job, world)) = Stoppable::here() else {
+        return false;
+    };
+    if job.kind != Kind::Job {
+        return false;
+    }
+    job.suspend(
+        &world,
+        Stop {
+            at: At::Sleep,
+            hold: Some(by),
+        },
+    );
+    true
 }
 
 /// Reports a read of the current node's clock that did not go through [`crate::time`], to
@@ -903,6 +966,28 @@ impl World {
         };
         rules.storage_max = max;
         self.faults.armed.store(true, Ordering::Relaxed);
+    }
+
+    /// The calls seeded storage pauses ([`World::set_storage_pauses`]) stop at, before and
+    /// after each: by default `SyncData`, `SyncAll` and `SyncDir`. Add `Write` for a pause
+    /// between a write and the sync that follows it, so an acknowledgement sent there can
+    /// leave before a crash lands, and `Rename` for one between a rename and its directory
+    /// sync. Rules of [`World::pause_storage`] are not affected.
+    ///
+    /// # Panics
+    ///
+    /// For an operation that has no pause point.
+    pub fn set_storage_pause_ops(&self, ops: &[FsOp]) {
+        for op in ops {
+            assert!(
+                matches!(
+                    op,
+                    FsOp::Write | FsOp::SyncData | FsOp::SyncAll | FsOp::SyncDir | FsOp::Rename
+                ),
+                "{op:?} calls have no pause point"
+            );
+        }
+        lock(&self.faults.rules).storage_ops = ops.to_vec();
     }
 
     /// The calls `node`'s jobs are suspended at, in the order they stopped.

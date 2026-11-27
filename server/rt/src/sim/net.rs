@@ -50,6 +50,23 @@
 //!   held messages arrive in order after the heal.
 //! - [`Planner`] decides per message and per dial (phase 10's `NetPlan` plugs in here).
 //!
+//! Three closer-to-TCP behaviours are opt-in, through [`crate::sim::Fidelity`]
+//! ([`World::set_fidelity`]); a run that sets none takes the same steps as before:
+//!
+//! - `power_off_dials_hang`: a dial to a powered-off host gets no answer, as a SYN to a dead
+//!   machine does, until the host restarts; then it connects or is refused. The dialer's
+//!   own timeout is what ends it. A crashed process's host still answers: refused at once.
+//! - `reset_after_reboot`: after a powered-off host restarts, the first segment a peer sends
+//!   on a session from before the power-off resets that session, as the new kernel answers
+//!   it with an RST. A peer that only reads keeps waiting, as without keepalives.
+//! - `kill_flush_per_mille`: when a process is killed ([`World::crash`]), each of its
+//!   connections, with this probability, delivers what the process already sent and then
+//!   FIN, as the kernel does on close, instead of resetting. Data the peer sends to it
+//!   afterwards resets the connection.
+//!
+//! Each message, connection and link fault the network decides is reported as a
+//! [`crate::sim::SimEvent::Net`] ([`NetFault`]), after the network's lock is released.
+//!
 //! Buffers are unbounded: a write never waits for the reader.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -64,8 +81,51 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, Sleep};
 
-use super::{World, current_node, world};
+use super::{SimEvent, SplitMix64, World, current_node, world};
 pub use crate::net::{Handshake, Target};
+
+/// A fault of the stream network, as [`SimEvent::Net`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NetFault {
+    /// The planner dropped a message: its direction stalls until the connection resets.
+    Drop {
+        conn: ConnId,
+        from: Option<u64>,
+        to: Option<u64>,
+    },
+    /// A connection was reset: by the planner, by [`World::reset_connection`], or by the
+    /// kernel of a rebooted host or of a killed process (see the module documentation).
+    Reset {
+        conn: ConnId,
+        from: Option<u64>,
+        to: Option<u64>,
+        cause: ResetCause,
+    },
+    /// The killed process `node`'s connection delivers what it sent, then FIN.
+    Flush { conn: ConnId, node: u64 },
+    /// [`World::black_hole`].
+    BlackHole { from: Option<u64>, to: Option<u64> },
+    /// [`World::heal`].
+    Heal { from: Option<u64>, to: Option<u64> },
+    /// [`World::heal_all`].
+    HealAll,
+    /// The planner refused a dial.
+    Refuse { from: Option<u64>, to: Option<u64> },
+}
+
+/// Why a connection was reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetCause {
+    /// [`Fate::Reset`].
+    Planner,
+    /// [`World::reset_connection`].
+    World,
+    /// A segment reached a host that rebooted since the session began.
+    Reboot,
+    /// A segment reached a killed process whose connection had flushed.
+    Killed,
+}
 
 /// The address of code outside any node (TEST-NET-1).
 pub const EXTERNAL_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
@@ -399,6 +459,12 @@ struct Connection {
     open: [bool; 2],
     reset: bool,
     power_cut: bool,
+    /// Under `reset_after_reboot`: a power-cut end's host is up again, so the next segment
+    /// from the other end resets the connection.
+    rebooted: bool,
+    /// Under `kill_flush_per_mille`: the side whose process was killed, after its sent data
+    /// and FIN were left to arrive.
+    killed: Option<Side>,
     alpn: Option<Vec<u8>>,
 }
 
@@ -428,6 +494,19 @@ impl Connection {
             if let Some(waker) = pipe.reader.take() {
                 waker.wake();
             }
+        }
+    }
+
+    /// The process of `side` was killed: what it sent arrives, then FIN; what it would read
+    /// is gone.
+    fn flush_killed(&mut self, side: Side) {
+        self.killed = Some(side);
+        self.holds[side.tx()] = None;
+        self.pipes[side.tx()].finish();
+        let incoming = &mut self.pipes[side.rx()];
+        incoming.queue.clear();
+        if let Some(waker) = incoming.reader.take() {
+            waker.wake();
         }
     }
 
@@ -491,6 +570,15 @@ struct State {
     /// Held links `(from, to)` and when each hole opened.
     holes: BTreeMap<(Option<u64>, Option<u64>), Instant>,
     planner: Option<Box<dyn Planner>>,
+    fidelity: Fidelity,
+    /// Powered-off hosts, under `power_off_dials_hang`.
+    powered_off: std::collections::BTreeSet<u64>,
+    /// Dials that wait for a powered-off host.
+    offline_dialers: Waiters,
+    /// Draws of `kill_flush_per_mille`.
+    rng: Option<SplitMix64>,
+    /// Faults decided under the lock, reported once it is released.
+    faults: Vec<NetFault>,
     next_conn: u64,
     next_listener: u64,
     next_port: u16,
@@ -581,6 +669,14 @@ impl State {
     }
 }
 
+/// The network part of [`crate::sim::Fidelity`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Fidelity {
+    pub(crate) power_off_dials_hang: bool,
+    pub(crate) reset_after_reboot: bool,
+    pub(crate) kill_flush_per_mille: u32,
+}
+
 /// The network of one world.
 struct Net {
     state: Mutex<State>,
@@ -589,6 +685,40 @@ struct Net {
 impl Net {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Runs `f` under the lock, then reports the faults it decided.
+    fn locked<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
+        let (value, faults) = {
+            let mut state = self.lock();
+            let value = f(&mut state);
+            (value, std::mem::take(&mut state.faults))
+        };
+        report(faults);
+        value
+    }
+}
+
+/// Reports faults decided under the network's lock, on the installed world.
+fn report(faults: Vec<NetFault>) {
+    if faults.is_empty() {
+        return;
+    }
+    if let Some(world) = world() {
+        for fault in faults {
+            world.emit(&SimEvent::Net(fault));
+        }
+    }
+}
+
+/// The node whose address is `ip`, if any.
+fn node_of(ip: IpAddr) -> Option<u64> {
+    match ip {
+        IpAddr::V4(v4) => u32::from(v4)
+            .checked_sub(0x0A00_0001)
+            .filter(|offset| *offset < 0x00FF_FFFE)
+            .map(u64::from),
+        IpAddr::V6(_) => None,
     }
 }
 
@@ -642,33 +772,94 @@ pub(crate) fn crash(world: &World, node: u64, black_hole: bool) {
     let Some(net) = find(&mut registry(), world) else {
         return;
     };
-    let mut state = net.lock();
-    let addrs: Vec<SocketAddr> = state
-        .listeners
-        .iter()
-        .filter(|(_, slot)| slot.node == Some(node))
-        .map(|(addr, _)| *addr)
-        .collect();
-    for addr in addrs {
-        state.disconnect_listener(addr, black_hole);
-    }
-    for conn in state.conns.values_mut() {
-        if conn.ends.iter().any(|end| end.node == Some(node)) {
+    net.locked(|state| {
+        let addrs: Vec<SocketAddr> = state
+            .listeners
+            .iter()
+            .filter(|(_, slot)| slot.node == Some(node))
+            .map(|(addr, _)| *addr)
+            .collect();
+        for addr in addrs {
+            state.disconnect_listener(addr, black_hole);
+        }
+        if black_hole && state.fidelity.power_off_dials_hang {
+            state.powered_off.insert(node);
+        }
+        let flush = state.fidelity.kill_flush_per_mille;
+        let State {
+            conns, rng, faults, ..
+        } = state;
+        for (id, conn) in conns.iter_mut() {
+            let Some(side) = [Side::Client, Side::Server]
+                .into_iter()
+                .find(|side| conn.end(*side).node == Some(node))
+            else {
+                continue;
+            };
             if black_hole {
                 conn.black_hole();
+                continue;
+            }
+            let flushes = !black_hole
+                && flush > 0
+                && !conn.reset
+                && !conn.power_cut
+                && rng
+                    .as_mut()
+                    .is_some_and(|rng| rng.below(1_000) < u64::from(flush));
+            if flushes {
+                conn.flush_killed(side);
+                faults.push(NetFault::Flush {
+                    conn: ConnId(*id),
+                    node,
+                });
             } else {
                 conn.reset();
             }
         }
-    }
-    state.wake_all();
+        state.wake_all();
+    });
+}
+
+/// The restart rule: a powered-off host answers again, and under `reset_after_reboot` its
+/// old sessions reset on the next segment. Called by [`World::restart`].
+pub(crate) fn restarted(world: &World, node: u64) {
+    let Some(net) = find(&mut registry(), world) else {
+        return;
+    };
+    net.locked(|state| {
+        if state.powered_off.remove(&node) {
+            state.offline_dialers.wake_all();
+        }
+        if state.fidelity.reset_after_reboot {
+            for conn in state.conns.values_mut() {
+                if conn.power_cut && conn.ends.iter().any(|end| end.node == Some(node)) {
+                    conn.rebooted = true;
+                }
+            }
+        }
+    });
 }
 
 impl World {
     fn with_net<T>(self: &Arc<Self>, f: impl FnOnce(&mut State) -> T) -> T {
-        let net = net_of(self);
-        let mut state = net.lock();
-        f(&mut state)
+        net_of(self).locked(f)
+    }
+
+    /// The network part of [`World::set_fidelity`].
+    pub(crate) fn set_net_fidelity(self: &Arc<Self>, fidelity: Fidelity) {
+        let seed = self.seed();
+        self.with_net(|state| {
+            state.fidelity = fidelity;
+            if !fidelity.power_off_dials_hang {
+                state.powered_off.clear();
+            }
+            if fidelity.kill_flush_per_mille > 0 && state.rng.is_none() {
+                // A stream of its own, so these draws never shift another stream.
+                state.rng = Some(SplitMix64::new(seed ^ 0x0F1A_5EED_0000_7C9F));
+            }
+            state.wake_all();
+        });
     }
 
     /// Records `node`'s certificate digest. Tests use the digest of the node's real test
@@ -721,7 +912,17 @@ impl World {
 
     /// Resets `conn`: both sides read and write `ConnectionReset`; unread data is lost.
     pub fn reset_connection(self: &Arc<Self>, conn: ConnId) {
-        self.with_net(|state| state.reset(conn.0));
+        self.with_net(|state| {
+            if let Some(info) = state.conns.get(&conn.0).map(|c| c.info(conn.0)) {
+                state.faults.push(NetFault::Reset {
+                    conn,
+                    from: info.client,
+                    to: info.server,
+                    cause: ResetCause::World,
+                });
+            }
+            state.reset(conn.0)
+        });
     }
 
     /// Closes `conn` gracefully in both directions: queued messages arrive, then EOF.
@@ -741,6 +942,7 @@ impl World {
         let now = Instant::now();
         self.with_net(|state| {
             state.holes.entry((from, to)).or_insert(now);
+            state.faults.push(NetFault::BlackHole { from, to });
             state.wake_all();
         });
     }
@@ -749,6 +951,7 @@ impl World {
     pub fn heal(self: &Arc<Self>, from: Option<u64>, to: Option<u64>) {
         self.with_net(|state| {
             state.holes.remove(&(from, to));
+            state.faults.push(NetFault::Heal { from, to });
             state.wake_all();
         });
     }
@@ -756,6 +959,7 @@ impl World {
     pub fn heal_all(self: &Arc<Self>) {
         self.with_net(|state| {
             state.holes.clear();
+            state.faults.push(NetFault::HealAll);
             state.wake_all();
         });
     }
@@ -832,21 +1036,27 @@ async fn dial_one(net: &Arc<Net>, from: Option<u64>, addr: SocketAddr) -> io::Re
     let mut waiter = None;
     let mut waiting_listener = None;
     poll_fn(|cx| {
-        let mut state = net.lock();
-        let state = &mut *state;
-        let Some(slot) = state
-            .listeners
-            .get(&addr)
-            .filter(|slot| waiting_listener.is_none_or(|id| id == slot.id))
-        else {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("nothing listens on simulated {addr}"),
-            )));
-        };
-        let to = slot.node;
-        let verdict =
-            if !state.holes.contains_key(&(from, to)) && !state.holes.contains_key(&(to, from)) {
+        net.locked(|state| {
+            let offline = node_of(addr.ip()).filter(|node| state.powered_off.contains(node));
+            if waiting_listener.is_none() && offline.is_some() {
+                // No host answers the SYN: the dial waits for the restart, or its timeout.
+                state.offline_dialers.register(&mut waiter, cx.waker());
+                return Poll::Pending;
+            }
+            let Some(slot) = state
+                .listeners
+                .get(&addr)
+                .filter(|slot| waiting_listener.is_none_or(|id| id == slot.id))
+            else {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("nothing listens on simulated {addr}"),
+                )));
+            };
+            let to = slot.node;
+            let verdict = if !state.holes.contains_key(&(from, to))
+                && !state.holes.contains_key(&(to, from))
+            {
                 state
                     .planner
                     .as_mut()
@@ -854,57 +1064,63 @@ async fn dial_one(net: &Arc<Net>, from: Option<u64>, addr: SocketAddr) -> io::Re
             } else {
                 Dial::Hang
             };
-        match verdict {
-            Dial::Refuse => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("simulated dial to {addr} refused"),
-            ))),
-            Dial::Hang => {
-                waiting_listener = Some(slot.id);
-                state
-                    .listeners
-                    .get_mut(&addr)
-                    .unwrap()
-                    .dialers
-                    .register(&mut waiter, cx.waker());
-                Poll::Pending
+            match verdict {
+                Dial::Refuse => {
+                    state.faults.push(NetFault::Refuse { from, to });
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("simulated dial to {addr} refused"),
+                    )))
+                }
+                Dial::Hang => {
+                    waiting_listener = Some(slot.id);
+                    state
+                        .listeners
+                        .get_mut(&addr)
+                        .unwrap()
+                        .dialers
+                        .register(&mut waiter, cx.waker());
+                    Poll::Pending
+                }
+                Dial::Connect => {
+                    let ip = host_ip(from);
+                    let port = match state.ephemeral_port(ip) {
+                        Ok(port) => port,
+                        Err(error) => return Poll::Ready(Err(error)),
+                    };
+                    let id = state.next_conn;
+                    state.next_conn += 1;
+                    let client = SocketAddr::new(ip, port);
+                    state.conns.insert(
+                        id,
+                        Connection {
+                            ends: [
+                                End {
+                                    node: from,
+                                    addr: client,
+                                },
+                                End { node: to, addr },
+                            ],
+                            holds: [client, addr].map(|addr| Some(state.ports.hold(addr))),
+                            accepted: false,
+                            pipes: [Pipe::default(), Pipe::default()],
+                            open: [true, true],
+                            reset: false,
+                            power_cut: false,
+                            rebooted: false,
+                            killed: None,
+                            alpn: None,
+                        },
+                    );
+                    let slot = state.listeners.get_mut(&addr).unwrap();
+                    slot.backlog.push_back(id);
+                    slot.acceptors.wake_all();
+                    Poll::Ready(Ok(Pending {
+                        half: Half::new(net.clone(), id, Side::Client),
+                    }))
+                }
             }
-            Dial::Connect => {
-                let ip = host_ip(from);
-                let port = match state.ephemeral_port(ip) {
-                    Ok(port) => port,
-                    Err(error) => return Poll::Ready(Err(error)),
-                };
-                let id = state.next_conn;
-                state.next_conn += 1;
-                let client = SocketAddr::new(ip, port);
-                state.conns.insert(
-                    id,
-                    Connection {
-                        ends: [
-                            End {
-                                node: from,
-                                addr: client,
-                            },
-                            End { node: to, addr },
-                        ],
-                        holds: [client, addr].map(|addr| Some(state.ports.hold(addr))),
-                        accepted: false,
-                        pipes: [Pipe::default(), Pipe::default()],
-                        open: [true, true],
-                        reset: false,
-                        power_cut: false,
-                        alpn: None,
-                    },
-                );
-                let slot = state.listeners.get_mut(&addr).unwrap();
-                slot.backlog.push_back(id);
-                slot.acceptors.wake_all();
-                Poll::Ready(Ok(Pending {
-                    half: Half::new(net.clone(), id, Side::Client),
-                }))
-            }
-        }
+        })
     })
     .await
 }
@@ -1099,13 +1315,33 @@ impl Half {
 
     /// Sends one message through the planner.
     fn send(&self, kind: Kind, body: Body) -> io::Result<()> {
-        let mut state = self.net.lock();
-        let state = &mut *state;
+        self.net.locked(|state| self.send_locked(state, kind, body))
+    }
+
+    fn send_locked(&self, state: &mut State, kind: Kind, body: Body) -> io::Result<()> {
         let Some(conn) = state.conns.get_mut(&self.conn) else {
             return Err(reset_error());
         };
         if conn.reset {
             return Err(reset_error());
+        }
+        let (client, server) = (conn.ends[0].node, conn.ends[1].node);
+        let peer_gone = match conn.killed {
+            Some(side) if side == self.side => return Err(reset_error()),
+            Some(_) => Some(ResetCause::Killed),
+            None if conn.power_cut && conn.rebooted => Some(ResetCause::Reboot),
+            None => None,
+        };
+        if let Some(cause) = peer_gone {
+            // The segment leaves; the peer's kernel answers it with an RST.
+            conn.reset();
+            state.faults.push(NetFault::Reset {
+                conn: ConnId(self.conn),
+                from: client,
+                to: server,
+                cause,
+            });
+            return Ok(());
         }
         if conn.power_cut {
             return Ok(());
@@ -1140,6 +1376,7 @@ impl Half {
                 .flatten(),
             bytes,
         };
+        let (envelope_from, envelope_to) = (envelope.from, envelope.to);
         let fate = state
             .planner
             .as_mut()
@@ -1161,10 +1398,21 @@ impl Half {
             }
             Fate::Drop => {
                 pipe.stalled = true;
+                state.faults.push(NetFault::Drop {
+                    conn: ConnId(self.conn),
+                    from: envelope_from,
+                    to: envelope_to,
+                });
                 Ok(())
             }
             Fate::Reset => {
                 conn.reset();
+                state.faults.push(NetFault::Reset {
+                    conn: ConnId(self.conn),
+                    from: client,
+                    to: server,
+                    cause: ResetCause::Planner,
+                });
                 Err(reset_error())
             }
         }

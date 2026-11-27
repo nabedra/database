@@ -1,12 +1,14 @@
 //! The shared fault vocabulary, and the subscriber that logs the faults the simulation
-//! reports today: [`SimEvent`] from the World and [`NetEvent`] from a `NetPlan`. A World
-//! event it does not know fails the trace.
+//! reports: [`SimEvent`] from the World and [`NetEvent`] from a `NetPlan`. A World event it
+//! does not know fails the trace.
 //!
 //! | Action | Node | `msg` | Reported by |
 //! | --- | --- | --- | --- |
-//! | `Crash` | the node | `kind`: `unspecified` | World |
+//! | `Crash` | the node | `kind`: `kill` or `power_off` | World |
 //! | `Restart` | the node | `cut`: `none`, `kill`, `crash`, `power512` or `power4k`; `incarnation`: restarts after a crash the trace saw, 0 when the node was not down | World |
-//! | `DiskLoss` | the node | `mount`; `how`: `reformat` or `replace` | World |
+//! | `TornWrite` | the node | `mount`, `unit`, and the counts `kept`, `lost`, `torn`, `destroyed`, `lengths_kept`, `lengths_lost`, `dir_ops_kept`, `dir_ops_lost`; one line per volume, after the `Restart` of a power-loss cut | World |
+//! | `DiskLoss` | the node | `mount`; `how`: `reformat` or `replace`; `mkfs`: inode numbers start over | World |
+//! | `StaleRestore` | the node | `mount`, `taken_ns`: when the image was taken | World |
 //! | `Pause` | `world` | `nanos` | World |
 //! | `DropMessage` | the sender | `to`; `cause`: `plan` or `blocked` | `NetPlan` |
 //! | `DelayMessage` | the sender | `to`, `delay_ns` | `NetPlan`, when asked for |
@@ -14,44 +16,45 @@
 //! | `Partition` | the link's `from` | `to` | `NetPlan` |
 //! | `Heal` | the link's `from`, or `world` | `to`, or `all` | `NetPlan` |
 //! | `HoldMessages`, `ReleaseMessages` | the node | none | `NetPlan` pause and resume |
+//! | `StreamDrop` | the sender | `to`, `conn` | stream network (`rt::sim::net`) |
+//! | `ResetConnection` | the dialing side | `to`, `conn`; `cause`: `planner`, `world`, `reboot` or `killed` | stream network |
+//! | `StreamFlush` | the killed node | `conn` | stream network |
+//! | `LinkDown`, `LinkUp` | the link's `from`, or `world` | `to`, or `all` | stream network black holes |
+//! | `DialRefused` | the dialer | `to` | stream network planner |
 //! | `StoragePaused` | the node | `op`, `path`; `side`: `before` or `after` the call | World |
 //! | `StorageResumed` | the node | none | World |
 //! | `ClockFrozen` | the node | none | World |
-//! | `SyncError` | the node | `mount`, `path`, `op` | nobody yet |
-//! | `Freeze`, `Thaw` | the node | none | nobody yet |
-//! | `ClockDrift` | the node | `ppm` | nobody yet |
-//! | `WallJump` | the node | `nanos`, signed | nobody yet |
-//! | `MonoAdvance` | the node | `nanos` | nobody yet |
-//! | `ResetConnection` | the side that reset, or `world` | `conn`, `cause` | nobody yet |
+//! | `Freeze`, `Thaw` | the node | none | World |
+//! | `ClockDrift` | the node | `ppm` | World |
+//! | `WallJump` | the node | `nanos`, signed | World |
+//! | `MonoAdvance` | the node | `nanos` | World |
+//! | `SyncError`, `WriteError`, `NoSpace` | the node | `mount`, `path`, `op` | World, from an injected fault or a full volume |
 //!
-//! `ClockFrozen` is the freeze that lands right after a clock read. A crash while a job is
-//! paused ends it without a `StorageResumed`.
+//! `ClockFrozen` is the freeze that lands right after a clock read; the `Thaw` that ends it
+//! is logged like any other. A crash while a job is paused ends it without a
+//! `StorageResumed`. A node outside the World (code outside every node) is `external`.
 //!
 //! **Not in a trace today**, so a spec that models one of these is not checked on it:
 //!
-//! - whether a crash was a kill or a power-off: the World reports both as the same event, so
-//!   `kind` is `unspecified`;
-//! - which unsynced sectors and directory operations a power loss kept (`TornWrite` in the
-//!   format contract);
-//! - clock drift, wall jumps and monotonic advances, `World::freeze`, and every thaw,
-//!   including the one that ends a `ClockFrozen`;
-//! - everything the simulated stream network does: lost and delayed messages, resets, black
-//!   holes, heals and refused dials;
-//! - injected filesystem errors of any kind, `crash_volume_after` and `flip_bit`;
+//! - `crash_volume_after` and `flip_bit`, which act on a `FaultFs` directly;
+//! - faults a harness injects into a `FaultFs` it does not mount on the World, and the cuts
+//!   it makes of one: log those with [`TlaSteps::fault`];
 //! - the inside of a blocking job or a service's step that no storage pause stops.
 //!
-//! Whoever injects one of these can log it with [`TlaSteps::fault`], where the table has a
-//! name for it. `SimEvent::Fs` is deliberately not turned into `SyncError`. A failed call
-//! there may be an injected fault, but also a call on a halted or wiped image by a
-//! destructor of an earlier incarnation, which can run after the node is up again.
+//! `SimEvent::Fs` becomes a line only when the call returned an injected error
+//! (`FsCall::fault`). Other failed calls are not faults: a call on a halted or wiped image
+//! by a destructor of an earlier incarnation fails too, and can run after the node is up
+//! again.
 //!
-//! `nanos`, `delay_ns` and `conn` can outgrow the 32-bit integers TLC reads, so they are
-//! decimal strings on every line. A `NetPlan` pause holds a node's messages while its tasks
-//! run, which is neither a `Pause` of the world nor a freeze of the node.
+//! `nanos`, `delay_ns`, `taken_ns` and `conn` can outgrow the 32-bit integers TLC reads, so
+//! they are decimal strings on every line. A `NetPlan` pause holds a node's messages while
+//! its tasks run, which is neither a `Pause` of the world nor a freeze of the node.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use nabedra_rt::fs::{FaultError, FsOp, PowerLossReport};
+use nabedra_rt::sim::net::{NetFault, ResetCause};
 use nabedra_rt::sim::{Cut, PausedCall, Side, SimEvent, StepOutcome, Wipe};
 use serde_json::{Value, json};
 
@@ -61,21 +64,37 @@ use crate::net::{BASE_DELAY_MS, NetEvent, Plan};
 /// The node of a world-wide fault.
 pub(super) const WORLD: &str = "world";
 
+/// The node of code outside every World node.
+pub(super) const EXTERNAL: &str = "external";
+
 /// One fault, in the shared vocabulary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Fault {
     Crash {
         node: u64,
+        /// [`nabedra_rt::sim::World::power_off`], not a process kill.
+        power_off: bool,
     },
     Restart {
         node: u64,
         cut: Option<Cut>,
     },
+    TornWrite {
+        node: u64,
+        mount: String,
+        report: PowerLossReport,
+    },
     DiskLoss {
         node: u64,
         mount: String,
         how: Wipe,
+        mkfs: bool,
+    },
+    StaleRestore {
+        node: u64,
+        mount: String,
+        taken: Duration,
     },
     Pause {
         by: Duration,
@@ -109,6 +128,35 @@ pub enum Fault {
     ReleaseMessages {
         node: u64,
     },
+    StreamDrop {
+        from: Option<u64>,
+        to: Option<u64>,
+        conn: u64,
+    },
+    /// `from` is the dialing side, `to` the accepting side.
+    ResetConnection {
+        from: Option<u64>,
+        to: Option<u64>,
+        conn: u64,
+        cause: String,
+    },
+    StreamFlush {
+        node: u64,
+        conn: u64,
+    },
+    LinkDown {
+        from: Option<u64>,
+        to: Option<u64>,
+    },
+    LinkUp {
+        from: Option<u64>,
+        to: Option<u64>,
+    },
+    LinkUpAll,
+    DialRefused {
+        from: Option<u64>,
+        to: Option<u64>,
+    },
     StoragePaused {
         node: u64,
         call: PausedCall,
@@ -120,6 +168,18 @@ pub enum Fault {
         node: u64,
     },
     SyncError {
+        node: u64,
+        mount: String,
+        path: String,
+        op: String,
+    },
+    WriteError {
+        node: u64,
+        mount: String,
+        path: String,
+        op: String,
+    },
+    NoSpace {
         node: u64,
         mount: String,
         path: String,
@@ -142,12 +202,6 @@ pub enum Fault {
     MonoAdvance {
         node: u64,
         by: Duration,
-    },
-    /// `node` is `None` when the world reset the connection.
-    ResetConnection {
-        node: Option<u64>,
-        conn: u64,
-        cause: String,
     },
 }
 
@@ -172,6 +226,8 @@ pub(super) struct Tracker {
     restarts: BTreeMap<u64, u64>,
     /// The cut image a node restarts from, until its `Restart` event.
     cuts: BTreeMap<u64, Cut>,
+    /// Nodes whose next `Crash` is a power-off.
+    powering_off: BTreeSet<u64>,
 }
 
 impl Tracker {
@@ -196,9 +252,73 @@ fn cut_name(cut: Option<Cut>) -> &'static str {
     }
 }
 
+fn reset_cause(cause: ResetCause) -> &'static str {
+    match cause {
+        ResetCause::Planner => "planner",
+        ResetCause::World => "world",
+        ResetCause::Reboot => "reboot",
+        ResetCause::Killed => "killed",
+    }
+}
+
 /// A duration as a message: always a decimal string.
 fn nanos(by: Duration) -> Value {
     json!({"nanos": by.as_nanos().to_string()})
+}
+
+/// The fault an injected filesystem error is.
+fn fs_fault(node: u64, mount: String, path: String, op: FsOp, error: FaultError) -> Fault {
+    let op_name = format!("{op:?}");
+    match error {
+        FaultError::Enospc => Fault::NoSpace {
+            node,
+            mount,
+            path,
+            op: op_name,
+        },
+        FaultError::Eio if matches!(op, FsOp::SyncData | FsOp::SyncAll | FsOp::SyncDir) => {
+            Fault::SyncError {
+                node,
+                mount,
+                path,
+                op: op_name,
+            }
+        }
+        FaultError::Eio => Fault::WriteError {
+            node,
+            mount,
+            path,
+            op: op_name,
+        },
+    }
+}
+
+fn net_fault(fault: NetFault) -> Option<Fault> {
+    Some(match fault {
+        NetFault::Drop { conn, from, to } => Fault::StreamDrop {
+            from,
+            to,
+            conn: conn.0,
+        },
+        NetFault::Reset {
+            conn,
+            from,
+            to,
+            cause,
+        } => Fault::ResetConnection {
+            from,
+            to,
+            conn: conn.0,
+            cause: reset_cause(cause).to_owned(),
+        },
+        NetFault::Flush { conn, node } => Fault::StreamFlush { node, conn: conn.0 },
+        NetFault::BlackHole { from, to } => Fault::LinkDown { from, to },
+        NetFault::Heal { from, to } => Fault::LinkUp { from, to },
+        NetFault::HealAll => Fault::LinkUpAll,
+        NetFault::Refuse { from, to } => Fault::DialRefused { from, to },
+        // A fault this writer does not know: the caller fails the trace.
+        _ => return None,
+    })
 }
 
 impl TlaSteps {
@@ -211,7 +331,14 @@ impl TlaSteps {
     pub(super) fn observe(&self, event: &SimEvent<'_>) {
         let mut inner = lock(&self.inner);
         let fault = match *event {
-            SimEvent::Crash { node } => Fault::Crash { node },
+            SimEvent::PowerOff { node } => {
+                inner.tracker.powering_off.insert(node);
+                return;
+            }
+            SimEvent::Crash { node } => Fault::Crash {
+                node,
+                power_off: inner.tracker.powering_off.remove(&node),
+            },
             SimEvent::Cut { node, cut } => {
                 // `World::restart_with` reports its `Restart` next.
                 inner.tracker.cuts.insert(node, cut);
@@ -221,10 +348,30 @@ impl TlaSteps {
                 node,
                 cut: inner.tracker.cuts.remove(&node),
             },
-            SimEvent::Wipe { node, mount, how } => Fault::DiskLoss {
+            SimEvent::TornWrite {
+                node,
+                mount,
+                report,
+            } => Fault::TornWrite {
+                node,
+                mount: mount.to_string_lossy().into_owned(),
+                report: *report,
+            },
+            SimEvent::Wipe {
+                node,
+                mount,
+                how,
+                mkfs,
+            } => Fault::DiskLoss {
                 node,
                 mount: mount.to_string_lossy().into_owned(),
                 how,
+                mkfs,
+            },
+            SimEvent::StaleRestore { node, mount, taken } => Fault::StaleRestore {
+                node,
+                mount: mount.to_string_lossy().into_owned(),
+                taken,
             },
             SimEvent::Pause { by } => Fault::Pause { by },
             SimEvent::StoragePaused { node, call } => Fault::StoragePaused {
@@ -233,13 +380,35 @@ impl TlaSteps {
             },
             SimEvent::StorageResumed { node } => Fault::StorageResumed { node },
             SimEvent::ClockFrozen { node } => Fault::ClockFrozen { node },
+            SimEvent::Freeze { node } => Fault::Freeze { node },
+            SimEvent::Thaw { node } => Fault::Thaw { node },
+            SimEvent::Drift { node, ppm } => Fault::ClockDrift { node, ppm },
+            SimEvent::WallJump { node, nanos } => Fault::WallJump { node, nanos },
+            SimEvent::MonoAdvance { node, by } => Fault::MonoAdvance { node, by },
+            SimEvent::Net(fault) => match net_fault(fault) {
+                Some(fault) => fault,
+                None => {
+                    return inner
+                        .fail(&format!("the network reported an unknown fault: {fault:?}"));
+                }
+            },
+            SimEvent::Fs { node, mount, call } => match call.fault {
+                Some(error) => fs_fault(
+                    node,
+                    mount.to_string_lossy().into_owned(),
+                    call.path.to_string_lossy().into_owned(),
+                    call.op,
+                    error,
+                ),
+                // Not a fault; see the module documentation.
+                None => return,
+            },
             SimEvent::Step {
                 service,
                 outcome: StepOutcome::Panicked,
                 ..
             } => return inner.fail(&format!("service {service} panicked")),
-            // Not faults; see the module documentation for `Fs`.
-            SimEvent::Step { .. } | SimEvent::Fs { .. } => return,
+            SimEvent::Step { .. } => return,
             // A fault this writer does not know must not be left out in silence.
             ref unknown => {
                 return inner.fail(&format!("the World reported an unknown event: {unknown:?}"));
@@ -290,7 +459,7 @@ impl Inner {
     /// The vocabulary line of `fault`.
     fn vocabulary(&mut self, fault: Fault, about: Option<Value>) -> FaultLine {
         let incarnation = match fault {
-            Fault::Crash { node } => {
+            Fault::Crash { node, .. } => {
                 self.tracker.down.insert(node);
                 0
             }
@@ -298,20 +467,55 @@ impl Inner {
             _ => 0,
         };
         let name = |id: u64| self.node_name(&NodeRef::World(id));
+        let any_name = |id: Option<u64>| id.map_or_else(|| EXTERNAL.to_owned(), name);
         let to = |id: u64| Some(json!({"to": name(id)}));
         let node = NodeRef::World;
+        let any_node = |id: Option<u64>| id.map_or_else(|| NodeRef::from(EXTERNAL), NodeRef::World);
         let world = || NodeRef::from(WORLD);
+        let fs_line = |id: &u64, mount: &String, path: &String, op: &String| {
+            (
+                node(*id),
+                Some(json!({"mount": mount, "path": path, "op": op})),
+            )
+        };
         let (action, node, msg) = match &fault {
-            Fault::Crash { node: id } => ("Crash", node(*id), Some(json!({"kind": "unspecified"}))),
+            Fault::Crash {
+                node: id,
+                power_off,
+            } => {
+                let kind = if *power_off { "power_off" } else { "kill" };
+                ("Crash", node(*id), Some(json!({"kind": kind})))
+            }
             Fault::Restart { node: id, cut } => (
                 "Restart",
                 node(*id),
                 Some(json!({"cut": cut_name(*cut), "incarnation": incarnation})),
             ),
+            Fault::TornWrite {
+                node: id,
+                mount,
+                report,
+            } => (
+                "TornWrite",
+                node(*id),
+                Some(json!({
+                    "mount": mount,
+                    "unit": report.unit,
+                    "kept": report.kept,
+                    "lost": report.lost,
+                    "torn": report.torn,
+                    "destroyed": report.destroyed,
+                    "lengths_kept": report.lengths_kept,
+                    "lengths_lost": report.lengths_lost,
+                    "dir_ops_kept": report.dir_ops_kept,
+                    "dir_ops_lost": report.dir_ops_lost,
+                })),
+            ),
             Fault::DiskLoss {
                 node: id,
                 mount,
                 how,
+                mkfs,
             } => {
                 let how = match how {
                     Wipe::Reformat => "reformat",
@@ -320,9 +524,18 @@ impl Inner {
                 (
                     "DiskLoss",
                     node(*id),
-                    Some(json!({"mount": mount, "how": how})),
+                    Some(json!({"mount": mount, "how": how, "mkfs": mkfs})),
                 )
             }
+            Fault::StaleRestore {
+                node: id,
+                mount,
+                taken,
+            } => (
+                "StaleRestore",
+                node(*id),
+                Some(json!({"mount": mount, "taken_ns": taken.as_nanos().to_string()})),
+            ),
             Fault::Pause { by } => ("Pause", world(), Some(nanos(*by))),
             Fault::DropMessage { from, to, blocked } => {
                 let cause = if *blocked { "blocked" } else { "plan" };
@@ -346,6 +559,42 @@ impl Inner {
             Fault::HealAll => ("Heal", world(), Some(json!({"all": true}))),
             Fault::HoldMessages { node: id } => ("HoldMessages", node(*id), None),
             Fault::ReleaseMessages { node: id } => ("ReleaseMessages", node(*id), None),
+            Fault::StreamDrop { from, to, conn } => (
+                "StreamDrop",
+                any_node(*from),
+                Some(json!({"to": any_name(*to), "conn": conn.to_string()})),
+            ),
+            Fault::ResetConnection {
+                from,
+                to,
+                conn,
+                cause,
+            } => (
+                "ResetConnection",
+                any_node(*from),
+                Some(json!({"to": any_name(*to), "conn": conn.to_string(), "cause": cause})),
+            ),
+            Fault::StreamFlush { node: id, conn } => (
+                "StreamFlush",
+                node(*id),
+                Some(json!({"conn": conn.to_string()})),
+            ),
+            Fault::LinkDown { from, to } => (
+                "LinkDown",
+                any_node(*from),
+                Some(json!({"to": any_name(*to)})),
+            ),
+            Fault::LinkUp { from, to } => (
+                "LinkUp",
+                any_node(*from),
+                Some(json!({"to": any_name(*to)})),
+            ),
+            Fault::LinkUpAll => ("LinkUp", world(), Some(json!({"all": true}))),
+            Fault::DialRefused { from, to } => (
+                "DialRefused",
+                any_node(*from),
+                Some(json!({"to": any_name(*to)})),
+            ),
             Fault::StoragePaused { node: id, call } => {
                 let side = match call.side {
                     Side::Before => "before",
@@ -362,11 +611,28 @@ impl Inner {
                 mount,
                 path,
                 op,
-            } => (
-                "SyncError",
-                node(*id),
-                Some(json!({"mount": mount, "path": path, "op": op})),
-            ),
+            } => {
+                let (node, msg) = fs_line(id, mount, path, op);
+                ("SyncError", node, msg)
+            }
+            Fault::WriteError {
+                node: id,
+                mount,
+                path,
+                op,
+            } => {
+                let (node, msg) = fs_line(id, mount, path, op);
+                ("WriteError", node, msg)
+            }
+            Fault::NoSpace {
+                node: id,
+                mount,
+                path,
+                op,
+            } => {
+                let (node, msg) = fs_line(id, mount, path, op);
+                ("NoSpace", node, msg)
+            }
             Fault::Freeze { node: id } => ("Freeze", node(*id), None),
             Fault::Thaw { node: id } => ("Thaw", node(*id), None),
             Fault::ClockDrift { node: id, ppm } => {
@@ -378,15 +644,6 @@ impl Inner {
                 Some(json!({"nanos": nanos.to_string()})),
             ),
             Fault::MonoAdvance { node: id, by } => ("MonoAdvance", node(*id), Some(nanos(*by))),
-            Fault::ResetConnection {
-                node: id,
-                conn,
-                cause,
-            } => (
-                "ResetConnection",
-                id.map_or_else(world, node),
-                Some(json!({"conn": conn.to_string(), "cause": cause})),
-            ),
         };
         FaultLine {
             action: action.to_owned(),
