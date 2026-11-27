@@ -164,6 +164,17 @@ impl Observations {
             .is_some_and(|report| now.upper_ms < report.received_ms.saturating_add(REPORT_AGE_MS))
     }
 
+    fn awaiting_first_report(
+        &self,
+        topology: &Topology,
+        worker: WorkerId,
+        now: ClockBounds,
+    ) -> bool {
+        !now.fenced(self.cold_reset_not_before_ms)
+            && topology.member(worker).is_some()
+            && !self.reports.contains_key(&worker)
+    }
+
     fn baseline(
         &self,
         worker: Option<WorkerId>,
@@ -630,6 +641,16 @@ impl<'a> Placement<'a> {
     fn recover_staged(&mut self, index: u16, slot: Slot, state: &State) -> Option<Change> {
         let source = slot.primary?;
         let moving = slot.moving.filter(|moving| moving.replica_only)?;
+        if self
+            .observed
+            .awaiting_first_report(self.topo, source, self.now)
+            || slot.replica.is_some_and(|replica| {
+                self.observed
+                    .awaiting_first_report(self.topo, replica, self.now)
+            })
+        {
+            return None;
+        }
         let retired = state.is_retired(source);
         let source_progress = self
             .observed
@@ -677,10 +698,11 @@ impl<'a> Placement<'a> {
                 prior_lease: slot.lease,
                 fence,
             };
-            if proof.within_lag() {
-                // Retirement prevents further renewals. An isolated old
-                // incarnation can still spend a grant it already received.
-                let cutoff = proof.cutoff(self.now.lower_ms);
+            // A retired source can acknowledge more writes until its last
+            // committed grant expires. Defer the plan without changing how
+            // the state machine applies previously committed reconcile entries.
+            let cutoff = proof.cutoff(self.now.lower_ms);
+            if proof.within_lag() && self.now.fenced(cutoff) {
                 let next = self.switch_owner(slot, moving.target, cutoff, None)?;
                 return Some(Change::Slot {
                     index,
@@ -730,6 +752,9 @@ impl<'a> Placement<'a> {
             .baseline(slot.replica, index, slot.epoch, self.now);
         let deadline = slot.lease.map_or(0, |lease| lease.expires_ms);
         let expired = self.now.fenced(deadline);
+        let awaiting_primary = self
+            .observed
+            .awaiting_first_report(self.topo, primary, self.now);
 
         if let Some(moving) = slot.moving {
             if moving.replica_only {
@@ -770,7 +795,11 @@ impl<'a> Placement<'a> {
             // baseline but cannot acknowledge freeze. The committed lease
             // still fences it when the controller's lower bound expires.
             let unavailable_before_freeze = moving.freeze_requested && moving.frozen.is_none();
-            if expired && (source.is_none() || unavailable_before_freeze) && replica.is_some() {
+            if expired
+                && !awaiting_primary
+                && (source.is_none() || unavailable_before_freeze)
+                && replica.is_some()
+            {
                 return self.switch_owner(slot, slot.replica?, deadline, None);
             }
             // A move can stall after freezing. Resume the same verified source
@@ -781,7 +810,7 @@ impl<'a> Placement<'a> {
             return None;
         }
 
-        if expired && source.is_none() && replica.is_some() {
+        if expired && !awaiting_primary && source.is_none() && replica.is_some() {
             return self.switch_owner(slot, slot.replica?, deadline, None);
         }
         if source.is_none() {
@@ -790,7 +819,8 @@ impl<'a> Placement<'a> {
         let replica_needs_replacement = slot.replica.is_none_or(|id| {
             self.topo.member(id).is_none()
                 || self.drain_operations.contains(&id.node)
-                || !self.observed.live(id, self.now)
+                || (!self.observed.awaiting_first_report(self.topo, id, self.now)
+                    && !self.observed.live(id, self.now))
         });
         if replica_needs_replacement
             && self.move_capacity(primary.node)

@@ -1,0 +1,13 @@
+# The Cache cluster design spec (specs/cache/CacheCluster.tla): every baseline exhaustively with coverage,
+# then every mutant with its control. See plans/cache.md, "Design review".
+id = "cache-cachecluster"
+module = "cache"
+kinds = ["T"]
+guarantees = ["CACHE-G02", "CACHE-G05", "CACHE-G06", "CACHE-G07", "CACHE-G09"]
+scenarios = ["K03"]
+tiers = ["T0", "T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/cache", "CacheCluster"]
+cwd = "."
+timeout_s = 18000
+needs = ["tlc"]
+result_parser = "tlc"

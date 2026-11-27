@@ -1,0 +1,13 @@
+# Directed Cache recovery schedules from the cluster Init. See plans/cache.md for coverage limits.
+id = "cache-recovery-policy"
+module = "cache"
+kinds = ["T"]
+# The directed schedules cover policy boundaries only. Broad coverage belongs to cache-cachecluster.
+guarantees = []
+scenarios = ["K03"]
+tiers = ["T0", "T1"]
+command = ["python3", "scripts/testing/cache_recovery_policy.py"]
+cwd = "."
+timeout_s = 600
+needs = ["tlc"]
+result_parser = "tlc"

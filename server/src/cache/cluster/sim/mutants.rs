@@ -11,11 +11,16 @@ use super::super::super::{
     clock::ClockMode,
     controller::{MAX_CUTOVER_LAG, RECONCILE_MS, STAGED_RESET_GRACE_MS, SourceFence},
     protocol::{LEASE_MS, RENEW_MS},
+    worker::{PROBES, REPLICATION_POLL},
 };
 use super::super::harness::{Cluster, Config, Partitions, memory_limit};
 use super::super::history::Op;
 use super::super::hooks::Knobs;
-use crate::cache::{command::key_slot, store::EvictionPolicy, wire::Response};
+use crate::cache::{
+    command::{SLOT_COUNT, key_slot},
+    store::EvictionPolicy,
+    wire::Response,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Case {
@@ -477,8 +482,21 @@ async fn retired_source_schedule(
         "retired source must still hold a live grant"
     );
 
+    // The clean path must leave the source writable until the fence.
+    if !enabled {
+        assert!(write_ok(
+            cluster
+                .send(
+                    key,
+                    Op::Set("source-before-fence".into(), None),
+                    Some(old.node)
+                )
+                .await
+        ));
+    }
+
     // Let the target report its verified copy and the leader plan.
-    let deadline = cluster.now() + 2 * RENEW_MS;
+    let deadline = expiry + 2 * RENEW_MS;
     let promoted = loop {
         let _ = cluster.renew_once(target.node).await;
         cluster.reconcile_once().await;
@@ -494,8 +512,8 @@ async fn retired_source_schedule(
     assert_eq!(promoted.primary, Some(target));
     assert!(!promoted.cold);
     if !enabled {
-        // The transition committed on the retirement proof, before the
-        // source's grant ended, and carries that grant as its start.
+        // The retirement proof prevents renewals. Publication still waits
+        // for the last committed grant to expire.
         let (at, _, proof) = cluster
             .observed
             .lock()
@@ -509,22 +527,24 @@ async fn retired_source_schedule(
         assert_eq!(proof.source, old);
         assert_eq!(proof.prior_lease, Some(grant));
         assert!(
-            at < expiry,
+            at >= expiry,
             "promotion committed at {at}, grant ends {expiry}"
         );
         assert_eq!(promoted.lease.unwrap().not_before_ms, grant.expires_ms);
     }
 
-    // The retired source still accepts writes after the promotion commits.
-    assert!(write_ok(
-        cluster
-            .send(
-                key,
-                Op::Set("source-after-retire".into(), None),
-                Some(old.node),
-            )
-            .await
-    ));
+    if enabled {
+        // The planted early cutover can discard a subsequent acknowledgement.
+        assert!(write_ok(
+            cluster
+                .send(
+                    key,
+                    Op::Set("source-after-retire".into(), None),
+                    Some(old.node),
+                )
+                .await
+        ));
+    }
     let deadline = expiry + STAGED_RESET_GRACE_MS + 2 * RENEW_MS;
     let first_authorized = loop {
         if cluster
@@ -856,6 +876,77 @@ fn staged_promotion_after_live_source_retirement_waits_for_grant() {
             clean.trace_hash, clean.trace_events
         );
     }
+}
+
+/// K03: after installing the retirement view, an existing replica must
+/// still pull an acknowledgement from the exact incarnation it follows.
+#[test]
+fn assigned_replica_keeps_pulling_the_retired_source_tail() {
+    runtime::run(1, |world| async move {
+        let key = (0..)
+            .map(|i| format!("{{retired-tail-{i}}}"))
+            .find(|key| key_slot(key.as_bytes()) < 63)
+            .unwrap();
+        let slot = key_slot(key.as_bytes());
+        let config = Case::RetiredStaged.config(false);
+        let mut cluster = Cluster::boot(world, vec![key.clone()], config).await;
+        let initial = cluster.slot(slot);
+        let old = initial.primary.unwrap();
+        let replica = initial.replica.unwrap();
+        assert!(write_ok(
+            cluster
+                .send(&key, Op::Set("before".into(), None), Some(old.node))
+                .await
+        ));
+        let deadline = cluster.now() + LEASE_MS;
+        let copied = loop {
+            if let Some(sample) = cluster.sample(Some(replica), slot).await
+                && sample.baseline
+                && sample.sequence > 0
+            {
+                break sample.sequence;
+            }
+            assert!(cluster.now() < deadline, "assigned copy did not catch up");
+            cluster.step(25).await;
+        };
+        cluster.immediate_delivery();
+        cluster.renew_once(old.node).await.unwrap();
+        cluster.isolate_controller_links(old.node);
+        assert!(matches!(
+            cluster.enroll_replacement(old.node).await,
+            Reply::Applied { .. }
+        ));
+        cluster.renew_once(replica.node).await.unwrap();
+        assert!(
+            cluster.workers[&replica.node]
+                .topology()
+                .member(old)
+                .is_none()
+        );
+        assert!(write_ok(
+            cluster
+                .send(&key, Op::Set("after".into(), None), Some(old.node))
+                .await
+        ));
+        // Allow a full poll cycle across the biggest possible source lane.
+        let poll_cycle = SLOT_COUNT.div_ceil(PROBES) as u64 * REPLICATION_POLL.as_millis() as u64;
+        let expires = cluster.slot(slot).lease.unwrap().expires_ms - nabedra_rt::sim::EPOCH_MS;
+        let deadline = (cluster.now() + poll_cycle + 250).min(expires);
+        loop {
+            let sample = cluster.sample(Some(replica), slot).await.unwrap();
+            assert_eq!(sample.epoch, initial.epoch);
+            if sample.sequence == copied + 1 {
+                break;
+            }
+            assert!(
+                cluster.now() < deadline,
+                "replica stopped pulling the retired tail at sequence {} instead of {}",
+                sample.sequence,
+                copied + 1
+            );
+            cluster.step(25).await;
+        }
+    });
 }
 
 #[test]
