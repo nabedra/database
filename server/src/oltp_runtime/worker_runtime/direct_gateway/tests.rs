@@ -626,14 +626,11 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
             "{stats:?}"
         );
         // Gets and mutations that reached the leader answered directly; the
-        // utf8 key went queued, typed failures came back exact. The row
-        // conflict (the duplicate insert) is settled at its anchor and
-        // answered by the queued path, and the two misses record their
-        // answers as entries (OD-2).
+        // utf8 key went queued, typed failures came back exact. The two
+        // misses and the row conflict record their answers as entries (OD-2).
         assert!(stats.direct_done >= 12, "{stats:?}");
-        // The gateway and then the queue owner settle it (two forwards).
-        assert_eq!(stats.forwards, 2, "{stats:?}");
-        assert_eq!(leader()["entries_applied"], json!(8));
+        assert_eq!(stats.forwards, 0, "{stats:?}");
+        assert_eq!(leader()["entries_applied"], json!(9));
 
         // A body without a declared length still takes the queued path with
         // the full parsing charge. Both the gateway and queue owner settle
@@ -728,10 +725,8 @@ async fn d03_o08_insert_conflict_texts_are_the_ones_the_history_checker_knows() 
                 }
             }
             let after = gateway.stats();
-            // Both paths settle a row conflict at its anchor first: the
-            // queued path for every mutation, the direct path because the
-            // leader hands a row conflict to the queued path (OD-2).
-            assert!(after.forwards > before.forwards, "{after:?}");
+            // Only the queued path settles the request at its anchor first.
+            assert_eq!(after.forwards > before.forwards, !direct, "{after:?}");
         }
         runtime.drain().await.unwrap();
     })

@@ -1178,9 +1178,7 @@ impl DirectExecutor {
                 #[cfg(test)]
                 crate::oltp_runtime::recovery_tests::pause("direct-applied", request.request_id)
                     .await;
-                return Ok(Attempt::Done(DirectResponse::Done(
-                    DirectData::from_json(result.as_str()).map_err(failed)?,
-                )));
+                return Ok(Attempt::Done(recorded_answer(result.as_str())));
             }
             Committed::Replayed(result) => {
                 let result = match result {
@@ -1218,9 +1216,7 @@ impl DirectExecutor {
                     }
                 };
                 self.stats.replayed();
-                return Ok(Attempt::Done(DirectResponse::Done(
-                    DirectData::from_json(result.get()).map_err(|_| failed(corrupt()))?,
-                )));
+                return Ok(Attempt::Done(recorded_answer(result.get())));
             }
             Committed::Forwarded => {
                 return Err(DirectResponse::Fallback {
@@ -1417,9 +1413,7 @@ impl DirectExecutor {
                 ..
             } if stored == digest => {
                 self.stats.replayed();
-                Ok(DirectResponse::Done(
-                    DirectData::from_json(result.get()).map_err(failed)?,
-                ))
+                Ok(recorded_answer(result.get()))
             }
             DedupLookup::Forwarded { digest: stored } if stored == digest => {
                 Err(DirectResponse::Fallback {
@@ -1460,10 +1454,12 @@ impl DirectExecutor {
                 let insert = matches!(operation, Operation::Insert(_));
                 let (version, old) = current.into_iter().next().expect("one key");
                 if insert && old.is_some() {
-                    return Err(row_conflict());
+                    changes.push(unchanged(&keys[0], version, old));
+                    refused_row_conflict()
+                } else {
+                    changes.push((keys[0].clone(), version, old, Some(p.row.clone())));
+                    serde_json::Value::Null
                 }
-                changes.push((keys[0].clone(), version, old, Some(p.row.clone())));
-                serde_json::Value::Null
             }
             Operation::InsertMany(p) => {
                 let mut rows: HashMap<Vec<u8>, &Row> = HashMap::with_capacity(p.rows.len());
@@ -1477,15 +1473,21 @@ impl DirectExecutor {
                         row,
                     );
                 }
-                for (key, (version, old)) in keys.iter().zip(current) {
-                    if old.is_some() {
-                        return Err(row_conflict());
+                if current.iter().any(|(_, old)| old.is_some()) {
+                    // The whole batch is refused; every key keeps its state,
+                    // as of the heads it read.
+                    for (key, (version, old)) in keys.iter().zip(current) {
+                        changes.push(unchanged(key, version, old));
                     }
-                    let encoded = serde_json::to_vec(key).map_err(|_| failed(corrupt()))?;
-                    let row = rows.get(&encoded).ok_or_else(|| failed(corrupt()))?;
-                    changes.push((key.clone(), version, None, Some((*row).clone())));
+                    refused_row_conflict()
+                } else {
+                    for (key, (version, _)) in keys.iter().zip(current) {
+                        let encoded = serde_json::to_vec(key).map_err(|_| failed(corrupt()))?;
+                        let row = rows.get(&encoded).ok_or_else(|| failed(corrupt()))?;
+                        changes.push((key.clone(), version, None, Some((*row).clone())));
+                    }
+                    serde_json::json!(p.rows.len())
                 }
-                serde_json::json!(p.rows.len())
             }
             Operation::Update(p) => {
                 let (version, old) = current.into_iter().next().expect("one key");
@@ -1703,9 +1705,7 @@ impl DirectExecutor {
                     }
                     ParticipantReply::Direct(DirectReply::Replayed { result }) => {
                         self.stats.replayed();
-                        return Ok(DirectResponse::Done(
-                            DirectData::from_json(result.get()).map_err(failed)?,
-                        ));
+                        return Ok(recorded_answer(result.get()));
                     }
                     ParticipantReply::Direct(DirectReply::Rejected(fault))
                     | ParticipantReply::Rejected(fault) => fault,
@@ -1984,15 +1984,43 @@ fn reused() -> ProtocolError {
     )
 }
 /// OD-2: an insert whose row exists is a row conflict, a definite answer
-/// that must stay the identity's answer on every retry. The entry format
-/// cannot record a refusal, so the leader does not answer it: the gateway
-/// settles the id at its anchor (`DirectForward`) and the queued path,
-/// which records its terminal answer, decides. A later attempt of the id
-/// finds the marker and cannot apply.
-fn row_conflict() -> DirectResponse {
-    DirectResponse::Fallback {
-        reason: FallbackReason::Ineligible,
+/// that must stay the identity's answer on every retry. It is recorded like
+/// a write: every key keeps its state (`unchanged`) with the head it read as
+/// its expected version, so a writer in between makes apply refuse it, and
+/// the record holds this refusal instead of a result. No mutation succeeds
+/// with a JSON object, so the shape is unambiguous (`recorded_answer`).
+pub(crate) const ROW_CONFLICT: &str = "primary key already exists";
+fn refused_row_conflict() -> serde_json::Value {
+    serde_json::json!({"refused": {"code": "conflict", "message": ROW_CONFLICT}})
+}
+
+/// The answer a committed record gives: its result, or the refusal it holds.
+fn recorded_answer(result: &str) -> DirectResponse {
+    #[derive(serde::Deserialize)]
+    struct Recorded {
+        refused: Refusal,
     }
+    #[derive(serde::Deserialize)]
+    struct Refusal {
+        message: String,
+    }
+    if let Ok(Recorded { refused }) = serde_json::from_str::<Recorded>(result) {
+        return failed(ProtocolError::new(
+            ErrorCode::Conflict,
+            refused.message,
+            Outcome::NotApplied,
+        ));
+    }
+    match DirectData::from_json(result) {
+        Ok(data) => DirectResponse::Done(data),
+        Err(error) => failed(error),
+    }
+}
+
+/// A key a recorded refusal read: its row rewritten as it is (a tombstone
+/// when absent), with the head it read as its expected version.
+fn unchanged(key: &MvccKey, version: Option<CommitTs>, row: Option<Row>) -> RowChange {
+    (key.clone(), version, row.clone(), row)
 }
 
 /// OD-2: an update or delete that finds no row records its `false` result

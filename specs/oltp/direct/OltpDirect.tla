@@ -17,8 +17,8 @@
 (*  - the retry-results rule (section 4, lead decision 2026-11-24): a      *)
 (*    no-op or row conflict is a definite result. A miss (update or delete *)
 (*    of an absent row) records it as a tombstone over the head it read    *)
-(*    (OD-2, fx-oltp-direct); a row conflict settles the id at its anchor  *)
-(*    with a forward marker and leaves the direct path (answer "fwd");     *)
+(*    (OD-2, fx-oltp-direct); a row conflict records its refusal with a    *)
+(*    write that keeps the row as it read it;                              *)
 (*  - RangeClock rules 1 to 3 (section 5, store/direct/clock.rs) against   *)
 (*    snapshot reads at a timestamp;                                       *)
 (*  - a queued writer that takes no direct latch (section 5, last          *)
@@ -109,11 +109,6 @@ RecRaw(s, key, id) ==
     IN IF R = {} THEN NoRec ELSE CHOOSE x \in R : TRUE
 \* What the leader and apply find. Mutant dedup_ignored: none is ever found.
 RecOf(s, key, id) == IF Mutant = "dedup_ignored" THEN NoRec ELSE RecRaw(s, key, id)
-\* What a direct attempt (marker FALSE) or a forward marker (TRUE) finds.
-\* Mutant forward_ignored: a direct attempt does not see a forward marker.
-RecFor(s, key, id, marker) ==
-    LET rec == RecOf(s, key, id)
-    IN IF Mutant = "forward_ignored" /\ rec.rk = "fwd" /\ ~marker THEN NoRec ELSE rec
 Has(rec) == rec.id # None
 
 Present(s, k) == s.row[k].v # None
@@ -137,20 +132,20 @@ Compute(q, s) ==
 \* Apply one direct member m in the order of `check`: dedup record, head
 \* version, timestamp above the newest version, then one batch with the row,
 \* the record and the applied position. o is "applied", "replayed" (with the
-\* record) or "conflict" (Rejected(Conflict): nothing written). A forward
-\* marker (m.rk = "fwd", `DirectForward`) has no row precondition: it is
-\* written whenever the id has no record. Mutant record_no_precondition: a
+\* record) or "conflict" (Rejected(Conflict): nothing written). A recorded
+\* refusal (m.rk = "na") writes the row it read unchanged: a version, but not
+\* the request's effect (ghosts w, dup). Mutant record_no_precondition: a
 \* recorded miss applies without its head checks.
 ApplyDirect(s, m) ==
-    LET rec == RecFor(s, m.key, m.id, m.rk = "fwd")
+    LET rec == RecOf(s, m.key, m.id)
         head == s.row[m.key]
         q == [id |-> m.id, op |-> m.dg[1], key |-> m.key, val |-> m.dg[3]]
-        fwd == m.rk = "fwd"
+        effect == m.rk # "na"
     IN
     IF Has(rec) THEN
         IF rec.dg = m.dg \/ Mutant = "digest_ignored" THEN [s |-> s, o |-> "replayed", rec |-> rec]
         ELSE [s |-> s, o |-> "conflict", rec |-> NoRec]
-    ELSE IF ~fwd /\ ~(Mutant = "record_no_precondition" /\ m.res = "miss")
+    ELSE IF ~(Mutant = "record_no_precondition" /\ m.res = "miss")
             /\ (head.ver # m.exp \/ (m.wr /\ m.ts <= head.ver))
          THEN [s |-> s, o |-> "conflict", rec |-> NoRec]
     ELSE
@@ -158,13 +153,14 @@ ApplyDirect(s, m) ==
             s1 == IF m.wr
                   THEN [s EXCEPT !.row[m.key] = [v |-> m.nv, ver |-> m.ts],
                                  !.hist = @ \cup {[k |-> m.key, ts |-> m.ts]},
-                                 !.dup = @ \/ (\E x \in s.w : x.key = m.key /\ x.id = m.id),
-                                 !.w = @ \cup {[key |-> m.key, id |-> m.id, dg |-> m.dg]}]
+                                 !.dup = @ \/ (effect /\ \E x \in s.w : x.key = m.key /\ x.id = m.id),
+                                 !.w = IF effect THEN @ \cup {[key |-> m.key, id |-> m.id, dg |-> m.dg]}
+                                       ELSE @]
                   ELSE s
         \* bad: the recorded result is not the operation's result on the state
         \* at this log position (ghost for G03_RecordedPrecondition).
         IN [s |-> [s1 EXCEPT !.recs = @ \cup {r1},
-                             !.bad = @ \/ (~fwd /\ Compute(q, s).res # m.res)],
+                             !.bad = @ \/ (Compute(q, s).res # m.res)],
             o |-> "applied", rec |-> r1]
 
 \* The queued writer's transaction: its intent and commit as one entry, with
@@ -224,14 +220,12 @@ End(G, A, c, kind, res) ==
 Waiting(G, c, k, a) == G[c].gs = "call" /\ G[c].k = k /\ a \in G[c].open
 
 \* Attempt a of call k of c ends with a reply that reaches the gateway.
-\* kind: "ok" or "na" (definite), "fwd" (the id is settled by a forward
-\* marker and the request goes to the queued path, which this spec does not
-\* model), "unk" (unknown), "ovl" (a typed 429 before execution), "busy"
-\* (NotLeader or a not-applied refusal of this attempt): the gateway keeps
-\* calling on the last three.
+\* kind: "ok" or "na" (definite), "unk" (unknown), "ovl" (a typed 429
+\* before execution), "busy" (NotLeader or a not-applied refusal of this
+\* attempt): the gateway keeps calling on the last three.
 Deliver(G, A, c, k, a, kind, res) ==
     IF ~Waiting(G, c, k, a) THEN [g |-> G, a |-> A]
-    ELSE IF kind \in {"ok", "na", "fwd"} THEN End(G, A, c, kind, res)
+    ELSE IF kind \in {"ok", "na"} THEN End(G, A, c, kind, res)
     ELSE IF kind = "ovl" /\ ~G[c].unc THEN End(G, A, c, NotApplied(G[c], a), "overloaded")
     ELSE [g |-> [G EXCEPT ![c].open = @ \ {a}, ![c].unc = @ \/ kind \in {"unk", "ovl"}],
           a |-> A]
@@ -345,20 +339,19 @@ CanExecute(x) == Serving(x.n, x.r) /\ LatchFree(x) /\ NoPending(x)
 \* no-op or a row conflict is a definite result (lead decision 2026-11-24).
 \* A miss is proposed as a tombstone over the head it read (`compute`,
 \* `recorded_miss`), so it carries that head as its expected version. A row
-\* conflict (an insert of a present row) is not answered directly: the
-\* leader answers Fallback and the gateway's forward attempt writes a
-\* marker under the latch after its own dedup lookup (`row_conflict`,
-\* `forward_admitted`), modelled here as one attempt that proposes the
-\* marker. The shipped executor returned both without a record (`prepare`:
+\* conflict (an insert of a present row) writes the row as it read it, with
+\* the same expected version, and records the refusal (`unchanged`,
+\* `refused_row_conflict`). The shipped executor returned both without a
+\* record (`prepare`:
 \* "A read-only outcome commits nothing"; `compute`: `already_exists()`):
 \* prefix_dr1_*.
 Execute(x) ==
     LET q == Req(x.c)  r == x.r  s == st[r]
-        rec == RecFor(s, q.key, q.id, FALSE)
+        rec == RecOf(s, q.key, q.id)
         c0 == Compute(q, s)
         unrecorded == \/ (Mutant = "prefix_dr1_readonly_unrecorded" /\ c0.res = "miss")
                       \/ (Mutant = "prefix_dr1_refusal_unrecorded" /\ c0.rk = "na")
-        cm == IF c0.rk = "na" THEN [c0 EXCEPT !.res = "fwd", !.rk = "fwd"] ELSE c0
+        cm == IF c0.rk = "na" THEN [c0 EXCEPT !.wr = TRUE, !.nv = s.row[q.key].v] ELSE c0
         ts == tso + 1
         mem == [c |-> x.c, k |-> x.k, a |-> x.a, id |-> q.id, dg |-> Dg(q), key |-> q.key,
                 exp |-> s.row[q.key].ver, wr |-> cm.wr, nv |-> cm.nv, res |-> cm.res,
@@ -593,7 +586,7 @@ TypeOK ==
     /\ tso \in Nat
     /\ \A x \in exec : x.ph \in {"pre", "prop", "retry"}
     /\ \A c \in Clients : gw[c].gs \in {"idle", "call", "done"}
-    /\ \A a \in answers : a.kind \in {"ok", "na", "fwd"}
+    /\ \A a \in answers : a.kind \in {"ok", "na"}
     /\ used \subseteq FaultKinds
     /\ qw \in {"idle", "sent"}
 
@@ -638,11 +631,6 @@ G03_DigestConflict ==
         (a.kind = "ok" /\ a.res \in {"ok", "upd", "del"})
         => ~\E w \in StateFor(a.c).w :
               w.key = KeyOf(a.c) /\ w.id = Req(a.c).id /\ w.dg # Dg(Req(a.c))
-
-\* OLTP-G03 (O08, D02, OD-2): once a forward marker settles an identity, no
-\* direct attempt of it ever writes, so only the queued path executes it.
-\* Checked in every later state.
-G03_ForwardExclusive == \A a \in answers : a.kind = "fwd" => ~Wrote(a.c)
 
 \* OLTP-G04 (O10, O29, D05, D10): not_applied only with proof that no
 \* attempt of the identity ever writes. Checked in every later state.

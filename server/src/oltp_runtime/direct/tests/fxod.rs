@@ -80,22 +80,34 @@ async fn d02_od2_an_update_of_a_missing_row_keeps_its_answer() {
     cluster.shutdown().await;
 }
 
-/// OD-2: an insert of a present row is a row conflict. The leader does not
-/// answer it with an unrecorded 409; it hands the id to the gateway's anchor
-/// settlement and the queued path.
+/// OD-2: an insert of a present row is a row conflict, recorded with the
+/// head it read. After the row is deleted, the same identity answers the
+/// same conflict and never inserts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn d02_od2_a_row_conflict_is_settled_at_the_anchor() {
+async fn d02_od2_a_row_conflict_keeps_its_answer() {
     let cluster = Cluster::new(Options::default()).await;
     let leader = cluster.leader().await;
     let row = serde_json::json!({"row": {"id": 1, "value": 1, "tag": "a", "score": 0.0}});
-    assert_eq!(cluster.op(leader, "table.insert", row.clone()).await, done("null"));
-    let response = cluster.op(leader, "table.insert", row).await;
-    assert_eq!(
-        response,
-        DirectResponse::Fallback {
-            reason: FallbackReason::Ineligible
-        }
+    assert_eq!(cluster.op(leader, "table.insert", row).await, done("null"));
+    let id = nabedra_rt::ids::uuid_v4();
+    let insert = cluster.body(
+        id,
+        "table.insert",
+        serde_json::json!({"row": {"id": 1, "value": 2, "tag": "b", "score": 0.0}}),
     );
+    let conflict = run_id(&cluster, leader, id, &insert).await;
+    assert_eq!(
+        code(&conflict),
+        Some((ErrorCode::Conflict, Outcome::NotApplied))
+    );
+    assert_eq!(
+        cluster
+            .op(leader, "table.delete", serde_json::json!({"key": 1}))
+            .await,
+        done("true")
+    );
+    assert_eq!(run_id(&cluster, leader, id, &insert).await, conflict);
+    assert_eq!(cluster.latest(leader, cluster.row_key(1)).await.1, None);
     cluster.shutdown().await;
 }
 

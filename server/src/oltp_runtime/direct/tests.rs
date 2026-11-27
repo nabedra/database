@@ -776,8 +776,8 @@ async fn o03_d01_point_operations_commit_one_entry_each_and_match_queued_results
         entry(before, cluster.last_index(leader), wrote);
         writes += u64::from(wrote);
     }
-    // Insert on an existing key: a row conflict, which the queued path
-    // answers after the gateway settles the id (OD-2). Nothing committed.
+    // Insert on an existing key: a row conflict, recorded like a write that
+    // keeps the row as it is (OD-2): one entry, the row unchanged.
     let before = cluster.last_index(leader);
     let conflict = cluster
         .op(
@@ -787,12 +787,20 @@ async fn o03_d01_point_operations_commit_one_entry_each_and_match_queued_results
         )
         .await;
     assert_eq!(
-        conflict,
-        DirectResponse::Fallback {
-            reason: FallbackReason::Ineligible
-        }
+        code(&conflict),
+        Some((ErrorCode::Conflict, Outcome::NotApplied))
     );
-    entry(before, cluster.last_index(leader), false);
+    entry(before, cluster.last_index(leader), true);
+    writes += 1;
+    assert!(
+        cluster
+            .latest(leader, cluster.row_key(7))
+            .await
+            .1
+            .unwrap()
+            .contains(r#""value":70"#),
+        "the refused insert kept the row"
+    );
     // A schema violation fails validation before anything is read.
     let invalid = cluster
         .op(
@@ -991,13 +999,9 @@ async fn o08_concurrent_same_key_mutations_admit_a_serial_order() {
     for task in tasks {
         match task.await.unwrap() {
             DirectResponse::Done(_) => won += 1,
-            // OD-2: a row conflict goes to the anchor settlement and the
-            // queued path, which answers it.
             other => assert_eq!(
-                other,
-                DirectResponse::Fallback {
-                    reason: FallbackReason::Ineligible
-                }
+                code(&other),
+                Some((ErrorCode::Conflict, Outcome::NotApplied))
             ),
         }
     }
@@ -2736,14 +2740,6 @@ async fn o06_d05_rd1_a_leader_without_a_quorum_serves_no_read() {
         assert_ne!(
             code(&response),
             Some((ErrorCode::Conflict, Outcome::NotApplied)),
-            "{operation} answered from local state without a quorum"
-        );
-        // OD-2: the row conflict, read from local state, is a fallback now.
-        assert_ne!(
-            response,
-            DirectResponse::Fallback {
-                reason: FallbackReason::Ineligible
-            },
             "{operation} answered from local state without a quorum"
         );
     }
