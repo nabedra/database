@@ -137,14 +137,14 @@ def metric_value(pattern, output):
     return median(values)
 
 
-def measure(spec, patterns, binary, side):
-    """Run one invocation and return {metric name: value}."""
+def measure(spec, patterns, binary, side, cwd=ROOT):
+    """Run one invocation from cwd and return {metric name: value}."""
     with tempfile.TemporaryDirectory(prefix=f"nabedra-ab-{side}-") as directory:
         work = Path(directory)
         command = invocation(spec.command, binary, work, side)
         started = time.perf_counter()
         try:
-            process = subprocess.run(command, cwd=ROOT, text=True, errors="replace",
+            process = subprocess.run(command, cwd=cwd, text=True, errors="replace",
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      timeout=spec.timeout_s)
         except subprocess.TimeoutExpired as error:
@@ -199,7 +199,8 @@ def noise(pairs, ci95):
     }
 
 
-def benchmark(spec, base, head):
+def benchmark(spec, base, head, roots=None):
+    """roots maps a side to the tree its command runs from (default: this repository)."""
     if not base or not head:
         raise ValueError("base and head commands must both be non-empty")
     binaries = {"base": base, "head": head}
@@ -209,7 +210,8 @@ def benchmark(spec, base, head):
     started = time.perf_counter()
     for index in range(spec.warmup + spec.rounds):
         order = ("base", "head") if index % 2 == 0 else ("head", "base")
-        pair = {side: measure(spec, patterns, binaries[side], side) for side in order}
+        pair = {side: measure(spec, patterns, binaries[side], side, (roots or {}).get(side, ROOT))
+                for side in order}
         if index >= spec.warmup:
             runs.append((list(order), pair))
     metrics = {}
@@ -282,6 +284,10 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True, help="directory for results.json and summary.md")
     parser.add_argument("--rounds", type=int, help="override the spec's measured pairs (at least 2)")
     parser.add_argument("--warmup", type=int, help="override the spec's warmup pairs")
+    for side in ("base", "head"):
+        parser.add_argument(f"--{side}-root", type=Path,
+                            help=f"run the {side} command from this tree, with its own drivers and config "
+                                 "writers (default: this repository)")
     args = parser.parse_args(argv)
     try:
         spec = load_spec(args.spec)
@@ -291,8 +297,13 @@ def main(argv=None):
             raise ValueError("--rounds must be at least 2 and --warmup nonnegative")
         spec = Spec(**{**asdict(spec), **overrides})
         base, head = (shlex.split(args.base), shlex.split(args.head)) if args.commands else ([args.base], [args.head])
-        result = benchmark(spec, base, head)
+        roots = {side: path.resolve() for side, path in (("base", args.base_root), ("head", args.head_root)) if path}
+        for path in roots.values():
+            if not path.is_dir():
+                raise ValueError(f"{path} is not a directory")
+        result = benchmark(spec, base, head, roots)
         result.update(spec=asdict(spec), base=base, head=head, cpu_model=cpu_model(),
+                      roots={side: str(roots.get(side, ROOT)) for side in ("base", "head")},
                       bootstrap_seed=BOOTSTRAP_SEED, date=datetime.now(timezone.utc).isoformat())
         write_result(args.output, result)
     except (OSError, ValueError, TypeError, re.error) as error:

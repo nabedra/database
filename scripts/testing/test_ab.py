@@ -97,7 +97,7 @@ class PairedBenchmarkTests(unittest.TestCase):
         measured = [{"metric": value} for value in (0.020, 0.020, 0.022, 0.020, 0.020, 0.022)]
         with patch.object(ab, "measure", side_effect=measured) as run:
             result = ab.benchmark(spec, ["old"], ["new"])
-        self.assertEqual([call.args[-1] for call in run.call_args_list],
+        self.assertEqual([call.args[3] for call in run.call_args_list],
                          ["base", "head", "head", "base", "base", "head"])
         self.assertTrue(result["regression"])
         wall = [("metric", None, None, False)]
@@ -193,6 +193,23 @@ class PairedBenchmarkTests(unittest.TestCase):
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(ab.main([str(path), peer, peer, "--commands", "--rounds", "1",
                                           "--output", directory]), 2)
+
+    def test_each_side_can_run_from_its_own_tree(self):
+        # A head that changes config keys or drivers runs its own copy; each side reads only its tree.
+        with TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            for side, value in (("base", 10), ("head", 30)):
+                (root / side).mkdir()
+                (root / side / "driver.py").write_text(f"print('cost={value}')\n")
+            spec = root / "spec.toml"
+            spec.write_text(SPEC_HEADER + 'command = ["{bin}", "driver.py"]\nwarmup = 0\nrounds = 2\n'
+                            r"metric = 'cost=(\d+)'" "\n")
+            status = ab.main([str(spec), sys.executable, sys.executable, "--base-root", str(root / "base"),
+                              "--head-root", str(root / "head"), "--output", str(root / "out")])
+            data = json.loads((root / "out" / "results.json").read_text())
+        self.assertEqual(status, 1)
+        self.assertEqual([(pair["base"], pair["head"]) for pair in data["pairs"]], [(10, 30), (10, 30)])
+        self.assertEqual(data["roots"], {"base": str((root / "base").resolve()), "head": str((root / "head").resolve())})
 
     def test_hung_command_times_out_as_an_error(self):
         spec = ab.Spec("Hung", "testing", ["{bin}"], 0, 2, "wall", timeout_s=0.5)

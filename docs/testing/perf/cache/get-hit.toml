@@ -2,7 +2,7 @@ name = "Cache GET hit and SET PX latency"
 module = "cache"
 command = [
     "sh", "-eu", "-c",
-    'exec python3.11 scripts/cache-benchmark/local_cluster.py --nabedra "$1" --valkey "$NABEDRA_PERF_VALKEY" --valkey-cli "$NABEDRA_PERF_VALKEY_CLI" --client-cpu "$NABEDRA_PERF_CLIENT_CPU" --drivers stock --output "$2"',
+    'export PYTHONPATH=orm/python/src; exec python3.11 scripts/cache-benchmark/local_cluster.py --nabedra "$1" --valkey "$NABEDRA_PERF_VALKEY" --valkey-cli "$NABEDRA_PERF_VALKEY_CLI" --client-cpu "$NABEDRA_PERF_CLIENT_CPU" --drivers stock --output "$2"',
     "cache-benchmark", "{bin}", "{work}",
 ]
 warmup = 1

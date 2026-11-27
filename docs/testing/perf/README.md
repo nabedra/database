@@ -66,11 +66,22 @@ output directory for each comparison.
 `jobs=ab` builds release binaries of `ab_base` and `sha` and runs every spec
 above, both sides on one runner per spec. `jobs=insn` runs the instruction
 counts below for the same pair. With `ab_base` empty both sides are `sha`,
-which measures the runner's noise (an A/A run). The specs, `ab.py` and the
-benchmark drivers come from the workflow ref, so both sides use the same
-driver. `ab_specs` selects specs by path, such as `kv/store,sim/oltp-seeds`.
-Results are in the `ab-<spec>` and `insn-counts` artifacts and the job
-summaries.
+which measures the runner's noise (an A/A run). The specs and `ab.py` come
+from the workflow ref. `ab_specs` selects specs by path, such as
+`kv/store,sim/oltp-seeds`. Results are in the `ab-<spec>` and `insn-counts`
+artifacts and the job summaries.
+
+Each invocation starts one side's processes on fresh data: new scratch and
+fixture directories, Docker containers, networks and volumes named per run, and
+config files the driver writes for that run. The two sides never share a data
+directory or peers. With `ab_drivers=harness`, the default, both sides use the
+workflow ref's drivers, fixtures and ORM, so a driver change cannot move the
+ratio. When the head changes configuration keys, a wire protocol or an
+on-disk format that the other side's driver cannot handle, use
+`ab_drivers=side`: each side then runs from its own tree (`ab.py --base-root`
+and `--head-root`), with its own drivers, config writers and ORM. Both trees
+must contain working drivers for the spec, and a driver difference becomes
+part of the measured change, so say which mode a result used.
 
 ```sh
 gh workflow run nabedra-build.yml --repo nabedra/database --ref main \
