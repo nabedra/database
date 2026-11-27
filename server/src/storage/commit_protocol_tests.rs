@@ -144,9 +144,8 @@ impl Writer<'_> {
             let id = self.next_id();
             let mut tables = base.catalog().tables.clone();
             tables.insert(table_name(w, m), entry(request_id(w, m)));
-            let prepared =
-                PreparedPublication::prepare(base.clone(), tables, decision(&base, w, m, id))
-                    .map_err(|e| format!("prepare: {e:?}"))?;
+            let prepared = prepare_test(base.clone(), tables, decision(&base, w, m, id))
+                .map_err(|e| format!("prepare: {e:?}"))?;
             match prepared.publish(self.storage, budget()).await {
                 Ok(PublicationOutcome::Terminal(d)) => {
                     if d.request_id != request_id(w, m) {
@@ -218,7 +217,7 @@ fn lockstep(plan: &Plan, bug: Bug) -> Result<(), String> {
     current_thread().block_on(async {
         let sim = SimObjectStore::new();
         let s = storage(&sim, bug);
-        s.initialize_cluster_catalog()
+        s.initialize_fenced_cluster_catalog(test_fence(), false)
             .await
             .map_err(|e| format!("init: {e:?}"))?;
         sim.interleave(plan.interleave_seed, 3);
@@ -320,7 +319,7 @@ fn lockstep(plan: &Plan, bug: Bug) -> Result<(), String> {
             .await
             .map_err(|e| format!("{e:?}"))?;
         let before = sim.applied().len();
-        let replay = PreparedPublication::prepare(
+        let replay = prepare_test(
             base.clone(),
             base.catalog().tables.clone(),
             decision(&base, 0, 0, Uuid::from_u128(1 << 64)),
@@ -337,11 +336,10 @@ fn lockstep(plan: &Plan, bug: Bug) -> Result<(), String> {
         }
         let mut reused = decision(&base, 0, 0, Uuid::from_u128((1 << 64) + 1));
         reused.request_body = reused.request_body.replace("\"id\":1", "\"id\":2");
-        let conflict =
-            PreparedPublication::prepare(base.clone(), base.catalog().tables.clone(), reused)
-                .map_err(|e| format!("{e:?}"))?
-                .publish(&s, budget())
-                .await;
+        let conflict = prepare_test(base.clone(), base.catalog().tables.clone(), reused)
+            .map_err(|e| format!("{e:?}"))?
+            .publish(&s, budget())
+            .await;
         if conflict != Ok(PublicationOutcome::IdentityConflict) {
             return Err(format!(
                 "request ID reused with a different body: {conflict:?}"
@@ -391,11 +389,14 @@ fn t03_cas_loser_recomputes_and_never_overwrites() {
     current_thread().block_on(async {
         let sim = SimObjectStore::new();
         let s = storage(&sim, Bug::None);
-        let base = s.initialize_cluster_catalog().await.unwrap();
+        let base = s
+            .initialize_fenced_cluster_catalog(test_fence(), false)
+            .await
+            .unwrap();
         let prepare = |w: usize, base: &LoadedClusterCatalog, id: u128| {
             let mut tables = base.catalog().tables.clone();
             tables.insert(table_name(w, 0), entry(request_id(w, 0)));
-            PreparedPublication::prepare(
+            prepare_test(
                 base.clone(),
                 tables,
                 decision(base, w, 0, Uuid::from_u128(id)),
@@ -473,12 +474,15 @@ fn t04_lost_root_reply_resolves_to_the_committed_decision() {
     current_thread().block_on(async {
         let sim = SimObjectStore::new();
         let s = storage(&sim, Bug::None);
-        let base = s.initialize_cluster_catalog().await.unwrap();
+        let base = s
+            .initialize_fenced_cluster_catalog(test_fence(), false)
+            .await
+            .unwrap();
         sim.inject(Rule::put("catalog.json", Fault::LostResponse));
         let mut tables = base.catalog().tables.clone();
         tables.insert("t".into(), entry(Uuid::from_u128(5)));
         let d = decision(&base, 0, 0, Uuid::from_u128(1));
-        let outcome = PreparedPublication::prepare(base, tables, d.clone())
+        let outcome = prepare_test(base, tables, d.clone())
             .unwrap()
             .publish(&s, budget())
             .await;
@@ -558,7 +562,7 @@ fn t05(delay: u64, hold: bool) -> Result<bool, String> {
         let sim = SimObjectStore::new();
         let s = storage(&sim, Bug::None);
         let base = s
-            .initialize_cluster_catalog()
+            .initialize_fenced_cluster_catalog(test_fence(), false)
             .await
             .map_err(|e| format!("{e:?}"))?;
         let old = CatalogFence {
@@ -570,7 +574,7 @@ fn t05(delay: u64, hold: bool) -> Result<bool, String> {
             scheduler_term: 1,
         };
         let fenced = s
-            .fence_cluster_catalog(&base, old, FenceTransition::Migrate)
+            .fence_cluster_catalog(&base, old, FenceTransition::ColdStart)
             .await
             .map_err(|e| format!("migrate: {e:?}"))?;
         let mut tables = fenced.catalog().tables.clone();
@@ -738,4 +742,36 @@ fn planted_cas_loser_overwrite_is_caught() {
     });
     assert!(found.is_some(), "CAS overwrite not caught in 32 seeds");
     println!("planted CAS overwrite caught: {}", found.unwrap());
+}
+
+#[allow(dead_code)]
+fn test_fence() -> crate::storage::CatalogFence {
+    crate::storage::CatalogFence {
+        run_id: uuid::Uuid::from_u128(0xf3),
+        scheduler_term: 1,
+    }
+}
+/// A format 6 root holding a legacy-shaped table set, fenced by `test_fence`.
+#[allow(dead_code)]
+fn test_root(
+    catalog: &crate::storage::Catalog,
+) -> Result<crate::storage::ClusterCatalog, crate::storage::StorageError> {
+    let mut root = crate::storage::ClusterCatalog::empty(test_fence(), None)?;
+    root.revision = catalog.revision;
+    root.commit_id = catalog.commit_id;
+    root.tables = catalog.tables.clone();
+    Ok(root)
+}
+/// Prepare under the base's own fence (every root is fenced).
+#[allow(dead_code)]
+fn prepare_test(
+    base: crate::storage::LoadedClusterCatalog,
+    tables: std::collections::BTreeMap<String, crate::storage::CatalogEntry>,
+    decision: crate::storage::Decision,
+) -> Result<crate::storage::PreparedPublication, crate::storage::StorageError> {
+    let fence = base
+        .catalog()
+        .fence
+        .ok_or(crate::storage::StorageError::InvalidCatalog)?;
+    crate::storage::PreparedPublication::prepare_fenced(base, tables, decision, fence)
 }

@@ -1,0 +1,15 @@
+# Regressions of the fx-sched queue fixes (wave rv phase 2): readiness without a copy and the takeover
+# merge (SCHED-1), the receiver join generation (OLAPS-1, SCHED-2), retry backoff and dispatch order
+# (SCHED-3, SCHED-4), terminal retirement (SCHED-5), the replay-nonce cache (SCHED-8), uncertain
+# submissions (SCHED-9) and local serve receipts (SCHED-11, SCHED-12).
+id = "scheduler-queue-runtime"
+module = "scheduler"
+kinds = ["U"]
+guarantees = []
+scenarios = ["R01", "R03", "R04", "F02", "C05", "Q01", "Q02", "U02", "T04"]
+tiers = ["T1"]
+command = ["cargo", "test", "--locked", "--lib", "--", "--test-threads=2", "node::queue_runtime::join_tests::", "node::queue_transport::replay_cache_tests::", "cluster::runtime::queue_response_tests::", "api::queue::tests::", "node::coordinator::resources::tests::"]
+cwd = "server"
+timeout_s = 2400
+needs = []
+result_parser = "cargo-test"

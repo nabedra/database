@@ -5,7 +5,9 @@
 //! blocking work, even if the client disconnects. This module owns no runtime.
 mod identified;
 mod job;
-pub(crate) use job::{CapturedInput, prepare_captured, run_captured, run_prepared};
+pub(crate) use job::{
+    CapturedInput, job_memory_bytes, prepare_captured, run_captured, run_prepared,
+};
 mod mutation;
 mod partition;
 mod query;

@@ -112,9 +112,8 @@ Stop with Ctrl-C or SIGTERM to stop admission and drain admitted work. After
 that local worker exits, restart the same bucket/prefix with `--cold-start` to
 fence the old run and open committed data with a new empty request queue.
 Outstanding old requests are abandoned unless a durable mutation decision
-proves they committed. For an existing format 1/2/3 catalog, stop all previous
-writers and explicitly pass `--migrate-catalog` to upgrade to format 4; keep
-old binaries stopped. Migration and cold start are separate confirmations.
+proves they committed. Catalog format 6 is the only format; a catalog of an
+older format is refused, not migrated.
 
 For separate API and worker processes, use `nabedra-db api --config PATH`
 and `nabedra-db worker --bootstrap PATH`. The API requires a supervisor
@@ -246,7 +245,9 @@ orphan objects.
 
 Requests and responses are limited to 8 MiB each, including their JSON envelope.
 Batches and collected results are limited to 10,000 rows; tables are limited to
-100,000 rows and 64 MiB of decoded row payload. Byte limits may be reached first.
+100,000 rows and 64 MiB of decoded row payload. Byte limits may be reached first, and
+one partition must decode within a task's memory budget, which limits wide tables to fewer
+rows (see [storage behavior and limits](reference.md#storage-behavior-and-limits)).
 Partitions do not multiply these limits. Oversized results fail rather than
 truncate. There is no pagination or streaming.
 

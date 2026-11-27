@@ -10,18 +10,16 @@ from .errors import ValidationError
 
 
 def serve(name: str, nodes: int | tuple[int, int] = 1, *, start_node=None,
-          stop_node=None, list_nodes=None, cold_start: bool = False,
-          migrate_catalog: bool = False) -> None:
+          stop_node=None, list_nodes=None, cold_start: bool = False) -> None:
     """Block while the configured API runs; signals stop its owned process.
 
     Set NABEDRA_CONFIG to the explicit API config file and NABEDRA_SERVER_BINARY
     when the executable is not on PATH. A tuple enables bounded autoscaling
     only with all three synchronous provider callbacks. cold_start abandons
-    old outstanding work after fencing its run. migrate_catalog confirms the
-    caller stopped every legacy writer before enabling the catalog fence.
+    old outstanding work after fencing its run.
     """
-    if type(cold_start) is not bool or type(migrate_catalog) is not bool:
-        raise ValidationError('cold_start and migrate_catalog must be booleans')
+    if type(cold_start) is not bool:
+        raise ValidationError('cold_start must be a boolean')
     args = _validate_serve_args(name, nodes, start_node, stop_node, list_nodes)
     config = _resolve_config_path()
     reservation = _reserve()
@@ -47,7 +45,7 @@ def serve(name: str, nodes: int | tuple[int, int] = 1, *, start_node=None,
                 bridge.stop_admission()
 
         run_process(config, startup, prepared=prepared, stop=stop, _receipt=receipt,
-                    cold_start=cold_start, migrate_catalog=migrate_catalog)
+                    cold_start=cold_start)
     finally:
         if not receipt._ready():
             receipt._retry()

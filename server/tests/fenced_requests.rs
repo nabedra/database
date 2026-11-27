@@ -57,48 +57,6 @@ fn decision(base: &LoadedClusterCatalog, n: u128) -> Decision {
         response_body: format!(r#"{{"request_id":"{}","data":null}}"#, id(n + 1000)),
     }
 }
-#[tokio::test]
-async fn r05_v3_explicit_migration_preserves_tables_and_decision_history() {
-    let s = Storage::new(Fake::default(), Namespace::new("fenced").unwrap());
-    let old = s.initialize_cluster_catalog().await.unwrap();
-    let d = decision(&old, 10);
-    let p =
-        PreparedPublication::prepare(old.clone(), old.catalog().tables.clone(), d.clone()).unwrap();
-    p.publish(&s, budget()).await.unwrap();
-    let old = s.load_cluster_catalog().await.unwrap();
-    let migrated = s
-        .fence_cluster_catalog(&old, fence(1, 1), FenceTransition::Migrate)
-        .await
-        .unwrap();
-    assert_eq!(migrated.catalog().format_version, 4);
-    assert_ne!(migrated.etag(), old.etag());
-    assert_eq!(migrated.catalog().decision_head, Some(d.id));
-    assert_eq!(migrated.catalog().revision, old.catalog().revision);
-    assert_eq!(
-        s.lookup_decision_by_id(&migrated, d.request_id, budget())
-            .await
-            .unwrap(),
-        Some(d)
-    );
-    assert!(
-        PreparedPublication::prepare(
-            migrated.clone(),
-            migrated.catalog().tables.clone(),
-            decision(&migrated, 11)
-        )
-        .is_err()
-    );
-    assert!(
-        s.fence_cluster_catalog(&migrated, fence(2, 1), FenceTransition::Takeover)
-            .await
-            .is_err()
-    );
-    assert!(
-        s.fence_cluster_catalog(&migrated, fence(1, 1), FenceTransition::Takeover)
-            .await
-            .is_err()
-    );
-}
 struct Gate {
     entered: Semaphore,
     release: Semaphore,
@@ -161,9 +119,12 @@ impl ObjectStore for Gated {
 }
 async fn delayed_order(after_apply: bool) {
     let s = Storage::new(Gated::default(), Namespace::new("fenced").unwrap());
-    let old = s.initialize_cluster_catalog().await.unwrap();
     let old = s
-        .fence_cluster_catalog(&old, fence(1, 1), FenceTransition::Migrate)
+        .initialize_fenced_cluster_catalog(test_fence(), false)
+        .await
+        .unwrap();
+    let old = s
+        .fence_cluster_catalog(&old, fence(1, 1), FenceTransition::ColdStart)
         .await
         .unwrap();
     let d = decision(&old, 10);
@@ -216,8 +177,11 @@ async fn t04_t05_applied_put_before_cold_fence_survives_lost_reply() {
 }
 async fn engine() -> (Engine<Fake>, WorkerThreads) {
     let s = Storage::new(Fake::default(), Namespace::new("fenced").unwrap());
-    let old = s.initialize_cluster_catalog().await.unwrap();
-    s.fence_cluster_catalog(&old, fence(1, 1), FenceTransition::Migrate)
+    let old = s
+        .initialize_fenced_cluster_catalog(test_fence(), false)
+        .await
+        .unwrap();
+    s.fence_cluster_catalog(&old, fence(1, 1), FenceTransition::ColdStart)
         .await
         .unwrap();
     let (pool, threads) = WorkerPool::start(
@@ -311,7 +275,9 @@ async fn t03_t06_local_identified_workflow_replay_noops_and_atomic_batch() {
             .iter()
             .all(|k| k.ends_with("catalog.json")
                 || k.contains("/tables/")
-                || k.contains("/decisions/"))
+                || k.contains("/decisions/")
+                // OLAP-1: immutable decision index pages.
+                || k.contains("/decision-index/"))
     );
     threads.shutdown().await.unwrap();
 }
@@ -335,8 +301,11 @@ async fn t03_concurrent_local_creates_recompute_cas_loser() {
 async fn t01_t02_local_upload_failure_leaves_entire_prior_catalog_visible() {
     for failed_upload in [1, 2] {
         let s = Storage::new(Gated::default(), Namespace::new("fenced").unwrap());
-        let old = s.initialize_cluster_catalog().await.unwrap();
-        s.fence_cluster_catalog(&old, fence(1, 1), FenceTransition::Migrate)
+        let old = s
+            .initialize_fenced_cluster_catalog(test_fence(), false)
+            .await
+            .unwrap();
+        s.fence_cluster_catalog(&old, fence(1, 1), FenceTransition::ColdStart)
             .await
             .unwrap();
         let (pool, threads) = WorkerPool::start(
@@ -395,20 +364,20 @@ async fn r04_bootstrap_creates_v4_directly_attaches_and_cold_fences_once() {
     let s = Storage::new(Fake::default(), Namespace::new("bootstrap").unwrap());
     s.backend().state.lock().unwrap().lose_put_response = true;
     let created = s
-        .initialize_fenced_cluster_catalog(fence(1, 1), false, false)
+        .initialize_fenced_cluster_catalog(fence(1, 1), false)
         .await
         .unwrap();
-    assert_eq!(created.catalog().format_version, 4);
+    assert_eq!(created.catalog().format_version, 6);
     assert_eq!(created.catalog().fence, Some(fence(1, 1)));
     assert_eq!(s.backend().state.lock().unwrap().puts, 1);
     let attached = s
-        .initialize_fenced_cluster_catalog(fence(999, 999), false, false)
+        .initialize_fenced_cluster_catalog(fence(999, 999), false)
         .await
         .unwrap();
     assert_eq!(attached, created);
     assert_eq!(s.backend().state.lock().unwrap().puts, 1);
     let cold = s
-        .initialize_fenced_cluster_catalog(fence(2, 1), false, true)
+        .initialize_fenced_cluster_catalog(fence(2, 1), true)
         .await
         .unwrap();
     assert_eq!(cold.catalog().fence, Some(fence(2, 1)));
@@ -416,28 +385,192 @@ async fn r04_bootstrap_creates_v4_directly_attaches_and_cold_fences_once() {
 }
 
 #[tokio::test]
-async fn r05_bootstrap_requires_explicit_migration_even_for_empty_existing_v3() {
-    for legacy in [true, false] {
-        let s = Storage::new(Fake::default(), Namespace::new("migration").unwrap());
-        if legacy {
-            s.initialize_catalog().await.unwrap();
-        } else {
-            s.initialize_cluster_catalog().await.unwrap();
-        }
-        let puts = s.backend().state.lock().unwrap().puts;
+async fn olap_1_older_catalog_formats_are_refused() {
+    // Format 6 is the only format: a legacy (format 2) root and every older
+    // cluster root are refused, never read or migrated, and nothing is written.
+    let s = Storage::new(Fake::default(), Namespace::new("migration").unwrap());
+    s.initialize_catalog().await.unwrap();
+    let puts = s.backend().state.lock().unwrap().puts;
+    for cold in [false, true] {
         assert_eq!(
-            s.initialize_fenced_cluster_catalog(fence(1, 1), false, false)
+            s.initialize_fenced_cluster_catalog(fence(1, 1), cold)
                 .await
                 .err(),
             Some(StorageError::UnsupportedCatalog)
         );
-        assert_eq!(s.backend().state.lock().unwrap().puts, puts);
-        let migrated = s
-            .initialize_fenced_cluster_catalog(fence(1, 1), true, false)
-            .await
-            .unwrap();
-        assert_eq!(migrated.catalog().format_version, 4);
-        assert_eq!(migrated.catalog().revision, 0);
-        assert_eq!(s.backend().state.lock().unwrap().puts, puts + 1);
     }
+    assert_eq!(
+        s.load_cluster_catalog().await.err(),
+        Some(StorageError::UnsupportedCatalog)
+    );
+    assert_eq!(s.backend().state.lock().unwrap().puts, puts);
+    for version in [3, 4, 5, 7] {
+        let mut root: Value = serde_json::from_slice(
+            &ClusterCatalog::empty(fence(1, 1), None)
+                .unwrap()
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
+        root["format_version"] = json!(version);
+        let s = Storage::new(Fake::default(), Namespace::new("old").unwrap());
+        s.put(
+            &ObjectKey::catalog(),
+            serde_json::to_vec(&root).unwrap(),
+            WriteCondition::Create,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            s.load_cluster_catalog().await.err(),
+            Some(StorageError::UnsupportedCatalog),
+            "format {version}"
+        );
+        assert_eq!(
+            s.initialize_owned_cluster_catalog(id(7), fence(1, 1), true)
+                .await
+                .err(),
+            Some(StorageError::UnsupportedCatalog)
+        );
+        assert_eq!(s.backend().state.lock().unwrap().puts, 1);
+    }
+}
+
+// OLAP-3: a mutation whose candidate root exceeds the 1 MiB catalog cap is a
+// definite limit. It must publish a replayable 413 decision with unchanged
+// tables, never answer `outcome_unknown` (the old local and queued paths).
+fn filler(n: usize, name_len: usize) -> (String, CatalogEntry) {
+    let table_id = Uuid::from_u128(0x10_0000 + n as u128);
+    let object = ObjectKey::snapshot(table_id, Uuid::from_u128(0x20_0000 + n as u128));
+    let entry: CatalogEntry = serde_json::from_value(json!({"id":table_id,"schema":{"id":"int64"},"key":"id","format":"parquet","data":{"layout":"legacy","snapshot":object.as_str()},"row_count":0})).unwrap();
+    (format!("f{n:05}{}", "x".repeat(name_len)), entry)
+}
+#[tokio::test]
+async fn olap_3_root_over_the_catalog_cap_is_a_replayable_413() {
+    let (e, threads) = engine().await;
+    let s = e.storage();
+    let created =
+        json!({"name":"items","schema":{"id":"int64","text":"utf8"},"key":"id","format":"parquet"});
+    let (status, _) = run(&e, 1, "table.create", created.clone()).await;
+    assert_eq!(status, 200);
+    let items = s.load_cluster_catalog().await.unwrap().catalog().tables["items"].clone();
+    // The next create adds one entry shaped like `items`. Pad the root so that
+    // the legacy private catalog of the local engine still fits the cap and
+    // the published cluster root (fence, head and index) does not.
+    let base = s.load_cluster_catalog().await.unwrap();
+    let mut tables = base.catalog().tables.clone();
+    let size = |tables: &std::collections::BTreeMap<String, CatalogEntry>| {
+        let mut with_new = tables.clone();
+        with_new.insert("other".into(), items.clone());
+        let mut root = base.catalog().clone();
+        root.tables = with_new.clone();
+        root.revision += 1;
+        let cluster = serde_json::to_vec(&root).unwrap().len();
+        let legacy = serde_json::to_vec(&json!({"format_version":2,"revision":root.revision,"commit_id":root.commit_id,"tables":with_new})).unwrap().len();
+        (cluster, legacy)
+    };
+    let cap = 1024 * 1024;
+    // Fillers of one name length all add the same bytes, so size the padding
+    // directly: n fillers stay under the cap, and the last name's extra
+    // characters end one byte above it.
+    let empty = size(&tables).0;
+    let (name, entry) = filler(0, 0);
+    tables.insert(name.clone(), entry);
+    let each = size(&tables).0 - empty;
+    tables.remove(&name);
+    let n = (cap - empty) / each;
+    for i in 0..n {
+        let (name, entry) = filler(i, 0);
+        tables.insert(name, entry);
+    }
+    // Spread the missing bytes over the last names, 32 characters each,
+    // within the table name limit.
+    let mut pad = cap + 1 - size(&tables).0;
+    let mut i = n;
+    while pad > 0 {
+        i -= 1;
+        let extra = pad.min(32);
+        tables.remove(&filler(i, 0).0);
+        let (name, entry) = filler(i, extra);
+        tables.insert(name, entry);
+        pad -= extra;
+    }
+    let (cluster, legacy) = size(&tables);
+    assert!(
+        cluster > cap && legacy <= cap,
+        "window: cluster {cluster}, legacy {legacy}"
+    );
+    let mut root = base.catalog().clone();
+    root.tables = tables.clone();
+    s.put(
+        &ObjectKey::catalog(),
+        root.encode().unwrap(),
+        WriteCondition::Match(base.etag()),
+    )
+    .await
+    .unwrap();
+    let before = s.load_cluster_catalog().await.unwrap();
+    let other =
+        json!({"name":"other","schema":{"id":"int64","text":"utf8"},"key":"id","format":"parquet"});
+    let first = e
+        .execute_identified(body(2, "table.create", other.clone()), fence(1, 1), None)
+        .await;
+    let first = first.expect("a definite limit, not outcome_unknown");
+    assert_eq!(
+        first.status,
+        413,
+        "{}",
+        String::from_utf8_lossy(&first.body)
+    );
+    let after = s.load_cluster_catalog().await.unwrap();
+    assert_eq!(after.catalog().tables, before.catalog().tables);
+    assert_eq!(after.catalog().revision, before.catalog().revision + 1);
+    // The decision is durable: a replay returns the same bytes.
+    let replay = e
+        .execute_identified(body(2, "table.create", other), fence(1, 1), None)
+        .await
+        .unwrap();
+    assert_eq!((replay.status, replay.body), (first.status, first.body));
+    drop(e);
+    threads.shutdown().await.unwrap();
+}
+
+#[allow(dead_code)]
+fn test_fence() -> nabedra_database_server::storage::CatalogFence {
+    nabedra_database_server::storage::CatalogFence {
+        run_id: uuid::Uuid::from_u128(0xf3),
+        scheduler_term: 1,
+    }
+}
+/// A format 6 root holding a legacy-shaped table set, fenced by `test_fence`.
+#[allow(dead_code)]
+fn test_root(
+    catalog: &nabedra_database_server::storage::Catalog,
+) -> Result<
+    nabedra_database_server::storage::ClusterCatalog,
+    nabedra_database_server::storage::StorageError,
+> {
+    let mut root = nabedra_database_server::storage::ClusterCatalog::empty(test_fence(), None)?;
+    root.revision = catalog.revision;
+    root.commit_id = catalog.commit_id;
+    root.tables = catalog.tables.clone();
+    Ok(root)
+}
+/// Prepare under the base's own fence (every root is fenced).
+#[allow(dead_code)]
+fn prepare_test(
+    base: nabedra_database_server::storage::LoadedClusterCatalog,
+    tables: std::collections::BTreeMap<String, nabedra_database_server::storage::CatalogEntry>,
+    decision: nabedra_database_server::storage::Decision,
+) -> Result<
+    nabedra_database_server::storage::PreparedPublication,
+    nabedra_database_server::storage::StorageError,
+> {
+    let fence = base
+        .catalog()
+        .fence
+        .ok_or(nabedra_database_server::storage::StorageError::InvalidCatalog)?;
+    nabedra_database_server::storage::PreparedPublication::prepare_fenced(
+        base, tables, decision, fence,
+    )
 }

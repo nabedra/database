@@ -7,13 +7,13 @@ use crate::{
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
 use axum_server::tls_rustls::RustlsConfig;
+use nabedra_rt::time::timeout_at;
 use serde::Deserialize;
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
-use nabedra_rt::time::timeout_at;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,26 +130,21 @@ struct Message {
     kind: String,
 }
 
-pub async fn run_api_configured(
-    path: PathBuf,
-    cold_start: bool,
-    migrate_catalog: bool,
-) -> Result<(), &'static str> {
+pub async fn run_api_configured(path: PathBuf, cold_start: bool) -> Result<(), &'static str> {
     #[cfg(feature = "sim")]
     if let Some(mut channel) = super::sim::supervisor() {
-        return run_api_with_channel(path, &mut channel, cold_start, migrate_catalog).await;
+        return run_api_with_channel(path, &mut channel, cold_start).await;
     }
     let mut channel = crate::supervisor::open().map_err(|_| "protocol_error")?;
-    run_api_with_channel(path, &mut channel, cold_start, migrate_catalog).await
+    run_api_with_channel(path, &mut channel, cold_start).await
 }
 
 async fn run_api_with_channel(
     path: PathBuf,
     channel: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
     cold_start: bool,
-    migrate_catalog: bool,
 ) -> Result<(), &'static str> {
-    let result = process(&path, channel, cold_start, migrate_catalog).await;
+    let result = process(&path, channel, cold_start).await;
     if let Err(error) = &result {
         let code = match error.code {
             ErrorCode::ValidationError | ErrorCode::UnsupportedOperation => "invalid_config",
@@ -169,7 +164,6 @@ async fn process(
     path: &Path,
     channel: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
     cold_start: bool,
-    migrate_catalog: bool,
 ) -> Result<(), ProtocolError> {
     let deadline = nabedra_rt::time::now() + Duration::from_secs(30);
     let init: Init = serde_json::from_slice(
@@ -179,7 +173,7 @@ async fn process(
     )
     .map_err(|_| invalid("invalid supervisor initialization"))?;
     crate::protocol::validate_identifier(&init.name)?;
-    if init.version != 1 || init.kind != "init" || migrate_catalog {
+    if init.version != 1 || init.kind != "init" {
         return Err(invalid("invalid OLTP supervisor initialization"));
     }
     let mut config: Config = read_config(path)?;
@@ -256,9 +250,7 @@ async fn process(
     } else {
         None
     };
-    let listener = bind_http(config.bind)
-        .await
-        .map_err(|_| unavailable())?;
+    let listener = bind_http(config.bind).await.map_err(|_| unavailable())?;
     let address = listener.local_addr().map_err(|_| unavailable())?;
     let bound_url = format!(
         "{}://{}",
@@ -368,14 +360,19 @@ pub(super) fn regular(path: &Path, secret: bool) -> Result<std::fs::File, Protoc
     Ok(file)
 }
 #[cfg(feature = "sim")]
-pub(super) fn regular(path: &Path, secret: bool) -> Result<nabedra_rt::fs::os::File, ProtocolError> {
+pub(super) fn regular(
+    path: &Path,
+    secret: bool,
+) -> Result<nabedra_rt::fs::os::File, ProtocolError> {
     use nabedra_rt::fs::os;
     let file = os::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)
         .map_err(|_| invalid("API material unreadable"))?;
-    let info = file.metadata().map_err(|_| invalid("API material unreadable"))?;
+    let info = file
+        .metadata()
+        .map_err(|_| invalid("API material unreadable"))?;
     if !info.is_file()
         || info.len() > 65536
         || (secret && (info.mode() & 0o077 != 0 || info.uid() != os::euid()))
@@ -583,9 +580,12 @@ mod sim_net_tests {
                     .expect("readiness request deadline");
 
                     let pending = world.spawn_node(HTTP_CLIENT, client.request(request()));
-                    nabedra_rt::time::timeout(Duration::from_secs(10), runtime.in_flight.notified())
-                        .await
-                        .expect("second request reached the readiness handler");
+                    nabedra_rt::time::timeout(
+                        Duration::from_secs(10),
+                        runtime.in_flight.notified(),
+                    )
+                    .await
+                    .expect("second request reached the readiness handler");
                     world.freeze(API_NODE);
                     runtime.resume.notify_one();
                     // Wake the handler while its node is frozen and give it a turn.

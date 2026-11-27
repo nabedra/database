@@ -1,0 +1,15 @@
+# Finding SCHED-11 of wave-rv (dr-olap F4); confirmed by the regression with the fix reverted (fx-sched).
+id = "REVIEW-local-stale-abandoned"
+title = "A stale local serve process answered abandoned for a newer run's live request"
+class = "fence-lifecycle-order"
+module = "scheduler"
+guarantees = ["SCHED-G04"]
+scenarios = ["R04"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/src/api/queue.rs r04_stale_serve_receipt_for_newer_run_is_not_abandoned"
+seed = "unknown"
+why_not_caught = "Cold-start tests stopped the old serve process before querying receipts."
+invariant_added = "Abandoned is answered only while the catalog carries the answering process's fence."
+fix_commits = ["042baf654f3d043ae80d847c804113153b042f1c"]
+revert_patch_ok = true

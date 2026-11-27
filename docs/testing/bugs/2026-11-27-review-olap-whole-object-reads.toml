@@ -1,0 +1,22 @@
+# Evidence: wave-rv findings OLAP-8 (code reading). The ObjectStore trait has only a whole-object get, and every get,
+# collect and count downloads and decodes whole partition objects (server/src/engine/partition.rs), with no ranged
+# reads, row-group pruning or footer cache. A point get on a one-partition 64 MiB table reads 64 MiB. Deferred by
+# fx-olap: ranged reads need a range call on the trait and every backend plus Parquet reader changes in the engine
+# (vector paths). Plan: plans/olap-commit.md, "Capacity plan".
+id = "REVIEW-olap-whole-object-reads"
+title = "Every OLAP get, collect and count downloads and decodes whole partition objects, so a point get on a 64 MiB table reads 64 MiB"
+class = "other"
+module = "olap"
+guarantees = ["OLAP-G10"]
+scenarios = []
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "unknown"
+seed = "unknown"
+why_not_caught = "No benchmark reports bytes read per point get against partition size."
+invariant_added = "Intended: bytes read per point get stay bounded by a row group and its footer, not by the partition size."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-26"

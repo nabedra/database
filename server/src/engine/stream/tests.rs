@@ -651,11 +651,24 @@ async fn st01_st02_u01_local_serve_streams_over_one_connection() {
         let table = table();
         let input: Vec<_> = (0..5).rev().map(|i| row(i, format!("id-{i}"))).collect();
         let catalog = fixture.legacy(&table, &input).await;
+        // A format 6 root (the only format) over the legacy-layout table,
+        // fenced by an earlier run, so serve starts with --cold-start.
+        let mut root = crate::storage::ClusterCatalog::empty(
+            crate::storage::CatalogFence {
+                run_id: uuid::Uuid::from_u128(0xf3),
+                scheduler_term: 1,
+            },
+            None,
+        )
+        .unwrap();
+        root.revision = catalog.revision;
+        root.commit_id = catalog.commit_id;
+        root.tables = catalog.tables.clone();
         fixture
             .storage
             .put(
                 &ObjectKey::catalog(),
-                catalog.encode().unwrap(),
+                root.encode().unwrap(),
                 WriteCondition::Create,
             )
             .await
@@ -675,7 +688,6 @@ async fn st01_st02_u01_local_serve_streams_over_one_connection() {
                 Ok(())
             },
             Default::default(),
-            false,
             true,
         ));
         let socket = TcpStream::connect(address).await.unwrap();

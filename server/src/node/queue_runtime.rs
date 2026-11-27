@@ -27,8 +27,6 @@ use std::{
 };
 use uuid::Uuid;
 
-// The last possible cursor has no successor in a legacy queue snapshot.
-pub(super) const STREAM_CAPABILITY_CURSOR: u64 = u64::MAX;
 
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,6 +49,24 @@ impl JoinBase {
         self.cluster == successor.cluster && self.revision < successor.revision
     }
 }
+
+/// The newest join base whose destructive copy reset this worker applied.
+#[derive(Default)]
+struct JoinFloor {
+    queue: Option<JoinBase>,
+    stream: Option<JoinBase>,
+}
+
+/// Which destructive join reset a joiner is asked to apply.
+#[derive(Clone, Copy)]
+pub(in crate::node) enum JoinReset {
+    Queue,
+    Stream,
+}
+
+/// Largest encoded record bytes in one queue snapshot page, except that a
+/// page always carries at least one record.
+const SNAPSHOT_PAGE_BYTES: usize = 1 << 20;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -76,9 +92,8 @@ pub(crate) enum Command {
     },
     Bootstrap {
         snapshot: QueueSnapshot,
-    },
-    Join {
-        node_id: Uuid,
+        /// The control-root base of the join that sends this reset.
+        base: JoinBase,
     },
     FencedJoin {
         node_id: Uuid,
@@ -98,7 +113,6 @@ impl Command {
             Self::Bootstrap { .. } => "bootstrap",
             Self::Stats => "stats",
             Self::Seal => "seal",
-            Self::Join { .. } => "join",
             Self::FencedJoin { .. } => "fenced_join",
             Self::Unseal { .. } => "unseal",
         }
@@ -214,7 +228,6 @@ pub(crate) enum Reply {
         snapshot: QueueSnapshot,
         done: bool,
     },
-    StreamCapable,
     Stats {
         pending: u64,
         running: u64,
@@ -236,11 +249,15 @@ pub(super) struct QueueRuntime {
     pub(super) streams: Arc<super::stream::Registry>,
     queue: Mutex<Option<RequestQueue>>,
     retained_data: Mutex<BTreeMap<RequestKey, super::runtime::DataGrant>>,
-    pub(super) seen: Mutex<BTreeMap<Uuid, u64>>,
+    pub(super) seen: Mutex<queue_transport::ReplayCache>,
     active: Mutex<BTreeSet<RequestKey>>,
     changes: Arc<tokio::sync::Mutex<()>>,
     stream_changes: Arc<tokio::sync::Mutex<()>>,
     seals: Mutex<BTreeMap<Uuid, QueueSeal>>,
+    join_floor: Mutex<JoinFloor>,
+    /// The catalog fence this replica last read for the control root's term.
+    /// A term's fence never changes while the root keeps that term.
+    observed_fence: Mutex<Option<CatalogFence>>,
     changed: tokio::sync::Notify,
     retries: Mutex<BTreeMap<RequestKey, (u32, tokio::time::Instant)>>,
     first_seen: Mutex<BTreeMap<RequestKey, u64>>,
@@ -269,11 +286,13 @@ impl QueueRuntime {
             streams: Arc::new(super::stream::Registry::new()),
             queue: Mutex::new(None),
             retained_data: Mutex::new(BTreeMap::new()),
-            seen: Mutex::new(BTreeMap::new()),
+            seen: Mutex::new(queue_transport::ReplayCache::new()),
             active: Mutex::new(BTreeSet::new()),
             changes: Arc::new(tokio::sync::Mutex::new(())),
             stream_changes: Arc::new(tokio::sync::Mutex::new(())),
             seals: Mutex::new(BTreeMap::new()),
+            join_floor: Mutex::new(JoinFloor::default()),
+            observed_fence: Mutex::new(None),
             changed: tokio::sync::Notify::new(),
             retries: Mutex::new(BTreeMap::new()),
             first_seen: Mutex::new(BTreeMap::new()),
@@ -383,6 +402,87 @@ impl QueueRuntime {
             seals.remove(&token);
             self.changed.notify_waiters();
         }
+    }
+
+    /// A joiner applies a destructive copy reset only at the control-root base
+    /// it currently observes, at most once per base, and never after a newer
+    /// one. The check and `apply` run under one lock, so a reset delayed from
+    /// an earlier join attempt cannot erase a later attempt's copy.
+    pub(in crate::node) fn admit_join_reset<T>(
+        &self,
+        kind: JoinReset,
+        base: JoinBase,
+        root: &Control,
+        apply: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut floor = self.join_floor.lock().unwrap();
+        let slot = match kind {
+            JoinReset::Queue => &mut floor.queue,
+            JoinReset::Stream => &mut floor.stream,
+        };
+        if JoinBase::of(root) != base
+            || slot.is_some_and(|seen| seen.cluster != base.cluster || seen.revision >= base.revision)
+        {
+            return Err(unavailable());
+        }
+        let applied = apply()?;
+        *slot = Some(base);
+        Ok(applied)
+    }
+
+    /// Drop the side state of a discarded, never-accepted proposal.
+    fn forget_proposal(&self, key: &RequestKey) {
+        self.retained_data.lock().unwrap().remove(key);
+        self.first_seen.lock().unwrap().remove(key);
+    }
+
+    /// Discard unaccepted proposals that no owner promoted within
+    /// `UNACCEPTED_TTL_MS`. Their submitter saw `outcome_unknown` or nothing;
+    /// a retry proposes them again. They would otherwise hold a pending slot
+    /// on this replica until a join accepted and ran them (SCHED-9).
+    /// Retire terminal records whose results expired (see `retirable`). Every
+    /// member applies the same rule to its own copy, so no extra message is
+    /// needed and a replica's tombstones cannot fill its queue bytes either.
+    fn retire_expired_records(&self, retention_ms: u64) {
+        let mut lock = self.queue.lock().unwrap();
+        let Some(q) = lock.as_mut() else {
+            return;
+        };
+        let active = self.active.lock().unwrap().clone();
+        if retire_expired(q, &active, now_ms(), retention_ms) > 0 {
+            let mut first = self.first_seen.lock().unwrap();
+            first.retain(|key, _| q.record(key.clone()).is_some());
+        }
+    }
+
+    fn discard_stale_proposals(&self) {
+        let cutoff = now_ms().saturating_sub(UNACCEPTED_TTL_MS);
+        let mut lock = self.queue.lock().unwrap();
+        let Some(q) = lock.as_mut() else {
+            return;
+        };
+        let stale = stale_unaccepted(q, &self.first_seen.lock().unwrap(), cutoff);
+        for (key, version) in stale {
+            if q.discard_unaccepted(key.clone(), version).is_ok() {
+                self.forget_proposal(&key);
+            }
+        }
+    }
+
+    /// Whether this replica already read `fence` from the catalog while the
+    /// control root had the same scheduler term.
+    fn fence_observed(&self, root: &Control, fence: CatalogFence) -> bool {
+        self.current_fence(root) == Some(fence)
+    }
+
+    /// The catalog fence already read for the fresh root's scheduler term.
+    pub(in crate::node) fn current_fence(&self, root: &Control) -> Option<CatalogFence> {
+        let fence = (*self.observed_fence.lock().unwrap())?;
+        (fence.scheduler_term == root.scheduler.scheduler_term).then_some(fence)
+    }
+
+    pub(in crate::node) fn observe_fence(&self, fence: CatalogFence) {
+        *self.observed_fence.lock().unwrap() = Some(fence);
     }
 
     pub(super) fn transport(&self, class: &str) -> Result<tokio::sync::OwnedSemaphorePermit> {
@@ -516,6 +616,15 @@ impl QueueRuntime {
         })
     }
 }
+/// OLAP-5: a denial is `unauthorized`; a slow or failed probe is retryable.
+fn access_failure(error: crate::storage::ObjectAccessError) -> crate::protocol::ProtocolError {
+    match error {
+        crate::storage::ObjectAccessError::Denied => {
+            http::failure(crate::protocol::ErrorCode::Unauthorized)
+        }
+        crate::storage::ObjectAccessError::Storage(_) => unavailable(),
+    }
+}
 fn encode_pin(loaded: &LoadedClusterCatalog) -> Result<Vec<u8>> {
     let catalog = loaded.catalog().encode().map_err(|_| invalid())?;
     let etag = loaded.etag().as_bytes();
@@ -545,6 +654,225 @@ fn decode_pin(bytes: &[u8]) -> Result<LoadedClusterCatalog> {
         .map_err(|_| invalid())?;
     LoadedClusterCatalog::new(catalog, etag).map_err(|_| invalid())
 }
+/// Installs in flight to one joiner during a join copy.
+const JOIN_COPY_CONCURRENCY: usize = 3;
+
+/// Longest wait between attempts of one accepted record.
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Capped exponential backoff with full jitter in its upper half. An accepted
+/// mutation whose outcome is unknown keeps retrying at this pace until an
+/// attempt or a receipt settles it from durable history; the old permanent
+/// skip after three failures wedged it until a takeover (SCHED-3).
+fn retry_backoff(attempts: u32) -> Duration {
+    let base = Duration::from_millis(100)
+        .saturating_mul(1u32 << attempts.saturating_sub(1).min(16))
+        .min(MAX_RETRY_BACKOFF);
+    let half = base.as_millis() as u64 / 2;
+    let jitter = (nabedra_rt::ids::uuid_v4().as_u128() % (u128::from(half) + 1)) as u64;
+    Duration::from_millis(half + jitter)
+}
+
+/// Records the pump may start now, in acceptance order. Records in backoff
+/// are filtered before the slot budget is applied, so neither a failing
+/// tenant nor a low storage key can occupy every slot (SCHED-3, SCHED-4).
+fn dispatch_candidates<'a>(
+    q: &'a RequestQueue,
+    active: &BTreeSet<RequestKey>,
+    retries: &BTreeMap<RequestKey, (u32, tokio::time::Instant)>,
+    now: tokio::time::Instant,
+) -> Vec<&'a RequestRecord> {
+    let mut candidates = q
+        .records()
+        .filter(|r| {
+            r.accepted
+                && (!r.state.terminal() || !q.ready(r.identity()))
+                && !active.contains(&r.identity())
+                && retries
+                    .get(&r.identity())
+                    .is_none_or(|(_, until)| *until <= now)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|r| r.sequence);
+    candidates
+}
+
+/// Terminal statuses that a mutation publishes as a durable decision
+/// (`engine/identified.rs`): a same-identity retry finds that decision in the
+/// history before it could publish again, and a receipt falls back to it.
+const DECIDED_STATUSES: [u16; 5] = [200, 400, 404, 409, 413];
+
+/// Whether a terminal record can leave RAM once its result retention ended.
+/// A read retried after that executes again, as a new read; a decided
+/// mutation is answered from its durable decision. A mutation that ended
+/// without a durable decision, or whose kind is no longer known, stays as a
+/// tombstone (SCHED-5).
+fn retirable(record: &RequestRecord, now_ms: u64, retention_ms: u64) -> bool {
+    record.accepted
+        && record.state.terminal()
+        && record
+            .completed_at_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) >= retention_ms)
+        && match record.response_status {
+            Some(status) if DECIDED_STATUSES.contains(&status) => true,
+            _ => {
+                !record.body.is_empty()
+                    && crate::protocol::parse_request(&record.body)
+                        .is_ok_and(|request| !request.operation.is_mutation())
+            }
+        }
+}
+
+/// Remove every retirable record except `active` ones. Returns how many.
+fn retire_expired(
+    q: &mut RequestQueue,
+    active: &BTreeSet<RequestKey>,
+    now_ms: u64,
+    retention_ms: u64,
+) -> usize {
+    let due = q
+        .records()
+        .filter(|r| !active.contains(&r.identity()) && retirable(r, now_ms, retention_ms))
+        .map(|r| (r.identity(), r.version))
+        .collect::<Vec<_>>();
+    due.into_iter()
+        .filter(|(key, version)| q.retire_terminal(key.clone(), *version).is_ok())
+        .count()
+}
+
+/// How long a replica keeps an unaccepted proposal it never saw promoted.
+/// Longer than two install rounds at the 30 s exchange deadline.
+const UNACCEPTED_TTL_MS: u64 = 120_000;
+
+/// The owner discarded a failed proposal and proposed the same identity again
+/// with a new sequence. Replace this replica's stale unaccepted copy, which
+/// would otherwise conflict with the retry forever (SCHED-9).
+fn replace_abandoned_proposal(q: &mut RequestQueue, incoming: &RequestRecord) -> bool {
+    if let Some(local) = q.record(incoming.identity())
+        && !local.accepted
+        && local.sequence != incoming.sequence
+        && local.digest == incoming.digest
+    {
+        let version = local.version;
+        return q.discard_unaccepted(incoming.identity(), version).is_ok();
+    }
+    false
+}
+
+/// Unaccepted proposals first seen before `cutoff_ms`. A proposal with no
+/// sighting yet is being installed now and is kept.
+fn stale_unaccepted(
+    q: &RequestQueue,
+    first_seen: &BTreeMap<RequestKey, u64>,
+    cutoff_ms: u64,
+) -> Vec<(RequestKey, u64)> {
+    q.records()
+        .filter(|r| !r.accepted && r.state == RequestState::Queued)
+        .filter(|r| {
+            first_seen
+                .get(&r.identity())
+                .is_some_and(|seen| *seen < cutoff_ms)
+        })
+        .map(|r| (r.identity(), r.version))
+        .collect()
+}
+
+fn record_page_bytes(record: &RequestRecord) -> usize {
+    1024usize
+        .saturating_add(record.body.len())
+        .saturating_add(record.context_bytes().unwrap_or(usize::MAX))
+        .saturating_add(record.pinned_catalog.as_ref().map_or(0, Vec::len))
+        .saturating_add(record.response_body.as_ref().map_or(0, Vec::len))
+}
+
+/// Every identity in acceptance order, sorted once per copy. Copying page by
+/// page with `RequestQueue::snapshot_page` rescans the whole queue for each
+/// record, which makes a join quadratic in the run's history (SCHED-6).
+fn sequence_order(q: &RequestQueue) -> Vec<RequestKey> {
+    let mut order = q
+        .records()
+        .map(|r| (r.sequence, r.identity()))
+        .collect::<Vec<_>>();
+    order.sort_unstable_by_key(|(sequence, _)| *sequence);
+    order.into_iter().map(|(_, key)| key).collect()
+}
+
+/// One page of records after `after`, in acceptance order, bounded by
+/// `SNAPSHOT_PAGE_BYTES` but never empty while records remain. A legacy
+/// reader appends every record of a page, so a longer page stays compatible.
+fn bounded_snapshot_page(q: &RequestQueue, after: Option<u64>) -> (QueueSnapshot, bool) {
+    let mut next = q
+        .records()
+        .filter(|r| after.is_none_or(|after| r.sequence > after))
+        .collect::<Vec<_>>();
+    next.sort_unstable_by_key(|r| r.sequence);
+    let mut bytes = 0usize;
+    let mut taken = 0;
+    for record in &next {
+        let size = record_page_bytes(record);
+        if taken > 0 && bytes.saturating_add(size) > SNAPSHOT_PAGE_BYTES {
+            break;
+        }
+        bytes = bytes.saturating_add(size);
+        taken += 1;
+    }
+    let done = taken == next.len();
+    (
+        QueueSnapshot {
+            run_id: q.run_id(),
+            scheduler_term: q.scheduler_term(),
+            membership_revision: q.membership_revision(),
+            members: q.members().clone(),
+            records: next.into_iter().take(taken).cloned().collect(),
+        },
+        done,
+    )
+}
+
+/// Merge records that surviving ready peers hold into a new owner's queue,
+/// after its own takeover rebased its local copy. A takeover must not rely on
+/// the new owner's copy alone (SCHED-1). A peer record is added when the owner
+/// lacks it, and replaces the owner's copy only when the peer has progressed
+/// further (accepted where the owner is not, or terminal where the owner is
+/// not). Unaccepted proposals were never acknowledged and are not merged.
+/// Returns the number of records added or advanced.
+fn peer_record_advances(local: Option<&RequestRecord>, peer: &RequestRecord) -> bool {
+    peer.accepted
+        && local
+            .is_none_or(|local| peer.state.terminal() && !local.state.terminal() || !local.accepted)
+}
+
+fn merge_peer_records(q: &mut RequestQueue, records: Vec<RequestRecord>) -> usize {
+    let mut merged = 0;
+    for mut record in records {
+        if record.run_id != q.run_id() {
+            continue;
+        }
+        let local = q.record(record.identity()).cloned();
+        if !peer_record_advances(local.as_ref(), &record) {
+            continue;
+        }
+        let version = local.map_or(record.version, |local| local.version.max(record.version));
+        let Some(version) = version.checked_add(1).filter(|v| *v != u64::MAX) else {
+            continue;
+        };
+        record.version = version;
+        record.scheduler_term = q.scheduler_term();
+        record.membership_revision = q.membership_revision();
+        record.replicas.clear();
+        if matches!(
+            record.state,
+            RequestState::Running | RequestState::Committing
+        ) {
+            record.state = RequestState::Reconciling;
+        }
+        if q.install(record).is_ok() {
+            merged += 1;
+        }
+    }
+    merged
+}
+
 pub(crate) fn now_ms() -> u64 {
     nabedra_rt::time::wall_now()
         .duration_since(UNIX_EPOCH)
@@ -746,7 +1074,7 @@ impl Worker {
             Err(_) => return Err(unavailable()),
         };
         storage
-            .initialize_owned_cluster_catalog(root.cluster_id, fence, false, cold)
+            .initialize_owned_cluster_catalog(root.cluster_id, fence, cold)
             .await
             .map_err(|_| unavailable())
     }
@@ -1009,17 +1337,101 @@ impl Worker {
         if desired.is_empty() {
             return Err(unavailable());
         }
+        let own = self.signer.sender().node_id();
+        let new_term = {
+            let lock = self.queue.queue.lock().unwrap();
+            let q = lock.as_ref().ok_or_else(unavailable)?;
+            if q.run_id() != fence.run_id {
+                return Err(unavailable());
+            }
+            q.scheduler_term() != fence.scheduler_term
+        };
+        // A new owner first collects every surviving peer's copy. All ready
+        // peers must answer: an unreachable one is either recovering or about
+        // to be published lost, and the owner admits nothing until then.
+        let recovered = if new_term && scheduler(root).is_ok_and(|n| Some(n.node_id) == own) {
+            Some(self.peer_records(root, fence).await?)
+        } else {
+            None
+        };
         let mut lock = self.queue.queue.lock().unwrap();
         let q = lock.as_mut().ok_or_else(unavailable)?;
         if q.run_id() != fence.run_id {
             return Err(unavailable());
         }
-        if q.scheduler_term() != fence.scheduler_term || q.members() != &desired {
+        let term_changed = q.scheduler_term() != fence.scheduler_term;
+        if term_changed || q.members() != &desired {
             q.takeover(fence.scheduler_term, root.revision, desired)
                 .map_err(|e| e.protocol())?;
+            if term_changed {
+                // Never-acknowledged proposals of the fenced owner cannot be
+                // accepted any more (SCHED-9); retries re-propose them.
+                let unaccepted = q
+                    .records()
+                    .filter(|r| !r.accepted)
+                    .map(|r| (r.identity(), r.version))
+                    .collect::<Vec<_>>();
+                for (key, version) in unaccepted {
+                    if q.discard_unaccepted(key.clone(), version).is_ok() {
+                        self.queue.forget_proposal(&key);
+                    }
+                }
+                if let Some(records) = recovered {
+                    merge_peer_records(q, records);
+                }
+            }
             self.queue.retries.lock().unwrap().clear();
         }
         Ok(())
+    }
+
+    /// Every record held by the other ready members, page by page.
+    async fn peer_records(
+        &self,
+        root: &Control,
+        fence: CatalogFence,
+    ) -> Result<Vec<RequestRecord>> {
+        let own = self.signer.sender().node_id();
+        let ready = members(root);
+        let mut records = Vec::new();
+        for node in root
+            .nodes
+            .iter()
+            .filter(|n| ready.contains(&n.node_id) && Some(n.node_id) != own)
+        {
+            let mut after = None;
+            loop {
+                match self
+                    .queue_exchange(root, node, &Command::Snapshot { after })
+                    .await?
+                {
+                    Reply::Snapshot { snapshot, done } => {
+                        if snapshot.run_id != fence.run_id {
+                            return Err(unavailable());
+                        }
+                        let last = snapshot.records.last().map(|r| r.sequence);
+                        // Keep only what can change the local copy, so the
+                        // owner never buffers a second full queue per peer.
+                        let lock = self.queue.queue.lock().unwrap();
+                        let q = lock.as_ref().ok_or_else(unavailable)?;
+                        records.extend(
+                            snapshot
+                                .records
+                                .into_iter()
+                                .filter(|r| peer_record_advances(q.record(r.identity()), r)),
+                        );
+                        drop(lock);
+                        if done {
+                            break;
+                        }
+                        after = Some(last.ok_or_else(invalid)?);
+                    }
+                    Reply::Error { error } => return Err(error),
+                    _ => return Err(invalid()),
+                }
+            }
+        }
+        Ok(records)
     }
     pub(super) async fn replicate_record(
         &self,
@@ -1064,33 +1476,21 @@ impl Worker {
                 .members()
                 .clone()
         };
-        for id in required {
-            if id != own {
-                let node = root
-                    .nodes
+        // Install on every other member concurrently: one round trip per
+        // replication round instead of one per member (SCHED-7). An ACK is
+        // recorded only after every install of the round succeeded.
+        let peers = required
+            .iter()
+            .filter(|id| **id != own)
+            .map(|id| {
+                root.nodes
                     .iter()
-                    .find(|n| n.node_id == id)
-                    .ok_or_else(unavailable)?;
-                match self
-                    .queue_exchange_class(
-                        root,
-                        node,
-                        &Command::Install {
-                            record: record.clone(),
-                        },
-                        if bootstrap { Some("bootstrap") } else { None },
-                    )
-                    .await?
-                {
-                    Reply::Record { record: installed }
-                        if installed.identity() == record.identity()
-                            && installed.context == record.context
-                            && installed.digest == record.digest
-                            && installed.version == record.version => {}
-                    Reply::Error { error } => return Err(error),
-                    _ => return Err(invalid()),
-                }
-            }
+                    .find(|n| n.node_id == *id)
+                    .ok_or_else(unavailable)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.install_on(root, &peers, &record, bootstrap).await?;
+        for id in required {
             record = self
                 .queue
                 .queue
@@ -1102,22 +1502,45 @@ impl Worker {
                 .map_err(|e| e.protocol())?;
         }
         // Replicate acceptance evidence as well as complete payload bytes.
-        for node in root
+        let replicas = root
             .nodes
             .iter()
             .filter(|n| record.replicas.contains(&n.node_id) && n.node_id != own)
-        {
-            match self
-                .queue_exchange_class(
-                    root,
-                    node,
-                    &Command::Install {
-                        record: record.clone(),
-                    },
-                    if bootstrap { Some("bootstrap") } else { None },
-                )
-                .await?
-            {
+            .collect::<Vec<_>>();
+        self.install_on(root, &replicas, &record, bootstrap).await?;
+        if record.state.terminal() {
+            self.queue
+                .retained_data
+                .lock()
+                .unwrap()
+                .remove(&record.identity());
+        }
+        Ok(record)
+    }
+    /// Install one exact record version on `nodes`, concurrently. Every
+    /// reply must confirm that version; the first failure is returned after
+    /// all exchanges settle, so no install outlives the round.
+    async fn install_on(
+        &self,
+        root: &Control,
+        nodes: &[&Node],
+        record: &RequestRecord,
+        bootstrap: bool,
+    ) -> Result<()> {
+        let command = Command::Install {
+            record: record.clone(),
+        };
+        let replies = futures_util::future::join_all(nodes.iter().map(|node| {
+            self.queue_exchange_class(
+                root,
+                node,
+                &command,
+                if bootstrap { Some("bootstrap") } else { None },
+            )
+        }))
+        .await;
+        for reply in replies {
+            match reply? {
                 Reply::Record { record: installed }
                     if installed.identity() == record.identity()
                         && installed.context == record.context
@@ -1127,14 +1550,7 @@ impl Worker {
                 _ => return Err(invalid()),
             }
         }
-        if record.state.terminal() {
-            self.queue
-                .retained_data
-                .lock()
-                .unwrap()
-                .remove(&record.identity());
-        }
-        Ok(record)
+        Ok(())
     }
     fn reply_working_bytes(&self, command: &Command) -> u64 {
         let record_bytes = |r: &RequestRecord| {
@@ -1183,7 +1599,12 @@ impl Worker {
                         .filter(|r| after.is_none_or(|after| r.sequence > after))
                         .min_by_key(|r| r.sequence)
                 })
-                .map_or(0, |r| record_bytes(r).saturating_mul(2)),
+                .map_or(0, |r| {
+                    record_bytes(r)
+                        .max(SNAPSHOT_PAGE_BYTES)
+                        .saturating_add(record_bytes(r))
+                        .saturating_mul(2)
+                }),
             _ => 0,
         };
         (bytes as u64).saturating_add(64 << 10)
@@ -1230,15 +1651,20 @@ impl Worker {
                 let token = self.queue.retain_seal(seal, stream_seal);
                 Ok(Reply::Joined { token })
             }
-            Command::Join { node_id } | Command::FencedJoin { node_id, .. } => {
-                let join_base = match command {
-                    Command::FencedJoin { base, .. } if base == JoinBase::of(root) => Some(base),
-                    Command::FencedJoin { .. } => return Err(unavailable()),
-                    _ => None,
-                };
+            Command::FencedJoin { node_id, base } => {
+                if base != JoinBase::of(root) {
+                    return Err(unavailable());
+                }
                 if sender.is_some()
                     || Some(scheduler(root)?.node_id) != self.signer.sender().node_id()
                 {
+                    return Err(unavailable());
+                }
+                // An unresolved fenced seal holds both change locks until a
+                // successor root appears. A retry must not wait behind it for
+                // the whole exchange deadline while the controller holds its
+                // own change lock; the next probe retries after resolution.
+                if self.queue.fenced_join().is_some() {
                     return Err(unavailable());
                 }
                 let stream_view = self.recover_streams_before_handoff(root).await?;
@@ -1268,7 +1694,10 @@ impl Worker {
                     .queue_exchange_class(
                         root,
                         node,
-                        &Command::Bootstrap { snapshot: metadata },
+                        &Command::Bootstrap {
+                            snapshot: metadata,
+                            base,
+                        },
                         Some("bootstrap"),
                     )
                     .await?
@@ -1277,57 +1706,45 @@ impl Worker {
                     Reply::Error { error } => return Err(error),
                     _ => return Err(invalid()),
                 }
-                let mut after = None;
-                loop {
-                    let (page, done) = self
-                        .queue
-                        .queue
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .ok_or_else(unavailable)?
-                        .snapshot_page(after);
-                    for record in page.records {
-                        after = Some(record.sequence);
-                        match self
-                            .queue_exchange_class(
-                                root,
-                                node,
-                                &Command::Install { record },
-                                Some("bootstrap"),
-                            )
-                            .await?
-                        {
-                            Reply::Record { .. } => {}
-                            Reply::Error { error } => return Err(error),
-                            _ => return Err(invalid()),
-                        }
-                    }
-                    if done {
-                        break;
+                // A few installs in flight at once, below the joiner's four
+                // bootstrap transport permits: the sealed copy takes about a
+                // third of the sequential time (SCHED-6, OLAPS-3).
+                use futures_util::StreamExt;
+                let mut installs = futures_util::stream::iter(self.records_in_order()?)
+                    .map(|record| async move {
+                        self.queue_exchange_class(
+                            root,
+                            node,
+                            &Command::Install { record },
+                            Some("bootstrap"),
+                        )
+                        .await
+                    })
+                    .buffer_unordered(JOIN_COPY_CONCURRENCY);
+                while let Some(reply) = installs.next().await {
+                    match reply? {
+                        Reply::Record { .. } => {}
+                        Reply::Error { error } => return Err(error),
+                        _ => return Err(invalid()),
                     }
                 }
-                self.copy_stream_replicas(root, node, self.queue.fence()?.run_id)
+                drop(installs);
+                self.copy_stream_replicas(root, node, self.queue.fence()?.run_id, base)
                     .await?;
-                if let Some(base) = join_base {
-                    // An ownership or membership change while copying already
-                    // fenced this attempt. It cannot authorize a new-root CAS.
-                    if JoinBase::of(&self.root().await?) != base {
-                        return Err(unavailable());
-                    }
-                    self.queue.insert_seal(
-                        seal,
-                        stream_seal,
-                        SealRelease::Successor {
-                            base,
-                            joiner: node_id,
-                        },
-                    );
-                    Ok(Reply::FencedJoined { base })
-                } else {
-                    let token = self.queue.retain_seal(seal, stream_seal);
-                    Ok(Reply::Joined { token })
+                // An ownership or membership change while copying already
+                // fenced this attempt. It cannot authorize a new-root CAS.
+                if JoinBase::of(&self.root().await?) != base {
+                    return Err(unavailable());
                 }
+                self.queue.insert_seal(
+                    seal,
+                    stream_seal,
+                    SealRelease::Successor {
+                        base,
+                        joiner: node_id,
+                    },
+                );
+                Ok(Reply::FencedJoined { base })
             }
             Command::Unseal { token } => {
                 if sender.is_some() {
@@ -1354,7 +1771,7 @@ impl Worker {
                 self.queue.changed.notify_waiters();
                 Ok(Reply::Joined { token })
             }
-            Command::Bootstrap { snapshot } => {
+            Command::Bootstrap { snapshot, base } => {
                 for record in &snapshot.records {
                     validate_context_mode(root, record.context.as_ref(), 0)?;
                 }
@@ -1381,18 +1798,20 @@ impl Worker {
                 .map_err(|e| e.protocol())?;
                 q.install_snapshot(snapshot).map_err(|e| e.protocol())?;
                 let snapshot = q.snapshot();
-                *self.queue.queue.lock().unwrap() = Some(q);
+                self.queue
+                    .admit_join_reset(JoinReset::Queue, base, root, || {
+                        *self.queue.queue.lock().unwrap() = Some(q);
+                        Ok(())
+                    })?;
                 Ok(Reply::Snapshot {
                     snapshot,
                     done: true,
                 })
             }
-            Command::Snapshot {
-                after: Some(STREAM_CAPABILITY_CURSOR),
-            } => Ok(Reply::StreamCapable),
             Command::Snapshot { after } => {
                 let q = self.queue.queue.lock().unwrap();
-                let (snapshot, done) = q.as_ref().ok_or_else(unavailable)?.snapshot_page(after);
+                let (snapshot, done) =
+                    bounded_snapshot_page(q.as_ref().ok_or_else(unavailable)?, after);
                 Ok(Reply::Snapshot { snapshot, done })
             }
             Command::Install { record } => {
@@ -1400,19 +1819,28 @@ impl Worker {
                 if sender != Some(scheduler(root)?.node_id) {
                     return Err(http::failure(crate::protocol::ErrorCode::Unauthorized));
                 }
-                let catalog = self
-                    .storage
-                    .load_cluster_catalog()
-                    .await
-                    .map_err(|_| unavailable())?;
-                if catalog.catalog().fence
-                    != Some(CatalogFence {
-                        run_id: record.run_id,
-                        scheduler_term: record.scheduler_term,
-                    })
-                    || root.scheduler.scheduler_term != record.scheduler_term
-                {
+                let fence = CatalogFence {
+                    run_id: record.run_id,
+                    scheduler_term: record.scheduler_term,
+                };
+                if root.scheduler.scheduler_term != record.scheduler_term {
                     return Err(unavailable());
+                }
+                // The catalog fence of a term is written once, after the
+                // control root moved to that term, and only a later term
+                // replaces it. With the fresh root still at this term, a fence
+                // this replica already read is current: one catalog read per
+                // term instead of one per installed record (SCHED-6, SCHED-7).
+                if !self.queue.fence_observed(root, fence) {
+                    let catalog = self
+                        .storage
+                        .load_cluster_catalog()
+                        .await
+                        .map_err(|_| unavailable())?;
+                    if catalog.catalog().fence != Some(fence) {
+                        return Err(unavailable());
+                    }
+                    self.queue.observe_fence(fence);
                 }
                 {
                     let mut lock = self.queue.queue.lock().unwrap();
@@ -1434,14 +1862,14 @@ impl Worker {
                 }
                 // Preflight count/bytes/immutable identity before reserving a
                 // registry client. An invalid record cannot grow the grant map.
-                self.queue
-                    .queue
-                    .lock()
-                    .unwrap()
-                    .as_mut()
-                    .ok_or_else(unavailable)?
-                    .install(record.clone())
-                    .map_err(|e| e.protocol())?;
+                {
+                    let mut lock = self.queue.queue.lock().unwrap();
+                    let q = lock.as_mut().ok_or_else(unavailable)?;
+                    if replace_abandoned_proposal(q, &record) {
+                        self.queue.forget_proposal(&record.identity());
+                    }
+                    q.install(record.clone()).map_err(|e| e.protocol())?;
+                }
                 if !record.state.terminal() && !record.accepted {
                     let authorized = async {
                         let grant = self.queue_data_for_record(&record).await?;
@@ -1505,12 +1933,12 @@ impl Worker {
                     let loaded = self.owned_catalog(root, &grant).await?;
                     grant
                         .storage()
-                        .authorize_catalog_objects(
+                        .authorize_catalog_access(
                             &loaded,
                             nabedra_rt::time::now() + Duration::from_secs(30),
                         )
                         .await
-                        .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
+                        .map_err(access_failure)?;
                     Some(grant)
                 } else {
                     None
@@ -1558,7 +1986,32 @@ impl Worker {
                     .unwrap()
                     .entry(record.identity())
                     .or_insert(now_ms());
-                let record = self.replicate_record(root, record).await.map_err(|_|crate::protocol::ProtocolError::new(crate::protocol::ErrorCode::OutcomeUnknown,"request replication outcome is uncertain; retry the same identity and body",crate::protocol::Outcome::Unknown))?;
+                let proposed = (record.identity(), record.version, record.accepted);
+                let record = match self.replicate_record(root, record).await {
+                    Ok(record) => record,
+                    Err(_) => {
+                        // A proposal no member promoted was never acknowledged.
+                        // Release its pending slot; a retry of the same
+                        // identity proposes it again (SCHED-9).
+                        let (key, version, accepted) = proposed;
+                        if !accepted
+                            && self
+                                .queue
+                                .queue
+                                .lock()
+                                .unwrap()
+                                .as_mut()
+                                .is_some_and(|q| q.discard_unaccepted(key.clone(), version).is_ok())
+                        {
+                            self.queue.forget_proposal(&key);
+                        }
+                        return Err(crate::protocol::ProtocolError::new(
+                            crate::protocol::ErrorCode::OutcomeUnknown,
+                            "request replication outcome is uncertain; retry the same identity and body",
+                            crate::protocol::Outcome::Unknown,
+                        ));
+                    }
+                };
                 self.queue.changed.notify_waiters();
                 Ok(Reply::Record { record })
             }
@@ -1587,14 +2040,14 @@ impl Worker {
                     }
                     let deadline = nabedra_rt::time::now() + Duration::from_secs(30);
                     storage
-                        .authorize_catalog_objects(&loaded, deadline)
+                        .authorize_catalog_access(&loaded, deadline)
                         .await
-                        .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
+                        .map_err(access_failure)?;
                     if let Some(pinned) = self.queue.pinned(key.clone()) {
                         storage
-                            .authorize_catalog_objects(&pinned, deadline)
+                            .authorize_catalog_access(&pinned, deadline)
                             .await
-                            .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
+                            .map_err(access_failure)?;
                     }
                 }
                 let result = {
@@ -1660,6 +2113,28 @@ impl Worker {
                                 | crate::request_queue::QueueError::NotFound
                         ) =>
                     {
+                        // OLAP-2: `abandoned` needs a root fenced by the current
+                        // run, so that no PUT of the request's run can still
+                        // apply. Fence it first, as dispatch does; without that
+                        // proof the receipt stays retryable.
+                        let loaded = if error == crate::request_queue::QueueError::Abandoned {
+                            let run = self.queue.fence()?.run_id;
+                            if loaded.catalog().fence.is_some_and(|f| f.run_id == run) {
+                                loaded
+                            } else {
+                                let grant = fresh_grant
+                                    .as_ref()
+                                    .filter(|_| !root.template.mode.is_fixed())
+                                    .ok_or_else(unavailable)?;
+                                let fenced = self.owned_catalog(root, grant).await?;
+                                if fenced.catalog().fence.is_none_or(|f| f.run_id != run) {
+                                    return Err(unavailable());
+                                }
+                                fenced
+                            }
+                        } else {
+                            loaded
+                        };
                         let budget = crate::storage::HistoryBudget::new(
                             4096,
                             64 << 20,
@@ -1710,24 +2185,32 @@ impl Worker {
         }
     }
     async fn refresh_join_records(&self, root: &Control) -> Result<()> {
-        let mut after = None;
-        loop {
-            let (page, done) = self
-                .queue
+        for record in self.records_in_order()? {
+            self.replicate_record_class(root, record, true).await?;
+        }
+        Ok(())
+    }
+
+    /// Current records in acceptance order, read one at a time so a copy
+    /// never clones the whole queue. Records removed meanwhile are skipped.
+    fn records_in_order(&self) -> Result<impl Iterator<Item = RequestRecord> + '_> {
+        let keys = sequence_order(
+            self.queue
                 .queue
                 .lock()
                 .unwrap()
                 .as_ref()
-                .ok_or_else(unavailable)?
-                .snapshot_page(after);
-            for record in page.records {
-                after = Some(record.sequence);
-                self.replicate_record_class(root, record, true).await?;
-            }
-            if done {
-                return Ok(());
-            }
-        }
+                .ok_or_else(unavailable)?,
+        );
+        Ok(keys.into_iter().filter_map(move |key| {
+            self.queue
+                .queue
+                .lock()
+                .unwrap()
+                .as_ref()?
+                .record(key)
+                .cloned()
+        }))
     }
 
     async fn resolve_fenced_join(&self, root: &Control) -> Result<()> {
@@ -1767,6 +2250,9 @@ impl Worker {
                 break;
             }
             self.queue.streams.reap(now_ms());
+            self.queue.discard_stale_proposals();
+            self.queue
+                .retire_expired_records(limits(&self).result_retention_ms);
             if self.queue.has_pending() && super::stream::memory_pressure(&self.cpu) {
                 self.queue.streams.evict_speculation();
             }
@@ -1781,14 +2267,12 @@ impl Worker {
                 let records = {
                     let q = self.queue.queue.lock().unwrap();
                     let active = self.queue.active.lock().unwrap();
+                    let retries = self.queue.retries.lock().unwrap();
+                    let now = nabedra_rt::time::now();
                     q.as_ref()
                         .map(|q| {
-                            q.records()
-                                .filter(|r| {
-                                    r.accepted
-                                        && (!r.state.terminal() || !q.ready(r.identity()))
-                                        && !active.contains(&r.identity())
-                                })
+                            dispatch_candidates(q, &active, &retries, now)
+                                .into_iter()
                                 .filter_map(|record| {
                                     let bytes = record
                                         .body
@@ -1814,18 +2298,6 @@ impl Worker {
                         .unwrap_or_default()
                 };
                 for (record, charge) in records {
-                    if self
-                        .queue
-                        .retries
-                        .lock()
-                        .unwrap()
-                        .get(&record.identity())
-                        .is_some_and(|(count, until)| {
-                            *count >= 3 || *until > nabedra_rt::time::now()
-                        })
-                    {
-                        continue;
-                    }
                     let mut active = self.queue.active.lock().unwrap();
                     if active.len() >= self.coordination_slots {
                         break;
@@ -1851,14 +2323,10 @@ impl Worker {
                             error = reconcile_attempt_error(reconcile_mutation, error);
                             let attempts = {
                                 let mut retry = owner.queue.retries.lock().unwrap();
-                                let count = retry.get(&id).map_or(1, |(n, _)| n + 1);
+                                let count = retry.get(&id).map_or(1, |(n, _)| n.saturating_add(1));
                                 retry.insert(
                                     id.clone(),
-                                    (
-                                        count,
-                                        nabedra_rt::time::now()
-                                            + Duration::from_millis(50 * (1u64 << count.min(5))),
-                                    ),
+                                    (count, nabedra_rt::time::now() + retry_backoff(count)),
                                 );
                                 count
                             };
@@ -1913,7 +2381,26 @@ impl Worker {
         record: RequestRecord,
     ) -> Result<()> {
         let id = record.identity();
-        let record = self.replicate_record(&root, record).await?;
+        // A record every member already acknowledged at this version needs no
+        // second copy before it starts: two install rounds fewer per request
+        // (SCHED-7). Takeovers, joins and expiry clear the ACKs, so those
+        // records are still re-replicated here.
+        let ready = self
+            .queue
+            .queue
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|q| {
+                q.record(id.clone())
+                    .map(|r| r.version == record.version && q.ready(id.clone()))
+            })
+            .unwrap_or(false);
+        let record = if ready {
+            record
+        } else {
+            self.replicate_record(&root, record).await?
+        };
         if record.state.terminal() {
             return Ok(());
         }
@@ -2004,6 +2491,12 @@ impl Worker {
             .await
             .map_err(|_| unavailable())?
             .to_vec();
+        // The coordinator answers 429 when a partition job was refused for
+        // memory and not executed. The record retries with backoff instead
+        // of settling a transient overload as its terminal result.
+        if status == 429 {
+            return Err(http::failure(crate::protocol::ErrorCode::Overloaded));
+        }
         if status == 503 {
             let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
             let error = value
@@ -2178,6 +2671,431 @@ pub(super) async fn handler(
             .body(Body::from(e.body))
             .unwrap()
     })
+}
+
+/// A control root with Ready, Verified workers `Uuid::from_u128(10 + i)`,
+/// coordinator 10, cluster 1, revision 1 and scheduler term 1.
+#[cfg(test)]
+pub(crate) fn fixture_root(ready: usize) -> Control {
+    use serde_json::json;
+    let id = |n| Uuid::from_u128(n);
+    let template = json!({"api_urls":["http://api/"],"listen":"127.0.0.1:0","operation_slots":1,"partition_slots":1,"queue_size":16,"partition_size":"4 KiB","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"fixture/","token_file":"/token","ca_file":null}},"tls":null});
+    let typed =
+        crate::cluster::configuration::Template::decode(&serde_json::to_vec(&template).unwrap())
+            .unwrap();
+    let nodes = (0..ready).map(|index| {
+        let node = id(index as u128 + 10);
+        json!({"node_id":node,"launch_id":null,"resource_id":format!("external:{node}"),"ownership":"external","state":"ready","incarnation":id(index as u128 + 100),"retired_incarnations":[],"endpoint":"http://worker/","operation_slots":256,"partition_slots":256,"resources":crate::config::WorkerResources::default(),"queue_size":16,"registration":"verified","session":{"id":id(index as u128 + 200),"verifier":"a".repeat(64)},"drain":null})
+    }).collect::<Vec<_>>();
+    let wire = json!({"version":1,"cluster_id":id(1),"name":"Fixture","config":{"generation":2,"storage_fingerprint":"a".repeat(64),"auth_fingerprint":"b".repeat(64),"template_fingerprint":typed.fingerprint().unwrap(),"lifecycle_fingerprint":"c".repeat(64),"worker_semantic_fingerprint":"d".repeat(64),"adapter_contract":null},"provisioning":"external","template":template,"timing":crate::cluster::configuration::Timing::default(),"revision":1,"change_id":id(2),"policy":{"revision":1,"mode":"fixed","desired":ready.max(1),"min_nodes":ready.max(1),"max_nodes":ready.max(1)},"controller":{"owner_id":null,"epoch":0,"lease_state":"released","lease_until_ms":null},"scheduler":{"coordinator_node":if ready > 0 {Some(id(10))} else {None},"scheduler_term":1,"cooldown_until_ms":0,"backoff_until_ms":0,"failures":0,"low_since_ms":null},"admin_seq":0,"admin_head":null,"nodes":nodes,"intents":[]});
+    Control::decode(&serde_json::to_vec(&wire).unwrap()).unwrap()
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+    use crate::request_queue::QueueLimits;
+
+    fn id(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+    fn limits() -> QueueLimits {
+        QueueLimits {
+            max_pending_requests: 64,
+            max_queue_bytes_per_replica: 16 << 20,
+            max_retained_result_bytes_per_worker: 16 << 20,
+            result_retention_ms: 300_000,
+        }
+    }
+    fn body(request: u128) -> Vec<u8> {
+        serde_json::to_vec(
+            &serde_json::json!({"request_id":id(request),"operation":"table.list","payload":{}}),
+        )
+        .unwrap()
+    }
+    fn at(root: &Control, revision: u64) -> Control {
+        let mut root = root.clone();
+        root.revision = revision;
+        root.change_id = id(1000 + revision as u128);
+        root
+    }
+
+    /// An owner and a replica of one run: `peer` holds what the owner lost.
+    fn queues() -> (RequestQueue, RequestQueue) {
+        let members: BTreeSet<Uuid> = [id(10), id(11)].into();
+        let run = id(50);
+        (
+            RequestQueue::new(run, 1, 1, limits(), members.clone()).unwrap(),
+            RequestQueue::new(run, 1, 1, limits(), members).unwrap(),
+        )
+    }
+    fn accept(q: &mut RequestQueue, request: u128) -> RequestRecord {
+        let record = q.propose(body(request), 0).unwrap();
+        q.acknowledge(record.identity(), id(10)).unwrap();
+        q.acknowledge(record.identity(), id(11)).unwrap()
+    }
+
+    #[test]
+    fn r01_r03_new_owner_merges_accepted_records_missing_from_its_own_copy() {
+        // The old owner accepted r1 and r2 on both copies, then r3 and a
+        // finished r1 reached only the peer: the new owner's copy lacks them,
+        // as a joiner published without a copy would (SCHED-1).
+        let (mut owner, mut peer) = queues();
+        for request in [1, 2] {
+            let record = accept(&mut peer, request);
+            owner.install(record).unwrap();
+        }
+        accept(&mut peer, 3);
+        let running = peer.start(id(1), Some(vec![1])).unwrap();
+        peer.acknowledge(running.identity(), id(10)).unwrap();
+        peer.acknowledge(running.identity(), id(11)).unwrap();
+        let response =
+            serde_json::to_vec(&serde_json::json!({"request_id":id(1),"data":[]})).unwrap();
+        peer.finish(id(1), 200, response, 5).unwrap();
+        // An unaccepted proposal on the peer was never acknowledged.
+        peer.propose(body(4), 0).unwrap();
+        let held = peer.records().cloned().collect::<Vec<_>>();
+
+        owner.takeover(2, 2, [id(11), id(12)].into()).unwrap();
+        let merged = merge_peer_records(&mut owner, held);
+
+        assert_eq!(merged, 2, "the missing r3 and the finished r1");
+        let r3 = owner
+            .record(id(3))
+            .expect("an accepted request survives the takeover");
+        assert!(r3.accepted && r3.state == RequestState::Queued && r3.scheduler_term == 2);
+        assert_eq!(owner.record(id(1)).unwrap().state, RequestState::Succeeded);
+        assert_eq!(owner.record(id(2)).unwrap().state, RequestState::Queued);
+        assert!(
+            owner.record(id(4)).is_none(),
+            "unaccepted proposals are not merged"
+        );
+        // Every merged record must be re-replicated before it is ready.
+        assert!(owner.records().all(|r| r.replicas.is_empty()));
+    }
+
+    #[test]
+    fn r01_merge_keeps_the_owner_copy_when_the_peer_is_not_further_along() {
+        let (mut owner, mut peer) = queues();
+        let record = accept(&mut owner, 1);
+        peer.install(record).unwrap();
+        let running = owner.start(id(1), Some(vec![1])).unwrap();
+        owner.acknowledge(running.identity(), id(10)).unwrap();
+        let held = peer.records().cloned().collect::<Vec<_>>();
+        owner.takeover(2, 2, [id(10)].into()).unwrap();
+        let before = owner.record(id(1)).unwrap().clone();
+        assert_eq!(merge_peer_records(&mut owner, held), 0);
+        assert_eq!(owner.record(id(1)), Some(&before));
+    }
+
+    #[test]
+    fn st04_r03_delayed_reset_from_an_earlier_join_attempt_is_refused() {
+        let queue = QueueRuntime::new();
+        let root = fixture_root(1);
+        let (first, second) = (at(&root, 7), at(&root, 9));
+        let applied = std::cell::Cell::new(0);
+        let apply = || {
+            applied.set(applied.get() + 1);
+            Ok(())
+        };
+        for kind in [JoinReset::Queue, JoinReset::Stream] {
+            applied.set(0);
+            // Attempt one resets at revision 7; its reply is lost.
+            queue
+                .admit_join_reset(kind, JoinBase::of(&first), &first, apply)
+                .unwrap();
+            // The same base cannot be reset twice: a second attempt waits for
+            // the root to advance, so a delayed first reset is distinguishable.
+            assert!(
+                queue
+                    .admit_join_reset(kind, JoinBase::of(&first), &first, apply)
+                    .is_err()
+            );
+            // A reset for a base the receiver already sees as fenced.
+            assert!(
+                queue
+                    .admit_join_reset(kind, JoinBase::of(&first), &second, apply)
+                    .is_err()
+            );
+            // Attempt two copies at revision 9.
+            queue
+                .admit_join_reset(kind, JoinBase::of(&second), &second, apply)
+                .unwrap();
+            // Attempt one's reset arrives late, read against a stale root: it
+            // must not erase attempt two's copy.
+            assert!(
+                queue
+                    .admit_join_reset(kind, JoinBase::of(&first), &first, apply)
+                    .is_err()
+            );
+            assert_eq!(applied.get(), 2, "only the two current resets applied");
+        }
+    }
+
+    #[test]
+    fn st04_r03_failed_reset_does_not_consume_its_base() {
+        let queue = QueueRuntime::new();
+        let root = at(&fixture_root(1), 7);
+        let base = JoinBase::of(&root);
+        assert!(
+            queue
+                .admit_join_reset(
+                    JoinReset::Queue,
+                    base,
+                    &root,
+                    || Err::<(), _>(unavailable())
+                )
+                .is_err()
+        );
+        queue
+            .admit_join_reset(JoinReset::Queue, base, &root, || Ok(()))
+            .unwrap();
+    }
+
+    #[test]
+    fn r03_snapshot_pages_are_ordered_bounded_and_complete() {
+        let (mut q, _) = queues();
+        for request in 1..=40 {
+            accept(&mut q, request);
+        }
+        let mut after = None;
+        let mut seen = Vec::new();
+        loop {
+            let (page, done) = bounded_snapshot_page(&q, after);
+            assert!(!page.records.is_empty());
+            seen.extend(page.records.iter().map(|r| r.sequence));
+            after = page.records.last().map(|r| r.sequence);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(seen, (1..=40).collect::<Vec<_>>());
+        let (page, done) = bounded_snapshot_page(&q, Some(40));
+        assert!(page.records.is_empty() && done);
+        let order = sequence_order(&q);
+        assert_eq!(order.len(), 40);
+        assert!(
+            order
+                .windows(2)
+                .all(|w| q.record(w[0].clone()).unwrap().sequence
+                    < q.record(w[1].clone()).unwrap().sequence)
+        );
+    }
+
+    fn tenant(bucket: &str) -> crate::storage::context::RequestContext {
+        serde_json::from_value(serde_json::json!({"version":1,"bucket":bucket,"region":"eu-west-1","prefix":"db/","credentials":{"access_key_id":"key","secret_access_key":"secret","session_token":null,"expires_at":null}})).unwrap()
+    }
+
+    #[test]
+    fn f2_reconciling_mutation_retries_after_three_failures_and_backoff_uses_no_slot() {
+        let (mut q, _) = queues();
+        for request in 1..=3 {
+            accept(&mut q, request);
+        }
+        let now = nabedra_rt::time::now();
+        let mut retries = BTreeMap::new();
+        // r1 failed three times and its backoff has elapsed: it must run
+        // again, or an unknown mutation wedges until a takeover.
+        retries.insert(RequestKey::from(id(1)), (3, now));
+        // r2 is backing off: it must not take a slot from r3.
+        retries.insert(RequestKey::from(id(2)), (1, now + Duration::from_secs(1)));
+        let picked = dispatch_candidates(&q, &BTreeSet::new(), &retries, now)
+            .into_iter()
+            .map(|r| r.request_id)
+            .collect::<Vec<_>>();
+        assert_eq!(picked, vec![id(1), id(3)]);
+        for attempts in 1..40 {
+            let wait = retry_backoff(attempts);
+            assert!(wait <= MAX_RETRY_BACKOFF && wait >= Duration::from_millis(50));
+        }
+        assert!(retry_backoff(30) >= MAX_RETRY_BACKOFF / 2);
+    }
+
+    #[test]
+    fn c05_pump_dispatches_in_acceptance_order_across_databases() {
+        let members: BTreeSet<Uuid> = [id(10)].into();
+        let mut q = RequestQueue::new(id(50), 1, 1, limits(), members).unwrap();
+        let (one, two) = (tenant("tenant-one"), tenant("tenant-two"));
+        let one_key = one.storage_key().unwrap();
+        let two_key = two.storage_key().unwrap();
+        // The database with the higher storage key submits first.
+        let (first, later) = if one_key > two_key {
+            (one, two)
+        } else {
+            (two, one)
+        };
+        let mut submit = |request: u128, context: &crate::storage::context::RequestContext| {
+            let record = q
+                .propose_with_context(body(request), Some(context.clone()), 0)
+                .unwrap();
+            q.acknowledge(record.identity(), id(10)).unwrap();
+        };
+        submit(1, &first);
+        for request in 2..=6 {
+            submit(request, &later);
+        }
+        let picked = dispatch_candidates(
+            &q,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            nabedra_rt::time::now(),
+        );
+        assert_eq!(picked.first().map(|r| r.request_id), Some(id(1)));
+        assert!(picked.windows(2).all(|w| w[0].sequence < w[1].sequence));
+    }
+
+    #[test]
+    fn q02_abandoned_uncertain_submission_releases_slot() {
+        let members: BTreeSet<Uuid> = [id(10), id(11)].into();
+        let mut limits = limits();
+        limits.max_pending_requests = 1;
+        let mut owner = RequestQueue::new(id(50), 1, 1, limits, members.clone()).unwrap();
+        let mut replica = RequestQueue::new(id(50), 1, 1, limits, members).unwrap();
+        // The owner proposes r1 and installs it on the replica; the second
+        // member answers 429, so the submission is uncertain.
+        let first = owner.propose(body(1), 0).unwrap();
+        replica.install(first.clone()).unwrap();
+        owner
+            .discard_unaccepted(first.identity(), first.version)
+            .unwrap();
+        assert_eq!(owner.pending(), 0, "the owner releases the slot at once");
+        // The client retries the same identity: a new sequence. The replica's
+        // stale copy must not conflict with it forever.
+        owner.propose(body(9), 0).unwrap();
+        let retry = owner.propose(body(1), 0);
+        assert!(retry.is_err(), "the cap holds while r9 is pending");
+        owner.discard_unaccepted(id(9), 1).unwrap();
+        let retry = owner.propose(body(1), 0).unwrap();
+        assert_ne!(retry.sequence, first.sequence);
+        assert!(
+            replica.install(retry.clone()).is_err(),
+            "the stale copy conflicts"
+        );
+        assert!(replace_abandoned_proposal(&mut replica, &retry));
+        replica.install(retry).unwrap();
+        // A proposal nobody retries leaves the replica after the TTL.
+        let mut seen = BTreeMap::new();
+        seen.insert(RequestKey::from(id(1)), 1_000);
+        assert!(stale_unaccepted(&replica, &seen, 1_000).is_empty());
+        assert_eq!(stale_unaccepted(&replica, &seen, 1_001).len(), 1);
+        assert!(stale_unaccepted(&replica, &BTreeMap::new(), u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn q01_long_run_beyond_queue_bytes_keeps_admitting() {
+        let members: BTreeSet<Uuid> = [id(10)].into();
+        let mut limits = limits();
+        limits.max_queue_bytes_per_replica = 64 << 10;
+        limits.result_retention_ms = 1_000;
+        let mut q = RequestQueue::new(id(50), 1, 1, limits, members).unwrap();
+        let drop_body = |request: u128| {
+            serde_json::to_vec(&serde_json::json!({"request_id":id(request),"operation":"table.drop","payload":{"table_id":id(request + 1_000_000)}})).unwrap()
+        };
+        let finish = |q: &mut RequestQueue,
+                      request: u128,
+                      mutation: bool,
+                      status: u16,
+                      now: u64| {
+            let record = q
+                .propose(
+                    if mutation {
+                        drop_body(request)
+                    } else {
+                        body(request)
+                    },
+                    now,
+                )
+                .unwrap();
+            q.acknowledge(record.identity(), id(10)).unwrap();
+            let response = if status == 200 {
+                serde_json::json!({"request_id":id(request),"data":null})
+            } else {
+                serde_json::json!({"request_id":id(request),"error":crate::protocol::ProtocolError::new(crate::protocol::ErrorCode::Unauthorized,"expired",crate::protocol::Outcome::NotApplied)})
+            };
+            q.finish(
+                id(request),
+                status,
+                serde_json::to_vec(&response).unwrap(),
+                now,
+            )
+            .unwrap();
+        };
+        // A long run: each second a read and a decided mutation finish, then
+        // their results expire. Without retirement the expired tombstones
+        // still fill the replica's queue bytes and every proposal is
+        // rejected as overloaded.
+        let mut now = 0;
+        let mut request = 1;
+        for _ in 0..200 {
+            finish(&mut q, request, false, 200, now);
+            finish(&mut q, request + 1, true, 200, now);
+            request += 2;
+            now += 1_000;
+            retire_expired(&mut q, &BTreeSet::new(), now, limits.result_retention_ms);
+        }
+        assert!(
+            q.records().count() <= 2,
+            "{} records left",
+            q.records().count()
+        );
+        // A mutation that ended without a durable decision stays a tombstone,
+        // so a delayed retry of it cannot execute again.
+        finish(&mut q, request, true, 401, now);
+        now += 1_000;
+        q.expire(now);
+        assert_eq!(
+            retire_expired(
+                &mut q,
+                &BTreeSet::new(),
+                now + 1,
+                limits.result_retention_ms
+            ),
+            0
+        );
+        assert!(q.record(id(request)).is_some_and(|r| r.result_expired));
+        // An active record is never retired under its runner.
+        let active: BTreeSet<RequestKey> = [RequestKey::from(id(request))].into();
+        assert_eq!(retire_expired(&mut q, &active, u64::MAX, 1), 0);
+    }
+
+    /// SCHED-6 measurement: copying a queue of `n` records page by page.
+    /// Run with `--ignored --nocapture` in a release build.
+    #[test]
+    #[ignore]
+    #[allow(clippy::disallowed_methods)] // A wall-clock measurement, not product time.
+    fn r03_measure_join_copy_order_cost() {
+        let members: BTreeSet<Uuid> = [id(10)].into();
+        let mut limits = limits();
+        limits.max_pending_requests = 1 << 20;
+        limits.max_queue_bytes_per_replica = 1 << 34;
+        let mut q = RequestQueue::new(id(50), 1, 1, limits, members).unwrap();
+        for n in [1_000usize, 4_000, 16_000] {
+            while q.records().count() < n {
+                let next = q.records().count() as u128 + 1;
+                let record = q.propose(body(next), 0).unwrap();
+                q.acknowledge(record.identity(), id(10)).unwrap();
+            }
+            let start = std::time::Instant::now();
+            let mut after = None;
+            loop {
+                let (page, done) = q.snapshot_page(after);
+                after = page.records.last().map(|r| r.sequence);
+                if done {
+                    break;
+                }
+            }
+            let paged = start.elapsed();
+            let start = std::time::Instant::now();
+            let keys = sequence_order(&q);
+            let copied = keys
+                .into_iter()
+                .filter_map(|k| q.record(k).cloned())
+                .count();
+            let ordered = start.elapsed();
+            assert_eq!(copied, n);
+            println!("join-copy n={n} snapshot_page={paged:?} sequence_order={ordered:?}");
+        }
+    }
 }
 
 #[cfg(test)]

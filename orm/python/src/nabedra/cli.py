@@ -97,11 +97,6 @@ def _parser():
         action.add_argument('--admin-token-file', required=True)
         action.add_argument('--ca-file')
         action.add_argument('--json', action='store_true')
-    migrate = commands.add_parser('migrate', allow_abbrev=False)
-    migrate.add_argument('--storage', required=True)
-    migrate.add_argument('--region', required=True)
-    migrate.add_argument('--cluster-id', required=True)
-    migrate.add_argument('--confirm-writers-stopped', action='store_true', required=True)
     return parser
 
 
@@ -250,10 +245,6 @@ def main(argv=None):
                 read_file(path, secret=path == (config['tls'] or {}).get('key_file'))
         if args.command == 'serve' and not args.storage:
             _auth(_absolute_config(load(args.config or 'nabedra-database.json'), args.config or 'nabedra-database.json'))
-        if args.command == 'migrate':
-            s3_storage(args.storage, args.region)
-            if str(UUID(args.cluster_id)) != args.cluster_id.lower():
-                raise ValueError('Invalid cluster identity')
         binary = resolve_server_binary(check=True)
         if args.command == 'serve':
             status = _serve(args, binary)
@@ -263,8 +254,6 @@ def main(argv=None):
             return status
         if args.command == 'worker':
             command = ['worker', '--bootstrap', args.bootstrap]
-        elif args.command == 'migrate':
-            command = ['database', 'migrate', '--storage', args.storage, '--region', args.region, '--cluster-id', args.cluster_id, '--confirm-writers-stopped']
         else:
             # Backend validates runtime-specific invariants and probes storage GETs.
             # No PUT probe is allowed. Write permissions remain unverified.

@@ -2,25 +2,22 @@
 use super::{
     Authority, Dependency, Driver, Entry, FENCE_READ_BYTES, Key, Registry, Source, Stored, Version,
     call, check_dependency, now_ms, record_bytes,
-    state::{MAX_IDENTITIES, MAX_RECORD_BYTES, Recovery, RecoveryStatus, RecoveryView},
+    state::{MAX_IDENTITIES, MAX_RECORD_BYTES, Recovery, RecoveryView},
     wire::{self, Batch, Capabilities, Error, Format, Opened, Reply, Request, SnapshotOpened},
 };
 use crate::{
     cluster::{
         member::{Node, NodeState, Registration},
-        state::{Control, MAX_NODES},
+        state::Control,
     },
     engine::stream::MAX_PINNED_QUERY_BYTES,
     node::{
         http,
-        queue_runtime::{
-            Command as QueueCommand, Reply as QueueReply, STREAM_CAPABILITY_CURSOR, members,
-            scheduler,
-        },
+        queue_runtime::{JoinBase, JoinReset, members, scheduler},
         queue_transport,
         runtime::Worker,
     },
-    protocol::{ErrorCode, MAX_PREDICATE_DEPTH, ProtocolError},
+    protocol::{MAX_PREDICATE_DEPTH, ProtocolError},
     scheduling::{MemoryCharge, ResourceScheduler},
     storage::{LoadedClusterCatalog, RuntimeStore, context::RequestContext},
     worker_pool::WorkerPool,
@@ -45,8 +42,7 @@ const CONTROL_REPLY_BYTES: usize = 16 << 10;
 const CONTROL_REQUEST_BYTES: usize = wire::MAX_REQUEST_BYTES + (64 << 10);
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RECOVERY_KEY_BYTES: usize = 4 << 10;
-const RECOVERY_CURSOR_BYTES: u64 = (4 * MAX_RECOVERY_KEY_BYTES + MAX_NODES) as u64;
-const LEGACY_PROBE_REPLY_BYTES: usize = 40 * MAX_NODES + 4096;
+const RECOVERY_CURSOR_BYTES: u64 = (4 * MAX_RECOVERY_KEY_BYTES) as u64;
 
 fn ready_stream_worker(node: &Node) -> bool {
     node.state == NodeState::Ready && node.registration == Registration::Verified
@@ -107,6 +103,8 @@ enum Command {
     },
     StreamReset {
         run: Uuid,
+        /// The control-root base of the join that sends this reset.
+        base: JoinBase,
     },
     StreamPage {
         run: Uuid,
@@ -160,7 +158,6 @@ struct StagedReply {
 enum StreamPage {
     Entry(Box<Entry>, MemoryCharge),
     End,
-    Legacy,
 }
 
 impl From<Reply> for WorkerReply {
@@ -331,14 +328,9 @@ impl Driver for WorkerDriver {
         if authority.term != self.1 {
             return Err(wire::unavailable());
         }
-        if self
-            .0
+        self.0
             .ensure_stream_recovered(stream_recovery_view(authority, &root))
-            .await?
-            != RecoveryStatus::AllPeers
-        {
-            return Err(wire::unavailable());
-        }
+            .await?;
         Ok(authority)
     }
 
@@ -399,9 +391,7 @@ impl Driver for WorkerDriver {
             return Err(Error::abandoned());
         }
         let view = stream_recovery_view(observed, &root);
-        if observed.term != authority.term
-            || self.registry().recovery_status(view) != Some(RecoveryStatus::AllPeers)
-        {
+        if observed.term != authority.term || !self.registry().recovered(view) {
             return Err(wire::unavailable().into());
         }
         check_dependency(self.registry(), dependency)?;
@@ -424,14 +414,20 @@ impl Driver for WorkerDriver {
             .node_id()
             .ok_or_else(wire::unavailable)?;
         let ready = members(&root);
+        // Transfer to every holder concurrently: the critical section under
+        // the stream change lock is one round trip, not one per holder
+        // (OLAPS-2). The reply still waits for every acknowledgement.
         let install = async {
-            for node in root
-                .nodes
-                .iter()
-                .filter(|node| node.node_id != own && ready.contains(&node.node_id))
-            {
-                self.0.transfer_stream(&root, node, &stored, false).await?;
-            }
+            let transfers = futures_util::future::join_all(
+                root.nodes
+                    .iter()
+                    .filter(|node| node.node_id != own && ready.contains(&node.node_id))
+                    .map(|node| self.0.transfer_stream(&root, node, &stored, false)),
+            )
+            .await;
+            transfers
+                .into_iter()
+                .collect::<Result<Vec<()>, ProtocolError>>()?;
             Ok::<(), ProtocolError>(())
         };
         nabedra_rt::time::timeout(TRANSACTION_TIMEOUT, install)
@@ -441,9 +437,7 @@ impl Driver for WorkerDriver {
         if current.run != observed.run {
             return Err(Error::abandoned());
         }
-        if stream_recovery_view(current, &fresh) != view
-            || self.registry().recovery_status(view) != Some(RecoveryStatus::AllPeers)
-        {
+        if stream_recovery_view(current, &fresh) != view || !self.registry().recovered(view) {
             return Err(wire::unavailable().into());
         }
         Ok(stored)
@@ -465,7 +459,7 @@ impl Worker {
         let authority = self.stream_fence(root).await?;
         let view = stream_recovery_view(authority, root);
         self.ensure_stream_recovered(view).await?;
-        if !self.queue.streams.handoff_ready(view, now_ms()) {
+        if !self.queue.streams.recovered(view) {
             return Err(wire::unavailable());
         }
         Ok(view)
@@ -477,25 +471,22 @@ impl Worker {
         expected: RecoveryView,
     ) -> Result<(), ProtocolError> {
         self.check_stream_view(expected).await?;
-        if !self.queue.streams.handoff_ready(expected, now_ms()) {
+        if !self.queue.streams.recovered(expected) {
             return Err(wire::unavailable());
         }
         Ok(())
     }
 
-    async fn ensure_stream_recovered(
-        &self,
-        expected: RecoveryView,
-    ) -> Result<RecoveryStatus, ProtocolError> {
+    async fn ensure_stream_recovered(&self, expected: RecoveryView) -> Result<(), ProtocolError> {
         let registry = &self.queue.streams;
-        if let Some(status) = registry.recovery_status(expected) {
-            return Ok(status);
+        if registry.recovered(expected) {
+            return Ok(());
         }
         nabedra_rt::time::timeout(TRANSACTION_TIMEOUT, async {
             let _change = self.queue.lock_stream_changes().await;
             let mut progress = registry.recovery.lock().await;
-            if let Some(status) = registry.recovery_status(expected) {
-                return Ok(status);
+            if registry.recovered(expected) {
+                return Ok(());
             }
             let root = self.check_stream_view(expected).await?;
             if progress
@@ -513,14 +504,9 @@ impl Worker {
             let recovery = progress.as_mut().unwrap();
             self.repair_stream_replicas(&root, recovery).await?;
             self.check_stream_view(expected).await?;
-            let status = if recovery.legacy_peers.contains(&true) {
-                RecoveryStatus::LegacyPeers
-            } else {
-                RecoveryStatus::AllPeers
-            };
-            registry.mark_recovered(expected, status)?;
+            registry.mark_recovered(expected)?;
             *progress = None;
-            Ok(status)
+            Ok(())
         })
         .await
         .map_err(|_| wire::unavailable())?
@@ -561,10 +547,6 @@ impl Worker {
                         cursor.finish_page(key);
                     }
                     StreamPage::End => cursor.finish_peer(),
-                    StreamPage::Legacy => {
-                        recovery.legacy_peers[cursor.peer] = true;
-                        cursor.finish_peer();
-                    }
                 }
             }
             recovery.merge = None;
@@ -572,11 +554,7 @@ impl Worker {
 
         let cursor = &mut recovery.repair;
         while let Some(node) = peers.clone().nth(cursor.peer) {
-            if recovery.legacy_peers[cursor.peer] {
-                cursor.finish_peer();
-            } else if let Some(stored) =
-                self.queue.streams.page(authority, cursor.after.as_ref())?
-            {
+            if let Some(stored) = self.queue.streams.page(authority, cursor.after.as_ref())? {
                 queue_transport::encoded_len(&stored.entry.key, MAX_RECOVERY_KEY_BYTES)?;
                 self.transfer_stream(root, node, &stored, true).await?;
                 cursor.finish_page(stored.entry.key.clone());
@@ -610,6 +588,16 @@ impl Worker {
     }
 
     async fn stream_fence(&self, root: &Control) -> Result<Authority, ProtocolError> {
+        // With the fresh root still at the term of a fence already read, that
+        // fence is current: a term's catalog fence is written once, after the
+        // root moved to the term. One catalog read per term on each worker
+        // instead of two per commit and one per install (OLAPS-2).
+        if let Some(fence) = self.queue.current_fence(root) {
+            return Ok(Authority {
+                run: fence.run_id,
+                term: fence.scheduler_term,
+            });
+        }
         let _catalog = self.charge_stream_bootstrap(FENCE_READ_BYTES)?;
         let loaded = self
             .storage
@@ -620,6 +608,7 @@ impl Worker {
         if fence.scheduler_term != root.scheduler.scheduler_term {
             return Err(wire::unavailable());
         }
+        self.queue.observe_fence(fence);
         Ok(Authority {
             run: fence.run_id,
             term: fence.scheduler_term,
@@ -742,42 +731,6 @@ impl Worker {
         }
     }
 
-    async fn confirm_legacy_stream_peer(
-        &self,
-        root: &Control,
-        node: &Node,
-        run: Uuid,
-    ) -> Result<(), ProtocolError> {
-        // A missing route could hide a modern replica. Probe the authenticated
-        // queue with a cursor that only a legacy worker answers with a snapshot.
-        let probe = QueueCommand::Snapshot {
-            after: Some(STREAM_CAPABILITY_CURSOR),
-        };
-        let encoded = queue_transport::encoded_len(&probe, CONTROL_REPLY_BYTES)?;
-        let _request = self.charge_stream_bootstrap(encoded as u64 + 64 * 1024)?;
-        let body = queue_transport::encode_exact(&probe, encoded)?;
-        let (bytes, _reply) = queue_transport::exchange_accounted(
-            &self.client,
-            &self.signer,
-            root,
-            node,
-            body,
-            LEGACY_PROBE_REPLY_BYTES,
-            None,
-            |length| self.charge_stream_bootstrap(4 * length as u64 + 4096),
-        )
-        .await?;
-        match serde_json::from_slice::<QueueReply>(&bytes).map_err(|_| wire::invalid())? {
-            QueueReply::Snapshot {
-                snapshot,
-                done: true,
-            } if snapshot.run_id == run && snapshot.records.is_empty() => Ok(()),
-            QueueReply::StreamCapable => Err(wire::unavailable()),
-            QueueReply::Error { error } => Err(error),
-            _ => Err(wire::invalid()),
-        }
-    }
-
     async fn fetch_stream_page(
         &self,
         root: &Control,
@@ -792,13 +745,7 @@ impl Worker {
         let result = self
             .stream_exchange(root, node, &command, MAX_RECORD_BYTES + 4096, true)
             .await;
-        let StagedReply { reply, _charge } = match result {
-            Err(error) if error.code == ErrorCode::NotFound && after.is_none() => {
-                self.confirm_legacy_stream_peer(root, node, run).await?;
-                return Ok(StreamPage::Legacy);
-            }
-            result => result?,
-        };
+        let StagedReply { reply, _charge } = result?;
         match reply {
             ControlReply::Page { entry: Some(entry) }
                 if entry.run == run
@@ -817,34 +764,24 @@ impl Worker {
         root: &Control,
         node: &Node,
         run: Uuid,
+        base: JoinBase,
     ) -> Result<(), ProtocolError> {
         let authority = Authority {
             run,
             term: root.scheduler.scheduler_term,
         };
-        let reset = self
+        match self
             .stream_exchange(
                 root,
                 node,
-                &Command::StreamReset { run },
+                &Command::StreamReset { run, base },
                 CONTROL_REPLY_BYTES,
                 true,
             )
-            .await;
-        match reset {
-            Ok(StagedReply {
-                reply: ControlReply::Installed,
-                ..
-            }) => {}
-            // Workers without the stream endpoint can still join before a
-            // stream identity needs to be transferred to them.
-            Err(error)
-                if error.code == ErrorCode::NotFound
-                    && self.queue.streams.page(authority, None)?.is_none() =>
-            {
-                return self.confirm_legacy_stream_peer(root, node, run).await;
-            }
-            Err(error) => return Err(error),
+            .await?
+            .reply
+        {
+            ControlReply::Installed => {}
             _ => return Err(wire::invalid()),
         }
         let mut after = None;
@@ -1083,7 +1020,7 @@ async fn accept(
             worker.install_stream_replica(fence, *entry)?;
             ControlReply::Installed
         }
-        Command::StreamReset { run } => {
+        Command::StreamReset { run, base } => {
             let fence = worker.stream_fence(root).await?;
             let own = worker
                 .signer
@@ -1103,7 +1040,11 @@ async fn accept(
             {
                 return Err(wire::unauthorized().into());
             }
-            worker.queue.streams.reset_replica(fence)?;
+            worker
+                .queue
+                .admit_join_reset(JoinReset::Stream, base, root, || {
+                    worker.queue.streams.reset_replica(fence)
+                })?;
             ControlReply::Installed
         }
         Command::StreamPage { run, after } => {
@@ -1140,7 +1081,7 @@ async fn accept(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WorkerResources;
+    use crate::{config::WorkerResources, protocol::ErrorCode};
 
     fn memory_budget(bytes: u64) -> ResourceScheduler {
         ResourceScheduler::new(vec![(

@@ -101,24 +101,6 @@ async fn run_cli() -> ExitCode {
         #[cfg(feature = "olap")]
         Command::Database {
             command:
-                nabedra_database_server::cli::DatabaseCommand::Migrate {
-                    storage,
-                    region,
-                    cluster_id,
-                    confirm_writers_stopped,
-                },
-        } => {
-            nabedra_database_server::maintenance::migrate(
-                &storage,
-                &region,
-                cluster_id,
-                confirm_writers_stopped,
-            )
-            .await
-        }
-        #[cfg(feature = "olap")]
-        Command::Database {
-            command:
                 nabedra_database_server::cli::DatabaseCommand::Export {
                     config,
                     output,
@@ -194,7 +176,7 @@ async fn run_cli() -> ExitCode {
         #[cfg(feature = "oltp")]
         Command::Serve(options) => nabedra_database_server::oltp_runtime::run(options).await,
         #[cfg(feature = "oltp")]
-        Command::Doctor { .. } | Command::Database { .. } => {
+        Command::Doctor { .. } => {
             Err("unsupported OLTP operator command for this deployment configuration")
         }
         #[cfg(all(feature = "oltp", unix))]
@@ -210,32 +192,17 @@ async fn run_cli() -> ExitCode {
         #[cfg(all(feature = "oltp", not(unix)))]
         Command::DataWorker { .. } => Err("OLTP data workers require POSIX descriptors"),
         #[cfg(all(feature = "oltp", unix))]
-        Command::Api {
-            config,
-            cold_start,
-            migrate_catalog,
-        } => {
+        Command::Api { config, cold_start } => {
             nabedra_database_server::oltp_runtime::api_process::run_api_configured(
-                config,
-                cold_start,
-                migrate_catalog,
+                config, cold_start,
             )
             .await
         }
         #[cfg(all(feature = "oltp", not(unix)))]
         Command::Api { .. } => Err("OLTP API supervision requires POSIX descriptors"),
         #[cfg(feature = "olap")]
-        Command::Api {
-            config,
-            cold_start,
-            migrate_catalog,
-        } => {
-            nabedra_database_server::cluster::runtime::run_api_configured(
-                config,
-                cold_start,
-                migrate_catalog,
-            )
-            .await
+        Command::Api { config, cold_start } => {
+            nabedra_database_server::cluster::runtime::run_api_configured(config, cold_start).await
         }
         #[cfg(feature = "olap")]
         Command::Worker { bootstrap } => {
@@ -339,7 +306,6 @@ async fn run(options: nabedra_database_server::config::ServeOptions) -> Result<(
             shutdown,
             config.execution(),
             config.options().cold_start,
-            config.options().migrate_catalog,
         )
         .await
         .map_err(|_| "listener failed")

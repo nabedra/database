@@ -1,0 +1,15 @@
+# Finding SCHED-12 of wave-rv (dr-olap F5); confirmed by the regression with the fix reverted (fx-sched).
+id = "REVIEW-local-unknown-failed"
+title = "Local serve settled an unknown mutation as terminal failed, which a later receipt could read as succeeded"
+class = "uncertain-outcome"
+module = "scheduler"
+guarantees = ["OLAP-G03", "OLAP-G07"]
+scenarios = ["T04", "U01"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/src/api/queue.rs t04_u01_local_unknown_mutation_stays_reconciling"
+seed = "unknown"
+why_not_caught = "The actor-unwind test used a read, where a failed unknown outcome cannot later turn into a success."
+invariant_added = "A local mutation without a definite outcome stays reconciling until its durable decision settles it."
+fix_commits = ["042baf654f3d043ae80d847c804113153b042f1c"]
+revert_patch_ok = true

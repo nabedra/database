@@ -1,0 +1,15 @@
+# Finding SCHED-8 of wave-rv; confirmed by the regression with the fix reverted (fx-sched).
+id = "REVIEW-queue-nonce-cap"
+title = "The replay-nonce cache capped every receiver at about 273 signed queue messages per second"
+class = "resource-release-order"
+module = "scheduler"
+guarantees = ["OLAP-G07"]
+scenarios = ["U02"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/src/node/queue_transport.rs u02_sustained_300_installs_per_second_not_rejected"
+seed = "unknown"
+why_not_caught = "No load test sustained more than 8,192 signed messages within one 30 s window on one receiver."
+invariant_added = "A receiver admits 300 messages per second for a minute; at its stated cap it answers overloaded."
+fix_commits = ["923d68b7256e5f98483b69745e7886e9229af297"]
+revert_patch_ok = true

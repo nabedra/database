@@ -270,7 +270,7 @@ impl Peers<'_> {
         )?;
         let response = self.worker.client.request(request, deadline).await?;
         if response.status() != 200 {
-            return Err(unavailable());
+            return Err(job_status_error(response.status().as_u16()));
         }
         http::framing(response.headers(), 0, true)?;
         if http::one(response.headers(), "content-type")? != "application/octet-stream" {
@@ -320,6 +320,25 @@ impl Peers<'_> {
         Ok(*result)
     }
 }
+/// Memory a coordinator charges for rows it retains until the reduction.
+fn retained_charge(table: &TableDescriptor, rows: &[protocol::Row]) -> Result<u64> {
+    let payload = rows.iter().try_fold(0usize, |sum, row| {
+        sum.checked_add(crate::snapshot::row_payload(row))
+            .ok_or_else(|| error(ErrorCode::LimitExceeded))
+    })?;
+    crate::snapshot::memory_shape(table, rows.len(), payload, 0)
+}
+
+/// A worker answers 429 only for a job it did not execute (its memory was
+/// short): a definite, retryable overload. Any other failure stays unknown.
+fn job_status_error(status: u16) -> ProtocolError {
+    if status == 429 {
+        http::failure(ErrorCode::Overloaded)
+    } else {
+        unavailable()
+    }
+}
+
 impl Peers<'_> {
     async fn dispatch_job(
         &self,
@@ -448,7 +467,7 @@ async fn execute_inner(
     let is_mutation = request.operation.is_mutation();
     let deadline = nabedra_rt::time::now() + Duration::from_secs(60);
     let budget = HistoryBudget::new(4096, 64 * 1024 * 1024, deadline).map_err(|_| unavailable())?;
-    for _ in 0..3 {
+    for attempt in 1..=3u32 {
         let storage = peers.data.storage();
         let original = bytes.clone();
         let id = request.request_id;
@@ -551,21 +570,39 @@ async fn execute_inner(
             .storage
             .as_ref()
             .map(|_| peers.worker.ready.prepared.input.value.cluster_id);
-        let candidate = cpu(&peers.worker.cpu, move |_| {
+        let (candidate, status) = cpu(&peers.worker.cpu, move |_| {
             let base = loaded.catalog();
-            let decision = Decision {
-                version: 1,
-                id: commit,
-                parent: base.decision_head,
-                base_revision: base.revision,
-                revision: base
-                    .revision
-                    .checked_add(1)
-                    .ok_or_else(|| error(ErrorCode::LimitExceeded))?,
-                request_id: id,
-                request_body: String::from_utf8(original.into_vec()).map_err(|_| invalid())?,
-                response_status: status,
-                response_body: String::from_utf8(body).map_err(|_| invalid())?,
+            let request_body = String::from_utf8(original.into_vec()).map_err(|_| invalid())?;
+            let decision = |response_status, response_body: Vec<u8>| {
+                Ok::<_, ProtocolError>(Decision {
+                    version: 1,
+                    id: commit,
+                    parent: base.decision_head,
+                    base_revision: base.revision,
+                    revision: base
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(|| error(ErrorCode::LimitExceeded))?,
+                    request_id: id,
+                    request_body: request_body.clone(),
+                    response_status,
+                    response_body: String::from_utf8(response_body).map_err(|_| invalid())?,
+                })
+            };
+            let prepare = |tables, decision| match owner {
+                Some(cluster) => PreparedPublication::prepare_owned(
+                    loaded.clone(),
+                    tables,
+                    decision,
+                    cluster,
+                    expected_fence,
+                ),
+                None => PreparedPublication::prepare_fenced(
+                    loaded.clone(),
+                    tables,
+                    decision,
+                    expected_fence,
+                ),
             };
             // Oversized response fallback must never publish changed tables.
             let tables = if status == 200 {
@@ -573,22 +610,26 @@ async fn execute_inner(
             } else {
                 base.tables.clone()
             };
-            match owner {
-                Some(cluster) => PreparedPublication::prepare_owned(
-                    loaded,
-                    tables,
-                    decision,
-                    cluster,
-                    expected_fence,
-                ),
-                None => {
-                    PreparedPublication::prepare_fenced(loaded, tables, decision, expected_fence)
+            match prepare(tables, decision(status, body)?) {
+                Ok(candidate) => Ok((candidate, status)),
+                // OLAP-3: a changed root above the catalog cap is a definite
+                // limit. Publish it as a 413 decision with unchanged tables, so
+                // the outcome is replayable instead of `outcome_unknown`.
+                Err(crate::storage::StorageError::LimitExceeded) if status == 200 => {
+                    let fallback =
+                        response::encode_error(Some(id), error(ErrorCode::LimitExceeded));
+                    prepare(
+                        base.tables.clone(),
+                        decision(fallback.status, fallback.body)?,
+                    )
+                    .map(|candidate| (candidate, fallback.status))
+                    .map_err(|_| error(ErrorCode::LimitExceeded))
                 }
+                Err(_) => Err(error(ErrorCode::LimitExceeded)),
             }
-            .map_err(|_| error(ErrorCode::LimitExceeded))
         })
         .await?;
-        if encoded.status == 200 {
+        if status == 200 {
             lease
                 .command(Command::UploadStaged(peers.data.storage()))
                 .await
@@ -621,6 +662,10 @@ async fn execute_inner(
             .command(Command::ClearStaged)
             .await
             .map_err(|_| unavailable())?;
+        // OLAP-9: CAS losers that lost together must not retry together.
+        if attempt < 3 {
+            nabedra_rt::time::sleep(crate::storage::cas_retry_delay(attempt)).await;
+        }
     }
     Err(ProtocolError::new(
         ErrorCode::OutcomeUnknown,
@@ -815,12 +860,16 @@ async fn calculate(
                             source_payload_bytes,
                             ..
                         } => {
-                            let charge_bytes = crate::snapshot::memory_shape(
-                                &table,
-                                source_rows as usize,
-                                source_payload_bytes as usize,
-                                0,
-                            )?;
+                            let Reply::Rows(part) = child
+                                .command(Command::TakeRows)
+                                .await
+                                .map_err(|_| unavailable())?
+                            else {
+                                return Err(invalid());
+                            };
+                            // Charge the rows this coordinator retains for the
+                            // reduction, not every row the job scanned (OLAP-7).
+                            let charge_bytes = retained_charge(&table, &part)?;
                             retained = retained
                                 .checked_add(charge_bytes)
                                 .ok_or_else(|| error(ErrorCode::LimitExceeded))?;
@@ -834,13 +883,6 @@ async fn calculate(
                                     .scheduler()
                                     .charge_memory(0, charge_bytes)?,
                             );
-                            let Reply::Rows(part) = child
-                                .command(Command::TakeRows)
-                                .await
-                                .map_err(|_| unavailable())?
-                            else {
-                                return Err(invalid());
-                            };
                             ordered_rows.insert(index, part);
                             (source_rows, source_payload_bytes)
                         }

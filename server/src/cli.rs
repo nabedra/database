@@ -52,9 +52,6 @@ pub enum Command {
         /// Fence prior workers and begin a fresh in-memory request run.
         #[arg(long)]
         cold_start: bool,
-        /// Confirm all old writers are stopped before upgrading a legacy catalog.
-        #[arg(long)]
-        migrate_catalog: bool,
     },
     #[cfg(not(feature = "cache"))]
     /// Enroll and run a manually provisioned worker.
@@ -131,16 +128,6 @@ pub enum DatabaseCommand {
         execution_config: Option<std::path::PathBuf>,
         #[arg(long, required = true)]
         cold_start: bool,
-    },
-    Migrate {
-        #[arg(long)]
-        storage: String,
-        #[arg(long)]
-        region: String,
-        #[arg(long)]
-        cluster_id: uuid::Uuid,
-        #[arg(long, required = true)]
-        confirm_writers_stopped: bool,
     },
 }
 

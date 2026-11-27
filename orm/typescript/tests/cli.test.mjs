@@ -21,7 +21,7 @@ test("CLI preserves grouped commands, version output and protected init", async 
     assert.deepEqual(JSON.parse((await launch(...flags)).stdout),
       { cli: "0.2.2", binary: "0.1.1", config: 2, protocol: 1 })
   }
-  for (const command of ["init", "serve", "doctor", "worker", "cluster", "migrate"]) {
+  for (const command of ["init", "serve", "doctor", "worker", "cluster"]) {
     assert.match((await launch("database", command, "--help")).stdout, new RegExp("database " + command))
   }
   await assert.rejects(launch("init"), { code: 2 })

@@ -71,7 +71,6 @@ pub async fn serve<B: ObjectStore + 'static>(
         shutdown,
         crate::config::ExecutionConfig::default(),
         false,
-        false,
     )
     .await
 }
@@ -85,7 +84,6 @@ pub async fn serve_configured<B: ObjectStore + 'static>(
     shutdown: impl Future<Output = io::Result<()>>,
     execution: crate::config::ExecutionConfig,
     cold_start: bool,
-    migrate_catalog: bool,
 ) -> io::Result<()> {
     let stream_frontend = std::sync::Arc::new(
         api::stream::Frontend::new()
@@ -97,7 +95,6 @@ pub async fn serve_configured<B: ObjectStore + 'static>(
         token,
         execution,
         cold_start,
-        migrate_catalog,
         stream_frontend.clone(),
     )
     .map_err(|_| io::Error::other("invalid queue configuration"))?;

@@ -90,49 +90,9 @@ impl RemoteScheduler {
         Ok(RemoteView { scheduler, nodes })
     }
 }
+/// The worker reserves the same estimate (`crate::engine::job_memory_bytes`).
 pub(super) fn task_bytes(job: &JobEnvelope) -> Result<u64> {
-    let file = match &job.task {
-        Task::Get { file, .. } | Task::Collect { file, .. } | Task::Count { file, .. } => {
-            Some(file)
-        }
-        Task::Prepare { file, .. } => file.as_ref(),
-    };
-    let (mut count, mut payload, encoded) = match file {
-        Some(FileInput::Partition {
-            row_count,
-            payload_bytes,
-            byte_size,
-            ..
-        }) => (*row_count, *payload_bytes, *byte_size),
-        // A legacy manifest contains no encoded or decoded byte counts. Use
-        // only its known lower bound for advisory placement. The worker bounds
-        // the download and checks actual metadata/payload before allocating it.
-        Some(FileInput::Legacy { row_count, .. }) => (*row_count, 0, 0),
-        None => (0, 0, 0),
-    };
-    if let Task::Prepare { mutation, .. } = &job.task {
-        let rows = match mutation {
-            RowMutation::Insert(p) | RowMutation::Upsert(p) => std::slice::from_ref(&p.row),
-            RowMutation::InsertMany(p) => p.rows.as_slice(),
-            RowMutation::Update(p) => std::slice::from_ref(&p.values),
-            _ => &[],
-        };
-        count = count
-            .checked_add(rows.len() as u64)
-            .ok_or_else(|| error(ErrorCode::LimitExceeded))?;
-        for row in rows {
-            payload = payload
-                .checked_add(crate::snapshot::row_payload(row) as u64)
-                .ok_or_else(|| error(ErrorCode::LimitExceeded))?;
-        }
-    }
-    crate::snapshot::memory_shape(
-        &job.table,
-        usize::try_from(count).map_err(|_| invalid())?,
-        usize::try_from(payload).map_err(|_| invalid())?,
-        usize::try_from(encoded).map_err(|_| invalid())?,
-    )
-    .map(|n| n.max(4096))
+    crate::engine::job_memory_bytes(job)
 }
 
 #[cfg(test)]
@@ -183,5 +143,168 @@ mod tests {
         drop((input, charge));
         assert_eq!(pool.scheduler().usage(), vec![(0, 0, 0)]);
         threads.shutdown().await.unwrap();
+    }
+
+    fn partition_job(
+        object: &str,
+        table: Uuid,
+        rows: &[crate::protocol::Row],
+        bytes: usize,
+    ) -> JobEnvelope {
+        let file = crate::node::job::FileInput::from(crate::storage::PartitionFile {
+            object: object.into(),
+            range: crate::storage::KeyRange {
+                lower: None,
+                upper: None,
+            },
+            row_count: rows.len() as u64,
+            byte_size: bytes as u64,
+            payload_bytes: rows.iter().map(crate::snapshot::row_payload).sum::<usize>() as u64,
+        });
+        job::parse_job(&serde_json::to_vec(&serde_json::json!({"version":1,
+            "cluster_id":Uuid::from_u128(3),"operation_id":Uuid::from_u128(4),"job_id":Uuid::from_u128(5),"attempt_id":Uuid::from_u128(6),"request_digest":"a".repeat(64),
+            "snapshot":{"catalog_revision":1,"catalog_commit_id":Uuid::from_u128(2),"catalog_etag":"token"},"ordinal":0,
+            "table":{"id":table,"name":"items","schema":{"id":"int64","payload":"utf8"},"key":"id","format":"parquet"},
+            "task":{"kind":"collect","payload":{"file":file,"query":{"select":null,"filter":null,"order_by":null,"limit":null}}}})).unwrap()).unwrap()
+    }
+
+    /// The bench's one-thread worker: before the fix every partition read
+    /// reserved the whole 256 MiB task budget, so a third concurrent read of
+    /// a few hundred bytes waited for memory that the coordinator's ledger,
+    /// which charges the estimate, believed free.
+    #[tokio::test]
+    async fn m01_concurrent_small_partition_reads_fit_a_one_thread_worker() {
+        use crate::{
+            storage::{Namespace, ObjectKey, Storage},
+            worker_pool::WorkerPool,
+        };
+        let table = Uuid::from_u128(1);
+        let storage = Storage::new(
+            crate::test_storage::Fake::default(),
+            Namespace::new("small-partitions/").unwrap(),
+        );
+        let rows: Vec<crate::protocol::Row> = (0..16)
+            .map(|id| {
+                [
+                    ("id".into(), crate::protocol::Scalar::Int64(id)),
+                    (
+                        "payload".into(),
+                        crate::protocol::Scalar::Utf8("x".repeat(48)),
+                    ),
+                ]
+                .into()
+            })
+            .collect();
+        let key = ObjectKey::partition(table, Uuid::from_u128(9), 0);
+        let descriptor: TableDescriptor = serde_json::from_value(serde_json::json!({
+            "id": table, "name": "items", "schema": {"id": "int64", "payload": "utf8"},
+            "key": "id", "format": "parquet"
+        }))
+        .unwrap();
+        let bytes = crate::snapshot::encode(&descriptor, &rows).unwrap();
+        let job = partition_job(key.as_str(), table, &rows, bytes.len());
+        storage
+            .put(&key, bytes, crate::storage::WriteCondition::Create)
+            .await
+            .unwrap();
+        let resources = WorkerResources {
+            max_threads: 1,
+            memory_limit_bytes: 768 << 20,
+            task_memory_limit_bytes: 256 << 20,
+            control_memory_reserve_bytes: 128 << 20,
+        };
+        let (pool, threads) =
+            WorkerPool::start_with_resources(resources, tokio::runtime::Handle::current()).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let prepared = nabedra_rt::time::timeout(
+                std::time::Duration::from_secs(5),
+                crate::engine::prepare_captured(&storage, &pool, &job),
+            )
+            .await
+            .expect("a small read must not wait for a whole task budget")
+            .unwrap();
+            assert!(prepared.1.bytes() <= task_bytes(&job).unwrap());
+            held.push(prepared);
+        }
+        assert!(pool.scheduler().usage()[0].2 < 64 << 20);
+        drop(held);
+        threads.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn m01_memory_refusal_of_a_job_is_a_definite_retryable_overload() {
+        use crate::{node::payload_owner::OwnerError, protocol::ErrorCode};
+        // The worker did not execute the job: overloaded, not invalid.
+        assert_eq!(
+            crate::node::payload_owner::prepare_refusal(ErrorCode::LimitExceeded),
+            OwnerError::Overloaded
+        );
+        assert_eq!(
+            crate::node::payload_owner::prepare_refusal(ErrorCode::ValidationError),
+            OwnerError::Invalid
+        );
+        let answered = crate::node::runtime::job_command_error(OwnerError::Overloaded);
+        assert_eq!(answered.code, ErrorCode::Overloaded);
+        assert_eq!(answered.outcome, crate::protocol::Outcome::NotApplied);
+        assert_eq!(answered.status_code(), 429);
+        // The coordinator keeps that definite answer instead of unknown.
+        let observed = job_status_error(429);
+        assert_eq!(observed.code, ErrorCode::Overloaded);
+        assert_eq!(observed.outcome, crate::protocol::Outcome::NotApplied);
+        assert_eq!(job_status_error(503).code, ErrorCode::StorageUnavailable);
+        assert_eq!(
+            crate::node::runtime::job_command_error(OwnerError::Invalid).code,
+            ErrorCode::StorageUnavailable
+        );
+    }
+
+    /// OLAP-7: a filtered collect over a 100,000-row, 7-column table retains
+    /// only its matched rows; charging every scanned row (537.6 MB at 768 B a
+    /// cell) exceeded the 512 MiB default task limit.
+    #[test]
+    fn olap_7_collect_charges_retained_rows_not_scanned_rows() {
+        let schema: serde_json::Map<String, serde_json::Value> = (0..7)
+            .map(|c| {
+                if c == 0 {
+                    ("id".to_string(), serde_json::json!("int64"))
+                } else {
+                    (format!("c{c}"), serde_json::json!("utf8"))
+                }
+            })
+            .collect();
+        let table: TableDescriptor = serde_json::from_value(serde_json::json!({
+            "id": Uuid::from_u128(1), "name": "wide", "schema": schema, "key": "id", "format": "parquet"
+        }))
+        .unwrap();
+        let limit = WorkerResources::default().task_memory_limit_bytes;
+        let scanned = crate::snapshot::memory_shape(&table, 100_000, 100_000 * 6 * 8, 0).unwrap();
+        assert!(scanned > limit, "{scanned} against {limit}");
+        let matched: Vec<crate::protocol::Row> = (0..1_000)
+            .map(|id| {
+                (0..7)
+                    .map(|c| {
+                        if c == 0 {
+                            ("id".to_string(), crate::protocol::Scalar::Int64(id))
+                        } else {
+                            (
+                                format!("c{c}"),
+                                crate::protocol::Scalar::Utf8("v".repeat(8)),
+                            )
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let retained = retained_charge(&table, &matched).unwrap();
+        assert!(retained < limit / 64, "{retained}");
+        let payload = matched
+            .iter()
+            .map(crate::snapshot::row_payload)
+            .sum::<usize>();
+        assert_eq!(
+            retained,
+            crate::snapshot::memory_shape(&table, 1_000, payload, 0).unwrap()
+        );
     }
 }

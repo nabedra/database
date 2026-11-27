@@ -347,7 +347,7 @@ impl RequestQueue {
     }
     /// The caller must already hold a durable, non-executable terminal identity
     /// proof. This removes RAM only and never creates a reusable identity.
-    #[cfg(feature = "oltp")]
+    #[cfg(any(feature = "oltp", feature = "olap"))]
     pub(crate) fn retire_terminal(
         &mut self,
         id: impl Into<RequestKey>,

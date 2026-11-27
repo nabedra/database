@@ -16,6 +16,12 @@
 (* give the controller a reply: the scheduler always resolves from the     *)
 (* next root. Worker loss and controller takeover are modeled as subsequent *)
 (* writes to the same root.                                                *)
+(*                                                                         *)
+(* Receiver generation (fx-sched): one failed attempt may leave its copy   *)
+(* reset in flight to the joiner (JoinFail). It lands later (LateReset).   *)
+(* The joiner applies a reset only at the base its fresh root shows, once  *)
+(* per base and never after a newer one (resetFloor). Mutant              *)
+(* "unbound_reset" applies every reset, as before the fix.                 *)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Workers, Joiner, FirstOwner, Stream, Request, MaxVersion, Mutant
@@ -24,15 +30,17 @@ ASSUME /\ Joiner \in Workers /\ FirstOwner \in Workers \ {Joiner}
        /\ Cardinality(Workers) = 3
        /\ Stream # Request
        /\ MaxVersion \in Nat /\ MaxVersion > 0
-       /\ Mutant \in {"none", "release_on_deadline", "no_abort"}
+       /\ Mutant \in {"none", "release_on_deadline", "no_abort", "unbound_reset"}
 
 VARIABLES revision, ready, alive, owner, controllerUp, copy, confirmed,
           sealBase, pendingBase, expired, usedDeadline, usedWorkerCrash,
-          usedControllerCrash
+          usedControllerCrash, resetInFlight, resetFloor, usedJoinFail
+
+resetVars == <<resetInFlight, resetFloor, usedJoinFail>>
 
 vars == <<revision, ready, alive, owner, controllerUp, copy, confirmed,
           sealBase, pendingBase, expired, usedDeadline, usedWorkerCrash,
-          usedControllerCrash>>
+          usedControllerCrash, resetInFlight, resetFloor, usedJoinFail>>
 
 Kinds == {Stream, Request}
 Zero == [key \in Kinds |-> 0]
@@ -44,15 +52,54 @@ Init ==
     /\ copy = [n \in Workers |-> Zero] /\ confirmed = Zero
     /\ sealBase = NoBase /\ pendingBase = NoBase /\ expired = FALSE
     /\ usedDeadline = FALSE /\ usedWorkerCrash = FALSE /\ usedControllerCrash = FALSE
+    /\ resetInFlight = NoBase /\ resetFloor = NoBase /\ usedJoinFail = FALSE
 
 JoinCopy ==
     /\ controllerUp /\ Joiner \in alive \ ready /\ ready \subseteq alive
     /\ sealBase = NoBase /\ pendingBase = NoBase
+    \* The joiner admits this attempt's reset: its root shows the base, and
+    \* no reset at this or a newer base was applied (admit_join_reset).
+    /\ resetFloor < revision /\ resetFloor' = revision
     /\ copy' = [copy EXCEPT ![Joiner] = copy[owner]]
     /\ sealBase' = revision
     /\ UNCHANGED <<revision, ready, alive, owner, controllerUp, confirmed,
                    pendingBase, expired, usedDeadline, usedWorkerCrash,
-                   usedControllerCrash>>
+                   usedControllerCrash, resetInFlight, usedJoinFail>>
+
+\* An attempt whose reset is delayed in the network. The coordinator's
+\* exchange times out, so the attempt seals nothing. The controller's abort
+\* at the same base may or may not apply.
+JoinFail ==
+    /\ controllerUp /\ Joiner \in alive \ ready /\ ready \subseteq alive
+    /\ sealBase = NoBase /\ pendingBase = NoBase /\ ~usedJoinFail
+    /\ usedJoinFail' = TRUE /\ resetInFlight' = revision
+    /\ revision' \in {revision, revision + 1}
+    /\ UNCHANGED <<ready, alive, owner, controllerUp, copy, confirmed, sealBase,
+                   pendingBase, expired, usedDeadline, usedWorkerCrash,
+                   usedControllerCrash, resetFloor>>
+
+\* The delayed reset reaches the joiner and erases its copy if admitted.
+LateReset ==
+    /\ resetInFlight # NoBase /\ Joiner \in alive
+    /\ resetInFlight' = NoBase
+    /\ IF Mutant = "unbound_reset"
+             \/ (resetInFlight = revision /\ resetFloor < resetInFlight)
+       THEN /\ copy' = [copy EXCEPT ![Joiner] = Zero]
+            /\ resetFloor' = IF resetFloor < resetInFlight THEN resetInFlight ELSE resetFloor
+       ELSE UNCHANGED <<copy, resetFloor>>
+    /\ UNCHANGED <<revision, ready, alive, owner, controllerUp, confirmed,
+                   sealBase, pendingBase, expired, usedDeadline, usedWorkerCrash,
+                   usedControllerCrash, usedJoinFail>>
+
+\* A join retried at a base whose reset was already applied waits for the
+\* root to advance: the next lease renewal or abort writes it.
+Renew ==
+    /\ controllerUp /\ Joiner \in alive \ ready /\ sealBase = NoBase
+    /\ pendingBase = NoBase /\ resetFloor = revision
+    /\ revision' = revision + 1
+    /\ UNCHANGED <<ready, alive, owner, controllerUp, copy, confirmed, sealBase,
+                   pendingBase, expired, usedDeadline, usedWorkerCrash,
+                   usedControllerCrash, resetVars>>
 
 SubmitReady ==
     /\ controllerUp /\ sealBase = revision /\ pendingBase = NoBase
@@ -63,6 +110,7 @@ SubmitReady ==
     /\ UNCHANGED <<revision, ready, alive, owner, controllerUp, copy, confirmed,
                    sealBase, expired, usedDeadline, usedWorkerCrash,
                    usedControllerCrash>>
+    /\ UNCHANGED resetVars
 
 ApplyReady ==
     /\ pendingBase = revision
@@ -72,6 +120,7 @@ ApplyReady ==
     /\ pendingBase' = NoBase
     /\ UNCHANGED <<alive, owner, controllerUp, copy, confirmed, sealBase,
                    expired, usedDeadline, usedWorkerCrash, usedControllerCrash>>
+    /\ UNCHANGED resetVars
 
 RejectStale ==
     /\ pendingBase # NoBase /\ pendingBase < revision
@@ -79,6 +128,7 @@ RejectStale ==
     /\ UNCHANGED <<revision, ready, alive, owner, controllerUp, copy, confirmed,
                    sealBase, expired, usedDeadline, usedWorkerCrash,
                    usedControllerCrash>>
+    /\ UNCHANGED resetVars
 
 Deadline ==
     /\ sealBase = revision /\ ~usedDeadline
@@ -87,6 +137,7 @@ Deadline ==
                    THEN NoBase ELSE sealBase
     /\ UNCHANGED <<revision, ready, alive, owner, controllerUp, copy, confirmed,
                    pendingBase, usedWorkerCrash, usedControllerCrash>>
+    /\ UNCHANGED resetVars
 
 FenceAbort ==
     /\ controllerUp /\ expired /\ sealBase = revision
@@ -97,6 +148,7 @@ FenceAbort ==
     /\ UNCHANGED <<ready, alive, owner, controllerUp, copy, confirmed, sealBase,
                    pendingBase, expired, usedDeadline, usedWorkerCrash,
                    usedControllerCrash>>
+    /\ UNCHANGED resetVars
 
 ResolveSeal ==
     /\ sealBase # NoBase /\ sealBase < revision
@@ -106,6 +158,7 @@ ResolveSeal ==
     /\ UNCHANGED <<revision, ready, alive, owner, controllerUp, copy, confirmed,
                    pendingBase, usedDeadline, usedWorkerCrash,
                    usedControllerCrash>>
+    /\ UNCHANGED resetVars
 
 Commit(key) ==
     /\ sealBase = NoBase /\ ready \subseteq alive /\ owner \in ready
@@ -117,6 +170,7 @@ Commit(key) ==
     /\ UNCHANGED <<revision, ready, alive, owner, controllerUp, sealBase,
                    pendingBase, expired, usedDeadline, usedWorkerCrash,
                    usedControllerCrash>>
+    /\ UNCHANGED resetVars
 
 CrashWorker(n) ==
     /\ ~usedWorkerCrash /\ n \in alive
@@ -126,6 +180,7 @@ CrashWorker(n) ==
     \* reassignment first changes the root, invalidating old Match tokens.
     /\ UNCHANGED <<revision, ready, owner, controllerUp, confirmed, sealBase,
                    pendingBase, expired, usedDeadline, usedControllerCrash>>
+    /\ UNCHANGED resetVars
 
 ObserveLoss ==
     /\ controllerUp
@@ -135,18 +190,21 @@ ObserveLoss ==
     /\ owner' \in (IF owner \in ready' THEN {owner} ELSE ready')
     /\ UNCHANGED <<alive, controllerUp, copy, confirmed, sealBase, pendingBase,
                    expired, usedDeadline, usedWorkerCrash, usedControllerCrash>>
+    /\ UNCHANGED resetVars
 
 CrashController ==
     /\ controllerUp /\ ~usedControllerCrash
     /\ controllerUp' = FALSE /\ usedControllerCrash' = TRUE
     /\ UNCHANGED <<revision, ready, alive, owner, copy, confirmed, sealBase,
                    pendingBase, expired, usedDeadline, usedWorkerCrash>>
+    /\ UNCHANGED resetVars
 
 TakeoverController ==
     /\ ~controllerUp
     /\ controllerUp' = TRUE /\ revision' = revision + 1
     /\ UNCHANGED <<ready, alive, owner, copy, confirmed, sealBase, pendingBase,
                    expired, usedDeadline, usedWorkerCrash, usedControllerCrash>>
+    /\ UNCHANGED resetVars
 
 CommitAny == \E key \in Kinds : Commit(key)
 CrashWorkerAny == \E n \in Workers : CrashWorker(n)
@@ -160,6 +218,7 @@ Next ==
     \/ JoinCopy \/ SubmitReady \/ ApplyReady \/ RejectStale
     \/ Deadline \/ FenceAbort \/ ResolveSeal \/ CommitAny
     \/ CrashWorkerAny \/ ObserveLoss \/ CrashController \/ TakeoverController
+    \/ JoinFail \/ LateReset \/ Renew
     \/ Done
 
 Spec == Init /\ [][Next]_vars
@@ -173,6 +232,7 @@ LiveSpec ==
     /\ WF_vars(JoinCopy) /\ WF_vars(SubmitReady) /\ WF_vars(ApplyReady)
     /\ WF_vars(RejectStale) /\ WF_vars(FenceAbort) /\ WF_vars(ResolveSeal)
     /\ WF_vars(ObserveLoss) /\ WF_vars(TakeoverController)
+    /\ WF_vars(LateReset) /\ WF_vars(Renew)
 
 TypeOK ==
     /\ revision \in Nat /\ revision > 0
@@ -183,6 +243,8 @@ TypeOK ==
     /\ controllerUp \in BOOLEAN /\ expired \in BOOLEAN
     /\ usedDeadline \in BOOLEAN /\ usedWorkerCrash \in BOOLEAN
     /\ usedControllerCrash \in BOOLEAN
+    /\ resetInFlight \in 0..revision /\ resetFloor \in 0..revision
+    /\ usedJoinFail \in BOOLEAN
 
 G04_ReadyHoldsReplied == \A n \in ready \cap alive : copy[n][Stream] >= confirmed[Stream]
 G07_ReadyHoldsAccepted == \A n \in ready \cap alive : copy[n][Request] >= confirmed[Request]

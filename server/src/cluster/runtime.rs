@@ -252,18 +252,20 @@ impl Api {
             self.authority_epoch.store(owner.epoch, Ordering::Release);
             return Ok(());
         }
-        let transition = if old.is_none() {
-            FenceTransition::Migrate
-        } else if cold {
+        // Every catalog root carries a fence (format 6); nothing migrates.
+        let Some(previous_fence) = old else {
+            return Err(unavailable());
+        };
+        let transition = if cold {
             FenceTransition::ColdStart
         } else {
             FenceTransition::Takeover
         };
-        let new_run = cold || old.is_none();
+        let new_run = cold;
         let run_id = if new_run {
             ids::uuid_v4()
         } else {
-            old.unwrap().run_id
+            previous_fence.run_id
         };
         self.storage
             .fence_cluster_catalog(
@@ -437,7 +439,7 @@ impl Api {
             .check(sample())
             .map_err(|_| unavailable())?;
         let root = loaded.root().clone();
-        use crate::node::queue_runtime::{Command, JoinBase, Reply, scheduler};
+        use crate::node::queue_runtime::{Command, JoinBase, Reply};
         let node_id = node.node_id;
         let observation = reply.observation().clone();
         let candidate = cpu(&self.pool, {
@@ -456,7 +458,17 @@ impl Api {
         })
         .await?;
 
-        let sealed = if let Ok(scheduler) = scheduler(&root) {
+        let scheduler = match join_requirement(&root) {
+            Ok(JoinRequirement::Copy(scheduler)) => Some(scheduler),
+            Ok(JoinRequirement::FirstEnrollment) => None,
+            Err(error) => {
+                // Ready holders exist but no Ready scheduler can copy their
+                // queue (SCHED-1). Repair the assignment; a later probe joins.
+                let _ = self.ensure_catalog_fence(owner).await;
+                return Err(error);
+            }
+        };
+        let sealed = if let Some(scheduler) = scheduler {
             let base = JoinBase::of(&root);
             let result = async {
                 let bytes = serde_json::to_vec(&Command::FencedJoin { node_id, base })
@@ -472,7 +484,7 @@ impl Api {
                 match serde_json::from_slice::<Reply>(&result).map_err(|_| invalid())? {
                     Reply::FencedJoined { base: copied } if copied == base => Ok(()),
                     Reply::Error { error } => Err(error),
-                    // A legacy expiry-based reply cannot authorize readiness.
+                    // Only the reply bound to this base authorizes readiness.
                     _ => Err(unavailable()),
                 }
             }
@@ -731,6 +743,29 @@ impl receipt_observation::QueueAccess for Api {
         Api::lookup(self, run_id, request_id, context).await
     }
 }
+/// How the controller may publish a Starting worker Ready (R03).
+enum JoinRequirement<'a> {
+    /// Copy the queue and stream registry from this Ready scheduler first.
+    Copy(&'a Node),
+    /// No worker holds a queue copy: the first enrollment of a run, or every
+    /// holder is gone. Nothing accepted can be missing from the joiner.
+    FirstEnrollment,
+}
+
+/// A worker is never published Ready without a copy while any Ready worker
+/// may hold accepted requests (SCHED-1). The old probe skipped the copy
+/// whenever the coordinator was not Ready, for example between a published
+/// owner loss and the coordinator reassignment.
+fn join_requirement(root: &Control) -> Result<JoinRequirement<'_>> {
+    match crate::node::queue_runtime::scheduler(root) {
+        Ok(node) => Ok(JoinRequirement::Copy(node)),
+        Err(_) if crate::node::queue_runtime::members(root).is_empty() => {
+            Ok(JoinRequirement::FirstEnrollment)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn heartbeat_binding(root: &Control, node: &Node) -> Result<HeartbeatBinding> {
     let session = node.session.as_ref().ok_or_else(unavailable)?;
     Ok(HeartbeatBinding {
@@ -980,18 +1015,17 @@ fn supervisor() -> Result<UnixStream> {
     crate::supervisor::open().map_err(|_| invalid())
 }
 pub async fn run_api(path: PathBuf) -> std::result::Result<(), &'static str> {
-    run_api_configured(path, false, false).await
+    run_api_configured(path, false).await
 }
 pub async fn run_api_with_cold_start(
     path: PathBuf,
     cold_start: bool,
 ) -> std::result::Result<(), &'static str> {
-    run_api_configured(path, cold_start, false).await
+    run_api_configured(path, cold_start).await
 }
 pub async fn run_api_configured(
     path: PathBuf,
     cold_start: bool,
-    migrate_catalog: bool,
 ) -> std::result::Result<(), &'static str> {
     let mut channel = supervisor().map_err(|_| "protocol_error")?;
     let (pool, threads) = WorkerPool::start(
@@ -999,7 +1033,7 @@ pub async fn run_api_configured(
         tokio::runtime::Handle::current(),
     )
     .map_err(|_| "startup_failed")?;
-    let result = api_process(path, &mut channel, pool, cold_start, migrate_catalog).await;
+    let result = api_process(path, &mut channel, pool, cold_start).await;
     if result.is_err() {
         let _ = send(
             &mut channel,
@@ -1016,7 +1050,6 @@ async fn api_process(
     channel: &mut UnixStream,
     pool: WorkerPool,
     cold_start: bool,
-    migrate_catalog: bool,
 ) -> Result<()> {
     let startup_end = time::now() + Duration::from_secs(30);
     let init: Init =
@@ -1141,11 +1174,7 @@ async fn api_process(
         let storage = storage.clone();
         move |runtime| {
             let catalog = runtime
-                .block_on(storage.initialize_fenced_cluster_catalog(
-                    proposed_fence,
-                    migrate_catalog,
-                    false,
-                ))
+                .block_on(storage.initialize_fenced_cluster_catalog(proposed_fence, false))
                 .map_err(|e| {
                     eprintln!("nabedra-db: catalog initialization {e}");
                     unavailable()
@@ -1358,6 +1387,47 @@ mod queue_response_tests {
         controller.lease_state = LeaseState::Held;
         controller.owner_id = None;
         assert!(!follower_ready(&controller, 7, Some(fence), 1000, false));
+    }
+    #[test]
+    fn r01_r03_joiner_without_scheduler_is_not_published_ready() {
+        let joiner = |root: &mut Control| {
+            let mut node = root.nodes[0].clone();
+            node.node_id = Uuid::from_u128(99);
+            node.state = NodeState::Starting;
+            node.registration = Registration::Registered;
+            root.nodes.push(node);
+        };
+        // A owns the queue; B and C hold copies; D is starting.
+        let mut root = crate::node::queue_runtime::fixture_root(3);
+        joiner(&mut root);
+        assert!(matches!(
+            join_requirement(&root),
+            Ok(JoinRequirement::Copy(node)) if node.node_id == Uuid::from_u128(10)
+        ));
+        // The owner's loss is published but the coordinator is not yet
+        // reassigned. B and C still hold every accepted request: D must wait.
+        root.nodes[0].state = NodeState::Lost;
+        assert!(join_requirement(&root).is_err());
+        // No holder is left: the first enrollment of a run may publish.
+        for node in &mut root.nodes[1..3] {
+            node.state = NodeState::Lost;
+        }
+        assert!(matches!(
+            join_requirement(&root),
+            Ok(JoinRequirement::FirstEnrollment)
+        ));
+        let mut fresh = crate::node::queue_runtime::fixture_root(0);
+        joiner_into_empty(&mut fresh);
+        assert!(matches!(
+            join_requirement(&fresh),
+            Ok(JoinRequirement::FirstEnrollment)
+        ));
+    }
+    fn joiner_into_empty(root: &mut Control) {
+        let mut node = crate::node::queue_runtime::fixture_root(1).nodes[0].clone();
+        node.state = NodeState::Starting;
+        node.registration = Registration::Registered;
+        root.nodes.push(node);
     }
     #[test]
     fn q04_t04_post_accept_lookup_failure_preserves_identity_and_unknown_outcome() {

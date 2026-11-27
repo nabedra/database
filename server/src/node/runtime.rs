@@ -424,7 +424,7 @@ impl Worker {
                 let Reply::Accepted(result) = lease
                     .command(Command::ExecuteCaptured(data.storage()))
                     .await
-                    .map_err(|_| unavailable())?
+                    .map_err(job_command_error)?
                 else {
                     return Err(invalid());
                 };
@@ -525,6 +525,16 @@ impl Worker {
         }
     }
 }
+/// A job refused for memory was not executed: answer `overloaded` (429,
+/// not applied), so the coordinator retries it instead of reporting the
+/// whole operation's outcome as unknown.
+pub(in crate::node) fn job_command_error(error: super::payload_owner::OwnerError) -> crate::protocol::ProtocolError {
+    match error {
+        super::payload_owner::OwnerError::Overloaded => http::failure(ErrorCode::Overloaded),
+        _ => unavailable(),
+    }
+}
+
 async fn internal(State(worker): State<Arc<Worker>>, request: Request<Body>) -> Response<Body> {
     let response = async {
         if !worker.accepting.load(Ordering::Acquire) {

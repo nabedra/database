@@ -131,6 +131,21 @@ pub(crate) async fn download_file<B: ObjectStore>(
     file: ReadFile,
 ) -> Result<DownloadedFile, ProtocolError> {
     let budget = pool.resources().task_memory_limit_bytes;
+    download_file_reserving(storage, pool, request, table, file, budget).await
+}
+
+/// Download one file while holding `reserve` bytes of the worker's memory,
+/// at most its task budget. The shape check still uses the whole budget.
+pub(crate) async fn download_file_reserving<B: ObjectStore>(
+    storage: &Storage<B>,
+    pool: &WorkerPool,
+    request: u64,
+    table: &TableDescriptor,
+    file: ReadFile,
+    reserve: u64,
+) -> Result<DownloadedFile, ProtocolError> {
+    let budget = pool.resources().task_memory_limit_bytes;
+    let reserve = reserve.min(budget);
     let (object, cap) = match &file {
         ReadFile::Legacy { object, row_count } => {
             let cap = crate::scheduling::with_task_limit(budget, || {
@@ -158,7 +173,7 @@ pub(crate) async fn download_file<B: ObjectStore>(
         }
     };
     let object = object.map_err(storage_failure)?;
-    let charge = pool.scheduler().reserve_memory(request, 0, budget).await?;
+    let charge = pool.scheduler().reserve_memory(request, 0, reserve).await?;
     let object = storage.read(&object, cap).await.map_err(storage_failure)?;
     if let ReadFile::Partition(f) = &file
         && object.bytes.len() as u64 != f.byte_size
