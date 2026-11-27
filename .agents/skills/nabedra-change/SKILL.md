@@ -29,24 +29,24 @@ When agents work in parallel on one codebase, every hot file has a single owner
 per wave. See the hot-file rule in the
 [subagent-driven development workflow](references/subagent-driven-development.md#prepare-the-work).
 
-# Keep CI waits out of Opus
+# Keep CI waits out of Opus and Astra
 
-Opus owns decisions about which checks to run, what failures mean, and whether
-the evidence supports merging. Use a CI completion event or a standalone
-watcher for the wait. If the harness requires an agent, use Codex Luna High
-for waiting alone, or Codex Sol when the job includes collecting and
+Opus and Astra retain responsibility for deciding which checks to run, what
+failures mean, and whether the evidence supports merging. Use a CI completion
+event or a standalone watcher for the wait. If the harness requires an agent,
+use Codex Luna High for waiting alone, or Codex Sol when the job includes collecting and
 summarizing evidence. Prefer either over Haiku, which is the fallback when
 Codex is unavailable.
 
 After dispatch, record the tested SHA, run ID or link, expected checks, and
-the decision that needs the result. Continue independent work or end the Opus
-turn while CI runs. Use an asynchronous handoff and report once at completion
-or timeout. Avoid synchronous delegate calls, sleeps, and status loops in Opus.
+the decision that needs the result. Continue independent work or end the turn
+while CI runs. Use an asynchronous handoff and report once at completion or
+timeout. Avoid synchronous delegate calls, sleeps, and status loops in either model.
 A blocking handoff can still expire the prompt cache and force a large rewrite
-when Opus resumes, even when a cheaper model does the waiting.
+when the decision-maker resumes, even when a cheaper model does the waiting.
 
 Return the tested SHA, outcome, and relevant failure excerpts or artifact links.
-If the Opus context is large, resume in a fresh or compacted context from the
+If the context is large, resume in a fresh or compacted context from the
 checkpoint and result. Keep the required checks and review gates in force.
 
 # Make trade-offs for long-term speed
