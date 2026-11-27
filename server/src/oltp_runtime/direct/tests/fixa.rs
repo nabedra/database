@@ -395,11 +395,21 @@ async fn d05_unknown_proposal_keeps_range_clock_pending_until_apply() {
         "the snapshot includes the commit below it: {}",
         String::from_utf8_lossy(seen.as_slice())
     );
+    // The reply keeps its share of the worker's Query reply arena, and every
+    // Query read reserves the whole arena first: release it before the next read.
+    drop(seen);
     assert_eq!(
         clock.pending_len(),
         0,
         "apply settled the pending timestamp"
     );
+    let latest = nabedra_rt::time::timeout(
+        Duration::from_secs(15),
+        cluster.latest(leader, cluster.row_key(1)),
+    )
+    .await
+    .expect("a latest read after apply returns");
+    assert!(latest.0.is_some(), "the latest read sees the late apply");
     drop(handle);
     drop(consensus);
     Arc::try_unwrap(cluster).ok().unwrap().shutdown().await;

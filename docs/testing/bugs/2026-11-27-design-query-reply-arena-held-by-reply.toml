@@ -1,0 +1,31 @@
+# Phase 2 of the 2026-11-26 review (fx-direct-fix, after the land-oltp-direct diagnosis of the OD-1 fixture).
+# Confirmed in a test fixture, production exposure by code reading. The worker's Query reply arena is 8 MiB
+# (resources/src/memory.rs SharedResourceConfig::default, query_reply_bytes; registered_process.rs native_resources
+# keeps it), and every Query-class read reserves the whole 8 MiB first: ParticipantMachine::read_at
+# (oltp-storage mvcc/store.rs, output_bytes 8 << 20) and ParticipantHandle::direct_latest (store/handle/direct.rs) go
+# through GroupStore::read_namespace -> reply_budget(Query, 8 MiB) -> ByteArena::reserve_wait, which has no deadline.
+# The returned ChargedBytes keeps its share of the arena until it is dropped. So while any read_at reply is alive,
+# every later Query read on that worker waits, on every group. The fixture fixa.rs
+# d05_unknown_proposal_keeps_range_clock_pending_until_apply held its snapshot reply: the next direct_latest did not
+# return within 80 s (land-oltp-direct) or 15 s (fx-direct-fix, local, without the drop(seen) fix). In production the
+# remote read_at server (oltp-replication service_rpc/participant_full.rs, ParticipantRead) returns the ChargedBytes as
+# its RPC reply, and charged bytes share their lifetime with transport frames, so a slow or stalled peer connection
+# can hold the arena; a caller that keeps a raw reply while it awaits something else does the same. The same sizing
+# also caps a worker at one Query read in native execution at a time, whatever query_threads is.
+id = "design-query-reply-arena-held-by-reply"
+title = "A live point-read reply holds the worker's whole Query reply arena, so every later Query read on the worker waits for it"
+class = "resource-release-order"
+module = "oltp"
+guarantees = ["OLTP-G09", "OLTP-G13"]
+scenarios = ["O05", "O22"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "oltp_runtime::direct::tests::fixa::d05_unknown_proposal_keeps_range_clock_pending_until_apply"
+seed = "unknown"
+why_not_caught = "Read tests drop each reply before the next read, and no test holds a reply (or stalls a peer that receives one) while it issues another read on the same worker; the fixture that did hung and was first dropped as undiagnosed."
+invariant_added = "A reply that left native execution no longer blocks other reads: point reads reserve what their reply needs (or copy the reply out of the Query arena before it leaves the store API, and the RPC server into its own frame budget), and a Query read waits for the arena only with a deadline."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-27"
