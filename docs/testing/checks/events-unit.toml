@@ -1,0 +1,14 @@
+# Every Events library unit test outside the simulator: control (EVENTS-1 empty-volume rule,
+# EVENTS-3 retention), partition (EVENTS-8 ack across a retention gap), raft (EVENTS-2 guarded
+# clock, election floors), store and HTTP.
+id = "events-unit"
+module = "events"
+kinds = ["U"]
+guarantees = ["EVT-G01", "EVT-G05", "EVT-G08", "EVT-G14"]
+scenarios = ["EV03", "EV06", "EV07"]
+tiers = ["T1"]
+command = ["cargo", "test", "--locked", "--lib"]
+cwd = "server/events"
+timeout_s = 1800
+needs = []
+result_parser = "cargo-test"

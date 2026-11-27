@@ -1,0 +1,18 @@
+# Design review rv-events, finding EVENTS-3 (wave-rv/findings/events.md): the retention loop sent one 128-event
+# Retain per visit and visited 8 hosted groups a second, so a partition publishing faster than its share grew
+# without bound. Confirmed by control::tests::events_3_one_retention_visit_trims_a_backlog_larger_than_one_page,
+# which removes 128 of 1,000 expired events with the old single-Retain visit.
+id = "EVENTS-RETENTION-THROUGHPUT"
+title = "Events retention removes at most 128 events per partition visit, slower than a busy partition publishes"
+class = "other"
+module = "events"
+guarantees = ["EVT-G08", "EVT-G07"]
+scenarios = ["EV09"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/events/src/control/tests.rs::events_3_one_retention_visit_trims_a_backlog_larger_than_one_page"
+seed = "unknown"
+why_not_caught = "No test or simulation ran retention against a backlog larger than one Retain page; EV09 has not run."
+invariant_added = "One retention visit trims the whole expired backlog of a group this broker leads within the tick budget."
+fix_commits = ["7ba250dc6132ac6d4dc229b193f95ed18f94b7de"]
+revert_patch_ok = false

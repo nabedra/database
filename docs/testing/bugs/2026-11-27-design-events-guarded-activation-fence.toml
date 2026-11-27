@@ -1,0 +1,20 @@
+# Residual of EVENTS-2 after fx-events: guarded stamps keep the entry format and have no replicated activation
+# fence, so a lease clock or retention cutoff that a legacy fast clock advanced before every voter ran the new
+# release stays advanced (specs/events-time/rollout mutants import_legacy_cutoff and import_legacy_lease_clock).
+id = "EVENTS-GUARDED-ACTIVATION-FENCE"
+title = "Guarded Events time keeps a lease clock or retention cutoff that a legacy fast clock advanced before activation"
+class = "fence-lifecycle-order"
+module = "events"
+guarantees = ["EVT-G08", "EVT-G05"]
+scenarios = ["EV03", "EV06"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "specs/events-time/rollout/mutants/import_legacy_cutoff.cfg"
+seed = "unknown"
+why_not_caught = "The compatible guarded stamps of fx-events change no replicated state, and no check runs a legacy clock jump before an upgrade."
+invariant_added = "Intended, not met: after activation no event is removed, and no lease replaced, earlier than its guarded age allows, whatever a legacy clock did before the fence."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-27"

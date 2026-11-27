@@ -1,3 +1,5 @@
+# Fixed in fx-events: Control::reopen applies the empty-volume rule (raft::rejoin); regressions in
+# control::tests::events_1_*, sim wipe_tests and sim::tests::wipe_sweep (wave-rv/reports/fx-events.md).
 # Design review rv-events, finding EVENTS-1 (wave-rv/findings/events.md). The plan allowed it ("Provision stable
 # broker IDs"; "joins with an empty volume and catches up from survivors") and the shipped code follows it for the
 # metadata group: Control::reopen (server/events/src/control/operate.rs:795) opens METADATA on an empty volume with
@@ -15,12 +17,9 @@ guarantees = ["EVT-G01", "EVT-G09", "EVT-G14"]
 scenarios = ["EV06", "EV07", "EV08"]
 found_by = "review"
 found_date = "2026-11-26"
-lowest_regression = "specs/events/mutants/prefix_empty_disk_rejoins_voter.cfg"
-seed = 26
+lowest_regression = "server/events/src/sim/cluster.rs::wipe_tests::events_1_wiped_follower_cannot_help_a_stale_candidate"
+seed = 11
 why_not_caught = "No check restarts a metadata voter on an empty volume: EV06 is cloud-deferred, the simulator has no metadata group and no check sets SimConfig.wipes, and the plan named no rule that an empty replica must not vote under its old membership."
 invariant_added = "Intended, not met: a broker never votes or counts toward a commit in a group from an empty volume under its old membership; it regains a vote only as a learner promoted by a membership change committed after its re-add."
-fix_commits = []
+fix_commits = ["7ba250dc6132ac6d4dc229b193f95ed18f94b7de"]
 revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-26"

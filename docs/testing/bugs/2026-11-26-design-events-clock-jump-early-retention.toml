@@ -1,3 +1,5 @@
+# Fixed in fx-events for the stated bound (one wrong clock in RF3): guarded stamps from raft::clock. The
+# activation fence is the open record EVENTS-GUARDED-ACTIVATION-FENCE.
 # Design review rv-events, finding EVENTS-2 (wave-rv/findings/events.md). The plan states no clock bound ("monitor
 # clock skew"). The retention cutoff is the leader's wall clock minus the retention (control/operate.rs:474), and
 # events::retain and publish keep the maximum of every cutoff and publish time (partition/events.rs:56-58, 240), so a
@@ -14,12 +16,9 @@ guarantees = ["EVT-G08", "EVT-G05"]
 scenarios = ["EV03"]
 found_by = "review"
 found_date = "2026-11-26"
-lowest_regression = "specs/events-delivery/EventsDelivery.strict.cfg"
-seed = "unknown"
+lowest_regression = "server/events/src/sim/cluster.rs::wipe_tests::events_2_one_fast_leader_clock_does_not_remove_events_early"
+seed = 17
 why_not_caught = "The plan names no clock bound, EVT-G08 names no tolerance, and the simulator has clock jumps but no retention loop and no G08 checker."
 invariant_added = "Intended, not met: an event is removed no earlier than its publish time plus the retention minus a stated clock bound, in true time, and one fast broker clock cannot advance the replicated retention cutoff or lease clock past that bound."
-fix_commits = []
+fix_commits = ["7ba250dc6132ac6d4dc229b193f95ed18f94b7de"]
 revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-26"
