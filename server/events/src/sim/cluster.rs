@@ -1706,7 +1706,12 @@ mod wipe_tests {
     /// EVENTS-2: the leader clock (and with `second`, one more clock) jumps `jump_ms`
     /// ahead after five acknowledged publishes; retention (3 s) then runs for 2 s. An
     /// acknowledged event removed before 3 s of true time is an EVT-G08 violation.
-    async fn clock_jump(mut cluster: Cluster, jump_ms: u64, second: bool) -> Result<Cluster> {
+    async fn clock_jump(cluster: Cluster, jump_ms: u64, second: bool) -> Result<Cluster> {
+        clock_jumps(cluster, jump_ms, second.then_some(true)).await
+    }
+
+    /// `second`: `Some(true)` moves one more clock ahead, `Some(false)` behind.
+    async fn clock_jumps(mut cluster: Cluster, jump_ms: u64, second: Option<bool>) -> Result<Cluster> {
         let leader_id = wait_for_leader(&mut cluster, &[1, 2, 3]).await?;
         let mut client = Client::new(cluster.sim.clone(), PRODUCER, 3, 3);
         for n in 1..=5 {
@@ -1714,8 +1719,10 @@ mod wipe_tests {
         }
         let jump = Duration::from_millis(jump_ms);
         cluster.world().jump_wall_forward(leader_id, jump);
-        if second {
-            cluster.world().jump_wall_forward(leader_id % 3 + 1, jump);
+        match second {
+            Some(true) => cluster.world().jump_wall_forward(leader_id % 3 + 1, jump),
+            Some(false) => cluster.world().jump_wall_backward(leader_id % 3 + 1, jump),
+            None => {}
         }
         let stop = Arc::new(AtomicBool::new(false));
         let task = nabedra_rt::task::spawn(retention(
@@ -1836,6 +1843,17 @@ mod wipe_tests {
                 .any(|violation| violation.contains("EVT-G08 early-removal")),
             "two wrong clocks are outside the bound the guard tolerates: {violations:#?}"
         );
+    }
+
+    /// Two wrong clocks that disagree (one 10 s ahead, one 10 s behind) are outside the
+    /// stated bound too, but the third clock still sits between them: the second-largest
+    /// lower endpoint is the honest one, and nothing is removed early.
+    #[test]
+    fn events_2_two_clocks_wrong_in_opposite_directions_remove_nothing_early() {
+        let violations = scripted_with(17, with_retention(false), |cluster| {
+            clock_jumps(cluster, 10_000, Some(false))
+        });
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 
     /// Within the stated bound: the leader runs 200 ms fast (the bound is 250 ms).
