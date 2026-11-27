@@ -1453,19 +1453,23 @@ impl Operation {
     /// Refuses what this build decodes but does not serve yet, and a table
     /// that needs `data.vector.v1` while the cluster has not enabled it.
     pub fn check_served(&self, vector: bool) -> Result<(), ProtocolError> {
-        match self {
-            Self::AddColumn(_)
-            | Self::DropColumn(_)
-            | Self::AddFullText(_)
-            | Self::DropFullText(_)
-            | Self::SearchStatus(_)
-            | Self::Rank(_)
-            | Self::RankMany(_) => Err(unsupported("the operation is not supported yet")),
+        let served = match self {
+            Self::AddColumn(_) => served::ADD_COLUMN,
+            Self::DropColumn(_) => served::DROP_COLUMN,
+            Self::AddFullText(_) => served::ADD_FULL_TEXT,
+            Self::DropFullText(_) => served::DROP_FULL_TEXT,
+            Self::SearchStatus(_) => served::SEARCH_STATUS,
+            Self::Rank(_) => served::RANK,
+            Self::RankMany(_) => served::RANK_MANY,
             Self::Create(p) if !vector && uses_search(&p.schema, &p.search) => {
-                Err(search_disabled())
+                return Err(search_disabled());
             }
-            _ => Ok(()),
+            _ => return Ok(()),
+        };
+        if !served {
+            return Err(unsupported("the operation is not supported yet"));
         }
+        Ok(())
     }
     /// As `check_served`, for the queued path, which runs the rows of a
     /// `*_many` call one by one.
@@ -1662,5 +1666,6 @@ fn payload_ref<'a, T: Deserialize<'a>>(raw: &'a RawValue) -> Result<T, ProtocolE
 
 #[cfg(test)]
 mod fixtures;
+mod served;
 #[cfg(test)]
 mod tests;

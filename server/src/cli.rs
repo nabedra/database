@@ -71,6 +71,31 @@ pub enum Command {
     /// Fold a local automatic growth inventory. Makes no provider or database changes.
     #[cfg(feature = "oltp")]
     GrowthPlan,
+    /// Vector search processes and their administration.
+    #[cfg(feature = "oltp")]
+    Search {
+        #[command(subcommand)]
+        command: SearchCommand,
+    },
+}
+
+/// `nabedra-db search ...`. Each command's options belong to its owner's
+/// module under `oltp_runtime::search`.
+#[cfg(feature = "oltp")]
+#[derive(Debug, Subcommand)]
+pub enum SearchCommand {
+    /// Run a search worker.
+    Worker(crate::oltp_runtime::search::worker::WorkerOptions),
+    /// Run an embedder.
+    Embedder(crate::oltp_runtime::search::embedder::EmbedderOptions),
+    /// Requeue failed embeddings of a table (operator, on a data worker host).
+    RetryEmbeddings(crate::oltp_runtime::search::embedder::RetryOptions),
+    /// Show a table's search columns, replicas and embedding backlog.
+    Status(crate::oltp_runtime::search::admin::StatusOptions),
+    /// Move a search shard replica to another search worker.
+    Assign(crate::oltp_runtime::search::admin::AssignOptions),
+    /// Set or drop an embedding model in the registry.
+    Model(crate::oltp_runtime::search::admin::ModelOptions),
 }
 
 #[cfg(feature = "cache")]

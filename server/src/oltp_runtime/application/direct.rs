@@ -72,6 +72,12 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 mod many;
+// Vector search operations (contract-w2 4.2): one dispatch in `search_ops`,
+// one module per owner (I `rank`, J `search_ddl`, K `embedding_status`).
+mod embedding_status;
+mod rank;
+mod search_ddl;
+mod search_ops;
 #[allow(unused_imports)] // `http.rs` passes the queued path.
 pub(crate) use many::{HttpQueue, QueuedRows};
 
@@ -686,13 +692,7 @@ impl DirectGateway {
                 }
                 return Ok(Routed::Queued);
             }
-            "table.add_column" | "table.drop_column" | "table.add_full_text"
-            | "table.drop_full_text" | "table.search_status" | "query.rank"
-            | "query.rank_many" => {
-                let request = crate::protocol::parse_oltp_request(body)?;
-                request.operation.check_served(self.vector())?;
-                return Ok(Routed::Queued);
-            }
+            name if search_ops::handles(name) => return search_ops::route(self, body).await,
             _ => {}
         }
         let Some(scanned) = scan_envelope(&envelope) else {

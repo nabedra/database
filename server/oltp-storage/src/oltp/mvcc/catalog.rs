@@ -6,6 +6,7 @@ use super::{
         KeySpan, ParticipantHandle,
         lifecycle::{GuardMode, VerifiedLifecycleGuard},
     },
+    vector::{ColumnId, SearchColumn},
 };
 use crate::{
     oltp::{
@@ -42,6 +43,46 @@ pub struct TableRecord {
     /// replace it, so an old pin cannot omit a newly Building index.
     #[serde(default, skip_serializing_if = "Uuid::is_nil")]
     pub lifecycle_id: Uuid,
+    /// The table's search columns (contract-w2 2.6); `None` for a table
+    /// without them. Not written when `None`, so such a table's record keeps
+    /// its bytes (the golden tests stay as they are).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search: Option<CatalogSearch>,
+}
+/// The Catalog's view of a table's search columns. `epoch` is raised in a
+/// committed Catalog write before any `SearchFence` uses it (DB-20).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogSearch {
+    pub epoch: u64,
+    /// The highest column id the table ever had; ids are never reused.
+    pub high: ColumnId,
+    pub columns: Vec<CatalogSearchColumn>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogSearchColumn {
+    pub id: ColumnId,
+    pub name: Text<128>,
+    pub kind: CatalogSearchKind,
+    pub state: ColumnLife,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum CatalogSearchKind {
+    Vector(SearchColumn),
+    FullText {
+        column: Text<128>,
+        language: Text<32>,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ColumnLife {
+    Building,
+    Ready,
+    Dropping,
+    Failed(Text<256>),
 }
 impl TableRecord {
     pub(super) fn with_lifecycle(&self, id: Uuid) -> Self {
@@ -454,6 +495,8 @@ impl CatalogHandle {
             schema_epoch: route.schema_epoch,
             routing_epoch: route.routing_epoch,
             lifecycle_id: table_id,
+            // TODO(J): a table created with search columns records them here.
+            search: None,
         };
         let entries = [
             (

@@ -14,6 +14,8 @@ mod proof;
 #[doc(hidden)]
 pub mod queue_access;
 #[doc(hidden)]
+pub mod search_rpc;
+#[doc(hidden)]
 pub mod service_rpc;
 pub mod typed_log;
 #[doc(hidden)]

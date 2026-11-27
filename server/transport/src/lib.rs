@@ -18,8 +18,8 @@ mod transport;
 
 pub use transport::{
     EndpointRegistry, ONE_SHOT_ALPN, OutgoingReservation, PeerDirectory, PeerFeature, ReplicaLease,
-    RequestError, RequestTarget, ResidentGroup, ResidentLease, TransportConfig, TransportTrust,
-    WorkerClient, WorkerTransport,
+    RequestError, RequestTarget, ResidentGroup, ResidentLease, SEARCH_ALPN, TransportConfig,
+    TransportTrust, WorkerClient, WorkerTransport,
 };
 #[cfg(feature = "sim")]
 pub use transport::{FrameKind, SimLimits, StreamFrame, session_alpn};
@@ -81,6 +81,14 @@ pub enum Purpose {
     /// NS14b: Control's damage-replacement scheduler to a worker (Control scope).
     GroupDamage = 18,
     SystemRecovery = 19,
+    /// Vector search (`plans/oltp-vector.md`, contract-w2 2.1): change feed,
+    /// snapshot, barrier and close interest on Data voters, routes on Catalog
+    /// voters.
+    SearchFeed = 20,
+    /// Gateway queries to a search worker, bound under the Control identity.
+    SearchQuery = 21,
+    /// Embedder leases and results on Data leaders.
+    SearchEmbed = 22,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrafficClass {
@@ -99,9 +107,12 @@ pub enum TrafficClass {
     ServiceMutation,
     ControlDelegation,
     RaftProgress,
+    SearchFeed,
+    SearchQuery,
+    SearchEmbed,
 }
 impl TrafficClass {
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 18] = [
         Self::ControlConsensus,
         Self::DataConsensus,
         Self::Authority,
@@ -117,6 +128,9 @@ impl TrafficClass {
         Self::ServiceMutation,
         Self::ControlDelegation,
         Self::RaftProgress,
+        Self::SearchFeed,
+        Self::SearchQuery,
+        Self::SearchEmbed,
     ];
     #[inline]
     pub fn byte_class(self) -> ByteClass {
@@ -135,7 +149,10 @@ impl TrafficClass {
             | Self::QueueData
             | Self::Snapshot
             | Self::Storage
-            | Self::ApiIngress => ByteClass::Data,
+            | Self::ApiIngress
+            | Self::SearchFeed
+            | Self::SearchQuery
+            | Self::SearchEmbed => ByteClass::Data,
         }
     }
 }

@@ -33,6 +33,7 @@ pub mod replica;
 #[cfg(test)]
 mod replication_tests;
 mod scoped_worker;
+pub mod search;
 mod transaction;
 pub mod worker_endpoint;
 pub(crate) mod worker_runtime;

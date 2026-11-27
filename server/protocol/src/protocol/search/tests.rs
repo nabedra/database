@@ -1569,3 +1569,47 @@ fn vs17_arbitrary_bytes_never_panic() {
     }
     assert!(accepted > 1_000);
 }
+
+/// contract-w2 4.2: the `served` table refuses every search operation until its
+/// owner flips the operation's line, on the direct and the queued path, with the
+/// cluster feature on or off.
+#[test]
+fn vs00_check_served_refuses_every_search_operation_until_its_owner_flips_it() {
+    let many = rank(|p| {
+        p["batch"] = p["rank"]["rankings"].clone();
+        p["rank"]["rankings"] = json!([]);
+    });
+    for (op, payload) in [
+        (
+            "table.add_column",
+            json!({"table_id":ID,"name":"v2","type":{"type":"vector","dim":3}}),
+        ),
+        (
+            "table.drop_column",
+            json!({"table_id":ID,"name":"embedding"}),
+        ),
+        (
+            "table.add_full_text",
+            json!({"table_id":ID,"column":"tenant","language":"english"}),
+        ),
+        (
+            "table.drop_full_text",
+            json!({"table_id":ID,"column":"body"}),
+        ),
+        ("table.search_status", json!({"table_id":ID})),
+        ("query.rank", rank(|_| ())),
+        ("query.rank_many", many.clone()),
+    ] {
+        let operation = parse_op(op, payload).unwrap();
+        for vector in [true, false] {
+            for result in [
+                operation.check_served(vector),
+                operation.check_queued(vector),
+            ] {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, ErrorCode::UnsupportedOperation, "{op}");
+                assert_eq!(error.message, "the operation is not supported yet", "{op}");
+            }
+        }
+    }
+}

@@ -369,6 +369,7 @@ impl NativePlanner {
                         table_version,
                         table.lifecycle_id,
                     )?,
+                    search: table.search.clone(),
                 })?,
             });
             writes.sort_by(|a, b| super::super::store::compare_keys(&a.key, &b.key));

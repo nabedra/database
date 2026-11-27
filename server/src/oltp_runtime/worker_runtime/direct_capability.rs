@@ -606,6 +606,8 @@ impl DirectSwitch {
             timestamps,
         );
         executor.install();
+        // Vector search leader tasks (contract-w2 4.2; F and K fill them in).
+        crate::oltp_runtime::search::spawn_leader_tasks(services, &executor);
         let expiry = executor.spawn_expiry();
         *self.executor.lock().unwrap_or_else(|e| e.into_inner()) = Some((executor, expiry));
         Ok(())

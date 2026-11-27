@@ -1212,3 +1212,95 @@ fn g6_api_reaches_control_authority_at_a_newer_incarnation_only() {
         &control
     ));
 }
+
+/// contract-w2 2.1: the search lanes have their own classes, only on the group
+/// kinds that serve them, decode from prologue bytes 20..=22, and travel only on
+/// `nabedra-search/1`.
+#[test]
+fn vs11_search_lanes_classes_bytes_and_alpn() {
+    let control = GroupIdentity {
+        cluster_id: Uuid::from_u128(1),
+        database: Text::try_from("vs11").unwrap(),
+        group_id: Uuid::from_u128(2),
+        kind: GroupKind::Control,
+        group_format_version: 1,
+    };
+    let with = |kind| GroupIdentity {
+        kind,
+        ..control.clone()
+    };
+    let data = with(GroupKind::Data {
+        table_id: Uuid::from_u128(3),
+        shard_id: Uuid::from_u128(4),
+    });
+    let catalog = with(GroupKind::Catalog);
+    let timestamps = with(GroupKind::Timestamps);
+    let expected = [
+        (
+            Purpose::SearchFeed,
+            TrafficClass::SearchFeed,
+            vec![&data, &catalog],
+        ),
+        (
+            Purpose::SearchQuery,
+            TrafficClass::SearchQuery,
+            vec![&control],
+        ),
+        (Purpose::SearchEmbed, TrafficClass::SearchEmbed, vec![&data]),
+    ];
+    for (purpose, class, allowed) in expected {
+        for group in [&control, &data, &catalog, &timestamps] {
+            let got = traffic(group, purpose).ok();
+            let want = allowed.contains(&group).then_some(class);
+            assert_eq!(got, want, "{purpose:?} on {:?}", group.kind);
+        }
+        assert_eq!(class.byte_class(), ByteClass::Data);
+        assert!(search_alpn_admits(Some(SEARCH_ALPN), purpose));
+        assert!(!search_alpn_admits(Some(b"nabedra-otp/2"), purpose));
+        assert!(!search_alpn_admits(Some(ONE_SHOT_ALPN), purpose));
+    }
+    assert!(!search_alpn_admits(Some(SEARCH_ALPN), Purpose::Raft));
+    assert!(search_alpn_admits(Some(b"nabedra-otp/2"), Purpose::Raft));
+    assert_eq!(SEARCH_ALPN, b"nabedra-search/1");
+    TransportConfig::default().validate().unwrap();
+
+    let member = WorkerIdentity {
+        worker_id: Uuid::from_u128(5),
+        incarnation: Uuid::from_u128(6),
+        certificate_sha256: Digest::from_bytes([1; 32]),
+        enrollment_revision: 1,
+    };
+    let certificate = Digest::from_bytes([1; 32]);
+    for (byte, purpose) in [
+        (20, Purpose::SearchFeed),
+        (21, Purpose::SearchQuery),
+        (22, Purpose::SearchEmbed),
+    ] {
+        assert_eq!(purpose as u8, byte);
+        let hello = Hello {
+            cluster_id: control.cluster_id,
+            group_id: control.group_id,
+            group_digest: Digest::from_bytes([0; 32]),
+            purpose,
+            from: member,
+            to: member,
+            nonce: Uuid::from_u128(7),
+            header_len: 0,
+        };
+        let decoded = Hello::decode(&hello.encode(), certificate, certificate).unwrap();
+        assert_eq!(decoded.purpose, purpose);
+    }
+    let mut unknown = Hello {
+        cluster_id: control.cluster_id,
+        group_id: control.group_id,
+        group_digest: Digest::from_bytes([0; 32]),
+        purpose: Purpose::SearchEmbed,
+        from: member,
+        to: member,
+        nonce: Uuid::from_u128(7),
+        header_len: 0,
+    }
+    .encode();
+    unknown[72] = 23;
+    assert!(Hello::decode(&unknown, certificate, certificate).is_err());
+}

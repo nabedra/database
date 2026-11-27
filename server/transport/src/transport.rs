@@ -29,12 +29,12 @@ use tokio::{
 mod resolve;
 mod session;
 use resolve::{PeerResolver, ResolveError};
-pub use session::PeerFeature;
 #[cfg(not(feature = "sim"))]
 use session::session_alpn;
 use session::{DIRECT_ADMISSION_ALPN, PeerSessions, RawReply, SESSION_ALPN};
 #[cfg(feature = "sim")]
 pub use session::{FrameKind, StreamFrame, session_alpn};
+pub use session::{PeerFeature, SEARCH_ALPN, search_alpn_admits};
 #[cfg(test)]
 mod tests;
 
@@ -46,7 +46,7 @@ const TRACE_TARGET: &str = "nabedra_database_server::oltp_replication::multiplex
 pub const ONE_SHOT_ALPN: &[u8] = b"nabedra-oltp-worker/1";
 const MAGIC: &[u8; 8] = b"NABOTP01";
 const PROLOGUE_BYTES: usize = 173;
-const CLASSES: usize = 15;
+const CLASSES: usize = 18;
 
 /// Applied enrollment authenticates only transport identity. Application
 /// endpoints still require fresh authority in preflight. Control Raft trust
@@ -231,8 +231,8 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             handshake_slots: 16,
-            preflight_slots: [4, 4, 4, 8, 4, 2, 4, 2, 4, 4, 4, 4, 4, 4, 8],
-            handler_slots: [2, 2, 4, 8, 4, 1, 4, 1, 4, 4, 8, 4, 4, 4, 8],
+            preflight_slots: [4, 4, 4, 8, 4, 2, 4, 2, 4, 4, 4, 4, 4, 4, 8, 4, 8, 4],
+            handler_slots: [2, 2, 4, 8, 4, 1, 4, 1, 4, 4, 8, 4, 4, 4, 8, 4, 8, 4],
             payload_bytes: [
                 128 << 10,
                 32 << 20,
@@ -249,6 +249,11 @@ impl Default for TransportConfig {
                 128 << 10,
                 128 << 10,
                 0,
+                // Search lanes: feed and embed requests are small; a query
+                // carries its probe vectors in section 1.
+                256 << 10,
+                4 << 20,
+                1 << 20,
             ],
             decode_bytes: [
                 512 << 10,
@@ -266,6 +271,9 @@ impl Default for TransportConfig {
                 1 << 20,
                 2 << 20,
                 RAFT_PROGRESS_DECODE_BYTES,
+                1 << 20,
+                8 << 20,
+                2 << 20,
             ],
             deadline: Duration::from_secs(30),
             session_slots: [256; CLASSES],
@@ -2007,6 +2015,17 @@ fn traffic(group: &GroupIdentity, purpose: Purpose) -> Result<TrafficClass, Prot
         Purpose::ControlDelegation if group.kind == GroupKind::Control => {
             Ok(TrafficClass::ControlDelegation)
         }
+        // Vector search (contract-w2 2.1). A search worker binds its query
+        // endpoint under the cluster's Control identity.
+        Purpose::SearchFeed
+            if matches!(group.kind, GroupKind::Data { .. } | GroupKind::Catalog) =>
+        {
+            Ok(TrafficClass::SearchFeed)
+        }
+        Purpose::SearchQuery if group.kind == GroupKind::Control => Ok(TrafficClass::SearchQuery),
+        Purpose::SearchEmbed if matches!(group.kind, GroupKind::Data { .. }) => {
+            Ok(TrafficClass::SearchEmbed)
+        }
         _ => Err(malformed("RPC purpose does not match group kind")),
     }
 }
@@ -2197,6 +2216,9 @@ impl Hello {
             17 => Purpose::RaftProgress,
             18 => Purpose::GroupDamage,
             19 => Purpose::SystemRecovery,
+            20 => Purpose::SearchFeed,
+            21 => Purpose::SearchQuery,
+            22 => Purpose::SearchEmbed,
             _ => return Err(malformed("unknown worker RPC purpose")),
         };
         let member = |start| WorkerIdentity {

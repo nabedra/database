@@ -53,6 +53,25 @@ pub(super) const SESSION_ALPN: &[u8] = b"nabedra-otp/2";
 /// a session with them.
 pub(super) const DIRECT_ADMISSION_ALPN: &[u8] = b"nabedra-otp/4";
 
+/// Vector search sessions (contract-w2 2.1): search workers and embedders
+/// offer only this protocol; it carries only the search purposes, and the
+/// search purposes travel on no other protocol.
+///
+/// S lands the constant and the rule. Offering and accepting it at the TLS
+/// layer, and calling `search_alpn_admits` where a session names its lane, is
+/// a later transport change through the lead: until then no connection
+/// negotiates it.
+pub const SEARCH_ALPN: &[u8] = b"nabedra-search/1";
+
+/// Whether a connection that negotiated `alpn` may carry `purpose`.
+pub fn search_alpn_admits(alpn: Option<&[u8]>, purpose: Purpose) -> bool {
+    let search = matches!(
+        purpose,
+        Purpose::SearchFeed | Purpose::SearchQuery | Purpose::SearchEmbed
+    );
+    search == (alpn == Some(SEARCH_ALPN))
+}
+
 pub fn session_alpn(alpn: Option<&[u8]>) -> bool {
     matches!(alpn, Some(SESSION_ALPN | DIRECT_ADMISSION_ALPN))
 }

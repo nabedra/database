@@ -548,6 +548,24 @@ impl HostedGroupManager {
                             // The ingress lane for `Method::Direct` (T5).
                             group.bind(Purpose::ApiIngress, services.clone())?;
                         }
+                        // Vector search lanes (contract-w2 4.2). The argument
+                        // lists belong to the endpoint owners (E/F, K, J).
+                        let roles = Arc::new(super::search_rpc::NoSearchRoles);
+                        if matches!(identity.kind, GroupKind::Data { .. }) {
+                            group.bind(
+                                Purpose::SearchFeed,
+                                super::search_rpc::feed_endpoint(identity.clone(), roles.clone()),
+                            )?;
+                            group.bind(
+                                Purpose::SearchEmbed,
+                                super::search_rpc::embed_endpoint(identity.clone(), roles),
+                            )?;
+                        } else {
+                            group.bind(
+                                Purpose::SearchFeed,
+                                super::search_rpc::routes_endpoint(identity.clone(), roles),
+                            )?;
+                        }
                     } else {
                         group.bind(Purpose::ServiceMutation, services.clone())?;
                     }

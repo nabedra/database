@@ -94,6 +94,10 @@ async fn run_cli() -> ExitCode {
     let result = match command {
         #[cfg(feature = "oltp")]
         Command::GrowthPlan => nabedra_database_server::oltp_deployment::live::run_planner(),
+        #[cfg(feature = "oltp")]
+        Command::Search { command } => {
+            nabedra_database_server::oltp_runtime::search::run(command).await
+        }
         #[cfg(feature = "olap")]
         Command::Doctor { config, json } => {
             nabedra_database_server::maintenance::doctor(&config, json).await

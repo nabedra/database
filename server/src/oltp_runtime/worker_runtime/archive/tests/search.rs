@@ -108,6 +108,8 @@ async fn fence(
             // A created table's first lifecycle id is its table id.
             lifecycle: Some(table),
             columns,
+            serving: Vec::new(),
+            text: Vec::new(),
         }),
         handle.resources(),
         ByteClass::Progress,

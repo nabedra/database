@@ -202,6 +202,8 @@ impl S {
             epoch,
             lifecycle: Some(self.f.table),
             columns,
+            serving: Vec::new(),
+            text: Vec::new(),
         })
     }
     async fn fence(&mut self, columns: Vec<SearchColumn>) -> SearchReply {

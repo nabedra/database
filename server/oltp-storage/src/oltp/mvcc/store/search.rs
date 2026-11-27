@@ -6,6 +6,7 @@
 //! replica of an older build cannot decode it.
 use super::{feed::Changes, *};
 use crate::oltp::mvcc::vector::{ColumnId, MAX_SEARCH_COLUMNS, SearchColumn};
+use nabedra_oltp_types::types::Text;
 
 /// The columns whose vectors this group stores. A table with full-text columns
 /// only has an empty list. A dropped column's id never returns.
@@ -19,6 +20,24 @@ pub struct SearchSchema {
     pub columns: Vec<SearchColumn>,
     /// The highest id this group ever had.
     pub high: ColumnId,
+    /// The published vector columns, a subset of `columns` (DB-9: a barrier
+    /// serves only these).
+    pub serving: Vec<ColumnId>,
+    /// The full-text columns, ids from the same never-reused space (`high`).
+    pub text: Vec<TextColumn>,
+}
+/// One full-text column of a search range (contract-w2 2.7). It has no
+/// stored vector; a worker builds its impact index from the row's text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextColumn {
+    pub id: ColumnId,
+    /// The text column of the table it indexes.
+    pub column: Text<128>,
+    /// One of `nabedra_vector::text::LANGUAGES` (L9).
+    pub language: Text<32>,
+    /// Published: a barrier serves it (DB-9).
+    pub serving: bool,
 }
 impl SearchSchema {
     pub(crate) fn valid(&self) -> bool {
@@ -78,6 +97,11 @@ pub struct SearchFence {
     /// As for `DirectSchemaChange::Fence`.
     pub lifecycle: Option<Uuid>,
     pub columns: Vec<SearchColumn>,
+    /// As `SearchSchema::serving`. J fills and checks it; until then `fence`
+    /// stores none.
+    pub serving: Vec<ColumnId>,
+    /// As `SearchSchema::text`.
+    pub text: Vec<TextColumn>,
 }
 impl SearchFence {
     pub(super) fn heap_bytes(&self) -> usize {
@@ -187,6 +211,8 @@ pub(super) fn restored(
                 epoch: 0,
                 columns: Vec::new(),
                 high: 0,
+                serving: Vec::new(),
+                text: Vec::new(),
             }));
         }
     }
@@ -248,10 +274,14 @@ pub(super) fn fence(
     };
     let first = config.search.is_none();
     let last = command.columns.last().map_or(0, |column| column.id);
+    // TODO(J): validate and store `command.serving` and `command.text`
+    // (contract-w2 2.7, DB-9); S stores both empty.
     config.search = Some(SearchSchema {
         epoch: command.epoch,
         columns: command.columns.clone(),
         high: last.max(high),
+        serving: Vec::new(),
+        text: Vec::new(),
     });
     config.direct_schema = Some(direct);
     if encoded_length(&config, METADATA_BYTES).is_err() {
