@@ -25,7 +25,9 @@ pub(super) enum Gate {
 /// other Control voter is in its own first bootstrap with an untouched Control
 /// replica, so that no Control entry can have committed.
 pub(super) fn first_bootstrap(local: Uuid, answers: &[Option<StartAnswer>]) -> Gate {
-    let mut fresh = !answers.is_empty();
+    // A single-voter cluster (`required_voters = 1`) has nobody to ask, and
+    // nobody else could have committed anything: it opens.
+    let mut fresh = true;
     for answer in answers {
         match answer {
             Some(StartAnswer::Revoked) => return Gate::Refuse(REVOKED),
@@ -45,6 +47,9 @@ pub(super) fn first_bootstrap(local: Uuid, answers: &[Option<StartAnswer>]) -> G
 pub(super) fn retained(answers: &[Option<StartAnswer>]) -> Gate {
     if answers.iter().any(|answer| answer == &Some(StartAnswer::Revoked)) {
         return Gate::Refuse(REVOKED);
+    }
+    if answers.is_empty() {
+        return Gate::Open;
     }
     if answers
         .iter()
@@ -156,7 +161,9 @@ mod tests {
         // One voter that cannot answer, or holds state it cannot read yet.
         assert_eq!(first_bootstrap(local, &[Some(Fresh), None]), Gate::Wait);
         assert_eq!(first_bootstrap(local, &[Some(Fresh), Some(Starting)]), Gate::Wait);
-        assert_eq!(first_bootstrap(local, &[]), Gate::Wait);
+        // A single-voter cluster has no peer to ask (review F3).
+        assert_eq!(first_bootstrap(local, &[]), Gate::Open);
+        assert_eq!(retained(&[]), Gate::Open);
         assert_eq!(retained(&[Some(Starting), Some(Revoked)]), Gate::Refuse(REVOKED));
         assert_eq!(retained(&[None, Some(Enrolled(Some(identity(local))))]), Gate::Open);
         assert_eq!(retained(&[Some(Fresh), None]), Gate::Wait);
