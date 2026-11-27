@@ -32,13 +32,13 @@ enum Case {
     ExcessDrift(i64),
     LocalSkew,
     UnfencedStaged,
-    LaggedStaged,
     RetiredStaged,
     RetiredEarlyCommit,
     StaleReport,
     LastCopyGate,
     HandoverShort,
     ColdRetains,
+    StaleSample,
 }
 
 impl Case {
@@ -51,13 +51,13 @@ impl Case {
             Self::ExcessDrift(_) => "E1",
             Self::LocalSkew => "E2",
             Self::UnfencedStaged => "P5",
-            Self::LaggedStaged => "P6",
             Self::RetiredStaged => "P7",
             Self::RetiredEarlyCommit => "last-live-grant",
             Self::StaleReport => "stale-source-report",
             Self::LastCopyGate => "last-copy-gate",
             Self::HandoverShort => "handover-short-prefix",
             Self::ColdRetains => "cold-reset-retains-data",
+            Self::StaleSample => "SIM-7-stale-sample",
         }
     }
 
@@ -71,12 +71,12 @@ impl Case {
             | Self::LocalSkew
             | Self::UnfencedStaged
             | Self::RetiredStaged => "LeaseExclusive",
-            Self::LaggedStaged => "promotion-lag",
             Self::RetiredEarlyCommit => "AckAfterHandover",
             Self::StaleReport => "TransferLag",
             Self::LastCopyGate => "LastCopyDiscarded",
             Self::HandoverShort => "lost-write",
             Self::ColdRetains => "resurrection",
+            Self::StaleSample => "ServedWithinLease",
             Self::DeleteIgnored | Self::ExpiryDeleteIgnored => "ReplicaPrefix",
             Self::EpochReused => "SlotOwnership",
         }
@@ -120,13 +120,13 @@ impl Case {
                 owner_change_keeps_epoch: enabled && self == Self::EpochReused,
                 cold_reset_ignores_live_lease: enabled && self == Self::LiveReset,
                 staged_ignores_fence: enabled && self == Self::UnfencedStaged,
-                staged_ignores_lag: enabled && self == Self::LaggedStaged,
                 staged_retire_is_fence: enabled && self == Self::RetiredStaged,
                 retired_promotion_commits_early: enabled && self == Self::RetiredEarlyCommit,
                 controller_keeps_older_report: enabled && self == Self::StaleReport,
                 last_copy_lag_gate: enabled && self == Self::LastCopyGate,
                 handover_short_prefix: enabled && self == Self::HandoverShort,
                 cold_reset_retains_data: enabled && self == Self::ColdRetains,
+                publish_reuses_first_sample: enabled && self == Self::StaleSample,
                 ..Knobs::default()
             },
             check_replica_prefix: true,
@@ -165,7 +165,6 @@ fn run_case_with(
         let staged = matches!(
             case,
             Case::UnfencedStaged
-                | Case::LaggedStaged
                 | Case::RetiredStaged
                 | Case::RetiredEarlyCommit
                 | Case::StaleReport
@@ -190,7 +189,7 @@ fn run_case_with(
         {
             let mut observed = cluster.observed.lock().unwrap();
             observed.check_transfer_lag = case == Case::StaleReport;
-            observed.check_last_copy = matches!(case, Case::LaggedStaged | Case::LastCopyGate);
+            observed.check_last_copy = case == Case::LastCopyGate;
         }
         if matches!(case, Case::RetiredStaged | Case::RetiredEarlyCommit) {
             let jitter = generated.then(|| choices.below(30));
@@ -218,10 +217,7 @@ fn run_case_with(
                 generated.then(|| choices.below(30)),
             )
             .await;
-            return trial(
-                &cluster,
-                matches!(case, Case::LaggedStaged | Case::LastCopyGate),
-            );
+            return trial(&cluster, case == Case::LastCopyGate);
         }
         let before = cluster.slot(slot);
         let old = before.primary.unwrap();
@@ -288,6 +284,28 @@ fn run_case_with(
             cluster.step(choices.below(30)).await;
         }
         cluster.isolate_controller_links(old.node);
+        if case == Case::StaleSample {
+            // SIM-7: the old primary pauses right after the clock sample of a
+            // write's turn, just before its grant ends, and resumes after the
+            // replica took over. The final check must take a fresh sample.
+            let grant = cluster
+                .sample(Some(old), slot)
+                .await
+                .unwrap()
+                .lease
+                .unwrap();
+            let deadline = grant.expires_ms - nabedra_rt::sim::EPOCH_MS;
+            cluster
+                .step((deadline - 100).saturating_sub(cluster.now()))
+                .await;
+            cluster.freeze_after_next_clock_sample(old.node);
+            let _ = cluster
+                .send(&key, Op::Set("stale-sample".into(), None), Some(old.node))
+                .await;
+            cluster.step(LEASE_MS).await;
+            cluster.thaw(old.node);
+            cluster.step(RENEW_MS).await;
+        }
         if case == Case::LiveReset {
             assert!(matches!(
                 cluster.admin(Admin::Drain { worker: old.node }).await,
@@ -407,7 +425,7 @@ async fn staged_schedule(
         assert!(cluster.now() < deadline, "staged copy did not finish");
         cluster.step(10).await;
     }
-    let lagged = matches!(case, Case::LaggedStaged | Case::LastCopyGate);
+    let lagged = case == Case::LastCopyGate;
     if lagged {
         cluster.link(target.node, old.node, true);
         for i in 0..=MAX_CUTOVER_LAG {
@@ -568,8 +586,7 @@ async fn retired_source_schedule(
     assert!(!promoted.cold);
     if !enabled {
         // Retirement prevents renewals. Publication still waits for the
-        // last committed grant to expire, and the proof names that expired
-        // lease, which every controller binary checks at apply.
+        // last committed grant to expire, which apply checks again.
         let (at, _, proof) = cluster
             .observed
             .lock()
@@ -579,7 +596,8 @@ async fn retired_source_schedule(
             .copied()
             .find(|(_, index, _)| *index == slot)
             .expect("committed staged proof");
-        assert_eq!(proof.fence, SourceFence::LeaseExpired);
+        assert_eq!(proof.fence, SourceFence::Retired);
+        assert!(proof.last_copy);
         assert_eq!(proof.source, old);
         assert_eq!(proof.prior_lease, Some(grant));
         assert!(
@@ -1119,13 +1137,13 @@ fn planted_cases_under_late_partitions() {
         Case::ExcessDrift(-1000),
         Case::LocalSkew,
         Case::UnfencedStaged,
-        Case::LaggedStaged,
         Case::RetiredStaged,
         Case::RetiredEarlyCommit,
         Case::StaleReport,
         Case::LastCopyGate,
         Case::HandoverShort,
         Case::ColdRetains,
+        Case::StaleSample,
     ] {
         let run = |enabled| run_case_with(Partitions::Late, case, seed, false, enabled, false);
         let (trial, clean) = (run(true), run(false));
@@ -1274,8 +1292,10 @@ fn planted_cold_reset_retains_data_scripted() {
     scripted(Case::ColdRetains);
 }
 
+/// SIM-7: a pause between a turn's clock sample and its use. The final lease
+/// check samples again; the planted check reuses the first sample and serves
+/// after the grant ended.
 #[test]
-fn planted_staged_promotion_beyond_lag_scripted_and_search() {
-    scripted(Case::LaggedStaged);
-    search(Case::LaggedStaged);
+fn planted_publish_reuses_first_sample_scripted() {
+    scripted(Case::StaleSample);
 }

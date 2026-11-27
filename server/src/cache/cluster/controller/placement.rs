@@ -55,7 +55,14 @@ pub(in crate::cache::cluster) struct StagedPromotion {
     pub source: WorkerId,
     pub source_sequence: u64,
     pub prior_lease: Option<Lease>,
+    /// Why the source cannot serve: retired, or its report and lease expired.
+    /// Either way the promotion commits only once the controller's lower
+    /// bound reaches the source's latest committed expiry (CACHE-1).
     pub fence: SourceFence,
+    /// The target holds the last verified copy of the slot, so it is promoted
+    /// whatever its lag behind the source watermark (CACHE-4). Ordinary
+    /// transfers still use the cutover limit.
+    pub last_copy: bool,
 }
 
 impl StagedPromotion {
@@ -73,12 +80,21 @@ impl StagedPromotion {
         self.prior_lease.map_or(0, |lease| lease.expires_ms)
     }
 
-    fn within_lag(self) -> bool {
+    /// The source's last grant has ended at `lower_ms`, so it can acknowledge
+    /// nothing more in this epoch.
+    fn grant_ended(self, lower_ms: u64) -> bool {
         #[cfg(feature = "sim")]
-        if super::super::sim::hooks::knobs().staged_ignores_lag {
+        if self.fence == SourceFence::Retired
+            && super::super::sim::hooks::knobs().retired_promotion_commits_early
+        {
             return true;
         }
-        self.source_sequence.saturating_sub(self.retained_sequence) <= MAX_CUTOVER_LAG
+        lower_ms >= self.cutoff(lower_ms)
+    }
+
+    fn within_lag(self) -> bool {
+        self.last_copy
+            || self.source_sequence.saturating_sub(self.retained_sequence) <= MAX_CUTOVER_LAG
     }
 }
 
@@ -457,6 +473,7 @@ impl State {
             && proof.target != proof.source
             && old.lease == proof.prior_lease
             && source_fenced(self, proof.source, old.lease, lower_ms, proof.fence)
+            && proof.grant_ended(lower_ms)
             && self.staging.get(&index).is_some_and(|staging| {
                 staging.source_sequence == Some(proof.source_sequence)
                     && (staging.revision..=topo.revision).contains(&proof.target_revision)
@@ -710,17 +727,23 @@ impl<'a> Placement<'a> {
         }
 
         // Retirement stops renewals, but the retired process can still spend
-        // its last committed grant (CACHE-1). Once that grant has expired, the
-        // proof names the expired lease, which every controller binary checks
-        // when it applies the entry. This needs no new replicated rule. A
-        // `Retired` proof is still applied as before when an older leader
-        // committed it.
-        let deadline = slot.lease.map_or(0, |lease| lease.expires_ms);
-        let fence = if retired && !self.now.fenced(deadline) {
+        // its last committed grant (CACHE-1). Retirement only skips the wait
+        // for its report to age out: the promotion commits once the
+        // controller's lower bound reaches that grant's expiry, which the
+        // state machine checks again at apply.
+        let fence = if retired {
             SourceFence::Retired
         } else {
             SourceFence::LeaseExpired
         };
+        // At this point the source cannot serve and the assigned replica has
+        // no usable copy, so a verified staged copy is the last one. It is
+        // promoted whatever its lag (CACHE-4). Only the planted lag gate of
+        // the simulator applies the ordinary cutover limit here.
+        #[cfg(feature = "sim")]
+        let last_copy = !super::super::sim::hooks::knobs().last_copy_lag_gate;
+        #[cfg(not(feature = "sim"))]
+        let last_copy = true;
         if source_fenced(state, source, slot.lease, self.now.lower_ms, fence)
             && self.topo.member(moving.target).is_some()
             && let Some((copy, target_revision)) =
@@ -739,14 +762,10 @@ impl<'a> Placement<'a> {
                 source_sequence,
                 prior_lease: slot.lease,
                 fence,
+                last_copy,
             };
-            let cutoff = proof.cutoff(self.now.lower_ms);
-            #[cfg(feature = "sim")]
-            let commits_early = fence == SourceFence::Retired
-                && super::super::sim::hooks::knobs().retired_promotion_commits_early;
-            #[cfg(not(feature = "sim"))]
-            let commits_early = false;
-            if proof.within_lag() && (self.now.fenced(cutoff) || commits_early) {
+            if proof.within_lag() && proof.grant_ended(self.now.lower_ms) {
+                let cutoff = proof.cutoff(self.now.lower_ms);
                 let next = self.switch_owner(slot, moving.target, cutoff, None)?;
                 return Some(vec![Change::Slot {
                     index,
@@ -755,49 +774,6 @@ impl<'a> Placement<'a> {
                     evidence: Some(copy),
                     staged: Some(proof),
                 }]);
-            }
-            // CACHE-4: the target holds the last verified copy, but it trails
-            // the source watermark by more than the cutover limit. Keep that
-            // prefix rather than reset the slot. A staged proof beyond the
-            // limit is refused by every deployed binary, so promote with two
-            // changes that every binary already applies: complete the
-            // transfer (the target becomes the assigned replica), then fail
-            // over to that replica at the expired grant. Completing the
-            // transfer needs the source to still be enrolled. A retired
-            // source keeps the reset fallback until a versioned rule exists.
-            #[cfg(feature = "sim")]
-            let lag_gate = super::super::sim::hooks::knobs().last_copy_lag_gate;
-            #[cfg(not(feature = "sim"))]
-            let lag_gate = false;
-            if !proof.within_lag()
-                && !lag_gate
-                && !retired
-                && fence == SourceFence::LeaseExpired
-                && self.now.fenced(deadline)
-            {
-                let replica = Slot {
-                    replica: Some(moving.target),
-                    moving: None,
-                    replica_seed: None,
-                    ..slot
-                };
-                let next = self.switch_owner(replica, moving.target, deadline, None)?;
-                return Some(vec![
-                    Change::Slot {
-                        index,
-                        expected: slot,
-                        next: replica,
-                        evidence: Some(copy),
-                        staged: None,
-                    },
-                    Change::Slot {
-                        index,
-                        expected: replica,
-                        next,
-                        evidence: Some(copy),
-                        staged: None,
-                    },
-                ]);
             }
         }
 

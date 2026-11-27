@@ -1,6 +1,7 @@
 # Fault model. Directed K03 recovery schedules, each run clean and with one planted defect: the last live grant of a
 # retired source, a stale source report, the last verified copy, a planned handover, a scoped cold reset, the assigned
-# replica of a retired source, and the closed-form lease checks on P1 and the staged plants. A clean twin must pass and
+# replica of a retired source, a pause between a clock sample and its use (SIM-7, the fx-sim fault API), and the
+# closed-form lease checks on P1 and the staged plants. A clean twin must pass and
 # its planted twin must break the named check. See plans/cache.md, "Design review".
 id = "cache-sim-recovery-plants"
 module = "cache"
@@ -14,6 +15,7 @@ command = ["cargo", "test", "--locked", "-j", "4", "--no-default-features", "--f
   "cache::cluster::sim::tests::mutants::planted_last_copy_lag_gate_scripted",
   "cache::cluster::sim::tests::mutants::planted_handover_short_prefix_scripted",
   "cache::cluster::sim::tests::mutants::planted_cold_reset_retains_data_scripted",
+  "cache::cluster::sim::tests::mutants::planted_publish_reuses_first_sample_scripted",
   "cache::cluster::sim::tests::mutants::assigned_replica_keeps_pulling_the_retired_source_tail",
   "cache::cluster::sim::tests::mutants::planted_lease_ignores_error_bound_scripted",
   "cache::cluster::sim::tests::mutants::planted_staged_promotion_beyond_lag_scripted_and_search",

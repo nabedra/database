@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -13,8 +13,15 @@ use super::super::transport::{Fingerprint, bounded_json};
 use super::placement::{Change, Order, Staging};
 use crate::cache::command::SLOT_COUNT;
 
+// Operator receipts kept for idempotent retries. The oldest is dropped when a
+// new operation needs room, so an operation ID is deduplicated across at least
+// the last 8,192 topology operations (CACHE-8).
 const MAX_OPERATIONS: usize = 8_192;
-const MAX_RETIRED_BOOTS: usize = 8_192;
+// Retired incarnations remembered per node, newest last. A process enrolls
+// once and then only renews, so a retired one can present its ID again only
+// while its enrollment reply is in flight. Eight restarts of the same node
+// later that process cannot still be running.
+const RETIRED_PER_NODE: usize = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) enum Command {
@@ -59,7 +66,7 @@ pub(super) struct State {
     pub topology: Topology,
     pub orders: Vec<Order>,
     tickets: BTreeMap<u64, Member>,
-    retired: BTreeSet<WorkerId>,
+    retired: BTreeMap<u64, VecDeque<Uuid>>,
     operations: BTreeMap<Uuid, Receipt>,
     groups: usize,
     // Replica-only moves keep the source watermark and the start revision across terms.
@@ -78,7 +85,19 @@ struct Receipt {
 
 impl State {
     pub(super) fn is_retired(&self, worker: WorkerId) -> bool {
-        self.retired.contains(&worker)
+        self.retired
+            .get(&worker.node)
+            .is_some_and(|boots| boots.contains(&worker.incarnation))
+    }
+
+    fn retire(&mut self, worker: WorkerId) {
+        let boots = self.retired.entry(worker.node).or_default();
+        if !boots.contains(&worker.incarnation) {
+            if boots.len() == RETIRED_PER_NODE {
+                boots.pop_front();
+            }
+            boots.push_back(worker.incarnation);
+        }
     }
 
     pub fn apply(&mut self, command: Command, respond: bool) -> Option<Reply> {
@@ -147,7 +166,7 @@ impl State {
     fn enroll(&mut self, member: Member, certificate: Fingerprint) -> Result<(), &'static str> {
         if !member.valid()
             || !member.authenticates(certificate)
-            || self.retired.contains(&member.id)
+            || self.is_retired(member.id)
             || self.topology.drained.contains(&member.id.node)
         {
             return Err("invalid worker or retired incarnation");
@@ -167,10 +186,8 @@ impl State {
 
         let revision = self.next_revision()?;
         if let Some(previous) = current {
-            if self.retired.len() == MAX_RETIRED_BOOTS {
-                return Err("worker incarnation history is full");
-            }
-            self.retired.insert(previous.id);
+            let previous = previous.id;
+            self.retire(previous);
         }
         self.topology.workers.insert(member.id.node, member);
         self.topology.revision = revision;
@@ -284,9 +301,6 @@ impl State {
                 Err("operation ID already names a different command")
             };
         }
-        if self.operations.len() == MAX_OPERATIONS {
-            return Err("operator receipt history is full");
-        }
         let revision = self.next_revision()?;
         match action {
             Admin::Init { groups } => self.init(groups)?,
@@ -301,6 +315,15 @@ impl State {
             Admin::Status => return Err("status is a read operation"),
         }
         self.topology.revision = revision;
+        if self.operations.len() == MAX_OPERATIONS
+            && let Some(oldest) = self
+                .operations
+                .iter()
+                .min_by_key(|(_, receipt)| receipt.revision)
+                .map(|(&id, _)| id)
+        {
+            self.operations.remove(&oldest);
+        }
         self.operations.insert(id, Receipt { digest, revision });
         Ok(revision)
     }
@@ -339,11 +362,11 @@ impl State {
     }
 
     pub fn complete_drain(&mut self, worker: u64) -> bool {
-        if self.topology.drained.contains(&worker) || self.retired.len() == MAX_RETIRED_BOOTS {
+        if self.topology.drained.contains(&worker) {
             return false;
         }
         if let Some(member) = self.topology.workers.remove(&worker) {
-            self.retired.insert(member.id);
+            self.retire(member.id);
         }
         self.tickets.remove(&worker);
         self.topology.drained.insert(worker)
@@ -527,7 +550,10 @@ impl State {
         self.operations.len() <= MAX_OPERATIONS
             && self.tickets.len() <= MAX_WORKERS
             && self.topology.workers.len() <= MAX_WORKERS
-            && self.retired.len() <= MAX_RETIRED_BOOTS
+            && self
+                .retired
+                .values()
+                .all(|boots| boots.len() <= RETIRED_PER_NODE)
             && self.groups <= MAX_WORKERS
             && self.staging.keys().all(|&index| {
                 self.topology

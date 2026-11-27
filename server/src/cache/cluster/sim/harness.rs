@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use nabedra_rt::sim::net::{Dial, Envelope, Fate, Planner, SimListener, node_ip};
-use nabedra_rt::sim::{self, NodeClock, World};
+use nabedra_rt::sim::{self, ClockRead, Fidelity, NodeClock, World};
 use nabedra_rt::time;
 use nabedra_sim::{Filters, NetPlan, Plan, RaftObserver, runtime};
 use uuid::Uuid;
@@ -245,6 +245,12 @@ impl Cluster {
             );
         }
         world.insert_ext(bounds);
+        if config.gradual_drift {
+            // The sweeps drift every clock within the declared bound. Declare
+            // it, so no in-bound drift change fires a timer early (SIM-13).
+            // The beyond-bound twins drift past it on purpose and declare none.
+            world.set_drift_bound_ppm(Some(i64::from(config.declared_ppm)));
+        }
         for node in nodes {
             let residual = if config.skew && (11..OPERATOR).contains(&node) {
                 (config.base_error_ns as i64) * if node == 11 { -1 } else { 1 }
@@ -483,6 +489,23 @@ impl Cluster {
         }
         self.plan.lock().unwrap().heal_all();
         self.world.heal_all();
+    }
+
+    /// Freezes `node` right after its next ClockBound sample returns, with the
+    /// sampling code suspended between the sample and its use (SIM-7), until
+    /// [`Cluster::thaw`].
+    pub fn freeze_after_next_clock_sample(&self, node: u64) {
+        self.trace(format_args!("freeze {node} after its next clock sample"));
+        let mut fidelity = Fidelity::default();
+        fidelity.freeze_after_ext_reads = true;
+        self.world.set_fidelity(fidelity);
+        self.world
+            .freeze_after_clock_read(node, ClockRead::nth(1).in_file("clock_bound.rs"));
+    }
+
+    pub fn thaw(&self, node: u64) {
+        self.trace(format_args!("thaw {node}"));
+        self.world.thaw(node);
     }
 
     pub fn drift(&self, node: u64, ppm: i64) {

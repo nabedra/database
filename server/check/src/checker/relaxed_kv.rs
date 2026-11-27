@@ -23,7 +23,8 @@
 //! change that moves the whole acknowledged prefix: no write may be lost across one.
 //! A simulated staged promotion includes its committed `reported_sequence`,
 //! `source_sequence`, and `max_lag` under `staged_promotion`. A larger gap reports
-//! `promotion-lag`, even if the worker catches up before it installs the new epoch.
+//! `promotion-lag`, even if the worker catches up before it installs the new epoch, unless
+//! the promotion carries `last_copy: true` (the only verified copy, promoted whatever its lag).
 //!
 //! Register keys (no `incr`):
 //! - `invented-value`: a value read that no op wrote, or read before its write was invoked;
@@ -297,7 +298,8 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
                 "staged promotion needs retained, source and lag sequences".into(),
             );
         };
-        if source.saturating_sub(retained) > max_lag {
+        let last_copy = proof["last_copy"].as_bool() == Some(true);
+        if !last_copy && source.saturating_sub(retained) > max_lag {
             anomalies.push(Anomaly::new(
                 "promotion-lag",
                 format!("retained sequence {retained}, source {source}, allowed lag {max_lag}"),

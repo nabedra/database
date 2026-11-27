@@ -39,7 +39,6 @@ pub(in crate::cache::cluster) struct Knobs {
     pub owner_change_keeps_epoch: bool,
     pub cold_reset_ignores_live_lease: bool,
     pub staged_ignores_fence: bool,
-    pub staged_ignores_lag: bool,
     // Reads decision 6's text literally: a retired source counts as
     // fenced, so the target's grant starts at once instead of at the
     // source's last committed expiry (design review R-cache-14).
@@ -62,6 +61,9 @@ pub(in crate::cache::cluster) struct Knobs {
     pub handover_short_prefix: bool,
     // Cold reset: a worker keeps its old store when it installs a cold epoch.
     pub cold_reset_retains_data: bool,
+    // SIM-7: the final lease check before a commit reuses the turn's first
+    // clock sample, so a pause between the two is not fenced.
+    pub publish_reuses_first_sample: bool,
 }
 
 pub(in crate::cache::cluster) enum Observed {

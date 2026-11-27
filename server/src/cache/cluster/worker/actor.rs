@@ -718,9 +718,15 @@ impl State {
                     .prepare_within(operation, now.upper_ms, self.config.turns, ceiling);
             #[cfg(feature = "sim")]
             let sequence = state.sequence;
+            // The final check takes a fresh sample, so a pause after the first
+            // one cannot stretch the grant (SIM-7).
+            #[cfg(feature = "sim")]
+            let reuse = hooks::knobs().publish_reuses_first_sample;
+            #[cfg(not(feature = "sim"))]
+            let reuse = false;
             let published = publish(
                 &self.config,
-                || self.clock.now(),
+                || if reuse { Ok(now) } else { self.clock.now() },
                 &mut self.journal,
                 &mut self.storage,
                 slot,

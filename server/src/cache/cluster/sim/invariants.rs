@@ -230,6 +230,8 @@ impl Observations {
                         // against this.
                         "source_published_sequence": published,
                         "max_lag": MAX_CUTOVER_LAG,
+                        // The last verified copy is promoted whatever its lag (CACHE-4).
+                        "last_copy": proof.last_copy,
                     });
                 }
                 self.history
