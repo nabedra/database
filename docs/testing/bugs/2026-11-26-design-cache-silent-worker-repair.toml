@@ -1,3 +1,6 @@
+# Code fixed by caeb6272 (Sol): a worker without a current-term report is unknown until cold_reset_not_before_ms.
+# Regression k03_new_controller_waits_for_the_first_worker_reports failed before it (45852728699) and passes at
+# 7ed7f21b (45979686152). The K03 Docker record stays open until a cache-cluster-real run says otherwise.
 # Design review rv-cache, 2026-11-26. The spec form of CACHE-K03-DOCKER-PLACEMENT. specs/cache/CacheCluster.tla: with the
 # candidate fix observe_window (CacheCluster.fixed.cfg) G05_NoRepairOfSteady holds; prefix_no_observe_window restores the
 # shipped planner, which fails over (placement.rs:784) and starts replica-only transfers (:790-811) on a worker it has not
@@ -10,12 +13,9 @@ guarantees = ["CACHE-G05"]
 scenarios = ["K03"]
 found_by = "review"
 found_date = "2026-11-26"
-lowest_regression = "specs/cache/mutants/prefix_no_observe_window.cfg"
+lowest_regression = "server/src/cache/cluster/controller/tests.rs::k03_new_controller_waits_for_the_first_worker_reports"
 seed = "unknown"
 why_not_caught = "The plan gives the 3 s report window only to the scoped cold reset, and no property separated a silent connected worker from a lost one."
 invariant_added = "G05_NoRepairOfSteady: no failover or replica replacement drops a worker connected since the current controller term started."
-fix_commits = []
+fix_commits = ["caeb6272c899dca4fc20d08efdb2d2b7f799675f"]
 revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-24"

@@ -1,3 +1,7 @@
+# Fixed in phase 2: 6d40164d (Sol) keeps a copy pulling from its retired source and defers the planner; f1b392f7
+# makes apply refuse any staged promotion before the prior grant's expiry. Twins in mutants.rs:
+# assigned_replica_keeps_pulling_the_retired_source_tail (cause 1) and planted_retired_promotion_commits_early_scripted
+# (cause 2, AckAfterHandover).
 # Confirmed in the Cache fault model only, by an independent review of #111. Local and unattested.
 # Whether this loss is allowed is an open contract question. This record is neither a pass nor a
 # fail of the guarantee it names.
@@ -21,12 +25,9 @@ guarantees = ["CACHE-G05"]
 scenarios = ["K03"]
 found_by = "review"
 found_date = "2026-11-24"
-lowest_regression = "K03"
+lowest_regression = "server/src/cache/cluster/sim/mutants.rs::planted_retired_promotion_commits_early_scripted"
 seed = 1
 why_not_caught = "The relaxed Cache checker has no time window in simulation, so it allows any acknowledged write above the retained prefix, and the committed schedules neither kept the peer link open during such a retirement nor asserted the surviving value."
-invariant_added = "Pending the contract decision: either a copy keeps applying a retired source's deltas until the source's last committed grant ends, or writes acknowledged after the retirement are recorded as allowed loss."
-fix_commits = []
+invariant_added = "A copy keeps applying its retired source's deltas until it installs a newer epoch, and apply refuses a staged promotion before the controller's lower bound reaches the prior grant's expiry; the sim flags any mutation published after a successor kept its prefix (AckAfterHandover)."
+fix_commits = ["f1b392f7b35c7dfae6bab001dbaa1d4d7a3c2bd8", "7ed7f21bdc4ceb62253ebbe40f22c6ac6d40171a", "6d40164dc6679e39ca21b6302d3c18c4218adee7"]
 revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-23"
