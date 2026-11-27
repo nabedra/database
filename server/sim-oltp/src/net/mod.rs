@@ -12,7 +12,7 @@ pub use leader::Election;
 pub use peers::{PeerDirectory, PeerProtocol};
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
@@ -60,6 +60,9 @@ pub enum Action {
     #[default]
     Pass,
     Delay(Duration),
+    /// Beyond TCP: delay this frame alone, so that later frames of other streams of its
+    /// session may pass it. Every other delay keeps the session in order (SIM-14).
+    Overtake(Duration),
     /// Leave the connection open while its sending direction stops making progress.
     Cut,
     /// Reset the session immediately. Pending calls see the transport's normal error.
@@ -77,6 +80,9 @@ struct State {
     trace: Trace,
     trace_observer: Option<TraceObserver>,
     leaders: leader::Watch,
+    /// When the last frame planned on each session direction arrives. A TCP session
+    /// delivers in order, so no later frame of it arrives earlier, whatever its stream.
+    arrivals: BTreeMap<(u64, bool), Duration>,
 }
 
 /// Installs profiles on the network used by the existing transport backend.
@@ -100,6 +106,7 @@ impl SimNet {
             trace: Trace::new(),
             trace_observer: None,
             leaders: leader::Watch::default(),
+            arrivals: BTreeMap::new(),
         }));
         world.set_net_planner(Router(state.clone()));
         Self {
@@ -196,6 +203,23 @@ impl SimNet {
 }
 
 impl State {
+    /// The delay that keeps `envelope` behind every frame planned before it on its session
+    /// direction: at least `delay`, and no less than the wait for the last one (SIM-14). The
+    /// runtime orders a frame only after its own stream, so a delay of one stream would let
+    /// another overtake it, which no TCP session does. A frame that waits here is head-of-line
+    /// blocking, as on TCP.
+    fn in_order(&mut self, envelope: &Envelope<'_>, delay: Duration) -> Duration {
+        let Some(world) = self.world.upgrade() else {
+            return delay;
+        };
+        let now = world.elapsed();
+        let key = (envelope.conn.0, envelope.direction == Direction::ToClient);
+        let last = self.arrivals.entry(key).or_default();
+        let arrival = (now + delay).max(*last);
+        *last = arrival;
+        arrival - now
+    }
+
     fn elected(&mut self, envelope: &Envelope<'_>) {
         if let Some(world) = self.world.upgrade() {
             let ms = world.elapsed().as_millis().try_into().unwrap();
@@ -286,14 +310,22 @@ impl Planner for Router {
             let connection = matches!(message, Message::Frame(_)).then_some(envelope.conn);
             state.record_observed(event, event, connection);
         }
-        let delay = match action {
-            Action::Pass => Duration::ZERO,
-            Action::Delay(delay) => delay,
+        let (delay, in_order) = match action {
+            Action::Pass => (Duration::ZERO, true),
+            Action::Delay(delay) => (delay, true),
+            Action::Overtake(delay) => (delay, false),
             Action::Cut => return Fate::Drop,
             Action::Reset => return Fate::Reset,
         };
         match stream {
-            Some(stream) => Fate::Frame { stream, delay },
+            Some(stream) => {
+                let delay = if in_order {
+                    state.in_order(envelope, delay)
+                } else {
+                    delay
+                };
+                Fate::Frame { stream, delay }
+            }
             None => Fate::Deliver { delay },
         }
     }
