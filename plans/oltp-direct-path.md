@@ -295,8 +295,9 @@ Found in review of T4 (`RV-T4`). These refine section 4 and 6 without changing t
 - **Splits under write load.** The split coordinator stops direct commits with a replicated barrier entry in the source
   range before allocating the cut, so a leader change cannot lose the pause. A frozen range answers a dedicated
   `SplitInProgress`, which the gateway treats as `Fallback`, not as a stale route. Every decided attempt releases the
-  barrier, including one aborted before its children were bound, and the source refuses a `DirectPause` of an attempt
-  it already settled, so a late or repeated pause cannot hold the range (design review of `specs/oltp/split`,
+  barrier, including one aborted before its children were bound. A late or repeated pause of a settled attempt still
+  applies (the apply rule is the same on every release, so the replicas of a group in a rolling upgrade agree), and the
+  run owner releases a barrier whose split is settled, so it cannot hold the range (design review of `specs/oltp/split`,
   `plans/oltp-engine.md`). The coordinator asks the source leader for the barrier through the split service
   (`Pause`); a source worker of an older release cannot decode that request, and the coordinator then splits without
   the barrier, as before it, so a mixed-version split is as safe as today and only its liveness under load differs.
