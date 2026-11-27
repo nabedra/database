@@ -551,21 +551,39 @@ async fn execute_inner(
             .storage
             .as_ref()
             .map(|_| peers.worker.ready.prepared.input.value.cluster_id);
-        let candidate = cpu(&peers.worker.cpu, move |_| {
+        let (candidate, status) = cpu(&peers.worker.cpu, move |_| {
             let base = loaded.catalog();
-            let decision = Decision {
-                version: 1,
-                id: commit,
-                parent: base.decision_head,
-                base_revision: base.revision,
-                revision: base
-                    .revision
-                    .checked_add(1)
-                    .ok_or_else(|| error(ErrorCode::LimitExceeded))?,
-                request_id: id,
-                request_body: String::from_utf8(original.into_vec()).map_err(|_| invalid())?,
-                response_status: status,
-                response_body: String::from_utf8(body).map_err(|_| invalid())?,
+            let request_body = String::from_utf8(original.into_vec()).map_err(|_| invalid())?;
+            let decision = |response_status, response_body: Vec<u8>| {
+                Ok::<_, ProtocolError>(Decision {
+                    version: 1,
+                    id: commit,
+                    parent: base.decision_head,
+                    base_revision: base.revision,
+                    revision: base
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(|| error(ErrorCode::LimitExceeded))?,
+                    request_id: id,
+                    request_body: request_body.clone(),
+                    response_status,
+                    response_body: String::from_utf8(response_body).map_err(|_| invalid())?,
+                })
+            };
+            let prepare = |tables, decision| match owner {
+                Some(cluster) => PreparedPublication::prepare_owned(
+                    loaded.clone(),
+                    tables,
+                    decision,
+                    cluster,
+                    expected_fence,
+                ),
+                None => PreparedPublication::prepare_fenced(
+                    loaded.clone(),
+                    tables,
+                    decision,
+                    expected_fence,
+                ),
             };
             // Oversized response fallback must never publish changed tables.
             let tables = if status == 200 {
@@ -573,22 +591,26 @@ async fn execute_inner(
             } else {
                 base.tables.clone()
             };
-            match owner {
-                Some(cluster) => PreparedPublication::prepare_owned(
-                    loaded,
-                    tables,
-                    decision,
-                    cluster,
-                    expected_fence,
-                ),
-                None => {
-                    PreparedPublication::prepare_fenced(loaded, tables, decision, expected_fence)
+            match prepare(tables, decision(status, body)?) {
+                Ok(candidate) => Ok((candidate, status)),
+                // OLAP-3: a changed root above the catalog cap is a definite
+                // limit. Publish it as a 413 decision with unchanged tables, so
+                // the outcome is replayable instead of `outcome_unknown`.
+                Err(crate::storage::StorageError::LimitExceeded) if status == 200 => {
+                    let fallback =
+                        response::encode_error(Some(id), error(ErrorCode::LimitExceeded));
+                    prepare(
+                        base.tables.clone(),
+                        decision(fallback.status, fallback.body)?,
+                    )
+                    .map(|candidate| (candidate, fallback.status))
+                    .map_err(|_| error(ErrorCode::LimitExceeded))
                 }
+                Err(_) => Err(error(ErrorCode::LimitExceeded)),
             }
-            .map_err(|_| error(ErrorCode::LimitExceeded))
         })
         .await?;
-        if encoded.status == 200 {
+        if status == 200 {
             lease
                 .command(Command::UploadStaged(peers.data.storage()))
                 .await
