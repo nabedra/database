@@ -733,7 +733,43 @@ impl ParticipantHandle {
                 ParticipantReply::DirectSchema(schema) => return Ok(schema),
                 // A run fence moved between the epoch read and the apply.
                 ParticipantReply::Rejected(Fault::StaleAuthority) if tries < 3 => continue,
+                ParticipantReply::Rejected(Fault::Conflict) => {
+                    return Err(failure(
+                        ErrorCode::Conflict,
+                        "direct schema fence expected another epoch",
+                    ));
+                }
                 _ => return Err(invalid()),
+            }
+        }
+    }
+    /// DDL-FENCE: fence direct writers for `lifecycle` as a compare-and-set:
+    /// probe the group's direct schema epoch, then fence at exactly that
+    /// epoch. A fence that lands between the two (only a late copy can) makes
+    /// the compare fail, and the probe is repeated.
+    pub async fn fence_direct_schema(
+        &self,
+        lifecycle: Option<Uuid>,
+    ) -> Result<super::direct::DirectSchema, ProtocolError> {
+        use super::direct::DirectSchemaChange;
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let probe = self
+                .change_direct_schema(DirectSchemaChange::Fence {
+                    lifecycle,
+                    expected_epoch: None,
+                })
+                .await?;
+            match self
+                .change_direct_schema(DirectSchemaChange::Fence {
+                    lifecycle,
+                    expected_epoch: Some(probe.epoch),
+                })
+                .await
+            {
+                Err(error) if error.code == ErrorCode::Conflict && tries < 3 => continue,
+                result => return result,
             }
         }
     }

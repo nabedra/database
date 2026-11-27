@@ -16,7 +16,17 @@ fn schema_reply(epoch: u64, lifecycle: Option<Uuid>) -> ParticipantReply {
     ParticipantReply::DirectSchema(DirectSchema { epoch, lifecycle })
 }
 fn fence(f: &Fixture, lifecycle: Option<Uuid>) -> ParticipantCommand {
-    schema_change(f, DirectSchemaChange::Fence { lifecycle })
+    fence_at(f, lifecycle, 1)
+}
+/// DDL-FENCE: the fence of a coordinator that probed epoch `expected`.
+fn fence_at(f: &Fixture, lifecycle: Option<Uuid>, expected: u64) -> ParticipantCommand {
+    schema_change(
+        f,
+        DirectSchemaChange::Fence {
+            lifecycle,
+            expected_epoch: Some(expected),
+        },
+    )
 }
 fn index_key(f: &Fixture, index_id: Uuid, key: i64) -> MvccKey {
     MvccKey::IndexEntry {
@@ -322,7 +332,7 @@ async fn o08_d11_a_drop_fence_stops_every_direct_commit_and_leaves_queued_epochs
     // If the drop never published, a later DDL fence binds a lifecycle again.
     let later = nabedra_rt::ids::uuid_v4();
     assert_eq!(
-        f.submit(fence(&f, Some(later))).await,
+        f.submit(fence_at(&f, Some(later), 2)).await,
         schema_reply(3, Some(later))
     );
     assert_eq!(f.direct(&insert(&f, 4, 30, 3, None)).await, applied(30));
@@ -411,4 +421,43 @@ async fn o02_d11_schema_fences_are_deterministic_and_survive_a_run_fence() {
         f.submit(foreign).await,
         ParticipantReply::Rejected(Fault::InvalidBinding)
     );
+}
+
+/// DDL-FENCE: a late copy of an earlier DDL's fence is refused and never
+/// reinstalls that DDL's lifecycle (the shipped fence bumped the epoch for any
+/// other lifecycle); the probe reports without changing anything.
+#[tokio::test]
+async fn d11_ddl_fence_a_late_fence_of_an_earlier_ddl_is_refused() {
+    let mut f = Fixture::new().await;
+    let (first, second) = (nabedra_rt::ids::uuid_v4(), nabedra_rt::ids::uuid_v4());
+    let probe = schema_change(
+        &f,
+        DirectSchemaChange::Fence {
+            lifecycle: Some(first),
+            expected_epoch: None,
+        },
+    );
+    assert_eq!(f.submit(probe.clone()).await, schema_reply(1, Some(f.table)));
+    let late = fence_at(&f, Some(first), 1);
+    assert_eq!(f.submit(late.clone()).await, schema_reply(2, Some(first)));
+    // A retry of the same fence is a no-op.
+    assert_eq!(f.submit(late.clone()).await, schema_reply(2, Some(first)));
+    assert_eq!(
+        f.submit(fence_at(&f, Some(second), 2)).await,
+        schema_reply(3, Some(second))
+    );
+    let before = f.dump().await;
+    assert_eq!(
+        f.submit(late).await,
+        ParticipantReply::Rejected(Fault::Conflict),
+        "the late fence of the first DDL"
+    );
+    assert_eq!(
+        f.submit(fence_at(&f, None, 1)).await,
+        ParticipantReply::Rejected(Fault::Conflict),
+        "a stale drop fence"
+    );
+    assert_eq!(f.submit(probe).await, schema_reply(3, Some(second)));
+    assert_eq!(f.dump().await, before);
+    assert_eq!(f.direct(&insert(&f, 1, 10, 3, None)).await, applied(10));
 }

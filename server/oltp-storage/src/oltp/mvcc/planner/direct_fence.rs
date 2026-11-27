@@ -59,7 +59,6 @@ impl NativePlanner {
         if !probe.active().await? {
             return Ok(0);
         }
-        let change = DirectSchemaChange::Fence { lifecycle };
         let mut fenced = 0u64;
         let mut next = match self.catalog.routing_root(pin, table_id).await? {
             CatalogRead::Value {
@@ -78,7 +77,7 @@ impl NativePlanner {
             };
             for route in page.shards.iter() {
                 let participant = self.resolver.participant(&route.group).await?;
-                let schema: DirectSchema = participant.change_direct_schema(change).await?;
+                let schema: DirectSchema = participant.fence_direct_schema(lifecycle).await?;
                 if schema.lifecycle != lifecycle {
                     return Err(failure(
                         ErrorCode::Conflict,
