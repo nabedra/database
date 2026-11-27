@@ -242,6 +242,11 @@ impl Probes {
         self.lock().protocol.exercised().clone()
     }
 
+    /// How many times `node`'s process has ended so far.
+    pub(crate) fn incarnation(&self, node: u64) -> u64 {
+        self.lock().incarnations.get(&node).copied().unwrap_or(0)
+    }
+
     /// Counts evaluations of a rule that the harness drives.
     pub(crate) fn ran(&self, rule: &'static str, times: u64) {
         self.lock().protocol.ran(rule, times);

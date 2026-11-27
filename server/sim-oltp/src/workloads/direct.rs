@@ -425,6 +425,15 @@ pub(crate) async fn run(
     let extra = moving
         .as_ref()
         .map_or(Vec::new(), |moving| moving.extra_pools(&cluster.world));
+    for worker in WORKERS {
+        let pools = extra.iter().filter(|(node, _)| *node == worker).count();
+        cluster.checks.pools_added(worker, pools as u64);
+    }
+    if moving.as_ref().is_some_and(moves::Move::retired)
+        && let Some(leader) = cluster.elected()
+    {
+        cluster.checks.led_removed_learner(leader);
+    }
     let (stats, leftover) = settle(cluster, &extra).await?;
     if !selection.focus.idle {
         cluster.checks.check_direct_path(&cluster.world, &stats);

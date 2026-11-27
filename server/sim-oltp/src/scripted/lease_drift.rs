@@ -237,6 +237,13 @@ fn judge(name: &str, leader_ppm: i64, voter_ppm: i64, window: Duration, stale: b
     for seed in first..first + var("NABEDRA_SEEDS", 1) {
         let run = run_schedule(seed, move |driver| lease(driver, leader_ppm, voter_ppm, window));
         let kinds = shrink::kinds(&run.violations);
+        // `NABEDRA_SIM_TRACE=full` keeps every frame and fault of the run, for a diagnosis.
+        if let (Some(trace), Some(dir)) = (&run.full_trace, env::var_os("NABEDRA_SIM_ARTIFACTS")) {
+            let path = std::path::Path::new(&dir).join(format!("{name}-seed-{seed}.trace"));
+            std::fs::create_dir_all(&dir).expect("artifact directory");
+            std::fs::write(&path, trace.join("\n")).expect("trace file");
+            println!("full trace in {}", path.display());
+        }
         let history = String::from_utf8_lossy(&run.history);
         // Everything from the isolation on: the computed window, the writes and the reads.
         let marks: Vec<&str> = history

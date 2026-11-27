@@ -1,5 +1,5 @@
 diff --git a/server/oltp-storage/src/oltp/mvcc/store.rs b/server/oltp-storage/src/oltp/mvcc/store.rs
-index 84ec8f87..b61164b4 100644
+index 84ec8f87..6cc99c61 100644
 --- a/server/oltp-storage/src/oltp/mvcc/store.rs
 +++ b/server/oltp-storage/src/oltp/mvcc/store.rs
 @@ -408,6 +408,9 @@ impl ParticipantMachine {
@@ -12,26 +12,33 @@ index 84ec8f87..b61164b4 100644
          for commit_ts in direct {
              self.clock.settle(commit_ts);
          }
-@@ -530,6 +533,24 @@ impl ParticipantMachine {
+@@ -530,6 +533,31 @@ impl ParticipantMachine {
      }
  }
  
 +/// Planted defect: from its first direct entry on, the worker holds one working-memory lease
-+/// of the size of a cached Control route (692 B), and never releases it. A baseline that let a
-+/// route cache excuse its own size would hide it.
++/// of the size of a cached Control route (692 B) for as long as its process runs. A baseline
++/// that let a route cache excuse its own size would hide it.
 +fn planted_lease(resources: &Arc<crate::oltp::pool::WorkerSharedResources>) {
 +    use crate::oltp::pool::{ByteClass, WorkerSharedResources};
 +    use std::sync::{Mutex, Weak};
-+    type Held = (Weak<WorkerSharedResources>, Box<dyn std::any::Any + Send>);
-+    static PLANTED: Mutex<Vec<Held>> = Mutex::new(Vec::new());
++    static PLANTED: Mutex<Vec<Weak<WorkerSharedResources>>> = Mutex::new(Vec::new());
 +    let worker = Arc::downgrade(resources);
 +    let mut planted = PLANTED.lock().expect("planted leases");
-+    if planted.iter().any(|(of, _)| of.ptr_eq(&worker)) {
++    if planted.iter().any(|of| of.ptr_eq(&worker)) {
 +        return;
 +    }
-+    if let Ok(lease) = resources.reserve_scratch(ByteClass::Data, 692) {
-+        planted.push((worker, Box::new(lease)));
-+    }
++    planted.push(worker.clone());
++    let Ok(lease) = resources.reserve_scratch(ByteClass::Data, 692) else {
++        return;
++    };
++    // Held by a task of the worker's process, so it ends with the process or the run.
++    nabedra_rt::task::spawn(async move {
++        let _lease = lease;
++        while worker.strong_count() > 0 {
++            nabedra_rt::time::sleep(std::time::Duration::from_millis(100)).await;
++        }
++    });
 +}
 +
  fn apply(

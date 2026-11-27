@@ -68,6 +68,12 @@ pub(crate) struct Checks {
     resources: BTreeMap<u64, ResourceUsage>,
     /// Per worker: every ledger at the resource baseline, from probes.
     ledger_baseline: BTreeMap<u64, Ledgers>,
+    /// Per worker: its process's incarnation when the baseline was taken.
+    baseline_incarnation: BTreeMap<u64, u64>,
+    /// Per worker: pools that a replica move mounted after the baseline.
+    added_pools: BTreeMap<u64, u64>,
+    /// Workers that led a range whose replica a move removed.
+    removed_learner_leaders: BTreeSet<u64>,
     /// Per worker: what [`Invariants::resources_at_baseline`] last observed.
     settling: BTreeMap<u64, Settling>,
     /// Per worker: what [`Invariants::resources_steady`] last observed.
@@ -291,6 +297,10 @@ impl Invariants {
         if let Some(ledgers) = ledgers {
             checks.ledger_baseline.insert(worker, ledgers);
         }
+        let incarnation = checks.probes.as_ref().map(|probes| probes.incarnation(worker));
+        if let Some(incarnation) = incarnation {
+            checks.baseline_incarnation.insert(worker, incarnation);
+        }
         match ResourceUsage::from_stats(stats) {
             Some(usage) => {
                 checks.check_storage_devices(world, worker, &usage);
@@ -358,6 +368,32 @@ impl Invariants {
                 "n{worker} was judged without the observation that settled it"
             )),
         };
+        // Lead decision 20: a process that restarted after the baseline has no judged
+        // baseline. It stays red, and its line says so, so that it is never mistaken for a
+        // leak of the process that took the baseline.
+        let restarted = match (&checks.probes, checks.baseline_incarnation.get(&worker)) {
+            (Some(probes), Some(&before)) => {
+                let now = probes.incarnation(worker);
+                (now != before).then(|| format!("{before} to {now}"))
+            }
+            _ => None,
+        };
+        let problem = match (problem, restarted) {
+            (Some(problem), Some(restarts)) => Some(format!(
+                "{problem} (restarted after its baseline, incarnation {restarts}: no judged baseline, lead decision 20)"
+            )),
+            (problem, _) => problem,
+        };
+        let problem = problem.map(|problem| {
+            if checks.removed_learner_leaders.contains(&worker) && problem.contains("ScratchBytes")
+            {
+                format!(
+                    "{problem} (the signature of open record {REMOVED_LEARNER_CHARGE}: n{worker} led a range whose replica a move removed)"
+                )
+            } else {
+                problem
+            }
+        });
         if let Some(problem) = problem {
             checks.violate(world, "ResourceBaseline", problem);
         }
@@ -415,6 +451,23 @@ impl Invariants {
         };
         checks.settling.insert(worker, observed);
         passes >= SETTLED_PASSES
+    }
+
+    /// Declares that a replica move mounted `pools` pools on `worker` after its baseline. Each
+    /// is charged [`POOL_OVERHEAD_BYTES`] to the scheduler, which ResourceBaseline then
+    /// expects on top of the baseline, exactly.
+    pub(crate) fn pools_added(&self, worker: u64, pools: u64) {
+        self.checks.lock().unwrap().added_pools.insert(worker, pools);
+    }
+
+    /// Declares that `worker` led a range whose replica a move removed, so that a scratch
+    /// charge left on it names the open record of that signature.
+    pub(crate) fn led_removed_learner(&self, worker: u64) {
+        self.checks
+            .lock()
+            .unwrap()
+            .removed_learner_leaders
+            .insert(worker);
     }
 
     /// Verify the workload reached the direct path using public worker stats.
@@ -544,6 +597,14 @@ fn deadline_message(label: &str, deadline: Duration) -> String {
 pub(crate) const ROUTE_CACHE_ENTRIES: u64 = 64;
 pub(crate) const ROUTE_CACHE_ENTRY_BYTES: u64 = 4 << 10;
 
+/// What a mounted pool charges the scheduler, as `POOL_OVERHEAD_BYTES` in
+/// `nabedra-resources`' `memory/worker.rs` states it. Restated, not imported.
+pub(crate) const POOL_OVERHEAD_BYTES: u64 = 64 << 20;
+
+/// The open record whose signature is a scratch charge left on the leader of a range whose
+/// replica a move removed.
+const REMOVED_LEARNER_CHARGE: &str = "OLTP-sim-removed-learner-charge";
+
 /// The ledgers that count a cached route's working-memory charge with every other one.
 const HOLD_ROUTES: [Ledger; 2] = [Ledger::ScratchBytes, Ledger::SchedulerBytes];
 
@@ -626,10 +687,25 @@ impl Checks {
         if now.is_empty() {
             return vec!["no ledger reported".into()];
         }
-        let (baseline, now) = match split_route_cache(baseline, now) {
+        let (baseline, mut now) = match split_route_cache(baseline, now) {
             Ok(split) => split,
             Err(off) => return vec![off],
         };
+        // A pool a move mounted is charged to the scheduler: expect exactly that on top of the
+        // baseline, from the number of pools, never an allowance off the total.
+        let pools = self.added_pools.get(&worker).copied().unwrap_or(0);
+        if pools > 0 {
+            let charge = pools * POOL_OVERHEAD_BYTES;
+            let Some(held) = now.get_mut(&(Ledger::SchedulerBytes, None)) else {
+                return vec![format!("{pools} added pools and no SchedulerBytes reported")];
+            };
+            let Some(rest) = held.checked_sub(charge) else {
+                return vec![format!(
+                    "{pools} added pools charge {charge} B, more than all of SchedulerBytes {held}"
+                )];
+            };
+            *held = rest;
+        }
         let (baseline, now) = (&baseline, &now);
         let keys: BTreeSet<_> = baseline.keys().chain(now.keys()).collect();
         keys.into_iter()
@@ -1106,6 +1182,29 @@ mod tests {
                 "{leak:?}"
             );
             assert!(leak.iter().any(|line| line.contains(says)), "{says}: {leak:?}");
+        }
+    }
+
+    /// A pool that a move mounted is expected on top of the baseline, exactly: one pool more
+    /// or less, or a lease beside it, is red.
+    #[test]
+    fn added_pools_are_expected_exactly() {
+        let sched = |bytes| Ledgers::from([((Ledger::SchedulerBytes, None), bytes)]);
+        let moved = |pools, now| {
+            let mut checks = Checks::default();
+            checks.ledger_baseline.insert(1, sched(1_000));
+            checks.added_pools.insert(1, pools);
+            checks.ledgers_moved(1, &sched(now))
+        };
+        assert!(moved(2, 1_000 + 2 * POOL_OVERHEAD_BYTES).is_empty());
+        assert!(moved(0, 1_000).is_empty());
+        for (pools, now) in [
+            (1, 1_000 + 2 * POOL_OVERHEAD_BYTES),
+            (2, 1_000 + POOL_OVERHEAD_BYTES),
+            (2, 1_692 + 2 * POOL_OVERHEAD_BYTES),
+            (0, 1_000 + POOL_OVERHEAD_BYTES),
+        ] {
+            assert_eq!(moved(pools, now).len(), 1, "{pools} pools, {now} B");
         }
     }
 
