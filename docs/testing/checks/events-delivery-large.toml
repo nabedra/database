@@ -1,0 +1,13 @@
+# EventsDelivery with overlapping faults (failover with isolation, clock jump and consumer crash), exhaustive, 5 h.
+id = "events-delivery-large"
+module = "events"
+kinds = ["T"]
+guarantees = ["EVT-G02", "EVT-G03", "EVT-G05", "EVT-G06", "EVT-G08"]
+scenarios = ["EV01", "EV02", "EV03", "EV07"]
+tiers = ["T2"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/events-delivery", "EventsDelivery", "--module", "events",
+           "--tier", "T2", "--budget-s", "18000"]
+cwd = "."
+timeout_s = 18600
+needs = ["tlc"]
+result_parser = "tlc"

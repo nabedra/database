@@ -1,0 +1,25 @@
+# Design review rv-events, landing review (land-events): the EventsDelivery liveness baseline (L_Drain, every
+# retained event is eventually acknowledged) never completed. With three claim IDs per consumer it stopped at the
+# 900 s T1 budget with 534,220 states queued (run 45831059295); with two it stopped at 900 s with 285,469 states left
+# (run 45844965293, 5,930,127 distinct states, depth 32). It is split out to specs/events-delivery/live and is not a
+# registered check, so EVT-G05's liveness (L_Drain) and the mutant claim_ignores_expiry have no attested run.
+# Candidates that shrink or split it: MaxTime 2, or L_Drain per consumer (one property per consumer with fairness
+# for that consumer's claim and poll loop only). An exhaustive T2 run (5 h budget) was dispatched once at 3939e472
+# in run 46018110181; if it passes, register events-delivery-live with that run and close this record.
+id = "EVENTS-DELIVERY-LIVENESS-BUDGET"
+title = "EventsDelivery liveness baseline: no completed run within a T2 budget"
+class = "other"
+module = "events"
+guarantees = ["EVT-G05"]
+scenarios = ["EV03"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "specs/events-delivery/live/EventsDelivery.large.cfg"
+seed = "unknown"
+why_not_caught = "The liveness baseline ran only inside the T1 events-delivery check, which stops each run at 900 s and reported it as not-run."
+invariant_added = "Intended, not met: L_Drain is checked exhaustively within a registered check's budget, and claim_ignores_expiry is caught against a finished control."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-27"

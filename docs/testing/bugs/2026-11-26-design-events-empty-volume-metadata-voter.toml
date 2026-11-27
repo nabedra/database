@@ -1,0 +1,26 @@
+# Design review rv-events, finding EVENTS-1 (wave-rv/findings/events.md). The plan allowed it ("Provision stable
+# broker IDs"; "joins with an empty volume and catches up from survivors") and the shipped code follows it for the
+# metadata group: Control::reopen (server/events/src/control/operate.rs:795) opens METADATA on an empty volume with
+# no election floor, so the replica votes with no log and no vote record (raft/mod.rs:409-465).
+# TLC (local, unattested): specs/events/mutants/prefix_empty_disk_rejoins_voter.cfg breaks G01_CommittedPrefixesAgree
+# in 5 states. Simulator (local scratch test rv_events_wipe_sweep, SimConfig.wipes = true, the harness reopens p0 on
+# start like reopen does METADATA): seeds 18 and 26 of 1..40 lose acknowledged publishes (EVT-G01 lost-write), 8 seeds
+# break MajorityReachedHighWatermark, AppliedPrefixesAgree or ConsistentCommittedData. Seed field: the server/events sim
+# seed (also 18), wipes = true, scratch patch in wave-rv/reports/rv-events.md.
+id = "EVENTS-EMPTY-VOLUME-METADATA-VOTER"
+title = "A metadata voter restarted on an empty volume rejoins as a voter under its stable ID and votes with no log"
+class = "membership-replacement-trust"
+module = "events"
+guarantees = ["EVT-G01", "EVT-G09", "EVT-G14"]
+scenarios = ["EV06", "EV07", "EV08"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/events/mutants/prefix_empty_disk_rejoins_voter.cfg"
+seed = 26
+why_not_caught = "No check restarts a metadata voter on an empty volume: EV06 is cloud-deferred, the simulator has no metadata group and no check sets SimConfig.wipes, and the plan named no rule that an empty replica must not vote under its old membership."
+invariant_added = "Intended, not met: a broker never votes or counts toward a commit in a group from an empty volume under its old membership; it regains a vote only as a learner promoted by a membership change committed after its re-add."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-26"

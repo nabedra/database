@@ -1,0 +1,12 @@
+# The ordered fence and guarded-clock activation for an existing Events partition.
+id = "events-time-rollout"
+module = "events"
+kinds = ["T"]
+guarantees = []
+scenarios = ["EV03", "EV05"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/events-time/rollout", "EventsTimeRollout", "--module", "events"]
+cwd = "."
+timeout_s = 3600
+needs = ["tlc"]
+result_parser = "tlc"

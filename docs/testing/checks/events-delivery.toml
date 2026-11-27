@@ -1,0 +1,12 @@
+# Design spec EventsDelivery (plans/events.md, client and delivery): leases, polls, acks, retention, replay; baselines, then mutants.
+id = "events-delivery"
+module = "events"
+kinds = ["T"]
+guarantees = ["EVT-G02", "EVT-G03", "EVT-G05", "EVT-G06"]
+scenarios = ["EV01", "EV02", "EV03", "EV07"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/events-delivery", "EventsDelivery", "--module", "events"]
+cwd = "."
+timeout_s = 17700
+needs = ["tlc"]
+result_parser = "tlc"
