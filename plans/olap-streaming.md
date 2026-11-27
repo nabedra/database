@@ -420,3 +420,46 @@ are a separate candidate: a legacy-shaped Bootstrap or StreamReset may authentic
 old root and wait before applying. Verify whether an old copy can erase newer data across a join
 retry, including on an already-ready target. A future fix should bind destructive copy steps to
 the copy generation at the receiver without adding control reads to successful ordinary operations.
+
+**Receiver-side copy generation (fx-sched, 2026-11-27).** A fenced join sends its control-root base
+with the two destructive copy steps, `Bootstrap` and `StreamReset`. The joiner applies each reset
+only when its own fresh root equals that base, at most once per base, and never after a newer base.
+The check and the reset run under one lock. A reset delayed from an earlier attempt therefore cannot
+erase a later attempt's copy, and a reset the joiner already sees as fenced is refused. A second
+attempt at an unchanged base waits until the root advances, for example at the next lease renewal
+or the controller's competing CAS. Once a fenced reset has reached a worker, a legacy reset (no
+base) is refused there. Installs need no binding: they are version-monotone, and an older record
+version is refused as stale. The field is serialized only for a fenced join; a legacy joiner rejects
+it, so a fenced join to a legacy joiner pauses, as the rollout above already requires. Successful
+ordinary operations read nothing extra. Regression tests:
+`st04_r03_delayed_reset_from_an_earlier_join_attempt_is_refused` and
+`st04_r03_failed_reset_does_not_consume_its_base`.
+
+A coordinator that still holds an unresolved fenced seal refuses a new fenced join at once instead
+of waiting behind its own seal for the 30 s exchange deadline, during which the controller would hold
+its change lock and delay lease renewal and loss observation.
+
+**No readiness without a copy (SCHED-1).** The controller publishes a Starting worker Ready without a
+join copy only when no Ready worker exists: the first enrollment of a run, or after every holder was
+lost. While any Ready worker may hold accepted requests and no Ready scheduler exists, for example
+between a published owner loss and the coordinator reassignment, the probe repairs the assignment
+and waits. A new scheduler owner also merges the records that the surviving ready peers hold before
+it admits or starts work: a missing accepted record is added, and a peer's terminal or accepted copy
+replaces the owner's less advanced one. The model is `specs/scheduler/QueueReady.tla` (baselines
+`QueueReady.cfg` and `QueueReady.total.cfg`).
+
+**Stream commit cost (OLAPS-2).** A commit now transfers to every holder concurrently, so the critical
+section under the stream change lock is one round trip instead of one per holder. Each worker reads
+the catalog fence once per scheduler term: with the fresh control root still at the term of a fence
+already read, that fence is current, because a term's fence is written once, after the root moved to
+that term. That removes two catalog reads per commit on the scheduler and one per install on each
+holder; the fresh root read remains. Deferred: per-stream change locks. The single lock is also the
+join seal, so splitting it needs a seal over every stream lock and a model change; the measurement to
+justify it is the per-batch critical section with the fixes above, from
+`scripts/benchmark_olap_streaming.py` at 1, 2 and 4 concurrent streams on 3 and 5 workers.
+
+**Join stall (OLAPS-3, SCHED-6).** The sealed copy now orders records once (O(N log N)) instead of
+rescanning the queue for every record (O(N^2)), keeps three installs in flight to the joiner, and
+each replica reads the catalog fence once per term instead of once per installed record. Deferred: a
+two-phase join that copies a snapshot without the seal and seals only for the delta and the readiness
+CAS, and paged installs. Both change the join protocol and need the join models extended first.

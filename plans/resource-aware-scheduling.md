@@ -129,3 +129,31 @@ S2 and S3 can proceed independently after S1; S4 and S5 can proceed independentl
 Existing code to extend: [local dispatch](../server/src/engine/partition.rs), [remote coordination](../server/src/node/coordinator.rs), [worker runtime](../server/src/node/runtime.rs), [admission/settlement](../server/src/node/admission.rs), [payload ownership](../server/src/node/payload_owner.rs), [publication](../server/src/storage/publication.rs), [decision history](../server/src/storage/decision.rs), and [current process evidence](../server/notes/DN-runtime-integration.md). Managed-node slot equality currently appears in `cluster/state.rs`; enrollment, fingerprints, authorization and heartbeat schemas must evolve together.
 
 Verified dependency behavior: [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) provide ETag preconditions for the root update; they do not transact several object keys. [Tokio semaphore fairness](https://docs.rs/tokio/1.54.1/tokio/sync/struct.Semaphore.html) can block smaller acquisitions behind `acquire_many`, so it does not replace the CPU/byte scheduler. [Rust Result](https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html) handles expected failures; [panic containment](https://doc.rust-lang.org/std/panic/fn.catch_unwind.html) does not catch process aborts. No new dependency is selected by this plan.
+
+## Retry, retention and admission limits (fx-sched, 2026-11-27)
+
+Decisions taken in the review wave's fix phase. None changes a wire format, the HTTP API or a
+configuration field.
+
+- Retry policy. A failed attempt of an accepted record backs off exponentially from 100 ms to at most
+  30 s, with jitter in the upper half of each interval. An unknown mutation outcome keeps retrying at
+  that pace with the same identity and body; publication finds an earlier attempt's durable decision
+  before it could apply twice, and a receipt can settle it from history meanwhile. A read whose
+  attempts end `not_applied` three times still finishes with that error. Records in backoff do not
+  take a dispatch slot, and dispatch follows acceptance order across databases.
+- Terminal identity retention. Once a result's retention ends, every worker removes a terminal record
+  from RAM when its identity stays answerable: a read, or a mutation whose terminal status (200, 400,
+  404, 409, 413) was published as a durable decision. A same-identity read submitted after that runs
+  again as a new read; a same-identity mutation is answered from its decision. A mutation that ended
+  without a durable decision stays a tombstone, so a delayed retry of it cannot execute again. Without
+  this, expired tombstones filled `max_queue_bytes_per_replica` after about 240,000 requests in one
+  run and every proposal was then rejected.
+- Uncertain submissions. A proposal that no member promoted is discarded when its submission fails,
+  and a replica drops an unaccepted copy that no owner promoted within 120 s, or replaces it when the
+  owner proposes the same identity again. A new scheduler term drops the fenced owner's unaccepted
+  proposals. Their submitters saw `outcome_unknown` and may retry.
+- Signed message rate. A receiver remembers at most 65,536 live replay nonces over the 30 s message
+  window, about 2,180 signed queue and stream messages per second, and answers `overloaded` beyond
+  that. The cache is bounded at about 5 MiB.
+- The per-database pending cap is a quarter of `max_pending_requests`, rounded up (SCHED-14): one
+  database cannot hold more than that many queued or running requests on a worker.
