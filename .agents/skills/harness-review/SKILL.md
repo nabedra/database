@@ -1,12 +1,15 @@
 ---
-name: speed-review
-description: Use only when the user asks for a speed review, "autoresearch" or a harness improvement run, asks which speed advice is still open, or a scheduled prompt names this skill. Never start it on your own.
+name: harness-review
+description: Use only for requested or scheduled reviews of development workflows, agent tooling, or CI speed, including harness autoresearch and open harness advice.
 ---
 
-# Speed review
+# Harness review
 
 [Design review](../design-review/SKILL.md) checks the plan. [Code review](../code-review/SKILL.md)
-checks the code. A speed review checks how we work, and answers one question:
+checks the code. A harness review checks how we work. Use
+[performance review](../performance-review/SKILL.md) for database benchmarks.
+
+The harness review asks one question.
 
 > What is slowing us down in the long term?
 
@@ -29,8 +32,8 @@ When the user only asks about advice, go to [Advice](#advice) and skip the run.
 
 ## 1. Prepare
 
-Set up the branch `nabedra/speed-review-<date>` and a worktree as [nabedra-change](../nabedra-change/SKILL.md)
-says. Read `log.md` and `advice.md` on `origin/main`. If a speed review PR is already open, finish or
+Set up the branch `nabedra/harness-review-<date>` and a worktree as [nabedra-change](../nabedra-change/SKILL.md)
+says. Read `log.md` and `advice.md` on `origin/main`. If a harness review PR is already open, finish or
 close that one first. If nothing landed since the last `Head:`, report that and stop without a PR.
 
 ## 2. Judge the last changes
@@ -50,7 +53,7 @@ A change whose instruction nobody followed has failed, however good it reads.
 
 ```sh
 git fetch origin
-python3 .agents/skills/speed-review/scripts/collect.py > "$SCRATCH/collect.md"
+python3 .agents/skills/harness-review/scripts/collect.py > "$SCRATCH/collect.md"
 ```
 
 Without a previous run it covers the last 7 days. It measures landed changes, time from opened to
@@ -205,7 +208,7 @@ Not read: <sources that were sampled or missing>
 
 # Scheduled runs
 
-A scheduler runs the same procedure with the prompt `Run the speed-review skill in this repository.`
+A scheduler runs the same procedure with the prompt `Run the harness-review skill in this repository.`
 Weekly is a good interval. A shorter one gives changes too little work to be judged on. Nobody is there
 to answer: never ask, put questions in `advice.md`, and skip any step whose tool or login is missing and
 record it under `Not read`.

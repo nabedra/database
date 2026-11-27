@@ -29,6 +29,30 @@ When agents work in parallel on one codebase, every hot file has a single owner
 per wave. See the hot-file rule in the
 [subagent-driven development workflow](references/subagent-driven-development.md#prepare-the-work).
 
+# Make trade-offs for long-term speed
+
+Use [long-term speed](../harness-review/references/long-term-speed.md) as
+the decision rule for ordinary changes. Optimize for finished work reaching
+`main` with less total time spent deciding, building, checking, waiting,
+and reworking, within the user's time and cost budgets.
+
+For database changes, judge improvements against the properties they can
+affect. When a decision depends on measured performance, evaluate both
+sides of the trade-off under the same workload.
+
+- **Performance and reliability.** Measure latency and throughput with the
+  required durability, consistency, and recovery guarantees in force.
+- **Scalability and performance.** Check how adding nodes or workers changes
+  sustainable throughput and tail latency.
+- **Performance and resource use.** Seek lower latency or higher goodput
+  within the same CPU, memory, disk, and network budget, or the same service
+  level with fewer resources.
+
+Preserve ease of use for the SDK, CLI, and API. Make routine, reversible
+choices within the task scope and verify the outcome. Bring decisions to
+the user when they require approval, change a public contract, or are
+costly to undo. See [Decide fast](../harness-review/references/long-term-speed.md#decide-fast).
+
 # Contracts for the change
 
 - For changes to request admission, queues, scheduling, workers, partition

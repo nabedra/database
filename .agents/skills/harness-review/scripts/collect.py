@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print how work flowed through the repository since the last speed review, as Markdown.
+"""Print how work flowed through the repository since the last harness review, as Markdown.
 
 Reads local Git history and the GitHub REST API through `gh`. Writes nothing, starts no run and
 changes no branch. Run `git fetch origin` first.
@@ -306,7 +306,7 @@ def main() -> None:
     base, start = resolve(args.since, head)
     now = dt.datetime.now(dt.timezone.utc)
     repo = api("repos/{owner}/{repo}")["full_name"]
-    print(f"# Work since the last speed review\n\nRange: `{base}..{head}`\n")
+    print(f"# Work since the last harness review\n\nRange: `{base}..{head}`\n")
     changes = landed(base, head)
     prs = pulls(repo, start)
     report_work(changes, prs, start, now)
