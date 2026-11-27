@@ -65,6 +65,7 @@ mod tls;
 
 mod cap1;
 mod fixa;
+mod fxod;
 mod gc1;
 mod gc2;
 #[cfg(target_os = "linux")]
@@ -727,17 +728,19 @@ async fn o03_d01_point_operations_commit_one_entry_each_and_match_queued_results
             extreme.as_str(),
             false,
         ),
+        // OD-2: a miss records its answer: one entry with a tombstone over
+        // the head it read and the dedup record.
         (
             "table.update",
             serde_json::json!({"key": 99, "values": {"value": 1}}),
             "false",
-            false,
+            true,
         ),
         (
             "table.delete",
             serde_json::json!({"key": 99}),
             "false",
-            false,
+            true,
         ),
         ("table.delete", serde_json::json!({"key": 1}), "true", true),
         ("table.get", serde_json::json!({"key": 1}), "null", false),
@@ -773,7 +776,8 @@ async fn o03_d01_point_operations_commit_one_entry_each_and_match_queued_results
         entry(before, cluster.last_index(leader), wrote);
         writes += u64::from(wrote);
     }
-    // Insert on an existing key: a conflict, nothing committed.
+    // Insert on an existing key: a row conflict, which the queued path
+    // answers after the gateway settles the id (OD-2). Nothing committed.
     let before = cluster.last_index(leader);
     let conflict = cluster
         .op(
@@ -783,8 +787,10 @@ async fn o03_d01_point_operations_commit_one_entry_each_and_match_queued_results
         )
         .await;
     assert_eq!(
-        code(&conflict),
-        Some((ErrorCode::Conflict, Outcome::NotApplied))
+        conflict,
+        DirectResponse::Fallback {
+            reason: FallbackReason::Ineligible
+        }
     );
     entry(before, cluster.last_index(leader), false);
     // A schema violation fails validation before anything is read.
@@ -822,7 +828,7 @@ async fn o03_d01_point_operations_commit_one_entry_each_and_match_queued_results
     assert_eq!(stats.entries_applied, writes);
     assert_eq!(stats.batch_sizes["le_1"], writes - 1);
     assert_eq!(stats.batch_sizes["le_8"], 1, "the 3-row insert_many");
-    assert_eq!(stats.read_only, 2);
+    assert_eq!(stats.read_only, 0, "no eligible mutation goes unrecorded");
     assert_eq!(stats.overloaded_429, 0);
     let mutations: Vec<_> = timings
         .iter()
@@ -985,9 +991,13 @@ async fn o08_concurrent_same_key_mutations_admit_a_serial_order() {
     for task in tasks {
         match task.await.unwrap() {
             DirectResponse::Done(_) => won += 1,
+            // OD-2: a row conflict goes to the anchor settlement and the
+            // queued path, which answers it.
             other => assert_eq!(
-                code(&other),
-                Some((ErrorCode::Conflict, Outcome::NotApplied))
+                other,
+                DirectResponse::Fallback {
+                    reason: FallbackReason::Ineligible
+                }
             ),
         }
     }
@@ -2594,26 +2604,30 @@ async fn o09_perf2b_the_commit_timestamp_is_fetched_during_the_reads() {
             .await,
         done("null")
     );
-    // Read-only: the fetch started (one call) and was dropped unanswered.
+    // A miss records its answer (OD-2), so it commits with a timestamp like
+    // a write: the fetch started during the reads (one call) and the
+    // commit waits for it.
     source.hold.store(true, Ordering::SeqCst);
     let calls = source.calls.load(Ordering::SeqCst);
     let before = cluster.last_index(leader);
-    let missing = nabedra_rt::time::timeout(
-        Duration::from_secs(5),
-        cluster.op(
-            leader,
-            "table.update",
-            serde_json::json!({"key": 99, "values": {"value": 1}}),
-        ),
-    )
-    .await
-    .expect("a read-only outcome does not wait for its timestamp");
-    assert_eq!(missing, done("false"));
+    let missing = cluster.op(
+        leader,
+        "table.update",
+        serde_json::json!({"key": 99, "values": {"value": 1}}),
+    );
+    tokio::pin!(missing);
+    assert!(
+        nabedra_rt::time::timeout(Duration::from_millis(300), &mut missing)
+            .await
+            .is_err(),
+        "a recorded miss waits for its timestamp"
+    );
     assert_eq!(source.calls.load(Ordering::SeqCst), calls + 1);
-    assert_eq!(cluster.last_index(leader), before, "nothing committed");
-    // The held call answers nobody once released (or was cancelled with
-    // the dropped fetch); later calls follow it.
     source.hold.store(false, Ordering::SeqCst);
+    assert_eq!(missing.await, done("false"));
+    assert_eq!(cluster.last_index(leader), before + 1, "one recorded entry");
+    // Every call answered or was cancelled with a dropped fetch; later
+    // calls follow it.
     watchdog(|| async {
         (source.answered.load(Ordering::SeqCst) + source.abandoned.load(Ordering::SeqCst)
             == source.calls.load(Ordering::SeqCst))
@@ -2714,6 +2728,14 @@ async fn o06_d05_rd1_a_leader_without_a_quorum_serves_no_read() {
         assert_ne!(
             code(&response),
             Some((ErrorCode::Conflict, Outcome::NotApplied)),
+            "{operation} answered from local state without a quorum"
+        );
+        // OD-2: the row conflict, read from local state, is a fallback now.
+        assert_ne!(
+            response,
+            DirectResponse::Fallback {
+                reason: FallbackReason::Ineligible
+            },
             "{operation} answered from local state without a quorum"
         );
     }
