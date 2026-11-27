@@ -189,6 +189,18 @@ impl WorkerRuntime {
                     authority = None;
                     continue;
                 }
+                if state.active.is_none() {
+                    state.since_open_check = state.since_open_check.saturating_add(1);
+                    // RANGES-2: without a policy the owner sweeps no group and
+                    // holds no sweep state. It only resumes open attempts from
+                    // the Timestamps index every OPEN_CHECK_EVERY observations.
+                    if policy.is_none() && state.since_open_check < OPEN_CHECK_EVERY {
+                        if !runtime.accepting.load(Ordering::Acquire) {
+                            break;
+                        }
+                        continue;
+                    }
+                }
                 let current = nabedra_rt::time::timeout(
                     Duration::from_secs(5),
                     runtime.services.control.current(&runtime.services.scope),
@@ -325,13 +337,17 @@ impl OwnerLoop {
         ready: ReadyMembership,
     ) -> Result<(), ProtocolError> {
         let authority = ready.view.authority();
-        self.since_open_check += 1;
         if self.since_open_check >= OPEN_CHECK_EVERY {
             self.since_open_check = 0;
             if self.resume_open(client, authority).await? {
                 return Ok(());
             }
         }
+        // Without a policy no group is swept: every attempt that can hold a
+        // source, manual or bound automatic, is in the open index.
+        let Some(policy) = policy else {
+            return Ok(());
+        };
         if self.blocked.len() >= runtime.services.shared.config().max_resident_groups {
             return Ok(());
         }
@@ -362,14 +378,11 @@ impl OwnerLoop {
                 return Ok(());
             }
         };
-        let target_bytes = policy.map_or(u64::MAX, |policy| policy.shard_target_bytes);
         match client
-            .observe_usage(&placement, authority, target_bytes, previous)
+            .observe_usage(&placement, authority, policy.shard_target_bytes, previous)
             .await?
         {
             Usage::Inactive => runtime.clear_split_deficit(source.group_id),
-            // Without a policy only a held source matters: the first page tells.
-            Usage::Scanning(_) if policy.is_none() => {}
             Usage::Scanning(scan) => self.scan = Some((record, scan)),
             Usage::Frozen { epoch, split_id } => {
                 // RANGES-2: a source frozen, or holding the direct barrier, by
@@ -399,9 +412,6 @@ impl OwnerLoop {
                 largest_image,
                 pivot,
             } => {
-                let Some(policy) = policy else {
-                    return Ok(());
-                };
                 runtime
                     .automatic_split
                     .lock()
