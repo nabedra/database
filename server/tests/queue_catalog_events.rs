@@ -630,7 +630,9 @@ impl History {
                 .keys()
                 .all(|key| key.ends_with("/catalog.json")
                     || key.contains("/tables/")
-                    || key.contains("/decisions/"))
+                    || key.contains("/decisions/")
+                    // OLAP-1: immutable decision index pages.
+                    || key.contains("/decision-index/"))
         );
     }
     async fn run(&mut self) {

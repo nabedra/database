@@ -56,72 +56,89 @@ re-reads the root.
 ## Receipts
 
 A receipt for the current run comes from the replicated queue record, then from the decision chain while the record is
-reconciling. A receipt for another run (`Command::Lookup`, `queue_runtime.rs:1473-1617`) answers from the decision chain
-of the database's catalog, and `abandoned` when the decision is absent.
+reconciling. A receipt for another run (`Command::Lookup`, `queue_runtime.rs`) answers from the decision history
+of the database's catalog. It answers `abandoned` only when the decision is absent from a root that carries the
+current run's fence (OLAP-2): a root still fenced by an older run is fenced first, as dispatch does
+(`owned_catalog`), and looked up again; without that proof the receipt answers `storage_unavailable`, which is
+retryable. The fence makes every pending PUT of the older run fail its `If-Match`.
 
 ## Limits
 
-The chain lookup reads one decision object per step, sequentially, within 4096 records, 64 MiB and the attempt's
-deadline (`coordinator.rs:450`; 30 s for receipts). Nothing truncates the chain. Nothing deletes table files,
-decisions or roots: superseded and orphaned objects stay in the bucket.
+On a legacy root (formats 4 and 5) the chain lookup reads one decision object per step, sequentially, within 4096
+records, 64 MiB and the attempt's deadline (`coordinator.rs:450`; 30 s for receipts), and absence is proved only at
+the null terminus. Format 6 replaces that walk with the decision index below. Nothing deletes table files,
+decisions, index pages or roots: superseded and orphaned objects stay in the bucket (OLAP-4).
 
 ## Persistent decision index
 
 The OLAP-1 fix keeps the exact mutation identity and its terminal response in an immutable UUID index. The request ID
 is a client-supplied UUID. An index over all committed decisions can prove the absence of an unused UUID at any
-catalog revision. The earlier bounded-window experiment assumed a trusted admission revision. Its model and its
-results are historical evidence of the chain budget failure.
+catalog revision, so replay stays indefinite and no new outcome is needed. The earlier bounded-window experiment
+assumed a trusted admission revision. Its model and its results are historical evidence of the chain budget failure.
 
 ### Catalog and index
 
-Catalog format 6 carries either a migration descriptor or an active immutable index root. It retains
-the database owner, run and term fence, tables and decision head. Use a copy-on-write radix tree with a maximum of
-one bounded page per UUID byte. Each slot names a child page or an entry containing the full UUID and its immutable
-decision ID. Bound encoding size and depth. Validate a fetched page against its content address and route prefix.
-Use full UUID equality at the terminal entry, then read the decision object and compare the exact request bytes
-where the caller supplied a body. Return the original status and response bytes for an exact hit and the existing
-identity conflict for a different body. Prove absence from a valid root and path with no matching UUID. If a
-referenced page or decision is missing, invalid or unreadable, the lookup returns an error or an unknown outcome
-within the existing deadline.
+Catalog format 6 is the indexed successor of formats 4 and 5. It keeps the owner cluster (optional), the run and
+term fence, the tables, the revision and the decision head, and adds `decision_index`: the SHA-256, in lowercase
+hex, of the index root page. The field is present exactly when the decision head is.
 
-The coordinator prepares from one captured root and names that base in its absence proof. It stages the decision,
-the new table objects and the copied index path as immutable objects. It publishes tables and the new index root in
-one catalog PUT with the captured ETag. After a definite conflict, re-read the winning root and consult its index
-before recomputing. After a lost or ambiguous response, use a fresh root to find the exact decision. If that
-decision is absent and the submission can still apply, return `outcome_unknown`. A receipt can report
-`abandoned` only after the existing run-fence proof and an authoritative absence lookup. Queue and identified
-local mutations use the same index semantics.
+The index is the canonical radix tree over the 16 bytes of the request UUID (`server/src/storage/decision_index.rs`).
+A page at depth `d` has up to 256 slots keyed by byte `d`. A slot holds an entry, the full request UUID and its
+decision UUID, when exactly one indexed UUID has that prefix, and otherwise a child page at depth `d + 1`. The tree is
+a function of its entry set, so every writer that indexes the same decisions writes the same bytes. A page is a
+fixed-width binary record of at most 8,712 bytes, stored once with `Create` at `decision-index/<sha256>.bin`. A
+reader checks the hash of the bytes, the depth, the order of the slots, the route prefix of every entry and the
+canonical shape before it uses a page. A referenced page that is missing or invalid is an error, never absence.
+
+A lookup descends from the root page to the slot of the request's next byte: an empty slot or an entry with another
+UUID proves absence; an entry with the same UUID names the decision, which is read and checked (its ID, its request
+ID and a revision not above the root's), and its exact request bytes are compared when the caller supplied a body.
+The original status and response bytes are returned for an exact hit and the identity conflict for a different
+body. Each `Storage` keeps validated pages in a cache of 1 MiB keyed by content hash; a hit is checked again against
+its route prefix, and the request budget counts only uncached reads.
+
+A commit prepares its candidate from one captured root. The lookup before publication returns the path it read, the
+commit copies that path with its own entry (adding a child page where two UUIDs share a prefix), and uploads the new
+pages, then the decision, then the root with one PUT `If-Match` on the captured ETag. The new index is the base's
+exact index plus one pair, so the conditional write keeps it exact. After a definite conflict the commit re-reads
+the winning root and consults its index before it recomputes; after a lost or ambiguous response a fresh root must
+show the exact decision, else the outcome stays `outcome_unknown`. A receipt can report `abandoned` only after the
+run-fence proof and an authoritative absence lookup. Queue and identified local mutations use the same code.
 
 | Operation | Object-store cost per attempt |
 | --- | --- |
-| Look up or prove absence | One catalog GET, up to 16 bounded page GETs, and one decision GET for a hit |
-| Publish a fresh mutation | The base lookup, up to 16 private page PUTs, one decision PUT, the new table objects and one catalog CAS |
-| Ambiguous response or CAS conflict | One fresh catalog GET and a bounded lookup before settlement or recomputation |
-| Migrate | One pass through the frozen decision chain to build the index, resumable beyond the normal lookup budget |
+| Look up or prove absence | One catalog GET, at most 16 page GETs (none for cached pages), one decision GET for a hit |
+| Publish a fresh mutation | The lookup, at most 17 page PUTs (the copied path, usually 2 or 3), one decision PUT, the table objects, one catalog CAS |
+| Ambiguous response or CAS conflict | One fresh catalog GET and an indexed lookup before settlement or recomputation |
+| Migrate a chain that fits the budget | The chain walk the legacy commit already paid, then about N/16 page PUTs in the commit, 16 at a time |
+| Migrate a longer chain | One GET per decision and one chunk PUT per 1,024 decisions, spread over the attempts that need it, then the page PUTs and one catalog CAS |
 
-Use one absence proof per root revision in the mutation path. The maximum lookup path depends on the 128-bit UUID
-width. The number of live entries and decisions grows with committed identities. Collection of unreachable copied
-pages is a separate retention design under OLAP-4.
+Measured on the in-memory store after a 5,000-decision history (`olap_1_mutations_after_a_long_history_cost_bounded_requests`
+in `server/tests/history.rs`): see the OLAP-1 row of the fix report. Collection of unreachable pages, chunks and
+copied paths is the separate retention design under OLAP-4.
 
 ### Migration and compatibility
 
-1. Deploy readers and writers that support the current catalog formats and the indexed format. Enable migration
-   explicitly per database. Check the root has space for the new metadata before freezing it. If preflight sees an
-   oversized candidate, leave the legacy root active for a planned catalog size migration.
-2. Pause mutation admission and use a catalog CAS to publish the building state, tied to the current owner, run and
-   term. The winning CAS freezes the source revision and decision head and invalidates every old-base mutation PUT.
-   Current old binaries reject the new format. Compatible participants use the migration state to pause writers.
-   The pause may return the existing retryable availability outcome.
-3. Validate the immutable source chain through its terminus, including decision IDs and contiguous revision links,
-   and build private pages under a migration ID. Checkpoint the source identity, next unprocessed decision and
-   candidate index root so maintenance can resume. The checkpoint is outside the serving root. Bind resumption to
-   the exact source and owner fence. If a contender or a run change fences the migrator, reload the current root
-   and resolve ownership before proceeding. The scan has its own bounded work units and can process a source
-   history larger than 4,096 entries or 64 MiB.
-4. Publish the complete validated index with a CAS on the building root. Confirm an ambiguous activation by
-   reading the current root. Mutation admission resumes once the active index is visible under the current fence.
-   A crash or `412` can leave private pages or a resumable checkpoint. No private index supplies absence proofs.
-   Use an indexed-format compatible binary for rollback after activation.
+There is no intermediate root state. The conditional write on the captured legacy root is the freeze: once a format
+6 root wins, every pending PUT based on the legacy ETag fails, and old binaries refuse format 6 (their decoder
+accepts formats 3 to 5 only and rejects the unknown field), so they never write a legacy root over an indexed one.
+
+1. **Inline.** A commit on a format 4 or 5 root whose lookup read the whole chain within the request budget (4,096
+   decisions, 64 MiB, 60 s) builds the canonical index of that chain plus its own decision and publishes it in its own
+   root PUT. Most databases migrate this way, with their first write after the upgrade.
+2. **Resumable.** When the walk exceeds the budget, the lookup indexes the chain with resumable work instead of
+   failing. It writes the pairs it read as immutable chunks of 1,024 decisions at
+   `decision-index-build/<head>/<n>.bin`, continues the walk from the last chunk (found by a galloping search, since
+   chunks are written in order), checks that the chunks link from the head to the null terminus, builds the index,
+   uploads its pages and publishes the captured root as format 6 with unchanged tables, `If-Match` its ETag. A chunk
+   is a function of the immutable chain, so concurrent migrators write the same bytes. The built index is exact for
+   the captured root whichever root wins, so the lookup answers from it. Attempts that run out of time keep their
+   chunks and return the existing retryable outcome; the next attempt continues. The migration holds 48 bytes per
+   decision in memory and refuses chains above 4,194,304 decisions.
+3. **Rollout.** Format 6 is written automatically by the first fenced commit of an upgraded binary. In a mixed-version
+   cluster, an older worker refuses a migrated database (`unavailable`, so the queue retries) and stays safe;
+   finish the worker rollout before relying on its writes. A downgrade is refused for every migrated database,
+   like the format 3 to 4 upgrade. Format 3 roots (unfenced, before `--migrate-catalog`) are not indexed.
 
 Acceptance exercises two UUIDs with a shared radix prefix, same-body and different-body replay across conversion,
 an unused UUID beyond both former limits, competing writers, timeout before a late CAS, a lost successful reply,
@@ -131,31 +148,97 @@ the fence and lookup justify.
 
 ### Index design review
 
-The refinement `specs/olap/index/OlapDecisionIndex.tla` abstracts bounded immutable pages as a map and covers
-the publication and migration boundary. `PublishedIndexIsExact` links the serving index to the committed
-decisions for OLAP-G01 and OLAP-G02. `LegacyWritersFenced` covers the migration gate for OLAP-G04.
-`OneDecisionPerUuid`, `ExactLookup`, and `ReplayIsExact` cover OLAP-G05. `TimeoutRemainsUnknown` covers
-OLAP-G03. `MigrationCompletes` relies on the resumable maintenance loop and conditional write resolution.
+The refinement `specs/olap/index/OlapDecisionIndex.tla` abstracts bounded immutable pages as a map and covers the
+publication and migration boundary. `PublishedIndexIsExact` links the serving index to the committed decisions for
+OLAP-G01 and OLAP-G02. `LegacyWritersFenced` covers format refusal by old writers for OLAP-G04.
+`OneDecisionPerUuid`, `ExactLookup`, and `ReplayIsExact` cover OLAP-G05. `TimeoutRemainsUnknown` covers OLAP-G03.
+`MigrationCompletes` relies on the resumable migration and conditional write resolution.
+
+Revised in fx-olap (2026-11-27) from the first draft (commit `8863bf0f`), which paused writers with a separate
+building root state. The implementation needs none: the model's constant `ChainFits` selects between the inline
+migration (the chain fits a request budget, writers and the migrator race on the legacy root) and the resumable
+migration (it does not, so no writer can prepare on the legacy root, as in the shipped code). The migrator captures
+a root, reads its chain, can lose its in-memory progress, and publishes only on its captured revision.
 
 The safety and liveness baselines start with one committed request, add two fresh request IDs, and use one legacy
-and two indexed writers. Each writer gets one attempt, which can stay pending across the format fence, a timeout
-or a CAS conflict. The model includes a lost reply and an interrupted private build. One migrator acts at a time.
-The freeze and activation actions abstract each root write as a CAS against the current captured state. Migration
-checkpoint encoding, page fanout and byte layout, multistage retry loops and the row payload belong to separate
-checks. The T1 check is `olap-decision-index`.
+and two indexed writers. Each writer gets one attempt, which can stay pending across the format change, a timeout or
+a CAS conflict. The model includes a lost reply and an interrupted build. One migrator acts at a time. Migration
+chunk encoding, page fanout and byte layout, multistage retry loops and the row payload belong to the unit and
+integration tests. The T1 check is `olap-decision-index`.
 
-Local pinned TLC 1.8.0 checked 67,485 distinct states at depth 19 in each baseline. All 12 actions were reached
-and all ten mutants were caught. Final-head Actions evidence is pending.
+Local pinned TLC 1.8.0 (2026-11-27, fx-olap): `OlapDecisionIndex.cfg` and `.live_fits.cfg` 490,882 distinct
+states at depth 19, `.long.cfg` and `.live.cfg` 3,818 states at depth 15; all 12 actions covered (minimum 10,746);
+all eleven mutants caught. Actions evidence is in the fx-olap report.
 
 | Mutant | Property | Counterexample states |
 | --- | --- | --- |
-| `incomplete_migration`, `index_update_omitted` | `PublishedIndexIsExact` | 3, 8 |
-| `old_accepts_new_root`, `stale_legacy_cas` | `LegacyWritersFenced` | 7, 5 |
-| `no_catalog_match` | `OneDecisionPerUuid` | 10 |
-| `only_match_prefix`, `missing_page_absent` | `ExactLookup` | 8, 5 |
+| `incomplete_migration`, `index_update_omitted`, `inline_partial` | `PublishedIndexIsExact` | 3, 4, 4 |
+| `old_accepts_new_root`, `stale_legacy_cas` | `LegacyWritersFenced` | 7, 7 |
+| `no_catalog_match` | `OneDecisionPerUuid` | 7 |
+| `only_match_prefix`, `missing_page_absent` | `ExactLookup` | 6, 5 |
 | `timeout_final` | `TimeoutRemainsUnknown` | 4 |
-| `lost_reply_old_root` | `ReplayIsExact` | 8 |
-| `no_migration` | `MigrationCompletes` | 9, lasso |
+| `lost_reply_old_root` | `ReplayIsExact` | 5 |
+| `no_migration` | `MigrationCompletes` | 5, lasso |
+
+## Capacity plan
+
+The review found four storage limits that need a format or contract decision rather than a local fix (findings
+OLAP-3, OLAP-4, OLAP-6 and OLAP-8 of the wave rv review). Their local parts are fixed; the designs below are the
+next steps, each with the measurement that justifies it. None of them is implemented yet.
+
+### Per-table manifests (OLAP-3)
+
+The root is one JSON document, capped at 1 MiB and rewritten whole on every commit. Measured with
+`ClusterCatalog::encode`: an empty root with one 10-column table is 634 bytes, each partition file entry about 198
+bytes, so about 1,900 tables of 10 columns, 370 tables of 128 columns or 5,000 partition files fill it. Every commit
+also uploads the whole root: a 500 KB root costs 500 KB of PUT per one-row insert.
+
+Fixed now: a commit whose candidate root would exceed the cap publishes a definite `limit_exceeded` decision with
+unchanged tables (coordinator and local engine), so the client gets a replayable 413 instead of
+`outcome_unknown`.
+
+Design for later: format 7 keeps in the root only the table directory (name, UUID, schema digest) and, per table, the
+content hash of an immutable table manifest object that lists its partition files. A commit changes one table, so it
+writes one manifest and a root that grows with the number of tables only. Readers pin the root and the manifest
+hashes, which also makes queue pins small (OLAP-6). Migration follows the decision index: the first commit after the
+upgrade writes format 7 in its own conditional root PUT; old binaries refuse it. Measure before committing to it: root
+bytes and commit latency for 100, 1,000 and 5,000 files, before and after.
+
+### Collection of unreachable objects (OLAP-4)
+
+Nothing deletes table files, decisions, index pages, migration chunks or roots. A one-row insert into a one-partition
+10 MiB table leaves a 10 MiB orphan per commit (1M commits: about 10 TB while the live data stays 10 MiB).
+
+Design for later, a garbage-collection contract:
+
+- An object may be deleted only when no current root reaches it, no pinned root reaches it (queue pins, stream pins
+  up to 30 minutes) and it is older than a grace period longer than the longest attempt (the 60 s mutation deadline,
+  plus the 30-minute stream pin, plus clock margin). The spec's candidate rule `Gc = "safe"` with the mutants
+  `gc_ignores_pins` and `gc_ignores_inflight` states this.
+- Candidates come from listing `tables/<id>/`, `decision-index/` and `decision-index-build/`; the listing only
+  proposes, reachability from the roots decides. Decisions are never collected while a replay can name them, which
+  with indefinite replay means a decision object is kept for as long as the index names it.
+- The user decides whether the product deletes objects at all, since the documentation promises none today.
+
+Measure first: bucket bytes over reachable bytes for a steady insert workload, and the cost of one reclaimer pass per
+10,000 objects.
+
+### Pins by reference (OLAP-6)
+
+Each request start copies the encoded root (up to 1 MiB) into its queue record and replicates it to every member.
+With format 7 a pin is the root's ETag plus the table manifest hash it reads, about 100 bytes. Until then the
+replicated bytes per read are the root size times the number of other members. The lock and the serial copy at
+request start belong to the scheduler (SCHED-7); measure admission throughput with a 500 KB root and 8 workers
+before and after.
+
+### Ranged reads and a footer cache (OLAP-8)
+
+Every get, collect and count downloads and decodes whole partition objects: a point get on a one-partition 64 MiB
+table reads 64 MiB. The `ObjectStore` trait has only a whole-object GET. Design for later: a ranged GET on the trait
+(S3 `Range`, the HTTP store's `Range` header), a footer and row-group statistics read through a cache keyed by the
+immutable partition key, and point gets that read one row group. A smaller default partition target cuts the cost
+first and needs no format change. Measure point-get latency and bytes read against partition size (scenarios B01,
+B02) before and after.
 
 ## Design review
 

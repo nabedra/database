@@ -311,7 +311,9 @@ async fn t03_t06_local_identified_workflow_replay_noops_and_atomic_batch() {
             .iter()
             .all(|k| k.ends_with("catalog.json")
                 || k.contains("/tables/")
-                || k.contains("/decisions/"))
+                || k.contains("/decisions/")
+                // OLAP-1: immutable decision index pages.
+                || k.contains("/decision-index/"))
     );
     threads.shutdown().await.unwrap();
 }

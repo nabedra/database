@@ -693,3 +693,224 @@ async fn sl02_warm_catalog_does_not_authorize_denied_backing_objects() {
     );
     assert_eq!(s.backend().backend.state.lock().unwrap().puts, 2);
 }
+
+// OLAP-1: the decision history must not bound the number of writes. With the
+// production lookup budget (4096 records, 64 MiB, 60 s), a fenced legacy chain
+// longer than the budget must still let a fresh request ID prove absence, and
+// later mutations must cost a bounded number of object requests.
+fn production_budget() -> HistoryBudget {
+    HistoryBudget::new(
+        4096,
+        64 * 1024 * 1024,
+        Instant::now() + Duration::from_secs(60),
+    )
+    .unwrap()
+}
+fn spread(n: u128) -> Uuid {
+    // Request IDs that spread over the whole UUID space, unlike from_u128(n).
+    Uuid::from_u128(n.wrapping_mul(0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835) ^ 0x5bd1_e995)
+}
+fn padded_decision(
+    n: u128,
+    base: u64,
+    parent: Option<Uuid>,
+    pad: usize,
+    request_id: Uuid,
+) -> Decision {
+    let body = format!(
+        "{}{{\"request_id\":\"{request_id}\",\"operation\":\"table.insert\",\"payload\":{{\"table_id\":\"{}\",\"row\":{{\"id\":1.00e0}}}}}} ",
+        " ".repeat(pad),
+        Uuid::from_u128(99)
+    );
+    Decision {
+        version: 1,
+        id: Uuid::from_u128(n),
+        parent,
+        base_revision: base,
+        revision: base + 1,
+        request_id,
+        request_body: body,
+        response_status: 200,
+        response_body: format!(" {{\"request_id\":\"{request_id}\",\"data\":null}} \t"),
+    }
+}
+fn olap1_fence() -> CatalogFence {
+    CatalogFence {
+        run_id: Uuid::from_u128(0x77),
+        scheduler_term: 1,
+    }
+}
+/// Seeds a fenced format 4 root whose chain holds `len` decisions.
+fn fenced_chain(
+    s: &Storage<Fake>,
+    len: u128,
+    pad: usize,
+    ids: fn(u128) -> Uuid,
+) -> (Vec<Decision>, LoadedClusterCatalog) {
+    let mut parent = None;
+    let mut all = Vec::new();
+    for n in 1..=len {
+        let d = padded_decision(n, (n - 1) as u64, parent, pad, ids(n));
+        seed(s, ObjectKey::decision(d.id), d.encode().unwrap());
+        parent = Some(d.id);
+        all.push(d);
+    }
+    let last = all.last().unwrap();
+    let mut c = root(last);
+    c.format_version = 4;
+    c.fence = Some(olap1_fence());
+    seed(s, ObjectKey::catalog(), c.encode().unwrap());
+    let loaded = LoadedClusterCatalog::new(c, "original-token".into()).unwrap();
+    (all, loaded)
+}
+async fn fresh_absent(s: &Storage<Fake>, loaded: &LoadedClusterCatalog, id: Uuid) -> HistoryLookup {
+    // The first lookups may only advance a resumable migration; each attempt
+    // gets its own production budget, as the coordinator's attempts do.
+    let mut last = None;
+    for _ in 0..8 {
+        let current = s
+            .load_cluster_catalog()
+            .await
+            .unwrap_or_else(|_| loaded.clone());
+        match s
+            .lookup_decision(&current, id, b"{}", production_budget())
+            .await
+        {
+            Ok(found) => return found,
+            Err(error) => last = Some(error),
+        }
+    }
+    panic!("fresh lookup never completed: {last:?}");
+}
+
+#[tokio::test]
+async fn olap_1_fresh_request_proves_absence_past_4096_decisions() {
+    let s = store();
+    let (all, loaded) = fenced_chain(&s, 5000, 0, spread);
+    let fresh = Uuid::from_u128(7);
+    assert_eq!(
+        fresh_absent(&s, &loaded, fresh).await,
+        HistoryLookup::Absent
+    );
+    // Replay of the oldest and the newest decision stays exact after migration.
+    let current = s.load_cluster_catalog().await.unwrap();
+    assert_eq!(current.catalog().format_version, 6);
+    assert_eq!(
+        current.catalog().decision_head,
+        loaded.catalog().decision_head
+    );
+    assert_eq!(current.catalog().tables, loaded.catalog().tables);
+    assert_eq!(current.catalog().fence, loaded.catalog().fence);
+    for d in [&all[0], &all[2500], &all[4999]] {
+        assert_eq!(
+            s.lookup_decision(
+                &current,
+                d.request_id,
+                d.request_body.as_bytes(),
+                production_budget()
+            )
+            .await
+            .unwrap(),
+            HistoryLookup::Found(d.clone())
+        );
+        assert_eq!(
+            s.lookup_decision(&current, d.request_id, b"{}", production_budget())
+                .await
+                .unwrap(),
+            HistoryLookup::IdentityConflict
+        );
+    }
+}
+
+#[tokio::test]
+async fn olap_1_fresh_request_proves_absence_past_64_mib_of_decisions() {
+    let s = store();
+    let (all, loaded) = fenced_chain(&s, 70, 1024 * 1024, spread);
+    assert_eq!(
+        fresh_absent(&s, &loaded, Uuid::from_u128(7)).await,
+        HistoryLookup::Absent
+    );
+    let current = s.load_cluster_catalog().await.unwrap();
+    assert_eq!(current.catalog().format_version, 6);
+    let first = &all[0];
+    assert_eq!(
+        s.lookup_decision(
+            &current,
+            first.request_id,
+            first.request_body.as_bytes(),
+            production_budget()
+        )
+        .await
+        .unwrap(),
+        HistoryLookup::Found(first.clone())
+    );
+}
+
+#[tokio::test]
+async fn olap_1_mutations_after_a_long_history_cost_bounded_requests() {
+    let s = store();
+    let (_, loaded) = fenced_chain(&s, 5000, 0, spread);
+    let _ = fresh_absent(&s, &loaded, Uuid::from_u128(7)).await;
+    let mut counts = Vec::new();
+    for n in 0..20u128 {
+        let base = s.load_cluster_catalog().await.unwrap();
+        let request = spread(1_000_000 + n);
+        let d = padded_decision(
+            2_000_000 + n,
+            base.catalog().revision,
+            base.catalog().decision_head,
+            0,
+            request,
+        );
+        let (gets, puts) = {
+            let state = s.backend().state.lock().unwrap();
+            (state.gets, state.puts)
+        };
+        let outcome = PreparedPublication::prepare_fenced(
+            base.clone(),
+            base.catalog().tables.clone(),
+            d.clone(),
+            olap1_fence(),
+        )
+        .unwrap()
+        .publish(&s, production_budget())
+        .await
+        .unwrap();
+        assert_eq!(outcome, PublicationOutcome::Terminal(d.clone()));
+        let state = s.backend().state.lock().unwrap();
+        counts.push((state.gets - gets, state.puts - puts));
+    }
+    println!(
+        "olap-1 requests per commit after 5000 decisions, warm cache (gets, puts): {counts:?}"
+    );
+    // One lookup path and one copy-on-write path, never a history walk.
+    for (gets, puts) in counts {
+        assert!(gets <= 16, "gets {gets}");
+        assert!(puts <= 8, "puts {puts}");
+    }
+    // A cold worker: a new Storage (empty page cache) over the same objects.
+    let cold = Storage::new(Fake::default(), Namespace::new("test").unwrap());
+    cold.backend().state.lock().unwrap().objects =
+        s.backend().state.lock().unwrap().objects.clone();
+    let root = cold.load_cluster_catalog().await.unwrap();
+    let mut cold_gets = Vec::new();
+    for n in 0..20u128 {
+        let before = cold.backend().state.lock().unwrap().gets;
+        let fresh = Storage::new(Fake::default(), Namespace::new("test").unwrap());
+        fresh.backend().state.lock().unwrap().objects =
+            cold.backend().state.lock().unwrap().objects.clone();
+        assert_eq!(
+            fresh
+                .lookup_decision(&root, spread(3_000_000 + n), b"{}", production_budget())
+                .await
+                .unwrap(),
+            HistoryLookup::Absent
+        );
+        cold_gets.push(fresh.backend().state.lock().unwrap().gets);
+        let _ = before;
+    }
+    println!("olap-1 cold absence proofs after 5020 decisions (page gets): {cold_gets:?}");
+    for gets in cold_gets {
+        assert!((1..=4).contains(&gets), "cold gets {gets}");
+    }
+}

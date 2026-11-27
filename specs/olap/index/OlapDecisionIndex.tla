@@ -9,23 +9,32 @@
 (* models a prepared private decision and copied index path. It can survive *)
 (* client timeout and the old writer's loss of admission.                   *)
 (*                                                                         *)
-(* A root transitions from legacy to fenced migration to indexed. A bump    *)
-(* to the migration format makes even a legacy writer that ignores the     *)
-(* maintenance switch reject the new root. Publication of partial private  *)
-(* migration pages and a legacy writer accepting the new format are mutants. *)
-(* This refinement checks one legacy and two indexed writer attempts, one   *)
-(* prior UUID and two fresh UUIDs, a migration interruption, CAS races, an *)
-(* ambiguous deadline and a lost reply. Row and reader behavior remains   *)
-(* in OlapCommit. Bounds do not model byte-level encoding or actual S3 I/O. *)
+(* A root goes from legacy (formats 4 and 5) to indexed (format 6) in one  *)
+(* of two conditional writes on the captured legacy root:                  *)
+(*  - inline: a new writer whose lookup read the whole chain publishes its *)
+(*    own commit with the index of that chain plus its decision;           *)
+(*  - migration: when the chain does not fit a request budget              *)
+(*    (ChainFits = FALSE), resumable work builds the index of the captured *)
+(*    root privately and then publishes it with unchanged tables.          *)
+(* There is no intermediate root state: the Match on the captured legacy   *)
+(* root is the freeze. An old binary refuses format 6, so it never writes  *)
+(* a legacy root over an indexed one; publishing a partial index, an       *)
+(* index without the new decision and a legacy writer accepting format 6   *)
+(* are mutants. The baselines check one legacy and two indexed writer      *)
+(* attempts, one prior UUID and two fresh UUIDs, an interrupted build, CAS *)
+(* races, an ambiguous deadline and a lost reply. Row and reader behavior  *)
+(* remains in OlapCommit. Bounds do not model byte-level encoding or S3 I/O. *)
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS LegacyWriter, Writers, Old, FreshA, FreshB, Nil, Mutant
+CONSTANTS LegacyWriter, Writers, Old, FreshA, FreshB, Nil, Mutant, ChainFits
 
 ASSUME /\ LegacyWriter \in Writers /\ Cardinality(Writers) = 3
        /\ Cardinality({Old, FreshA, FreshB}) = 3
+       /\ ChainFits \in BOOLEAN
        /\ Mutant \in {"none", "incomplete_migration", "ignore_match", "drop_index_update",
-                      "old_accepts_new_root", "match_prefix", "missing_page_absent",
-                      "timeout_final", "lost_reply_old_root", "no_migration"}
+                      "inline_partial", "old_accepts_new_root", "match_prefix",
+                      "missing_page_absent", "timeout_final", "lost_reply_old_root",
+                      "no_migration"}
 
 Requests == {Old, FreshA, FreshB}
 Bodies == {"a", "b"}
@@ -33,18 +42,18 @@ Empty == [r \in Requests |-> Nil]
 OldDecision == [req |-> Old, body |-> "a", result |-> <<LegacyWriter, 0>>]
 Initial == [Empty EXCEPT ![Old] = OldDecision]
 
-VARIABLES mode, revision, migrationStarted, ledger, committed,
+VARIABLES mode, revision, migrated, ledger, committed,
           index, staging, interrupted, attempts, timedOut, lostReply,
           lookupVerified, lookupAccurate, timeoutAccurate, replayAccurate
 
-vars == <<mode, revision, migrationStarted, ledger, committed,
+vars == <<mode, revision, migrated, ledger, committed,
           index, staging, interrupted, attempts, timedOut, lostReply,
           lookupVerified, lookupAccurate, timeoutAccurate, replayAccurate>>
 
 Init ==
-    /\ mode = "legacy" /\ revision = 1 /\ migrationStarted = FALSE
+    /\ mode = "legacy" /\ revision = 1 /\ migrated = FALSE
     /\ ledger = Initial /\ committed = {<<Old, OldDecision.result>>}
-    /\ index = Empty /\ staging = Empty /\ interrupted = FALSE
+    /\ index = Empty /\ staging = Nil /\ interrupted = FALSE
     /\ attempts = [w \in Writers |-> Nil]
     /\ timedOut = FALSE /\ lostReply = FALSE
     /\ lookupVerified = FALSE /\ lookupAccurate = TRUE
@@ -66,56 +75,71 @@ Resolve(r, body, readable) ==
     ELSE LET actual == IF Mutant = "match_prefix" /\ r = FreshB THEN FreshA ELSE r
          IN Answer(index[actual], body)
 
-\* The migration fence is a CAS on the captured legacy root: whichever of a
-\* legacy attempt and the freeze wins first determines the frozen history.
-Freeze ==
+\* A lookup on a legacy root walks the chain. It answers within a request
+\* budget only when the chain fits it; otherwise the migration answers.
+CanWalk == mode = "legacy" /\ ChainFits
+
+\* The migrator captures the legacy root and reads its immutable chain.
+\* A capture of an older root is discarded and started again.
+StartBuild ==
     /\ mode = "legacy"
-    /\ mode' = "building" /\ revision' = revision + 1
-    /\ migrationStarted' = TRUE
-    /\ UNCHANGED <<ledger, committed, index, staging, interrupted, attempts,
-                   timedOut, lostReply, lookupVerified, lookupAccurate,
+    /\ IF staging = Nil THEN TRUE ELSE staging.base # revision
+    /\ staging' = [base |-> revision, source |-> ledger, map |-> Empty]
+    /\ UNCHANGED <<mode, revision, migrated, ledger, committed, index, interrupted,
+                   attempts, timedOut, lostReply, lookupVerified, lookupAccurate,
                    timeoutAccurate, replayAccurate>>
 
 BuildPage(r) ==
-    /\ mode = "building" /\ ledger[r] # Nil /\ staging[r] = Nil
-    /\ staging' = [staging EXCEPT ![r] = ledger[r]]
-    /\ UNCHANGED <<mode, revision, migrationStarted, ledger, committed, index,
-                   interrupted, attempts, timedOut, lostReply, lookupVerified,
-                   lookupAccurate, timeoutAccurate, replayAccurate>>
+    /\ staging # Nil /\ staging.source[r] # Nil /\ staging.map[r] = Nil
+    /\ staging' = [staging EXCEPT !.map[r] = staging.source[r]]
+    /\ UNCHANGED <<mode, revision, migrated, ledger, committed, index, interrupted,
+                   attempts, timedOut, lostReply, lookupVerified, lookupAccurate,
+                   timeoutAccurate, replayAccurate>>
 
+\* Worst case of a crash: in-memory progress is lost. Saved chunks only
+\* shorten the next build, they never change what it publishes.
 InterruptBuild ==
-    /\ mode = "building" /\ ~interrupted /\ staging # Empty
-    /\ interrupted' = TRUE /\ staging' = Empty
-    /\ UNCHANGED <<mode, revision, migrationStarted, ledger, committed, index,
+    /\ staging # Nil /\ ~interrupted
+    /\ interrupted' = TRUE /\ staging' = Nil
+    /\ UNCHANGED <<mode, revision, migrated, ledger, committed, index,
                    attempts, timedOut, lostReply, lookupVerified, lookupAccurate,
                    timeoutAccurate, replayAccurate>>
 
+\* The conditional root write on the captured root, with unchanged tables.
 PublishMigration ==
-    /\ mode = "building" /\ Mutant # "no_migration"
-    /\ staging = ledger \/ Mutant = "incomplete_migration"
-    /\ mode' = "indexed" /\ revision' = revision + 1 /\ index' = staging
-    /\ UNCHANGED <<migrationStarted, ledger, committed, staging, interrupted,
-                   attempts, timedOut, lostReply, lookupVerified, lookupAccurate,
-                   timeoutAccurate, replayAccurate>>
+    /\ mode = "legacy" /\ Mutant # "no_migration"
+    /\ staging # Nil /\ staging.base = revision
+    /\ staging.map = staging.source \/ Mutant = "incomplete_migration"
+    /\ mode' = "indexed" /\ migrated' = TRUE
+    /\ revision' = revision + 1 /\ index' = staging.map /\ staging' = Nil
+    /\ UNCHANGED <<ledger, committed, interrupted, attempts, timedOut, lostReply,
+                   lookupVerified, lookupAccurate, timeoutAccurate, replayAccurate>>
+
+\* The index a commit publishes: the base's exact index (or, inline, the
+\* whole legacy chain it read) plus its own decision.
+NextIndex(r, decision) ==
+    LET base == IF mode = "indexed" THEN index
+                ELSE IF Mutant = "inline_partial" THEN Empty ELSE ledger
+    IN IF Mutant = "drop_index_update" THEN base ELSE [base EXCEPT ![r] = decision]
 
 Prepare(w, r, body) ==
     /\ attempts[w] = Nil
     /\ IF w = LegacyWriter
-       THEN mode = "legacy" \/ (mode = "indexed" /\ Mutant = "old_accepts_new_root")
-       ELSE mode = "indexed"
+       THEN CanWalk \/ (mode = "indexed" /\ Mutant = "old_accepts_new_root")
+       ELSE mode = "indexed" \/ CanWalk
     /\ Resolve(r, body, TRUE) = NoAnswer("absent")
     /\ LET decision == [req |-> r, body |-> body, result |-> <<w, revision>>]
        IN attempts' = [attempts EXCEPT ![w] =
             [base |-> revision, decision |-> decision, timedOut |-> FALSE,
-             slot |-> [index EXCEPT ![r] = decision], phase |-> "prepared"]]
-    /\ UNCHANGED <<mode, revision, migrationStarted, ledger, committed, index,
+             slot |-> NextIndex(r, decision), phase |-> "prepared"]]
+    /\ UNCHANGED <<mode, revision, migrated, ledger, committed, index,
                    staging, interrupted, timedOut, lostReply, lookupVerified,
                    lookupAccurate, timeoutAccurate, replayAccurate>>
 
 Submit(w) ==
     /\ attempts[w] # Nil /\ attempts[w].phase = "prepared"
     /\ attempts' = [attempts EXCEPT ![w].phase = "pending"]
-    /\ UNCHANGED <<mode, revision, migrationStarted, ledger, committed, index,
+    /\ UNCHANGED <<mode, revision, migrated, ledger, committed, index,
                    staging, interrupted, timedOut, lostReply, lookupVerified,
                    lookupAccurate, timeoutAccurate, replayAccurate>>
 
@@ -126,14 +150,13 @@ Apply(w, afterTimeout) ==
     \* A legacy writer serializes the old root shape. With format validation
     \* and the exact Match predicate, that shape cannot become current again.
     /\ mode' = IF w = LegacyWriter THEN "legacy" ELSE "indexed"
+    /\ migrated' = (migrated \/ w # LegacyWriter)
     /\ revision' = revision + 1
-    /\ index' = CASE w = LegacyWriter -> Empty
-                   [] Mutant = "drop_index_update" -> index
-                   [] OTHER -> a.slot
+    /\ index' = IF w = LegacyWriter THEN Empty ELSE a.slot
     /\ ledger' = [ledger EXCEPT ![a.decision.req] = a.decision]
     /\ committed' = committed \cup {<<a.decision.req, a.decision.result>>}
     /\ attempts' = [attempts EXCEPT ![w].phase = "applied"]
-    /\ UNCHANGED <<migrationStarted, staging, interrupted, timedOut, lostReply,
+    /\ UNCHANGED <<staging, interrupted, timedOut, lostReply,
                    lookupVerified, lookupAccurate, timeoutAccurate, replayAccurate>>
 
 Conflict(w) ==
@@ -144,7 +167,7 @@ Conflict(w) ==
     /\ replayAccurate' = (replayAccurate /\ Resolve(a.decision.req, a.decision.body, TRUE) =
                           Answer(ledger[a.decision.req], a.decision.body))
     /\ attempts' = [attempts EXCEPT ![w].phase = "conflict"]
-    /\ UNCHANGED <<mode, revision, migrationStarted, ledger, committed, index,
+    /\ UNCHANGED <<mode, revision, migrated, ledger, committed, index,
                    staging, interrupted, timedOut, lostReply, lookupVerified,
                    lookupAccurate, timeoutAccurate>>
 
@@ -160,7 +183,7 @@ Deadline(w) ==
                     ELSE IF Mutant = "timeout_final" THEN NoAnswer("not_applied")
                          ELSE NoAnswer("unknown")
        IN timeoutAccurate' = (timeoutAccurate /\ reply.kind # "not_applied")
-    /\ UNCHANGED <<mode, revision, migrationStarted, ledger, committed, index,
+    /\ UNCHANGED <<mode, revision, migrated, ledger, committed, index,
                    staging, interrupted, lostReply, lookupVerified, lookupAccurate,
                    replayAccurate>>
 
@@ -171,7 +194,7 @@ LoseReplyAndRecover(w) ==
     /\ replayAccurate' =
         (replayAccurate /\ (IF Mutant = "lost_reply_old_root" THEN NoAnswer("absent")
                             ELSE Resolve(a.decision.req, a.decision.body, TRUE)) = Found(a.decision))
-    /\ UNCHANGED <<mode, revision, migrationStarted, ledger, committed, index,
+    /\ UNCHANGED <<mode, revision, migrated, ledger, committed, index,
                    staging, interrupted, attempts, timedOut, lookupVerified,
                    lookupAccurate, timeoutAccurate>>
 
@@ -182,7 +205,7 @@ ProbeLookup ==
         \A r \in Requests, body \in Bodies :
             /\ Resolve(r, body, TRUE) = Answer(ledger[r], body)
             /\ Resolve(r, body, FALSE) = NoAnswer("unknown")
-    /\ UNCHANGED <<mode, revision, migrationStarted, ledger, committed, index,
+    /\ UNCHANGED <<mode, revision, migrated, ledger, committed, index,
                    staging, interrupted, attempts, timedOut, lostReply,
                    timeoutAccurate, replayAccurate>>
 
@@ -201,32 +224,34 @@ Done ==
     /\ UNCHANGED vars
 
 Next ==
-    \/ Freeze \/ BuildPageAny \/ InterruptBuild \/ PublishMigration
+    \/ StartBuild \/ BuildPageAny \/ InterruptBuild \/ PublishMigration
     \/ PrepareAny \/ SubmitAny \/ ApplyOnTime \/ ApplyLate \/ ConflictAny
     \/ DeadlineAny \/ LostReplyAny \/ ProbeLookup \/ Done
 
 Spec == Init /\ [][Next]_vars
 
-\* The maintenance migrator resumes scanning, then retries the publication.
-\* Object storage eventually evaluates each delivered conditional PUT.
+\* Requests keep driving the resumable migration, which then retries its
+\* conditional write. Object storage eventually evaluates each delivered PUT.
 LiveSpec ==
     /\ Spec
-    /\ WF_vars(Freeze) /\ WF_vars(BuildPageAny) /\ WF_vars(PublishMigration)
+    /\ WF_vars(StartBuild) /\ WF_vars(BuildPageAny) /\ WF_vars(PublishMigration)
     /\ \A w \in Writers : WF_vars(Apply(w, FALSE) \/ Apply(w, TRUE) \/ Conflict(w))
 
 TypeOK ==
-    /\ mode \in {"legacy", "building", "indexed"} /\ revision \in Nat
-    /\ DOMAIN ledger = Requests /\ DOMAIN index = Requests /\ DOMAIN staging = Requests
+    /\ mode \in {"legacy", "indexed"} /\ revision \in Nat
+    /\ DOMAIN ledger = Requests /\ DOMAIN index = Requests
+    /\ IF staging = Nil THEN TRUE
+       ELSE DOMAIN staging.map = Requests /\ DOMAIN staging.source = Requests
     /\ DOMAIN attempts = Writers
     /\ \A w \in Writers : IF attempts[w] = Nil THEN TRUE ELSE attempts[w].phase \in
                           {"prepared", "pending", "applied", "conflict"}
-    /\ migrationStarted \in BOOLEAN /\ interrupted \in BOOLEAN
+    /\ migrated \in BOOLEAN /\ interrupted \in BOOLEAN
     /\ timedOut \in BOOLEAN /\ lostReply \in BOOLEAN
     /\ lookupVerified \in BOOLEAN /\ lookupAccurate \in BOOLEAN
     /\ timeoutAccurate \in BOOLEAN /\ replayAccurate \in BOOLEAN
 
 PublishedIndexIsExact == mode = "indexed" => index = ledger
-LegacyWritersFenced == migrationStarted => mode # "legacy"
+LegacyWritersFenced == migrated => mode = "indexed"
 OneDecisionPerUuid == \A r \in Requests : Cardinality({x \in committed : x[1] = r}) <= 1
 ExactLookup == lookupAccurate
 TimeoutRemainsUnknown == timeoutAccurate

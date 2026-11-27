@@ -7,10 +7,12 @@ pub mod registry;
 pub use backend::RuntimeStore;
 mod control_decision;
 mod decision;
+mod decision_index;
 mod history;
 mod publication;
 pub use control_decision::{ControlDecision, MAX_CONTROL_BODY_BYTES, MAX_CONTROL_DECISION_BYTES};
 pub use decision::{CatalogFence, ClusterCatalog, Decision, MAX_DECISION_BYTES};
+pub use decision_index::MAX_INDEX_PAGE_BYTES;
 pub use history::{FenceTransition, HistoryBudget, HistoryLookup, LoadedClusterCatalog};
 pub use publication::{PreparedPublication, PublicationOutcome};
 pub mod http;
@@ -43,6 +45,14 @@ impl ObjectKey {
     }
     pub fn decision(id: Uuid) -> Self {
         Self(format!("decisions/{id}.json"))
+    }
+    /// An immutable decision index page, named by the SHA-256 of its bytes.
+    pub fn decision_index_page(hash: &[u8; 32]) -> Self {
+        Self(format!("decision-index/{}.bin", decision_index::hex(hash)))
+    }
+    /// One resumable migration chunk of the legacy chain under `head`.
+    pub fn decision_index_chunk(head: Uuid, ordinal: u32) -> Self {
+        Self(format!("decision-index-build/{head}/{ordinal}.bin"))
     }
     pub fn control_decision(id: Uuid) -> Self {
         Self(format!("control-decisions/{id}.json"))
@@ -88,6 +98,29 @@ impl ObjectKey {
         }
         if path == "cluster/control.json" {
             return Ok(Self::control());
+        }
+        if let Some(hash) = path
+            .strip_prefix("decision-index/")
+            .and_then(|s| s.strip_suffix(".bin"))
+        {
+            let hash = decision_index::parse_hex(hash).ok_or(StorageError::InvalidPath)?;
+            return Ok(Self::decision_index_page(&hash));
+        }
+        if let Some(rest) = path.strip_prefix("decision-index-build/") {
+            let (head, ordinal) = rest
+                .strip_suffix(".bin")
+                .and_then(|s| s.split_once('/'))
+                .ok_or(StorageError::InvalidPath)?;
+            let head = Uuid::parse_str(head).map_err(|_| StorageError::InvalidPath)?;
+            let ordinal = ordinal
+                .parse::<u32>()
+                .map_err(|_| StorageError::InvalidPath)?;
+            let key = Self::decision_index_chunk(head, ordinal);
+            return if key.0 == path {
+                Ok(key)
+            } else {
+                Err(StorageError::InvalidPath)
+            };
         }
         for (prefix, constructor) in [
             ("decisions/", Self::decision as fn(Uuid) -> Self),
@@ -224,10 +257,15 @@ pub trait ObjectStore: Send + Sync {
 pub struct Storage<B> {
     backend: B,
     namespace: Namespace,
+    index_cache: decision_index::PageCache,
 }
 impl<B: ObjectStore> Storage<B> {
     pub fn new(backend: B, namespace: Namespace) -> Self {
-        Self { backend, namespace }
+        Self {
+            backend,
+            namespace,
+            index_cache: Default::default(),
+        }
     }
     pub fn backend(&self) -> &B {
         &self.backend

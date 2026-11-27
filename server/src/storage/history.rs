@@ -2,6 +2,7 @@
 use super::{
     Catalog, CatalogFence, ClusterCatalog, Decision, MAX_DECISION_BYTES, Object, ObjectAccessError,
     ObjectKey, ObjectStore, Storage, StorageError, WriteCondition,
+    decision_index::{IndexBase, PageHash, Reads, hex},
 };
 use crate::protocol::MAX_CATALOG_BYTES;
 use nabedra_rt::time::{Instant, timeout_at};
@@ -73,6 +74,9 @@ impl HistoryBudget {
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
     }
+    fn caps(&self) -> (usize, usize) {
+        (self.max_records, self.max_bytes)
+    }
     fn check_deadline(&self) -> Result<(), StorageError> {
         if nabedra_rt::time::now() >= self.deadline {
             Err(StorageError::Unavailable)
@@ -104,7 +108,7 @@ fn decode_root(object: Object) -> Result<Root, StorageError> {
     }
     let version: Version =
         serde_json::from_slice(&object.bytes).map_err(|_| StorageError::InvalidCatalog)?;
-    if matches!(version.format_version, 3 | 4 | 5) {
+    if matches!(version.format_version, 3..=6) {
         Ok(Root::Cluster(LoadedClusterCatalog::new(
             ClusterCatalog::decode(&object.bytes)?,
             object.etag,
@@ -115,6 +119,16 @@ fn decode_root(object: Object) -> Result<Root, StorageError> {
             return Err(StorageError::Unavailable);
         }
         Ok(Root::Legacy(catalog, object.etag))
+    }
+}
+/// The fenced format of a root: indexed roots stay indexed.
+fn fenced_format(catalog: &ClusterCatalog) -> u32 {
+    if catalog.indexed() {
+        6
+    } else if catalog.owner_cluster.is_some() {
+        5
+    } else {
+        4
     }
 }
 /// Migration requires compatible old writers stopped; ColdStart requires explicit
@@ -217,7 +231,9 @@ impl<B: ObjectStore> Storage<B> {
             Err(StorageError::NotFound) => (ClusterCatalog::from_catalog(&Catalog::empty())?, None),
             Err(error) => return Err(error),
         };
-        catalog.format_version = 5;
+        if !catalog.indexed() {
+            catalog.format_version = 5;
+        }
         catalog.owner_cluster = Some(cluster_id);
         catalog.fence = Some(fence);
         let condition = token
@@ -308,7 +324,9 @@ impl<B: ObjectStore> Storage<B> {
         fence.validate()?;
         let (mut catalog, token) = match self.read(&ObjectKey::catalog(), MAX_CATALOG_BYTES).await {
             Ok(object) => match decode_root(object)? {
-                Root::Cluster(loaded) if loaded.catalog.format_version == 4 => {
+                Root::Cluster(loaded)
+                    if loaded.catalog.fence.is_some() && loaded.catalog.owner_cluster.is_none() =>
+                {
                     if cold {
                         return self
                             .fence_cluster_catalog(&loaded, fence, FenceTransition::ColdStart)
@@ -335,11 +353,7 @@ impl<B: ObjectStore> Storage<B> {
             Err(StorageError::NotFound) => (ClusterCatalog::from_catalog(&Catalog::empty())?, None),
             Err(error) => return Err(error),
         };
-        catalog.format_version = if catalog.owner_cluster.is_some() {
-            5
-        } else {
-            4
-        };
+        catalog.format_version = fenced_format(&catalog);
         catalog.fence = Some(fence);
         let condition = token
             .as_deref()
@@ -387,11 +401,7 @@ impl<B: ObjectStore> Storage<B> {
             _ => return Err(StorageError::Conflict),
         }
         let mut catalog = base.catalog.clone();
-        catalog.format_version = if catalog.owner_cluster.is_some() {
-            5
-        } else {
-            4
-        };
+        catalog.format_version = fenced_format(&catalog);
         catalog.fence = Some(fence);
         let result = self
             .put(
@@ -454,46 +464,228 @@ impl<B: ObjectStore> Storage<B> {
         request_body: Option<&[u8]>,
         budget: HistoryBudget,
     ) -> Result<HistoryLookup, StorageError> {
+        self.lookup_planned(loaded, request_id, request_body, budget, false)
+            .await
+            .map(|(lookup, _)| lookup)
+    }
+
+    /// Lookup that also returns what a commit on `loaded` needs to publish
+    /// the next index. `collect` keeps the legacy chain's pairs in memory.
+    pub(crate) async fn lookup_planned(
+        &self,
+        loaded: &LoadedClusterCatalog,
+        request_id: Uuid,
+        request_body: Option<&[u8]>,
+        budget: HistoryBudget,
+        collect: bool,
+    ) -> Result<(HistoryLookup, IndexBase), StorageError> {
         budget.check_deadline()?;
+        if loaded.catalog.indexed() {
+            let root = loaded.catalog.index_root()?;
+            let lookup = self
+                .lookup_indexed(loaded, root, request_id, request_body, budget)
+                .await?;
+            return Ok((lookup, IndexBase::Index(root)));
+        }
+        let mut walked = Vec::new();
+        let walk = self
+            .walk_chain(loaded, request_id, request_body, budget, &mut walked)
+            .await;
+        let fenced = loaded.catalog.fence.is_some();
+        match walk {
+            Ok(lookup) if fenced && collect => Ok((
+                lookup,
+                IndexBase::Chain(walked.into_iter().map(|(r, d, _)| (r, d)).collect()),
+            )),
+            Ok(lookup) => Ok((
+                lookup,
+                if fenced {
+                    IndexBase::Chain(Vec::new())
+                } else {
+                    IndexBase::Unindexed
+                },
+            )),
+            // OLAP-1: a fenced chain longer than any request budget is indexed
+            // with resumable work, and the lookup is answered from that index.
+            Err((StorageError::LimitExceeded, cursor)) if fenced => {
+                let root = self
+                    .migrate_long_chain(loaded, walked, cursor, budget)
+                    .await?;
+                let lookup = self
+                    .lookup_indexed(loaded, root, request_id, request_body, budget)
+                    .await?;
+                Ok((lookup, IndexBase::Index(root)))
+            }
+            Err((error, _)) => Err(error),
+        }
+    }
+
+    /// Index a legacy chain that no single lookup budget can walk, then try to
+    /// publish the migrated root with one conditional PUT on the captured
+    /// ETag. The index is exact for `loaded` whichever root wins, so the
+    /// caller may answer from it either way.
+    async fn migrate_long_chain(
+        &self,
+        loaded: &LoadedClusterCatalog,
+        walked: Vec<(Uuid, Uuid, u64)>,
+        cursor: Option<(Uuid, u64)>,
+        budget: HistoryBudget,
+    ) -> Result<Option<PageHash>, StorageError> {
+        let Some(head) = loaded.catalog.decision_head else {
+            return Err(StorageError::LimitExceeded);
+        };
+        let deadline = budget.deadline();
+        // Another process may have finished this exact migration already.
+        if let Ok(Ok(current)) = timeout_at(deadline, self.load_cluster_catalog()).await
+            && current.catalog.indexed()
+            && current.catalog.decision_head == Some(head)
+            && current.catalog.revision == loaded.catalog.revision
+        {
+            return current.catalog.index_root();
+        }
+        let built = self
+            .build_chain_index(head, loaded.catalog.revision, (walked, cursor), deadline)
+            .await?;
+        let Some((root, pages)) = built else {
+            return Err(StorageError::InvalidCatalog);
+        };
+        self.put_index_pages(pages, deadline).await?;
+        let mut migrated = loaded.catalog.clone();
+        migrated.format_version = 6;
+        migrated.decision_index = Some(hex(&root));
+        // The private index is exact for `loaded`, so the outcome of this PUT
+        // changes only which root later lookups start from.
+        let _ = timeout_at(
+            deadline,
+            self.put(
+                &ObjectKey::catalog(),
+                migrated.encode()?,
+                WriteCondition::Match(loaded.etag()),
+            ),
+        )
+        .await;
+        Ok(Some(root))
+    }
+
+    /// Indexed lookup: at most 16 validated pages and one decision.
+    async fn lookup_indexed(
+        &self,
+        loaded: &LoadedClusterCatalog,
+        root: Option<PageHash>,
+        request_id: Uuid,
+        request_body: Option<&[u8]>,
+        budget: HistoryBudget,
+    ) -> Result<HistoryLookup, StorageError> {
+        let Some(root) = root else {
+            return Ok(HistoryLookup::Absent);
+        };
+        let mut reads = Reads {
+            records: 0,
+            bytes: 0,
+        };
+        let caps = budget.caps();
+        let Some(id) = self
+            .index_find(&root, request_id, budget.deadline, &mut reads, caps)
+            .await?
+        else {
+            budget.check_deadline()?;
+            return Ok(HistoryLookup::Absent);
+        };
+        reads.records += 1;
+        if reads.records > caps.0 {
+            return Err(StorageError::LimitExceeded);
+        }
+        let remaining = caps
+            .1
+            .checked_sub(reads.bytes)
+            .ok_or(StorageError::LimitExceeded)?;
+        let object = timeout_at(
+            budget.deadline,
+            self.read(&ObjectKey::decision(id), MAX_DECISION_BYTES.min(remaining)),
+        )
+        .await
+        .map_err(|_| StorageError::Unavailable)?
+        .map_err(|error| {
+            if error == StorageError::NotFound {
+                StorageError::InvalidCatalog
+            } else {
+                error
+            }
+        })?;
+        let decision = Decision::decode(&object.bytes)?;
+        if decision.id != id
+            || decision.request_id != request_id
+            || decision.revision > loaded.catalog.revision
+        {
+            return Err(StorageError::InvalidCatalog);
+        }
+        budget.check_deadline()?;
+        Ok(
+            if request_body.is_none_or(|body| decision.request_body.as_bytes() == body) {
+                HistoryLookup::Found(decision)
+            } else {
+                HistoryLookup::IdentityConflict
+            },
+        )
+    }
+
+    /// The legacy walk. Records every visited `(request, decision, revision)`
+    /// into `walked`; on failure also returns the next unread position.
+    async fn walk_chain(
+        &self,
+        loaded: &LoadedClusterCatalog,
+        request_id: Uuid,
+        request_body: Option<&[u8]>,
+        budget: HistoryBudget,
+        walked: &mut Vec<(Uuid, Uuid, u64)>,
+    ) -> Result<HistoryLookup, (StorageError, Option<(Uuid, u64)>)> {
+        budget.check_deadline().map_err(|e| (e, None))?;
         let mut next = loaded.catalog.decision_head;
         let mut revision = loaded.catalog.revision;
         let mut records = 0usize;
         let mut bytes = 0usize;
         while let Some(id) = next {
-            budget.check_deadline()?;
-            records = records.checked_add(1).ok_or(StorageError::LimitExceeded)?;
+            let cursor = Some((id, revision));
+            let fail = |error| (error, cursor);
+            budget.check_deadline().map_err(fail)?;
+            records = records
+                .checked_add(1)
+                .ok_or(StorageError::LimitExceeded)
+                .map_err(fail)?;
             if records > budget.max_records {
-                return Err(StorageError::LimitExceeded);
+                return Err(fail(StorageError::LimitExceeded));
             }
             let remaining = budget
                 .max_bytes
                 .checked_sub(bytes)
-                .ok_or(StorageError::LimitExceeded)?;
+                .ok_or(StorageError::LimitExceeded)
+                .map_err(fail)?;
             let object = timeout_at(
                 budget.deadline,
                 self.read(&ObjectKey::decision(id), MAX_DECISION_BYTES.min(remaining)),
             )
             .await
-            .map_err(|_| StorageError::Unavailable)?
+            .map_err(|_| fail(StorageError::Unavailable))?
             .map_err(|error| {
-                if error == StorageError::NotFound {
+                fail(if error == StorageError::NotFound {
                     StorageError::InvalidCatalog
                 } else {
                     error
-                }
+                })
             })?;
-            budget.check_deadline()?;
+            budget.check_deadline().map_err(fail)?;
             bytes = bytes
                 .checked_add(object.bytes.len())
-                .ok_or(StorageError::LimitExceeded)?;
-            let decision = Decision::decode(&object.bytes)?;
+                .ok_or(StorageError::LimitExceeded)
+                .map_err(fail)?;
+            let decision = Decision::decode(&object.bytes).map_err(|e| (e, None))?;
             if decision.id != id
                 || decision.revision != revision
                 || revision.checked_sub(1) != Some(decision.base_revision)
             {
-                return Err(StorageError::InvalidCatalog);
+                return Err((StorageError::InvalidCatalog, None));
             }
-            budget.check_deadline()?;
+            budget.check_deadline().map_err(fail)?;
             if decision.request_id == request_id {
                 return Ok(
                     if request_body.is_none_or(|body| decision.request_body.as_bytes() == body) {
@@ -503,11 +695,12 @@ impl<B: ObjectStore> Storage<B> {
                     },
                 );
             }
+            walked.push((decision.request_id, decision.id, decision.revision));
             // Strict decrease detects cycles without a visited-ID allocation.
             revision = decision.base_revision;
             next = decision.parent;
         }
-        budget.check_deadline()?;
+        budget.check_deadline().map_err(|e| (e, None))?;
         Ok(HistoryLookup::Absent)
     }
 }
