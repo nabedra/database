@@ -1,3 +1,7 @@
+# Fixed 2026-11-27 (fx-oltp-direct): a miss commits a tombstone over the head it read with its record; a row
+# conflict commits the keys it read unchanged and records its refusal (37139fd9, replacing a queued fallback).
+# Regressions in direct/tests/fxod.rs, application/direct/tests.rs and worker_runtime/direct_gateway/tests.rs.
+# The three reverts conflict at the head because later test commits edit fxod.rs, so revert_patch_ok is false.
 # Design review 2026-11-26 (wave-rv, rv-oltp-direct, finding OD-2; earlier DR-1, draft PR #118, reproduced on one
 # simulator seed, local). Found in TLC: specs/oltp/direct, mutant prefix_dr1_readonly_unrecorded, 9 states, no fault.
 # The shipped executor answers a no-op (update or delete of a missing row) and a row conflict (insert of a present row)
@@ -17,8 +21,5 @@ lowest_regression = "specs/oltp/direct/mutants/prefix_dr1_readonly_unrecorded.cf
 seed = "unknown"
 why_not_caught = "D02 and D03 lost their no-op and conflict assertions (c8c12413, e46ea63d), and the plan's rule names no mechanism, so nothing proposes a record for these outcomes."
 invariant_added = "G03_SameResult: every definite answer of an identity with the same body is the same and equals its dedup record, including no-ops and row conflicts."
-fix_commits = []
+fix_commits = ["37139fd9da7ba020a700245ad632bc9763cced30", "6f7ad6e090cd75a32ac7269e93bf05c02fb54514", "8b356fcfb561e9594ea3da6d187cb6bfa678dacf"]
 revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-24"

@@ -99,8 +99,9 @@ PROGRAM = dict(sections=[
     ]),
 ])
 # Writing mutations in the `direct` section: 3 inserts, 1 update, 2 upserts, 1 delete and
-# 1 insert_many. Conflicts, misses and gets write nothing.
-DIRECT_ENTRIES = 8
+# 1 insert_many, plus the 2 misses and 2 row conflicts, which record their answers (OD-2).
+# Validation errors and gets write nothing.
+DIRECT_ENTRIES = 12
 
 
 def run_program(orm, url, table, *, token, ca=None, snapshot):
@@ -1128,16 +1129,22 @@ def suite_barriers(args, output):
             outcomes = list(pool.map(offer, range(96)))
         after = cluster.all_stats()
         accepted = [body for body, status, _ in outcomes if status == 200]
-        refused = [(body, reply) for body, status, reply in outcomes if status == 429]
-        other = [(status, reply) for body, status, reply in outcomes if status not in (200, 429)]
+        # OD-3: a refused mutation (the leader's budget or a full lane, before execution)
+        # proves nothing about an earlier call of its id, so it answers outcome_unknown.
+        refused = [(body, reply) for body, status, reply in outcomes
+                   if status == 503 and reply['error']['code'] == 'outcome_unknown']
+        other = [(status, reply) for body, status, reply in outcomes
+                 if status != 200 and (body, reply) not in refused]
         assert not other, other[:5]
         assert refused, 'no request exceeded the leader budget'
-        assert all(reply['error']['code'] == 'overloaded' and reply['error']['outcome'] == 'not_applied'
-                   for _, reply in refused), refused[:3]
+        assert all(reply['error']['outcome'] == 'unknown' for _, reply in refused), refused[:3]
         # A typed 429 comes from the leader's in-flight budget or, earlier, from its
         # full handler lane (`worker handler lane full`); both refuse before execution.
         overloaded = direct(after, 'overloaded_429') - direct(before, 'overloaded_429')
         executed = direct(after, 'mutations') - direct(before, 'mutations')
+        # The public 429 is gone for mutations (OD-3 answers outcome_unknown): the
+        # refused rows are checked absent below, and the report keeps the leaders'
+        # own 429 count.
         for body in accepted:
             assert table.get(body['payload']['row']['id']) == body['payload']['row']
         for body, _ in refused:

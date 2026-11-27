@@ -157,6 +157,25 @@ fn r01_r02_r03_survivor_takeover_and_join_preserve_every_record() {
         Some(b"pin".as_slice())
     );
 }
+/// OQ-6: a join published while the queue is at its byte limit still
+/// installs on every holder. The larger ready set's ACK UUIDs may exceed the
+/// limit; admission then refuses until retirement frees bytes.
+#[test]
+fn r03_oq6_published_join_installs_at_the_byte_limit() {
+    let mut q = queue(&[2]);
+    for n in 10..13 {
+        q.propose(body(n), 0).unwrap();
+        replicate(&mut q, id(n));
+    }
+    q.limits.max_queue_bytes_per_replica = q.charged_bytes().0;
+    q.takeover(2, 2, [id(2), id(3)].into())
+        .expect("a published view installs at the byte limit");
+    assert_eq!(q.members.len(), 2);
+    assert_eq!(q.propose(body(20), 0), Err(QueueError::Overloaded));
+    for n in 10..13 {
+        assert!(q.record(id(n)).is_some());
+    }
+}
 #[test]
 fn r04_cold_run_abandons_old_memory_without_replaying() {
     let mut old = queue(&[2]);

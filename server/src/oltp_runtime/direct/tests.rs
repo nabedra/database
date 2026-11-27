@@ -65,6 +65,7 @@ mod tls;
 
 mod cap1;
 mod fixa;
+mod fxod;
 mod gc1;
 mod gc2;
 #[cfg(target_os = "linux")]
@@ -727,17 +728,19 @@ async fn o03_d01_point_operations_commit_one_entry_each_and_match_queued_results
             extreme.as_str(),
             false,
         ),
+        // OD-2: a miss records its answer: one entry with a tombstone over
+        // the head it read and the dedup record.
         (
             "table.update",
             serde_json::json!({"key": 99, "values": {"value": 1}}),
             "false",
-            false,
+            true,
         ),
         (
             "table.delete",
             serde_json::json!({"key": 99}),
             "false",
-            false,
+            true,
         ),
         ("table.delete", serde_json::json!({"key": 1}), "true", true),
         ("table.get", serde_json::json!({"key": 1}), "null", false),
@@ -773,7 +776,8 @@ async fn o03_d01_point_operations_commit_one_entry_each_and_match_queued_results
         entry(before, cluster.last_index(leader), wrote);
         writes += u64::from(wrote);
     }
-    // Insert on an existing key: a conflict, nothing committed.
+    // Insert on an existing key: a row conflict, recorded like a write that
+    // keeps the row as it is (OD-2): one entry, the row unchanged.
     let before = cluster.last_index(leader);
     let conflict = cluster
         .op(
@@ -786,7 +790,17 @@ async fn o03_d01_point_operations_commit_one_entry_each_and_match_queued_results
         code(&conflict),
         Some((ErrorCode::Conflict, Outcome::NotApplied))
     );
-    entry(before, cluster.last_index(leader), false);
+    entry(before, cluster.last_index(leader), true);
+    writes += 1;
+    assert!(
+        cluster
+            .latest(leader, cluster.row_key(7))
+            .await
+            .1
+            .unwrap()
+            .contains(r#""value":70"#),
+        "the refused insert kept the row"
+    );
     // A schema violation fails validation before anything is read.
     let invalid = cluster
         .op(
@@ -822,7 +836,7 @@ async fn o03_d01_point_operations_commit_one_entry_each_and_match_queued_results
     assert_eq!(stats.entries_applied, writes);
     assert_eq!(stats.batch_sizes["le_1"], writes - 1);
     assert_eq!(stats.batch_sizes["le_8"], 1, "the 3-row insert_many");
-    assert_eq!(stats.read_only, 2);
+    assert_eq!(stats.read_only, 0, "no eligible mutation goes unrecorded");
     assert_eq!(stats.overloaded_429, 0);
     let mutations: Vec<_> = timings
         .iter()
@@ -1601,6 +1615,7 @@ async fn d05_one_stopped_follower_keeps_writes_and_two_stop_every_success() {
         );
     }
     let before = cluster.latest(leader, cluster.row_key(1)).await;
+    let versions = cluster.keys_with(leader, b'v').await;
     cluster.stop(followers[1]).await;
     let id = nabedra_rt::ids::uuid_v4();
     let body = cluster.body(
@@ -1635,9 +1650,13 @@ async fn d05_one_stopped_follower_keeps_writes_and_two_stop_every_success() {
             "{stats:?}"
         );
     }
+    // OD-1: a proposal that may still commit stays pending, so a latest
+    // read waits for it instead of reading around it. The applied state
+    // gained no version.
+    assert!(before.0.is_some());
     assert_eq!(
-        cluster.latest(leader, cluster.row_key(1)).await,
-        before,
+        cluster.keys_with(leader, b'v').await,
+        versions,
         "row unchanged"
     );
     cluster.shutdown().await;
@@ -2594,26 +2613,33 @@ async fn o09_perf2b_the_commit_timestamp_is_fetched_during_the_reads() {
             .await,
         done("null")
     );
-    // Read-only: the fetch started (one call) and was dropped unanswered.
+    // A miss records its answer (OD-2), so it commits with a timestamp like
+    // a write: the fetch started during the reads (one call) and the
+    // commit waits for it.
     source.hold.store(true, Ordering::SeqCst);
     let calls = source.calls.load(Ordering::SeqCst);
     let before = cluster.last_index(leader);
-    let missing = nabedra_rt::time::timeout(
-        Duration::from_secs(5),
-        cluster.op(
+    let missing = {
+        let missing = cluster.op(
             leader,
             "table.update",
             serde_json::json!({"key": 99, "values": {"value": 1}}),
-        ),
-    )
-    .await
-    .expect("a read-only outcome does not wait for its timestamp");
+        );
+        tokio::pin!(missing);
+        assert!(
+            nabedra_rt::time::timeout(Duration::from_millis(300), &mut missing)
+                .await
+                .is_err(),
+            "a recorded miss waits for its timestamp"
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), calls + 1);
+        source.hold.store(false, Ordering::SeqCst);
+        missing.await
+    };
     assert_eq!(missing, done("false"));
-    assert_eq!(source.calls.load(Ordering::SeqCst), calls + 1);
-    assert_eq!(cluster.last_index(leader), before, "nothing committed");
-    // The held call answers nobody once released (or was cancelled with
-    // the dropped fetch); later calls follow it.
-    source.hold.store(false, Ordering::SeqCst);
+    assert_eq!(cluster.last_index(leader), before + 1, "one recorded entry");
+    // Every call answered or was cancelled with a dropped fetch; later
+    // calls follow it.
     watchdog(|| async {
         (source.answered.load(Ordering::SeqCst) + source.abandoned.load(Ordering::SeqCst)
             == source.calls.load(Ordering::SeqCst))

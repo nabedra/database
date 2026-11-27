@@ -15,7 +15,10 @@
 (*    mvcc/store/direct.rs `check`, `write`): dedup record, expected       *)
 (*    version, timestamp above the newest version;                         *)
 (*  - the retry-results rule (section 4, lead decision 2026-11-24): a      *)
-(*    no-op or row conflict is a definite result and is recorded;          *)
+(*    no-op or row conflict is a definite result. A miss (update or delete *)
+(*    of an absent row) records it as a tombstone over the head it read    *)
+(*    (OD-2, fx-oltp-direct); a row conflict records its refusal with a    *)
+(*    write that keeps the row as it read it;                              *)
 (*  - RangeClock rules 1 to 3 (section 5, store/direct/clock.rs) against   *)
 (*    snapshot reads at a timestamp;                                       *)
 (*  - a queued writer that takes no direct latch (section 5, last          *)
@@ -120,34 +123,39 @@ Compute(q, s) ==
       [] q.op = "upd" ->
            IF Present(s, q.key)
            THEN [wr |-> TRUE, nv |-> q.val, res |-> "upd", rk |-> "ok"]
-           ELSE [wr |-> FALSE, nv |-> None, res |-> "miss", rk |-> "ok"]
+           ELSE [wr |-> TRUE, nv |-> None, res |-> "miss", rk |-> "ok"]
       [] q.op = "del" ->
            IF Present(s, q.key)
            THEN [wr |-> TRUE, nv |-> None, res |-> "del", rk |-> "ok"]
-           ELSE [wr |-> FALSE, nv |-> None, res |-> "miss", rk |-> "ok"]
+           ELSE [wr |-> TRUE, nv |-> None, res |-> "miss", rk |-> "ok"]
 
 \* Apply one direct member m in the order of `check`: dedup record, head
 \* version, timestamp above the newest version, then one batch with the row,
 \* the record and the applied position. o is "applied", "replayed" (with the
-\* record) or "conflict" (Rejected(Conflict): nothing written).
+\* record) or "conflict" (Rejected(Conflict): nothing written). A recorded
+\* refusal (m.rk = "na") writes the row it read unchanged: a version, but not
+\* the request's effect (ghosts w, dup). Mutant record_no_precondition: a
+\* recorded miss applies without its head checks.
 ApplyDirect(s, m) ==
     LET rec == RecOf(s, m.key, m.id)
         head == s.row[m.key]
         q == [id |-> m.id, op |-> m.dg[1], key |-> m.key, val |-> m.dg[3]]
+        effect == m.rk # "na"
     IN
     IF Has(rec) THEN
         IF rec.dg = m.dg \/ Mutant = "digest_ignored" THEN [s |-> s, o |-> "replayed", rec |-> rec]
         ELSE [s |-> s, o |-> "conflict", rec |-> NoRec]
-    ELSE IF (head.ver # m.exp /\ ~(Mutant = "record_no_precondition" /\ ~m.wr))
-            \/ (m.wr /\ m.ts <= head.ver)
+    ELSE IF ~(Mutant = "record_no_precondition" /\ m.res = "miss")
+            /\ (head.ver # m.exp \/ (m.wr /\ m.ts <= head.ver))
          THEN [s |-> s, o |-> "conflict", rec |-> NoRec]
     ELSE
         LET r1 == [key |-> m.key, id |-> m.id, dg |-> m.dg, res |-> m.res, rk |-> m.rk]
             s1 == IF m.wr
                   THEN [s EXCEPT !.row[m.key] = [v |-> m.nv, ver |-> m.ts],
                                  !.hist = @ \cup {[k |-> m.key, ts |-> m.ts]},
-                                 !.dup = @ \/ (\E x \in s.w : x.key = m.key /\ x.id = m.id),
-                                 !.w = @ \cup {[key |-> m.key, id |-> m.id, dg |-> m.dg]}]
+                                 !.dup = @ \/ (effect /\ \E x \in s.w : x.key = m.key /\ x.id = m.id),
+                                 !.w = IF effect THEN @ \cup {[key |-> m.key, id |-> m.id, dg |-> m.dg]}
+                                       ELSE @]
                   ELSE s
         \* bad: the recorded result is not the operation's result on the state
         \* at this log position (ghost for G03_RecordedPrecondition).
@@ -328,30 +336,35 @@ CanExecute(x) == Serving(x.n, x.r) /\ LatchFree(x) /\ NoPending(x)
 \* Steps 2 to 5 under the latch: dedup lookup, compute, timestamp, register
 \* in `pending` (rule 1 holds: a new timestamp is above every snapshot
 \* already served), propose. With a dedup record it answers from it. A
-\* read-only outcome (a no-op or a row conflict) is a definite result: the
-\* fixed design commits a record for it in the same kind of entry, with the
-\* expected version of the key it read (lead decision 2026-11-24). The
-\* shipped executor returns it without a record (`prepare`: "A read-only
-\* outcome commits nothing"; `compute`: `already_exists()`): prefix_dr1_*.
+\* no-op or a row conflict is a definite result (lead decision 2026-11-24).
+\* A miss is proposed as a tombstone over the head it read (`compute`,
+\* `recorded_miss`), so it carries that head as its expected version. A row
+\* conflict (an insert of a present row) writes the row as it read it, with
+\* the same expected version, and records the refusal (`unchanged`,
+\* `refused_row_conflict`). The shipped executor returned both without a
+\* record (`prepare`:
+\* "A read-only outcome commits nothing"; `compute`: `already_exists()`):
+\* prefix_dr1_*.
 Execute(x) ==
     LET q == Req(x.c)  r == x.r  s == st[r]
         rec == RecOf(s, q.key, q.id)
-        cm == Compute(q, s)
-        unrecorded == \/ (Mutant = "prefix_dr1_readonly_unrecorded" /\ cm.rk = "ok")
-                      \/ (Mutant = "prefix_dr1_refusal_unrecorded" /\ cm.rk = "na")
+        c0 == Compute(q, s)
+        unrecorded == \/ (Mutant = "prefix_dr1_readonly_unrecorded" /\ c0.res = "miss")
+                      \/ (Mutant = "prefix_dr1_refusal_unrecorded" /\ c0.rk = "na")
+        cm == IF c0.rk = "na" THEN [c0 EXCEPT !.wr = TRUE, !.nv = s.row[q.key].v] ELSE c0
         ts == tso + 1
         mem == [c |-> x.c, k |-> x.k, a |-> x.a, id |-> q.id, dg |-> Dg(q), key |-> q.key,
                 exp |-> s.row[q.key].ver, wr |-> cm.wr, nv |-> cm.nv, res |-> cm.res,
                 rk |-> cm.rk, ts |-> ts, q |-> FALSE]
     IN
     /\ x \in exec /\ x.ph \in {"pre", "retry"} /\ CanExecute(x)
-    /\ IF Has(rec) \/ (~cm.wr /\ unrecorded) THEN
+    /\ IF Has(rec) \/ unrecorded THEN
           /\ exec' = exec \ {x}
           /\ IF Has(rec)
              THEN Out(x, IF rec.dg # Dg(q) /\ Mutant # "digest_ignored" THEN "na" ELSE rec.rk,
                       IF rec.dg # Dg(q) /\ Mutant # "digest_ignored" THEN "reused"
                       ELSE IF Mutant = "reexecute_on_retry" THEN cm.res ELSE rec.res)
-             ELSE Out(x, cm.rk, cm.res)
+             ELSE Out(x, c0.rk, c0.res)
           /\ UNCHANGED <<prop, pend, tso>>
        ELSE
           /\ tso' = ts

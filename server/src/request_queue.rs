@@ -1027,7 +1027,20 @@ impl RequestQueue {
                 )
                 .ok_or(QueueError::Overloaded)?;
         }
-        if queue_bytes > self.limits.max_queue_bytes_per_replica {
+        // OQ-6: Control has already published this view, so refusing it here
+        // would leave every holder on a view that no longer exists, with
+        // admission, copies and retirement all waiting for it. Admission
+        // reserved ACK bytes for the old ready set; a larger set may exceed
+        // the byte limit by its extra ACK UUIDs (32 bytes per record and new
+        // member, bounded by the record count), and admission refuses new
+        // work until retirement brings the queue back under it.
+        let growth = members
+            .len()
+            .saturating_sub(self.members.len())
+            .checked_mul(32)
+            .and_then(|per_record| per_record.checked_mul(self.records.len()))
+            .ok_or(QueueError::Overloaded)?;
+        if queue_bytes.saturating_sub(growth) > self.limits.max_queue_bytes_per_replica {
             return Err(QueueError::Overloaded);
         }
         for record in self.records.values_mut() {
