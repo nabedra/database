@@ -1,5 +1,5 @@
-# Design review rv-lsm (wave-rv), finding LSM-1. Open: the fix (keyed CRCs) changes the on-disk format and waits for
-# the user; the reproduction is rv-lsm-lsm1-test.patch in wave-rv/reports/rv-lsm-patches.
+# Design review rv-lsm (wave-rv), finding LSM-1. The engine fix is in fx-lsm (dd8b8930: format 2 stores with
+# authenticated journal frames, mitigation b for format 1); open until pools and Events stores run in format 2.
 id = "RV-LSM-1"
 title = "Client bytes inside a journal value pass as recovery evidence after a torn header: the pool is refused, or a forged batch is replayed"
 class = "other"
