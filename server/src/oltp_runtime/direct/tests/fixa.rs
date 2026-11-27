@@ -349,9 +349,12 @@ async fn d05_unknown_proposal_keeps_range_clock_pending_until_apply() {
         &insert(&cluster, id, 1),
         id,
         1,
-        Duration::from_millis(400),
+        Duration::from_secs(3),
     );
-    let response = voter.executor.execute(&handle, request).await;
+    // The proposal reaches the held consensus, then the deadline passes.
+    let mut response = Box::pin(voter.executor.execute(&handle, request));
+    at_proposal(voter, response.as_mut(), 1).await;
+    let response = response.await;
     assert_eq!(
         code(&response).map(|(_, outcome)| outcome),
         Some(Outcome::Unknown),
