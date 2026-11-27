@@ -2418,6 +2418,7 @@ jobs:
           - { spec: cache/get-hit, name: cache-get-hit, target: cache }
           - { spec: events/publish, name: events-publish, target: events }
           - { spec: olap/streaming, name: olap-streaming, target: olap }
+          - { spec: olap/streaming-sparse, name: olap-streaming-sparse, target: olap }
           - { spec: oltp/point-update, name: oltp-point-update, target: oltp }
           - { spec: oltp/queued-update, name: oltp-queued-update, target: oltp }
           - { spec: kv/store, name: kv-store, target: kv }

@@ -9,6 +9,6 @@ command = [
     "NABEDRA_SIM_ARTIFACTS={work}/artifacts", "{bin}", "sweep",
 ]
 warmup = 1
-rounds = 6
+rounds = 12
 timeout_s = 1800
 metric = "wall"

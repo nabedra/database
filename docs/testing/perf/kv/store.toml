@@ -4,7 +4,7 @@ module = "kv"
 # NS5 for flush and compaction throughput, NS18 for put, read and install costs.
 command = ["{bin}", "--ignored", "--nocapture", "--test-threads", "1"]
 warmup = 1
-rounds = 12
+rounds = 24
 timeout_s = 900
 
 # The 1-writer put and append costs follow the runner's fsync and journal timing; their A/A

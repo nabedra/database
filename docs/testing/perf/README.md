@@ -11,13 +11,14 @@ python3.11 scripts/testing/ab.py docs/testing/perf/oltp/point-update.toml \
 
 | Spec | Input and runner setup | Metrics |
 | --- | --- | --- |
-| `cache/get-hit` | Cache binaries on Linux. Set `NABEDRA_PERF_VALKEY` and `NABEDRA_PERF_VALKEY_CLI` to the reference tool paths and `NABEDRA_PERF_CLIENT_CPU` to a client CPU ID. Follow the prerequisites in [the Cache benchmark](../cache-benchmark.md). | GET-hit p99 and p50 and SET PX p99 at 24 offered requests/s with the stock client. |
-| `events/publish` | Two locally built Events images and Docker. | Medians of the publish p99 and poll p99 values from the measured load stages. |
-| `kv/store` | The release `store_bench` test executable of `nabedra-kv`. | NS18 put, Raft append, get, scan and install costs, NS5 flush and compaction throughput. |
-| `olap/streaming` | Matching OLAP binaries and the streaming fixture. Set `NABEDRA_PERF_BASE_SHA`, `NABEDRA_PERF_HEAD_SHA` and `NABEDRA_PERF_FIXTURE_SHA` to the source revisions. | Medians of the steady-state next-batch p99 and the first-batch p99 across prefetch depths. |
-| `oltp/point-update` | Linux OLTP binaries and Docker. Set `NABEDRA_PERF_OLTP_IMAGE` to a locally available image with the benchmark's runtime dependencies. | Median of phase p99 latencies for direct updates at 20 offered requests/s. |
+| `cache/get-hit` | Cache binaries on Linux. Set `NABEDRA_PERF_VALKEY` and `NABEDRA_PERF_VALKEY_CLI` to the reference tool paths and `NABEDRA_PERF_CLIENT_CPU` to a client CPU ID. Follow the prerequisites in [the Cache benchmark](../cache-benchmark.md). | GET-hit and SET PX p50 at 24 offered requests/s with the stock client; their p99s are reported. |
+| `events/publish` | Two locally built Events images and Docker. | Median of the publish p99 values from the measured load stages; poll p99 is reported. |
+| `kv/store` | The release `store_bench` test executable of `nabedra-kv`. | NS18 16-writer synced put, get, scan and install costs, NS5 flush and compaction throughput; the 1-writer put and append costs are reported. |
+| `olap/streaming` | Matching OLAP binaries and the streaming fixture. Set `NABEDRA_PERF_BASE_SHA`, `NABEDRA_PERF_HEAD_SHA` and `NABEDRA_PERF_FIXTURE_SHA` to the source revisions. | Medians of the steady-state next-batch p99 and the first-batch p99 across prefetch depths, dense profile. |
+| `olap/streaming-sparse` | As `olap/streaming`. | The same metrics for the sparse/wide profile, with ordinary requests during the stream. |
+| `oltp/point-update` | Linux OLTP binaries and Docker. Set `NABEDRA_PERF_OLTP_IMAGE` to a locally available image with the benchmark's runtime dependencies. | Medians of the phase p99 and p50 latencies for direct updates at 20 offered requests/s. |
 | `oltp/queued-update` | As `oltp/point-update`. | The same workload with direct OLTP off, so updates take the queued path. |
-| `sim/oltp-seeds` | The release `nabedra-sim` binary, built with `RUSTFLAGS='--cfg tokio_unstable'`. | Wall time of a smoke sweep of seeds 1 to 8, each replayed once. |
+| `sim/oltp-seeds` | The release `nabedra-sim` binary, built with `RUSTFLAGS='--cfg tokio_unstable'`. | Wall time of a smoke sweep of seeds 1 to 8, each run twice for replay. |
 
 A spec provides `name`, `module`, `command`, `warmup` pairs, `rounds` of
 measured pairs, and either one `metric` or a `[metrics]` table. A command can
@@ -37,11 +38,14 @@ per operation.
 
 A `[metrics]` table names several metrics read from the same invocation. Each
 value is a regex, `"wall"`, or a table with `pattern`, an optional `file` that
-overrides `metric_file`, and `higher_is_better = true` for a rate such as
-MiB/s, which the runner compares as its reciprocal. The first metric is the
+overrides `metric_file`, `higher_is_better = true` for a rate such as MiB/s,
+which the runner compares as its reciprocal, and `gate = false` for a metric
+that is reported but cannot decide the comparison. The first metric is the
 primary one, whose ratio and interval also appear at the top of
-`results.json`. The comparison fails if any metric regresses, so every metric
-added to a spec adds a chance of a false alarm. Check its A/A noise first.
+`results.json`. The comparison fails if any gating metric regresses, so every
+gating metric adds a chance of a false alarm. Measure its A/A noise first, and
+report a metric whose noise hides a 5% shift at the spec's rounds instead of
+gating on it.
 
 The runner alternates who goes first, including during warmup. It computes the
 median head/base ratio across measured pairs and resamples those pairs with a

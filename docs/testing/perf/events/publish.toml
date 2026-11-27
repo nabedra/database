@@ -5,7 +5,7 @@ command = [
     "--cases", "load-1", "--load-events", "96", "--output", "{work}/events.json",
 ]
 warmup = 2
-rounds = 20
+rounds = 40
 timeout_s = 600
 metric_file = "events.json"
 

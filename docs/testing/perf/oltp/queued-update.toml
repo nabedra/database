@@ -7,7 +7,7 @@ command = [
     "oltp-benchmark", "{bin}", "{work}",
 ]
 warmup = 2
-rounds = 10
+rounds = 24
 timeout_s = 1200
 metric_file = "results.json"
 
