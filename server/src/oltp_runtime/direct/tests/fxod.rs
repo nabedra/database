@@ -210,5 +210,42 @@ async fn d02_od2_cost_a_missed_delete_writes_no_more_than_a_delete() {
     assert_eq!(*delete_entries, *miss_entries, "one entry per request on both");
     assert_eq!(delete, &vec![2 * n, 0, n, n], "row and index tombstones, record, expiry");
     assert_eq!(miss, &vec![n, n, n, n], "one tombstone and a new head per absent key");
+
+    // A refused insert writes no more than an insert: the row and its index
+    // entry rewritten as they were, a record and its expiry, one entry.
+    let insert = |id: i64| serde_json::json!({"row": {"id": id, "value": id, "tag": "c", "score": 0.0}});
+    let mut measured = Vec::new();
+    for (label, expected) in [("insert", "null"), ("conflict", "")] {
+        let before = counts(&cluster, leader).await;
+        let entries = cluster.last_index(leader);
+        let started = nabedra_rt::time::now_std();
+        for id in 2_001..2_001 + N {
+            let response = cluster.op(leader, "table.insert", insert(id)).await;
+            if expected.is_empty() {
+                assert_eq!(
+                    code(&response),
+                    Some((ErrorCode::Conflict, Outcome::NotApplied)),
+                    "{label} {id}"
+                );
+            } else {
+                assert_eq!(response, done(expected), "{label} {id}");
+            }
+        }
+        let elapsed = nabedra_rt::time::elapsed(started);
+        let after = counts(&cluster, leader).await;
+        let delta: Vec<usize> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+        measured.push((label, delta, cluster.last_index(leader) - entries, elapsed));
+    }
+    for (label, delta, entries, elapsed) in &measured {
+        eprintln!(
+            "od2 cost {label}: {entries} entries, new keys v/h/D/E {delta:?}, mean {:.3} ms",
+            elapsed.as_secs_f64() * 1e3 / N as f64
+        );
+    }
+    let (_, inserted, insert_entries, _) = &measured[0];
+    let (_, refused, refused_entries, _) = &measured[1];
+    assert_eq!(*insert_entries, *refused_entries, "one entry per request on both");
+    assert_eq!(inserted, &vec![2 * n, 2 * n, n, n], "row and index versions and heads");
+    assert_eq!(refused, &vec![2 * n, 0, n, n], "the same versions, no new head");
     cluster.shutdown().await;
 }

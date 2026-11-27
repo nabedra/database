@@ -1142,6 +1142,9 @@ def suite_barriers(args, output):
         # full handler lane (`worker handler lane full`); both refuse before execution.
         overloaded = direct(after, 'overloaded_429') - direct(before, 'overloaded_429')
         executed = direct(after, 'mutations') - direct(before, 'mutations')
+        # The public 429 is gone for mutations (OD-3 answers outcome_unknown): the
+        # refused rows are checked absent below, and the report keeps the leaders'
+        # own 429 count.
         for body in accepted:
             assert table.get(body['payload']['row']['id']) == body['payload']['row']
         for body, _ in refused:
