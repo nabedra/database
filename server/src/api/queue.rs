@@ -819,7 +819,7 @@ mod tests {
             pool,
             Default::default(),
         );
-        let queue = LocalQueue::new(&engine, Default::default(), false, false).unwrap();
+        let queue = LocalQueue::new(&engine, Default::default(), false).unwrap();
         let fence = queue.initialize(&engine).await.unwrap();
         (engine, queue, fence, threads)
     }
