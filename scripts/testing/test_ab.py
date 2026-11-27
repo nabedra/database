@@ -55,7 +55,8 @@ class PairedBenchmarkTests(unittest.TestCase):
         self.assertEqual(data["pairs"][0]["order"], ["head", "base"])
         self.assertEqual(data["bootstrap_seed"], ab.BOOTSTRAP_SEED)
         self.assertTrue(data["cpu_model"])
-        self.assertIn("Regression on ", summary)
+        self.assertIn("Runner CPU: ", summary)
+        self.assertIn("\nRegression in ", summary)
         print(f"Planted 20% sleep slowdown flagged (head/base {data['median_ratio']:.4f}).")
 
     def test_null_false_positive_rate_and_power_on_paired_noise(self):
@@ -89,8 +90,74 @@ class PairedBenchmarkTests(unittest.TestCase):
         self.assertFalse(assess([1.04] * 5)["regression"])
         self.assertTrue(assess([1.05] * 5)["regression"])
         noisy = assess([0.9, 1.0, 1.08, 1.1, 1.2])
-        self.assertEqual(noisy, {"median_ratio": 1.08, "ci95": [0.9, 1.2], "regression": False})
+        # Not flagged, but the interval reaches 1.05: too noisy to call a pass.
+        self.assertEqual(noisy, {"median_ratio": 1.08, "ci95": [0.9, 1.2], "regression": False,
+                                 "inconclusive": True})
         self.assertEqual(noisy, assess([0.9, 1.0, 1.08, 1.1, 1.2]))
+
+    def test_inconclusive_needs_an_unflagged_interval_reaching_the_threshold(self):
+        def assess(ratios):
+            return ab.compare([{"base": 100, "head": 100 * ratio} for ratio in ratios], 5, 2000)
+
+        # A quiet A/A: the interval stays below 1.05, so it is a pass.
+        quiet = assess([0.99, 1.0, 1.01, 1.0, 0.995, 1.005])
+        self.assertEqual((quiet["regression"], quiet["inconclusive"]), (False, False))
+        # A blind A/A, as on the AMD runners (ratio MAD 20 to 40%): median near 1, interval past 1.05.
+        blind = assess([0.72, 0.85, 0.97, 1.02, 1.1, 1.18])
+        self.assertLess(blind["median_ratio"], 1.05)
+        self.assertGreaterEqual(blind["ci95"][1], 1.05)
+        self.assertEqual((blind["regression"], blind["inconclusive"]), (False, True))
+        # Just below the threshold, but the interval does not reach it: pass.
+        near = assess([1.03, 1.035, 1.04, 1.03, 1.04, 1.035])
+        self.assertLess(near["ci95"][1], 1.05)
+        self.assertEqual((near["regression"], near["inconclusive"]), (False, False))
+        # A flagged regression is never also inconclusive.
+        flagged = assess([1.06, 1.07, 1.08, 1.06, 1.07, 1.09])
+        self.assertEqual((flagged["regression"], flagged["inconclusive"]), (True, False))
+
+    def test_metric_threshold_overrides_the_spec_threshold(self):
+        spec = write_spec(
+            'command = ["{bin}"]\nwarmup = 0\nrounds = 4\n[metrics]\n'
+            r"strict = 'value=(\d+)'" "\n"
+            r"loose = { pattern = 'value=(\d+)', threshold_pct = 10 }" "\n"
+        )
+        side = lambda value: [sys.executable, "-c", f"print('value={value}')"]
+        result = ab.benchmark(spec, side(100), side(107))
+        strict, loose = result["metrics"]["strict"], result["metrics"]["loose"]
+        self.assertEqual((strict["threshold_pct"], strict["regression"]), (5, True))
+        # 7% is under the loose metric's 10% and its interval does not reach 1.10.
+        self.assertEqual((loose["threshold_pct"], loose["regression"], loose["inconclusive"]), (10, False, False))
+        with self.assertRaisesRegex(ValueError, "threshold_pct must be"):
+            write_spec('command = ["{bin}"]\nwarmup = 0\nrounds = 2\n[metrics]\n'
+                       r"a = { pattern = 'a=(\d+)', threshold_pct = -1 }" "\n")
+
+    def test_inconclusive_gating_metric_exits_3_and_report_only_does_not(self):
+        with TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            # Head alternates fast and slow around the base, so the median is 1 and the interval is wide.
+            driver = root / "driver.py"
+            driver.write_text("import pathlib, sys\n"
+                              "state = pathlib.Path(sys.argv[1]) / 'count'\n"
+                              "n = int(state.read_text()) if state.exists() else 0\n"
+                              "state.write_text(str(n + 1))\n"
+                              "noisy = 100 if sys.argv[2] == 'base' else (70, 100, 130)[n % 3]\n"
+                              "print(f'steady=100 noisy={noisy}')\n")
+            for gate, expected in (("true", 3), ("false", 0)):
+                (root / "count").unlink(missing_ok=True)
+                spec = root / f"spec-{gate}.toml"
+                spec.write_text(SPEC_HEADER + f'command = ["{{bin}}", "{driver}", "{root}", "{{side}}"]\n'
+                                'warmup = 0\nrounds = 6\n[metrics]\n'
+                                r"steady = 'steady=(\d+)'" "\n"
+                                r"noisy = { pattern = 'noisy=(\d+)', gate = " + gate + " }\n")
+                out = root / f"out-{gate}"
+                with self.subTest(gate=gate):
+                    self.assertEqual(ab.main([str(spec), sys.executable, sys.executable, "--output", str(out)]),
+                                     expected)
+                    summary = (out / "summary.md").read_text()
+                    data = json.loads((out / "results.json").read_text())
+                    self.assertEqual(data["inconclusive"], expected == 3)
+                    self.assertIn("inconclusive", summary)
+                    self.assertIn("Inconclusive in " if expected == 3 else "Pass in ", summary)
 
     def test_wall_mode_measures_positive_time_and_alternates_all_pairs(self):
         spec = ab.Spec("Measured wall", "testing", ["{bin}"], 1, 2, "wall")
@@ -186,7 +253,7 @@ class PairedBenchmarkTests(unittest.TestCase):
             peer = join([sys.executable, "-c", "pass"])
             status = ab.main([str(path), peer, peer, "--commands", "--rounds", "2", "--warmup", "0",
                               "--output", directory])
-            self.assertIn(status, (0, 1))
+            self.assertIn(status, (0, 1, 3))  # two wall-time pairs of a no-op: any decision
             data = json.loads((Path(directory) / "results.json").read_text())
             self.assertEqual((data["spec"]["rounds"], data["spec"]["warmup"], len(data["pairs"])), (2, 0, 2))
             self.assertIn("| metric | 2 |", (Path(directory) / "summary.md").read_text())

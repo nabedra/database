@@ -21,6 +21,8 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP_SEED = 20261122
+# Exit status of a run that flags nothing but cannot rule out a threshold-sized regression.
+INCONCLUSIVE_EXIT = 3
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,11 @@ class Spec:
     def gated(self, name):
         value = self.metrics.get(name)
         return not isinstance(value, dict) or value.get("gate", True)
+
+    def threshold(self, name):
+        """A metric's own `threshold_pct`, for one too noisy to judge at the spec's threshold."""
+        value = self.metrics.get(name)
+        return value.get("threshold_pct", self.threshold_pct) if isinstance(value, dict) else self.threshold_pct
 
     def measurements(self):
         """Return (name, pattern, file, higher_is_better) per metric."""
@@ -87,11 +94,16 @@ def load_spec(path):
         raise ValueError("give exactly one of metric and metrics")
     if not isinstance(spec.metrics, dict) or not all(
             isinstance(value, str) or (isinstance(value, dict)
-                                       and set(value) <= {"pattern", "file", "higher_is_better", "gate"}
+                                       and set(value) <= {"pattern", "file", "higher_is_better", "gate",
+                                                          "threshold_pct"}
                                        and type(value.get("gate", True)) is bool)
             for value in spec.metrics.values()):
-        raise ValueError("metrics values must be a pattern or a table of pattern, file, higher_is_better "
-                         "and a boolean gate")
+        raise ValueError("metrics values must be a pattern or a table of pattern, file, higher_is_better, "
+                         "threshold_pct and a boolean gate")
+    for name, *_ in spec.measurements():
+        value = spec.threshold(name)
+        if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
+            raise ValueError(f"metric {name}: threshold_pct must be a nonnegative finite number")
     if not any(spec.gated(row[0]) for row in spec.measurements()):
         raise ValueError("at least one metric must gate the comparison")
     if (not isinstance(spec.command, list)
@@ -175,10 +187,15 @@ def compare(pairs, threshold_pct, bootstrap_samples):
     estimates = [median(rng.choices(ratios, k=len(ratios))) for _ in range(bootstrap_samples)]
     percentiles = quantiles(estimates, n=40, method="inclusive")
     lower, upper = percentiles[0], percentiles[-1]
+    limit = 1 + threshold_pct / 100
+    regression = ratio >= limit and lower > 1
     return {
         "median_ratio": ratio,
         "ci95": [lower, upper],
-        "regression": ratio >= 1 + threshold_pct / 100 and lower > 1,
+        "regression": regression,
+        # Not flagged, but the interval still reaches the threshold: the run was too noisy to
+        # rule out a regression of that size, so it is no evidence of a pass.
+        "inconclusive": not regression and upper >= limit,
     }
 
 
@@ -218,15 +235,17 @@ def benchmark(spec, base, head, roots=None):
     for name, *_ in patterns:
         pairs = [{"order": order, "base": pair["base"][name], "head": pair["head"][name]}
                  for order, pair in runs]
-        result = compare(pairs, spec.threshold_pct, spec.bootstrap_samples)
-        metrics[name] = {"pairs": pairs, **result, "gate": spec.gated(name),
+        result = compare(pairs, spec.threshold(name), spec.bootstrap_samples)
+        metrics[name] = {"pairs": pairs, **result, "gate": spec.gated(name), "threshold_pct": spec.threshold(name),
                          "noise": noise(pairs, result["ci95"])}
     primary = metrics[patterns[0][0]]
+    regression = any(row["regression"] and row["gate"] for row in metrics.values())
     return {
         "pairs": primary["pairs"],
         "median_ratio": primary["median_ratio"],
         "ci95": primary["ci95"],
-        "regression": any(row["regression"] and row["gate"] for row in metrics.values()),
+        "regression": regression,
+        "inconclusive": not regression and any(row["inconclusive"] and row["gate"] for row in metrics.values()),
         "metrics": metrics,
         "runtime_seconds": time.perf_counter() - started,
     }
@@ -252,25 +271,32 @@ def cpu_model():
     return platform.processor() or platform.machine() or "unknown"
 
 
+def status_of(result):
+    return "Regression" if result["regression"] else "Inconclusive" if result["inconclusive"] else "Pass"
+
+
 def write_result(output, result):
     output.mkdir(parents=True, exist_ok=True)
     (output / "results.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     spec = result["spec"]
-    status = "Regression" if result["regression"] else "Pass"
+    status = status_of(result)
     rows = []
     for name, row in result["metrics"].items():
         lower, upper = row["ci95"]
+        decision = "regression" if row["regression"] else "inconclusive" if row["inconclusive"] else "pass"
         rows.append(
             f"| {name} | {len(row['pairs'])} | {row['median_ratio']:.4f} | {lower:.4f} to {upper:.4f} "
-            f"| {row['noise']['ratio_mad_pct']:.2f}% | {'yes' if row['regression'] else 'no'}"
+            f"| {row['noise']['ratio_mad_pct']:.2f}% | {row['threshold_pct']:g}% | {decision}"
             f"{'' if row['gate'] else ' (report only)'} |"
         )
     summary = (
         f"# {spec['name']}\n\n"
-        f"{status} on {result['cpu_model']} in {result['runtime_seconds']:.0f} s. "
-        f"Regression threshold {spec['threshold_pct']:g}%.\n\n"
-        f"| Metric | Measured pairs | Median head/base | 95% bootstrap CI | Ratio MAD | Regression |\n"
-        f"| --- | ---: | ---: | ---: | ---: | --- |\n" + "\n".join(rows) + "\n"
+        f"Runner CPU: {result['cpu_model']}.\n\n"
+        f"{status} in {result['runtime_seconds']:.0f} s. Regression threshold {spec['threshold_pct']:g}%."
+        + (" A gating metric's interval reaches the threshold, so this run can neither show a regression"
+           " nor rule one out: rerun the spec." if status == "Inconclusive" else "") + "\n\n"
+        f"| Metric | Measured pairs | Median head/base | 95% bootstrap CI | Ratio MAD | Threshold | Decision |\n"
+        f"| --- | ---: | ---: | ---: | ---: | ---: | --- |\n" + "\n".join(rows) + "\n"
     )
     (output / "summary.md").write_text(summary, encoding="utf-8")
 
@@ -310,9 +336,9 @@ def main(argv=None):
         print(f"ab: {error}", file=sys.stderr)
         return 2
     ratios = ", ".join(f"{name} {row['median_ratio']:.4f}" for name, row in result["metrics"].items())
-    print(f"Median head/base: {ratios}. Wrote {args.output / 'results.json'} "
+    print(f"{status_of(result)}. Median head/base: {ratios}. Wrote {args.output / 'results.json'} "
           f"and {args.output / 'summary.md'}.")
-    return int(result["regression"])
+    return 1 if result["regression"] else INCONCLUSIVE_EXIT if result["inconclusive"] else 0
 
 
 if __name__ == "__main__":

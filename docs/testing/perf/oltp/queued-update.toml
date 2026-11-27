@@ -12,6 +12,7 @@ timeout_s = 1200
 metric_file = "results.json"
 
 # Medians of the per-phase percentiles; 200 updates per phase, so p99 is the second largest.
+# The p99 had an A/A sd of 11% to 13%, so it gates at 10% and the p50 at 5%.
 [metrics]
-p99_ms = '"success_latency_ms"\s*:\s*\{[^}]*"p99"\s*:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
 p50_ms = '"success_latency_ms"\s*:\s*\{[^}]*"p50"\s*:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+p99_ms = { pattern = '"success_latency_ms"\s*:\s*\{[^}]*"p99"\s*:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)', threshold_pct = 10 }
