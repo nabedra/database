@@ -37,6 +37,12 @@ enum Command {
         #[arg(long)]
         backup: PathBuf,
     },
+    /// Authorize the first metadata voter, on its empty volume, to create a new cluster
+    /// on its next start. Run once, before the first `serve`.
+    Init {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 // Simulation swaps the Raft runtime, network and storage threading; it never ships.
@@ -66,5 +72,6 @@ async fn main() -> Result<()> {
         }
         Command::Backup { config, output } => run_backup(&Config::load(&config)?, &output).await,
         Command::Restore { config, backup } => run_restore(&Config::load(&config)?, &backup).await,
+        Command::Init { config } => Config::load(&config)?.initialize(),
     }
 }

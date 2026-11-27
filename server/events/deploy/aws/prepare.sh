@@ -80,12 +80,10 @@ jq -en --slurpfile settings "$settings" --slurpfile secret "$stage/secret.json" 
     if ($credentials.peer_token | type) != "string"
         or ($credentials.keyring | type) != "object"
         or ($credentials.keyring.cluster_id != $config.cluster_id)
-        or ($credentials.initialize_new_cluster | type) != "boolean"
     then error("invalid Events credentials")
     else $config + {
         peer_token: $credentials.peer_token,
         keyring: $credentials.keyring,
-        initialize_new_cluster: $credentials.initialize_new_cluster,
         peer_ca: ($stage + "/peer_ca.pem"),
         peer_identity: ($stage + "/peer_identity.pem"),
         peer_tls: { cert: ($stage + "/peer_cert.pem"), key: ($stage + "/peer_key.pem") },

@@ -36,6 +36,10 @@ pub use serve::{RECOVERY_EXIT_CODE, StoreRecoveryRequired, serve};
 
 const METADATA: &str = "metadata";
 const RESTORE_REBIND: &str = "restore-rebind";
+/// Written by `nabedra-events init` on the first metadata voter's empty volume: the one
+/// authorization to create a new cluster. `Control::join_metadata` removes it once the
+/// metadata group is initialized, and a volume that loses its data loses it too.
+const INITIALIZE_CLUSTER: &str = "initialize-cluster";
 const CACHE_TOPICS: usize = 32;
 const CACHE_LEADERS: usize = 512;
 const CACHE_FRESH_FOR: Duration = Duration::from_secs(3);
@@ -57,7 +61,6 @@ pub struct Config {
     public_tls: Option<TlsFiles>,
     peer_tls: Option<TlsFiles>,
     bootstrap: Bootstrap,
-    initialize_new_cluster: Option<bool>,
     keyring: Option<KeyringConfig>,
     #[serde(default)]
     http_limits: HttpLimits,
@@ -157,6 +160,27 @@ impl Config {
                 .take()
                 .context("broker config needs a keyring")?,
         )
+    }
+
+    /// `nabedra-events init`: authorize this broker to create a new cluster on its next
+    /// start. Only the first bootstrap metadata voter, only on a volume that never served.
+    /// After a total loss of the bootstrap disks a new cluster also needs a new
+    /// `cluster_id` and keyring, so old grants, tokens and stray brokers are refused.
+    pub fn initialize(&self) -> Result<()> {
+        ensure!(
+            self.bootstrap.metadata_voters.first() == Some(&self.broker_id),
+            "only the first bootstrap metadata voter initializes a new cluster"
+        );
+        ensure!(
+            !self.data_dir.join("kv").try_exists()?,
+            "this volume already holds an Events store; a new cluster starts on an empty volume"
+        );
+        std::fs::create_dir_all(&self.data_dir)?;
+        let marker = self.data_dir.join(INITIALIZE_CLUSTER);
+        let file = std::fs::File::create(&marker)?;
+        file.sync_all()?;
+        std::fs::File::open(&self.data_dir)?.sync_all()?;
+        Ok(())
     }
 
     pub(super) fn open_broker(&self) -> Result<Arc<Broker>> {

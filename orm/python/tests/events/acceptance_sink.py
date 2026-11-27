@@ -268,7 +268,6 @@ class Broker:
             "public_bind": f"127.0.0.1:{public_port}",
             "peer_bind": f"127.0.0.1:{peer_port}",
             "allow_plaintext": True,
-            "initialize_new_cluster": True,
             "peer_token": secrets.token_urlsafe(40),
             "bootstrap": {"metadata_voters": [1], "brokers": [{
                 "id": 1, "zone": "fixture", "peer_url": f"http://127.0.0.1:{peer_port}",
@@ -277,6 +276,8 @@ class Broker:
             "http_limits": {"lease_ms": 6000},
         })
         log = stack.enter_context((directory / "broker.log").open("wb"))
+        subprocess.run([str(binary), "init", "--config", str(self.config)],
+                       check=True, timeout=30, stdout=log, stderr=log)
         process = subprocess.Popen([str(binary), "serve", "--config", str(self.config)],
                                    stdout=log, stderr=log, env=dict(os.environ, TOKIO_WORKER_THREADS="2"))
         stack.callback(stop_process, process)

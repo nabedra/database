@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::forward::{Fence, GroupCall, Rpc};
-use super::{Control, Error, METADATA, RESTORE_REBIND, catalog, parse_partition_id, partition_id};
+use super::{
+    Control, Error, INITIALIZE_CLUSTER, METADATA, RESTORE_REBIND, catalog, parse_partition_id,
+    partition_id,
+};
 use crate::{
     http::{self, ApiError},
     partition,
@@ -832,12 +835,11 @@ impl Control {
                  until an operator re-adds this replica"
             );
         } else if initial.contains(&self.config.broker_id) && !self.broker.was_retired(METADATA)? {
+            // Only an explicit `nabedra-events init` (or a restore) creates a cluster: a
+            // first voter that lost every disk with its peers must not re-form an empty
+            // cluster under the old identity.
             let initializer = initial.first() == Some(&self.config.broker_id)
-                && (restoring
-                    || self
-                        .config
-                        .initialize_new_cluster
-                        .unwrap_or(self.config.allow_plaintext));
+                && (restoring || self.config.data_dir.join(INITIALIZE_CLUSTER).try_exists()?);
             let stored = self.broker.group(METADATA);
             match stored {
                 // The restore CLI seeded every initial voter from one backup cut.
@@ -938,6 +940,20 @@ impl Control {
                 }
                 Ok(())
             }
+            Rejoin::Genesis
+                if !initializer
+                    && self.config.bootstrap.metadata_voters.first()
+                        == Some(&self.config.broker_id) =>
+            {
+                // The first voter without `init`: every peer is empty, which is a new
+                // cluster nobody authorized or a total loss of the bootstrap disks. Wait.
+                tracing::warn!(
+                    "no peer holds Events state and this broker was not initialized; run \
+                     `nabedra-events init` on it to create a new cluster (after a total loss, \
+                     with a new cluster_id and keyring), or restore a backup"
+                );
+                Ok(())
+            }
             Rejoin::Genesis => {
                 let group = match open {
                     Some(group) => group,
@@ -945,6 +961,13 @@ impl Control {
                 };
                 if initializer && !group.is_initialized() {
                     group.initialize(self.initial_addresses()).await?;
+                }
+                if initializer {
+                    let marker = self.config.data_dir.join(INITIALIZE_CLUSTER);
+                    if marker.try_exists()? {
+                        std::fs::remove_file(&marker)?;
+                        std::fs::File::open(&self.config.data_dir)?.sync_all()?;
+                    }
                 }
                 done();
                 Ok(())

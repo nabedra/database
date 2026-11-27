@@ -133,9 +133,12 @@ def cgroup_sample(container):
 class Cluster:
     def __init__(
         self, directory, *, brokers, metadata_voters, image, cpus, memory_mib,
-        config=None, standby=0, tls=None,
+        config=None, standby=0, tls=None, initialize=True,
     ):
         self.directory = Path(directory)
+        # A new cluster forms only after `nabedra-events init` on broker 1's empty volume;
+        # a restore target skips it.
+        self.initialize = initialize
         self.image = image
         self.brokers = brokers
         self.metadata_voters = metadata_voters
@@ -174,6 +177,9 @@ class Cluster:
 
     def start(self, brokers, *, ready=True):
         brokers = list(brokers)
+        if self.initialize and 1 in brokers:
+            self.cli(1, "init", "--config", CONFIG)
+            self.initialize = False
         self.docker("up", "-d", "--no-recreate", *(self.service(broker) for broker in brokers))
         self.running.update(brokers)
         for broker in brokers:

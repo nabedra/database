@@ -34,7 +34,6 @@ fn config(dir: &Path) -> Config {
             "metadata_voters": [1],
             "brokers": [{ "id": 1, "zone": "zone-a", "peer_url": "http://127.0.0.1:10" }],
         },
-        "initialize_new_cluster": false,
         "keyring": { "cluster_id": CLUSTER, "grant": keys("g1", "a1"), "session": keys("s1", "b2") },
     }))
     .expect("test broker config")
@@ -191,7 +190,6 @@ fn config_with_peers(dir: &Path, id: u64, peers: &[(u64, String)]) -> Config {
         "peer_token": "local-testing-peer-token-with-32-bytes",
         "allow_plaintext": true,
         "bootstrap": { "metadata_voters": [1], "brokers": brokers },
-        "initialize_new_cluster": id == 1,
         "keyring": { "cluster_id": CLUSTER, "grant": keys("g1", "a1"), "session": keys("s1", "b2") },
     }))
     .expect("test broker config")
@@ -231,6 +229,12 @@ async fn wait_initialized(group: &Group) -> Result<()> {
         }
     })
     .await?;
+    Ok(())
+}
+
+/// What `nabedra-events init` writes: the authorization to create a new cluster.
+fn authorize(dir: &Path) -> Result<()> {
+    std::fs::write(dir.join(INITIALIZE_CLUSTER), b"")?;
     Ok(())
 }
 
@@ -351,6 +355,7 @@ async fn events_1_empty_volume_does_not_reinitialize_metadata_while_a_peer_holds
     let (url, server) = serve_peer(peer.clone()).await?;
 
     let (disk, fs) = empty_volume()?;
+    authorize(disk.path())?;
     let broker = open_as(disk.path(), &fs, 1)?;
     let control = Control::new(
         config_with_peers(disk.path(), 1, &[(2, url)]),
@@ -402,6 +407,7 @@ async fn events_1_new_cluster_initializes_once_every_peer_answers_empty() -> Res
         peer_broker,
     )?;
     let (url, server) = serve_peer(peer).await?;
+    authorize(disk.path())?;
     let control = Control::new(
         config_with_peers(disk.path(), 1, &[(2, url)]),
         broker.clone(),
@@ -412,6 +418,10 @@ async fn events_1_new_cluster_initializes_once_every_peer_answers_empty() -> Res
         .group(METADATA)
         .expect("a new cluster opens its metadata group");
     wait_initialized(&group).await?;
+    assert!(
+        !disk.path().join(INITIALIZE_CLUSTER).exists(),
+        "the one-shot authorization is consumed"
+    );
     assert_eq!(control.broker_report()["metadata_replica_lost"], false);
     server.abort();
     broker.close_group(METADATA).await?;
@@ -482,5 +492,53 @@ async fn events_3_one_retention_visit_trims_a_backlog_larger_than_one_page() -> 
     };
     assert_eq!(status.earliest_offset, 1_001);
     broker.close_group(&id).await?;
+    Ok(())
+}
+
+/// Review S1 of #176: after every bootstrap disk is lost, the first metadata voter found
+/// every peer empty and, with `initialize_new_cluster` defaulting to `allow_plaintext`,
+/// re-formed an empty cluster under the old identity. Without `nabedra-events init` it
+/// now waits: no metadata group, the join stays pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_1_s1_uninitialized_first_voter_waits_when_every_peer_is_empty() -> Result<()> {
+    let (peer_disk, peer_fs) = empty_volume()?;
+    let peer = Control::new(
+        config_with_peers(peer_disk.path(), 2, &[(2, "http://127.0.0.1:11/".into())]),
+        open_as(peer_disk.path(), &peer_fs, 2)?,
+    )?;
+    let (url, server) = serve_peer(peer).await?;
+    let (disk, fs) = empty_volume()?;
+    let broker = open_as(disk.path(), &fs, 1)?;
+    let control = Control::new(
+        config_with_peers(disk.path(), 1, &[(2, url)]),
+        broker.clone(),
+    )?;
+    control.reopen(false).await?;
+    control.join_metadata().await?;
+    assert!(broker.group(METADATA).is_none(), "no cluster forms without init");
+    assert_eq!(control.broker_report()["metadata_join_pending"], true);
+    server.abort();
+    Ok(())
+}
+
+/// Review S1 for RF1: a broker alone in its bootstrap roster forms no cluster without
+/// `nabedra-events init`, and forms one with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_1_s1_single_broker_needs_init() -> Result<()> {
+    let (disk, fs) = empty_volume()?;
+    let broker = open_as(disk.path(), &fs, 1)?;
+    let control = Control::new(config_with_peers(disk.path(), 1, &[]), broker.clone())?;
+    control.reopen(false).await?;
+    assert!(broker.group(METADATA).is_none(), "no cluster forms without init");
+    assert_eq!(control.broker_report()["metadata_join_pending"], true);
+    authorize(disk.path())?;
+    control.join_metadata().await?;
+    assert_eq!(control.broker_report()["metadata_join_pending"], true, "the start decides");
+    drop(control);
+    let control = Control::new(config_with_peers(disk.path(), 1, &[]), broker.clone())?;
+    control.reopen(false).await?;
+    let group = broker.group(METADATA).expect("init authorizes the new cluster");
+    wait_initialized(&group).await?;
+    broker.close_group(METADATA).await?;
     Ok(())
 }

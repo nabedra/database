@@ -720,9 +720,7 @@ def backup(clusters, temporary, args, evidence):
                 "backup image length, checksum, or committed applied index differs")
     source.kill([1, 2, 3])
 
-    def config(_, settings):
-        settings["initialize_new_cluster"] = False
-    target = make_cluster(clusters, temporary, args, 3, name="target", standby=1, config=config)
+    target = make_cluster(clusters, temporary, args, 3, name="target", standby=1, initialize=False)
     require(target.cluster_id != source.cluster_id, "restore is using the source cluster identity")
     corrupt = bundle_area / "corrupt"
     shutil.copytree(bundle, corrupt)

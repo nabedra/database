@@ -63,7 +63,6 @@ def create_fixture(args, directory):
             "public_bind": "0.0.0.0:8080",
             "peer_bind": "0.0.0.0:8081",
             "allow_plaintext": True,
-            "initialize_new_cluster": broker == 1,
             "peer_token": peer_token,
             "bootstrap": bootstrap,
             "keyring": keyring,
