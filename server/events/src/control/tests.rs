@@ -542,3 +542,26 @@ async fn events_1_s1_single_broker_needs_init() -> Result<()> {
     broker.close_group(METADATA).await?;
     Ok(())
 }
+
+/// Review S2 of #176 (land-events scratch test): a crash between the initialization and
+/// the marker's removal left `initialize-cluster` for good, and a later loss of the store
+/// would re-form an empty cluster. The next start consumes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_1_s2_marker_left_by_a_crash_after_init_is_consumed_on_restart() -> Result<()> {
+    let (disk, fs) = empty_volume()?;
+    let broker = open_as(disk.path(), &fs, 1)?;
+    authorize(disk.path())?;
+    let control = Control::new(config_with_peers(disk.path(), 1, &[]), broker.clone())?;
+    control.reopen(false).await?;
+    let group = broker.group(METADATA).expect("init forms the cluster");
+    wait_initialized(&group).await?;
+    drop(control);
+    authorize(disk.path())?; // the crash window: initialized, marker not yet removed
+    let control = Control::new(config_with_peers(disk.path(), 1, &[]), broker.clone())?;
+    control.reopen(false).await?;
+    control.join_metadata().await?;
+    let left = disk.path().join(INITIALIZE_CLUSTER).exists();
+    broker.close_group(METADATA).await?;
+    assert!(!left, "the marker outlives the initialized cluster");
+    Ok(())
+}

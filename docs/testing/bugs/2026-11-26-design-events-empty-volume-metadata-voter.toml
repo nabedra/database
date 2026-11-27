@@ -20,6 +20,6 @@ found_date = "2026-11-26"
 lowest_regression = "server/events/src/sim/cluster.rs::wipe_tests::events_1_wiped_follower_cannot_help_a_stale_candidate"
 seed = 11
 why_not_caught = "No check restarts a metadata voter on an empty volume: EV06 is cloud-deferred, the simulator has no metadata group and no check sets SimConfig.wipes, and the plan named no rule that an empty replica must not vote under its old membership."
-invariant_added = "Intended, not met: a broker never votes or counts toward a commit in a group from an empty volume under its old membership; it regains a vote only as a learner promoted by a membership change committed after its re-add."
+invariant_added = "A broker never votes or counts toward a commit in a group from an empty volume under its old membership; it regains a vote only as a learner promoted by a membership change committed after its re-add."
 fix_commits = ["7ba250dc6132ac6d4dc229b193f95ed18f94b7de"]
 revert_patch_ok = false

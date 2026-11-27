@@ -4,7 +4,7 @@
 # clock skew"). The retention cutoff is the leader's wall clock minus the retention (control/operate.rs:474), and
 # events::retain and publish keep the maximum of every cutoff and publish time (partition/events.rs:56-58, 240), so a
 # leader clock that jumps ahead removes retained events early and the jump stays in replicated time.
-# TLC (local, unattested): specs/events-delivery/EventsDelivery.strict.cfg breaks G08_RetentionByPublishTime in 8
+# TLC (local, unattested; the cfg was removed once the bound was decided): EventsDelivery.strict.cfg broke G08_RetentionByPublishTime in 8
 # states: publish e1 at true time 0, the leader's clock jumps one tick ahead, two ticks pass, the retention loop
 # proposes cutoff 1 and removes e1 at true age 2 with a retention of 2. The fix needs a user decision (a stated
 # bound and EVT-G08's wording); EventsDelivery.cfg checks the proposed bound (Variant drift_bound_stated).
@@ -19,6 +19,6 @@ found_date = "2026-11-26"
 lowest_regression = "server/events/src/sim/cluster.rs::wipe_tests::events_2_one_fast_leader_clock_does_not_remove_events_early"
 seed = 17
 why_not_caught = "The plan names no clock bound, EVT-G08 names no tolerance, and the simulator has clock jumps but no retention loop and no G08 checker."
-invariant_added = "Intended, not met: an event is removed no earlier than its publish time plus the retention minus a stated clock bound, in true time, and one fast broker clock cannot advance the replicated retention cutoff or lease clock past that bound."
+invariant_added = "An event is removed no earlier than its publish time plus the retention, in true time, while at most one broker clock of a group is outside the stated bound: one fast clock cannot advance the replicated retention cutoff or lease clock (sim EVT-G08 early-removal check, raft::clock)."
 fix_commits = ["7ba250dc6132ac6d4dc229b193f95ed18f94b7de"]
 revert_patch_ok = false

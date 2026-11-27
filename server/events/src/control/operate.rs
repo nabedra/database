@@ -848,8 +848,14 @@ impl Control {
                         group.initialize(self.initial_addresses()).await?;
                     }
                 }
-                // The volume holds the group, and nothing is left to initialize.
-                Some(group) if !initializer || group.is_initialized() => {}
+                // The volume holds the group, and nothing is left to initialize. A crash
+                // between the initialization and the marker's removal leaves the marker:
+                // consume it here, or a later loss of the store would re-form a cluster.
+                Some(group) if !initializer || group.is_initialized() => {
+                    if self.broker.disk_state(METADATA)?.formed {
+                        self.consume_init_marker()?;
+                    }
+                }
                 // EVENTS-1: this volume does not hold the group, or holds it without the
                 // initial membership. A broker cannot tell a new volume from one that lost
                 // its replica, so the peers decide. Probing them waits for their listeners,
@@ -861,6 +867,16 @@ impl Control {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Removes the one-shot `init` authorization once the metadata group exists.
+    fn consume_init_marker(&self) -> Result<()> {
+        let marker = self.config.data_dir.join(INITIALIZE_CLUSTER);
+        if marker.try_exists()? {
+            std::fs::remove_file(&marker)?;
+            std::fs::File::open(&self.config.data_dir)?.sync_all()?;
         }
         Ok(())
     }
@@ -963,11 +979,7 @@ impl Control {
                     group.initialize(self.initial_addresses()).await?;
                 }
                 if initializer {
-                    let marker = self.config.data_dir.join(INITIALIZE_CLUSTER);
-                    if marker.try_exists()? {
-                        std::fs::remove_file(&marker)?;
-                        std::fs::File::open(&self.config.data_dir)?.sync_all()?;
-                    }
+                    self.consume_init_marker()?;
                 }
                 done();
                 Ok(())
