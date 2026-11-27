@@ -1110,6 +1110,22 @@ pub(super) fn registered_raft_config() -> openraft::Config {
 
 pub(crate) use crate::oltp_replication::raft_config;
 
+/// RANGES-3: the registered timeouts keep the lease read window inside every
+/// voter's vote-refusal window at the stated clock-rate bound (the relation and
+/// its derivation: `oltp_replication::hosted::lease_read_window`).
+#[cfg(test)]
+#[test]
+fn o18_ranges3_registered_lease_window_has_the_drift_margin() {
+    use crate::oltp_replication::hosted::{LEASE_DRIFT_PPM, lease_read_window};
+    let config = registered_raft_config();
+    let lease = u128::from(config.election_timeout_max) * 1_000;
+    let window = lease_read_window(config.election_timeout_max).as_micros();
+    let ppm = u128::from(LEASE_DRIFT_PPM);
+    // Leader slow, voter fast, from the same instant: window / (1 - rho) < lease / (1 + rho).
+    assert!(window * (1_000_000 + ppm) < lease * (1_000_000 - ppm), "{window} us of {lease} us");
+    assert!(config.election_timeout_min <= config.election_timeout_max);
+}
+
 pub(super) fn queue_limits(execution: &ExecutionConfig) -> QueueLimits {
     QueueLimits {
         max_pending_requests: execution.max_pending_requests as usize,

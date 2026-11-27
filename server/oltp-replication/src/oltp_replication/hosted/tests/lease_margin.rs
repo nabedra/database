@@ -32,6 +32,8 @@ fn o18_ranges3_lease_window_is_inside_the_voter_refusal_at_the_drift_bound() {
     assert_eq!(LEASE_DRIFT_PPM, 1_000);
     assert_eq!(LEASE_EPSILON, Duration::from_millis(1));
     assert_eq!(lease_read_window(3_000), Duration::from_millis(2_993));
+    // The simulator's 400 ms timeouts: 400 x 0.998 - 1 = 398.2 ms.
+    assert_eq!(lease_read_window(400), Duration::from_micros(398_200));
     for timeout in [300, 400, 600, 950, 3_000, 4_000, 60_000] {
         assert!(holds(timeout, LEASE_DRIFT_PPM), "{timeout} ms at the bound");
         assert!(holds(timeout, 0), "{timeout} ms without drift");
