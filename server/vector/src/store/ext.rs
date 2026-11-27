@@ -70,14 +70,24 @@ impl Extensions {
         if ext.len() != self.bytes {
             return Err(Error::Internal("an extension of the wrong size"));
         }
-        if self.ram().contains_key(&key) || self.file(&key).contains(&key) {
-            return Err(Error::Internal("a stored extension is stored again"));
+        const AGAIN: Error = Error::Internal("a stored extension is stored again");
+        // The check and the insert into RAM are one hold of the map, so that racing puts of a
+        // key cannot both take RAM and charge the memory twice.
+        let mut ram = self.ram();
+        if ram.contains_key(&key) || self.file(&key).contains(&key) {
+            return Err(AGAIN);
         }
         if self.memory.try_extension(self.bytes as u64) {
-            self.ram().insert(key, ext.into());
+            ram.insert(key, ext.into());
             return Ok(Tier::Ram);
         }
+        // The file refuses a key it holds. A racing put that took RAM meanwhile wins.
+        drop(ram);
         self.file(&key).put(key, ext)?;
+        if self.ram().contains_key(&key) {
+            self.file(&key).release(&key);
+            return Err(AGAIN);
+        }
         Ok(Tier::Nvme)
     }
 
