@@ -283,7 +283,11 @@ impl LocalQueue {
                 q.acknowledge_version(id, record.version, self.member)
                     .map_err(|error| error.protocol())?;
             }
-            let encoded = engine.execute_identified(bytes, fence, pinned).await?;
+            let encoded = if mutation {
+                self.settle_mutation(&engine, bytes, fence, id).await?
+            } else {
+                engine.execute_identified(bytes, fence, pinned).await?
+            };
             if !mutation
                 && engine
                     .storage()
@@ -303,7 +307,16 @@ impl LocalQueue {
             Ok(encoded)
         }
         .await;
-        let encoded = result.unwrap_or_else(|error| super::response::encode_error(Some(id), error));
+        let encoded = match result {
+            Ok(encoded) => encoded,
+            // An unknown mutation outcome is never settled as terminal
+            // `failed`: the publication may have landed, and its receipt would
+            // later read `succeeded` (SCHED-12). The record stays reconciling.
+            Err(error) if error.outcome == Outcome::Unknown && self.record_is_mutation(id) => {
+                return Err(error);
+            }
+            Err(error) => super::response::encode_error(Some(id), error),
+        };
         let mut state = self.state.lock().unwrap();
         let q = state.as_mut().ok_or_else(unavailable)?;
         let record = q
@@ -313,11 +326,94 @@ impl LocalQueue {
             .map_err(|error| error.protocol())?;
         Ok(())
     }
+    /// Execute a mutation until its outcome is definite. Each retry carries
+    /// the same identity and body, so publication finds an earlier attempt's
+    /// durable decision instead of applying twice. While the outcome is
+    /// unknown the record is `reconciling`, as in the distributed runtime.
+    async fn settle_mutation<B: ObjectStore + 'static>(
+        &self,
+        engine: &Engine<B>,
+        bytes: Vec<u8>,
+        fence: CatalogFence,
+        id: Uuid,
+    ) -> Result<EncodedResponse, ProtocolError> {
+        let mut attempts = 0u32;
+        loop {
+            match engine.execute_identified(bytes.clone(), fence, None).await {
+                Err(error) if error.outcome == Outcome::Unknown => {
+                    attempts = attempts.saturating_add(1);
+                    self.mark_reconciling(id);
+                    // A fenced run cannot settle here: keep the record
+                    // reconciling and let a receipt settle it from history.
+                    if attempts >= MAX_LOCAL_SETTLE_ATTEMPTS
+                        || engine
+                            .storage()
+                            .load_cluster_catalog()
+                            .await
+                            .is_ok_and(|loaded| loaded.catalog().fence != Some(fence))
+                    {
+                        return Err(error);
+                    }
+                    let delay = Duration::from_millis(100)
+                        .saturating_mul(1u32 << attempts.saturating_sub(1).min(16))
+                        .min(Duration::from_secs(30));
+                    nabedra_rt::time::sleep(delay).await;
+                }
+                other => return other,
+            }
+        }
+    }
+    fn mark_reconciling(&self, id: Uuid) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(q) = state.as_mut()
+            && q.record(id).is_some_and(|record| {
+                record.accepted
+                    && !record.state.terminal()
+                    && record.state != crate::request_queue::RequestState::Reconciling
+            })
+            && let Ok(record) = q.transition(id, crate::request_queue::RequestState::Reconciling)
+        {
+            let _ = q.acknowledge_version(id, record.version, self.member);
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+    fn record_is_mutation(&self, id: Uuid) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(|q| q.record(id))
+            .is_some_and(|record| {
+                crate::protocol::parse_request(&record.body)
+                    .is_ok_and(|request| request.operation.is_mutation())
+            })
+    }
     fn fail_unsettled(&self, id: Uuid, sequence: u64, retire: bool) {
+        if self.record_is_mutation(id) {
+            // The actor ended before a definite outcome. A mutation may have
+            // published: it stays reconciling until history settles it.
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(q) = state.as_mut()
+                && q.record(id).is_some_and(|record| {
+                    record.sequence == sequence
+                        && record.accepted
+                        && !record.state.terminal()
+                        && record.state != crate::request_queue::RequestState::Reconciling
+                })
+                && let Ok(record) =
+                    q.transition(id, crate::request_queue::RequestState::Reconciling)
+            {
+                let _ = q.acknowledge_version(id, record.version, self.member);
+            }
+        }
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(q) = state.as_mut() {
             if q.record(id).is_some_and(|record| {
-                record.sequence == sequence && record.accepted && !record.state.terminal()
+                record.sequence == sequence
+                    && record.accepted
+                    && !record.state.terminal()
+                    && record.state != crate::request_queue::RequestState::Reconciling
             }) {
                 let encoded = super::response::encode_error(
                     Some(id),
@@ -360,6 +456,9 @@ impl LocalQueue {
             .ok_or_else(unavailable)?
             .lookup(run, id, now());
         match result {
+            Ok(receipt) if receipt.state == crate::request_queue::RequestState::Reconciling => {
+                self.settle_receipt(engine, receipt).await
+            }
             Ok(receipt) => Ok(receipt),
             Err(error)
                 if run != current.run_id || error == crate::request_queue::QueueError::NotFound =>
@@ -400,6 +499,17 @@ impl LocalQueue {
                     });
                 }
                 if run != current.run_id {
+                    // A serve process that outlived a newer run's cold start
+                    // still caches the old fence. It cannot tell an old run
+                    // from the newer one: only a current fence may answer
+                    // `abandoned` (SCHED-11, the local twin of OLAP-2).
+                    if loaded.catalog().fence != Some(current) {
+                        return Err(ProtocolError::new(
+                            ErrorCode::StorageUnavailable,
+                            "this serve process was fenced by a newer run",
+                            Outcome::Unknown,
+                        ));
+                    }
                     return Ok(Receipt {
                         run_id: run,
                         request_id: id,
@@ -412,6 +522,68 @@ impl LocalQueue {
             }
             Err(error) => Err(error.protocol()),
         }
+    }
+    /// A reconciling mutation settles from its durable decision, if any.
+    async fn settle_receipt<B: ObjectStore + 'static>(
+        &self,
+        engine: &Engine<B>,
+        receipt: Receipt,
+    ) -> Result<Receipt, ProtocolError> {
+        let loaded = engine
+            .storage()
+            .load_cluster_catalog()
+            .await
+            .map_err(|_| unavailable())?;
+        let budget = HistoryBudget::new(
+            4096,
+            64 << 20,
+            nabedra_rt::time::now() + Duration::from_secs(30),
+        )
+        .map_err(|_| unavailable())?;
+        let Some(decision) = engine
+            .storage()
+            .lookup_decision_by_id(&loaded, receipt.request_id, budget)
+            .await
+            .map_err(|_| unavailable())?
+        else {
+            return Ok(receipt);
+        };
+        {
+            let mut state = self.state.lock().unwrap();
+            let q = state.as_mut().ok_or_else(unavailable)?;
+            if q.record(receipt.request_id).is_some_and(|record| {
+                record.state == crate::request_queue::RequestState::Reconciling
+                    && crate::node::http::digest(decision.request_body.as_bytes()) == record.digest
+            }) {
+                let record = q
+                    .finish(
+                        receipt.request_id,
+                        decision.response_status,
+                        decision.response_body.as_bytes().to_vec(),
+                        now(),
+                    )
+                    .map_err(|error| error.protocol())?;
+                q.acknowledge_version(receipt.request_id, record.version, self.member)
+                    .map_err(|error| error.protocol())?;
+            }
+        }
+        self.changed.notify_waiters();
+        let value: serde_json::Value =
+            serde_json::from_str(&decision.response_body).map_err(|_| unavailable())?;
+        Ok(Receipt {
+            state: if decision.response_status == 200 {
+                crate::request_queue::RequestState::Succeeded
+            } else {
+                crate::request_queue::RequestState::Failed
+            },
+            result: value.get("data").filter(|v| !v.is_null()).cloned(),
+            error: value
+                .get("error")
+                .map(|v| serde_json::from_value(v.clone()))
+                .transpose()
+                .map_err(|_| unavailable())?,
+            ..receipt
+        })
     }
     pub(super) async fn wait<B: ObjectStore + 'static>(
         &self,
@@ -432,6 +604,17 @@ impl LocalQueue {
                     Outcome::Unknown,
                 ));
             }
+            // A reconciling mutation whose actor ended cannot settle while
+            // this caller waits: answer with the unknown outcome.
+            if receipt.state == crate::request_queue::RequestState::Reconciling
+                && !self.active.lock().unwrap().contains(&record.request_id)
+            {
+                return Err(ProtocolError::new(
+                    ErrorCode::OutcomeUnknown,
+                    "mutation outcome is reconciling; retry the same identity and body",
+                    Outcome::Unknown,
+                ));
+            }
             if receipt.state.terminal() {
                 return Ok(if let Some(e) = receipt.error {
                     super::response::encode_error(Some(record.request_id), e)
@@ -446,6 +629,10 @@ impl LocalQueue {
         self.tasks.clone()
     }
 }
+/// Attempts of one local mutation before its actor leaves it reconciling.
+/// About five minutes at the capped backoff.
+const MAX_LOCAL_SETTLE_ATTEMPTS: u32 = 16;
+
 fn unavailable() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::StorageUnavailable,
@@ -615,6 +802,98 @@ mod tests {
                 .state
                 .terminal()
         );
+        threads.shutdown().await.unwrap();
+    }
+    async fn local_fixture(
+        name: &str,
+    ) -> (
+        Engine<PanicOnce>,
+        Arc<LocalQueue>,
+        CatalogFence,
+        crate::worker_pool::WorkerThreads,
+    ) {
+        let (pool, threads) = crate::worker_pool::WorkerPool::start(
+            std::num::NonZeroUsize::new(1).unwrap(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        let engine = Engine::new(
+            Storage::new(PanicOnce::default(), Namespace::new(name).unwrap()),
+            pool,
+            Default::default(),
+        );
+        let queue = LocalQueue::new(&engine, Default::default(), false, false).unwrap();
+        let fence = queue.initialize(&engine).await.unwrap();
+        (engine, queue, fence, threads)
+    }
+    #[tokio::test]
+    async fn r04_stale_serve_receipt_for_newer_run_is_not_abandoned() {
+        let (engine, queue, fence, threads) = local_fixture("stale-serve/").await;
+        // An old run's request, while this serve still holds the current fence.
+        let old_run = nabedra_rt::ids::uuid_v4();
+        let receipt = queue
+            .receipt(&engine, old_run, nabedra_rt::ids::uuid_v4())
+            .await
+            .unwrap();
+        assert_eq!(receipt.state, crate::request_queue::RequestState::Abandoned);
+        // A newer serve cold-starts and fences the catalog. A client asks this
+        // stale process about a live request of the newer run.
+        let loaded = engine.storage().load_cluster_catalog().await.unwrap();
+        let newer = CatalogFence {
+            run_id: nabedra_rt::ids::uuid_v4(),
+            scheduler_term: fence.scheduler_term + 1,
+        };
+        engine
+            .storage()
+            .fence_cluster_catalog(&loaded, newer, crate::storage::FenceTransition::ColdStart)
+            .await
+            .unwrap();
+        let answer = queue
+            .receipt(&engine, newer.run_id, nabedra_rt::ids::uuid_v4())
+            .await;
+        assert!(
+            matches!(&answer, Err(error) if error.outcome == Outcome::Unknown),
+            "a fenced serve must not answer abandoned: {answer:?}"
+        );
+        threads.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn t04_u01_local_unknown_mutation_stays_reconciling() {
+        let (engine, queue, fence, threads) = local_fixture("local-unknown/").await;
+        let id = nabedra_rt::ids::uuid_v4();
+        let body = serde_json::to_vec(&serde_json::json!({"request_id":id,"operation":"table.drop","payload":{"table_id":nabedra_rt::ids::uuid_v4()}})).unwrap();
+        // The mutation started and its actor ended before a definite outcome,
+        // as after a lost catalog CAS reply.
+        let sequence = {
+            let mut state = queue.state.lock().unwrap();
+            let q = state.as_mut().unwrap();
+            let proposal = q.propose(body, 0).unwrap();
+            let accepted = q
+                .acknowledge_version(id, proposal.version, queue.member)
+                .unwrap();
+            let running = q.start(id, None).unwrap();
+            q.acknowledge_version(id, running.version, queue.member)
+                .unwrap();
+            accepted.sequence
+        };
+        queue.active.lock().unwrap().insert(id);
+        drop(ActiveLocalRequest {
+            owner: queue.clone(),
+            id,
+            sequence,
+            _charge: engine
+                .worker_pool()
+                .scheduler()
+                .charge_memory(0, 1)
+                .unwrap(),
+        });
+        let receipt = queue.receipt(&engine, fence.run_id, id).await.unwrap();
+        assert_eq!(
+            receipt.state,
+            crate::request_queue::RequestState::Reconciling,
+            "an unknown mutation must not settle as terminal failed"
+        );
+        assert!(queue.active.lock().unwrap().is_empty());
         threads.shutdown().await.unwrap();
     }
     #[tokio::test]
