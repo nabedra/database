@@ -116,7 +116,7 @@ impl<B: ObjectStore + 'static> Engine<B> {
             nabedra_rt::time::now() + Duration::from_secs(60),
         )
         .map_err(|_| unavailable())?;
-        for _ in 0..3 {
+        for attempt in 1..=3u32 {
             let loaded = if mutation {
                 self.storage()
                     .load_cluster_catalog()
@@ -245,6 +245,10 @@ impl<B: ObjectStore + 'static> Engine<B> {
                 }
                 PublicationOutcome::Unknown => return Err(unavailable()),
                 PublicationOutcome::NeedsRecompute => {}
+            }
+            // OLAP-9: CAS losers that lost together must not retry together.
+            if mutation && attempt < 3 {
+                nabedra_rt::time::sleep(crate::storage::cas_retry_delay(attempt)).await;
             }
         }
         Err(unavailable())

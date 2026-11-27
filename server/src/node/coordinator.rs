@@ -448,7 +448,7 @@ async fn execute_inner(
     let is_mutation = request.operation.is_mutation();
     let deadline = nabedra_rt::time::now() + Duration::from_secs(60);
     let budget = HistoryBudget::new(4096, 64 * 1024 * 1024, deadline).map_err(|_| unavailable())?;
-    for _ in 0..3 {
+    for attempt in 1..=3u32 {
         let storage = peers.data.storage();
         let original = bytes.clone();
         let id = request.request_id;
@@ -643,6 +643,10 @@ async fn execute_inner(
             .command(Command::ClearStaged)
             .await
             .map_err(|_| unavailable())?;
+        // OLAP-9: CAS losers that lost together must not retry together.
+        if attempt < 3 {
+            nabedra_rt::time::sleep(crate::storage::cas_retry_delay(attempt)).await;
+        }
     }
     Err(ProtocolError::new(
         ErrorCode::OutcomeUnknown,
