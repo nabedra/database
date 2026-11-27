@@ -1,0 +1,29 @@
+# Trace validation of the journal's group commit against specs/lsm/Lsm.tla: eight seeded runs
+# of server/kv/tests/lsm_trace.rs (two writers, two keys, synced and unsynced commits on one
+# simulated store) write nabedra.trace/1 traces that TLC must accept against
+# specs/lsm/LsmTrace.tla, and mutated copies of two of them (a publish that claims durability
+# before a sync, a sync swapped before the write it covers, a group written without its
+# submission) that it must reject at the line each name gives. The run has no roll, flush,
+# compaction or fault, so it checks the group commit only: no product guarantee is claimed.
+id = "lsm-lsm-trace"
+module = "lsm"
+kinds = ["T"]
+guarantees = []
+scenarios = []
+tiers = ["T1"]
+command = ["bash", "-euc", '''
+traces="$PWD/target/lsm-lsm-trace"
+rm -rf "$traces"
+export NABEDRA_TRACE_DIR="$traces"
+export RUSTFLAGS="--cfg tokio_unstable"
+export CARGO_TARGET_DIR="$PWD/server/target/sim"
+cargo test --locked -p nabedra-kv --features sim --manifest-path server/Cargo.toml --test lsm_trace
+# A run without its traces must not pass on the rejections alone.
+test "$(find "$traces/accepted" -name "Lsm-*.ndjson" | wc -l)" -eq 8
+test "$(find "$traces/rejected" -name "Lsm-*.ndjson" | wc -l)" -ge 4
+exec python3 scripts/testing/tla_trace.py check specs/lsm Lsm "$traces/accepted" --expect-rejected "$traces/rejected" --module lsm
+''']
+cwd = "."
+timeout_s = 2400
+needs = ["tlc"]
+result_parser = "tlc"

@@ -148,3 +148,275 @@ The server can hide query time while the GPU works. Network transfer, CPU decodi
 - **ST06.** Compare depth 0, 1, and 2 on identical snapshots and simulated training intervals, then on representative multi-GPU training. Measure first-batch latency, p50/p95/p99 steady-state `next()` wait, GPU input idle time, samples/sec, per-rank skew, scanned bytes per emitted row, cache hits, network and host-to-device time, worker RSS and charged bytes, and contention with ordinary queries. Include fast and slow consumers, variable row width, selective filters, and storage jitter. Follow the warm-up, repetitions, and provenance rules in [the scheduler test contract](../docs/testing/scheduler-contract.md). Promote depth two only where measured GPU savings justify extra server memory and ordinary queries still make progress.
 
 Current OLAP storage limits include 100,000 rows and 64 MiB decoded payload per table, plus a 1 MiB catalog. This first scan implementation can exceed the existing `collect()` response row limit by delivering multiple batches. Production training on larger datasets also needs a separate OLAP storage change to remove whole-table caps with bounded, versioned manifests, or a later stream over a versioned set of tables. Keep per-batch, partition, and worker resource limits in either design. Require a dataset larger than the current table limits and larger than a worker's RAM before claiming large-dataset support.
+
+---
+
+## Design review
+
+Reviewed as a shipped design (2026-11-24). Two TLA+ specs in `specs/olap-stream/`: `OlapStream` models the data
+protocol (demand, checkpoint, replay, takeover, cold start, table commits), and `join/OlapStreamJoin` models joins
+and the join seal. The interface between them is one invariant: every ready worker holds every replied stream entry.
+`OlapStream` assumes it across fixed membership, and `OlapStreamJoin` proves it across joins.
+
+### Guarantees
+
+| Guarantee | Properties (spec) | Notes |
+| --- | --- | --- |
+| OLAP-STR-G01 | `G01_OracleOrder`, `G01_FreshPin`; batch content through `G03_ReplyMatchesOracle` | A batch is a pure function of the pinned catalog version and the cursor. Sharded ranges, filters, byte limits, Arrow encoding and byte compatibility are not modelled (pure computation or client encoding; the sim and unit checks cover them). |
+| OLAP-STR-G02 | `G02_OneHandle` | The body conflict rule is not modelled: the digest comparison is pure, and the same request ID is serialised by the coordinator. |
+| OLAP-STR-G03 | `G03_ReplyMatchesOracle`, `G03_AckFence` | Replay identity holds because content is deterministic. Byte-level encoding differences across versions are not modelled. |
+| OLAP-STR-G04 | `G04_ReplyImpliesReplicated`, `G04_NoSpuriousFailure`, `G04_HoldersAgree`, `G04_HolderMonotone`, `Termination`; `G04_ReadyHoldsReplied`, `G04_ServingIsCurrent`, `JoinProgress` in the join spec | The L2 guarantee. |
+| OLAP-STR-G05 | `G05_OldRunNeverServed` | Run and handle checks on every request, and a cold start. |
+| OLAP-STR-G06 | `G06_NoRescan` | Cursor level only. File-level and prefetch rescans stay with the sim counter. |
+
+Not modelled: idle and absolute expiry, close, output slots and memory caps (timing or resources), shared snapshots
+and shards (pure row-range arithmetic), table drop or recreate, prefetch, and reclamation of pinned files. No OLAP
+code in this repository deletes table objects today, so pin lifetime has nothing to race, but the plan states the
+rule without naming a reclaimer. Legacy peers without the stream route are also out of scope: while any ready peer
+is legacy, streams are unavailable, so no protocol step changes.
+
+### Topology
+
+```text
+ ORM client --HTTP--> API node (forwards) --signed HTTP--> scheduler owner (stream coordinator)
+                                                               |  StreamInstall (sequential transfers)
+                                                               v
+                                        every ready worker (RAM copy of each stream entry)
+ control root, catalog fence (run, term, scheduler, ready set), OLAP table catalog: object store (durable)
+```
+
+| Channel or store | Modelled faults | Out of scope |
+| --- | --- | --- |
+| Client to coordinator and back | Loss, duplication, delay, reordering. A retry racing its reply is duplication. | Truncated bodies: the ORM accepts only a complete frame (client encoding) |
+| Coordinator to holders (StreamInstall) | Loss, delayed delivery after the coordinator gave up, duplication, reordering, transfer to a subset of holders | Corrupted entries (checksums) |
+| Workers (RAM) | Crash (empty registry), a coordinator crash after a subset of transfers, partition of one worker, return only through a join | Byzantine workers |
+| Control root and catalog | Durable and atomic. A takeover (new term) and a join publication (CAS) are single steps. | Object-store inconsistency |
+| Join | Seal expiry (30 s), a joiner crash during the join, publication after the seal | Slow copies inside the join |
+
+Faults left out: clock drift (timers are events here and nothing depends on their values), storage faults on GET (a
+failed scan sends no reply and the client retries), and table drop or recreate.
+
+### Spec
+
+| | Value |
+| --- | --- |
+| Specs | `specs/olap-stream/OlapStream.tla` (data protocol), `specs/olap-stream/join/OlapStreamJoin.tla` (joins) |
+| T1 bounds, data protocol | 3 workers, 2 concurrent clients (the second only opens), `batch_rows` 2, table versions of 2 and 3 rows, 1 crash, 1 message loss, 1 duplicate, 1 delayed transfer, 1 partition, 1 concurrent table commit. A coordinator crash mid-commit takes the crash budget. |
+| T1 liveness, data protocol | `OlapStream.live.cfg`: 2 workers, 1 client, no symmetry (deviation, see below) |
+| T1 bounds, joins | 3 workers, 2 request IDs, 1 crash, 1 partition, 1 seal expiry, 1 partial commit. Liveness at the same bounds without symmetry. |
+| Symmetry | Nodes, and request IDs in the join spec, in safety runs only. Not in any liveness run. |
+| State constraints | None. Every run is finite because every fault has a finite budget. |
+| Fairness | Weak fairness on the ORM's retry timer, the coordinator's handlers and transfers, delivery of in-flight transfers, the operator's cold start, and partition healing (join spec). Strong fairness on the join's readiness publication: the provider retries the join loop. Each is named next to its mechanism in the spec. Election and recovery are inside the loss step. |
+| T checks | `olap-stream-olap-stream`, `olap-stream-olap-stream-join`, `olap-stream-olap-stream-long` (T2, exhaustive with a 5-hour budget), `olap-stream-olap-stream-large` (T2, simulation) |
+
+Abstractions, stated in the specs:
+
+- A1. A commit is one step. `WorkerDriver::commit` holds `lock_stream_changes` across the local install, every
+  transfer and the final authority recheck, so the only outcomes are "every ready peer installed and the reply was
+  sent" or "a subset installed and no reply" (`CommitPartial`, `CrashMidCommit`). Undelivered transfers stay in
+  flight and can land later (`DeliverInstall`).
+- A2. The reply is folded into the step that sends it. The ORM's next request still travels through `reqs`, where it
+  can be lost, duplicated, reordered or delayed.
+- A3. A lost worker, the election of the next scheduler and stream recovery by that scheduler are one step
+  (`Settle`). The time while a lost worker is still listed as ready adds only unreplied partial commits.
+- A4. Membership in `OlapStream` only shrinks, except in a cold start. Joins are in `OlapStreamJoin`.
+- A5. Streams are independent. They share only membership, the atomic commit and the handle counter. One full
+  stream plus one client that only opens covers two streams, since every property is per handle or per key.
+- J1 to J3 in `OlapStreamJoin`: versions stand in for entries, a commit is one step, and recovery is eager on a loss
+  and lazy after a join, as in the code.
+
+Reduced bounds, for reviewer approval: the liveness run of the data protocol uses 2 workers and 1 client, because
+the exhaustive temporal check at the safety bounds does not fit the 15-minute budget. Safety and the join liveness
+use the L2 minimums. The safety baseline at the L2 minimums (`OlapStream.cfg`) does not finish within the 15-minute
+T1 budget either (re-checked 2026-11-26: stopped with about 2M states on the queue), so the T1 check reports it
+`not-run`, and the T2 check `olap-stream-olap-stream-long` runs it exhaustively with a 5-hour budget. Neither bound is
+cut: the open work is an abstraction or an Apalache run that fits T1.
+
+### Results
+
+Re-checked against main e6b4040b on 2026-11-26 (wave rv, task rv-olap); the code locations above still hold. TLC
+v1.8.0, pinned image.
+
+| Run | Result | Distinct states | Depth |
+| --- | --- | --- | --- |
+| `OlapStream.cfg` (3 workers, 2 clients), Actions run 45800777105 at 0f075ab3 | not-run: stopped at the 900 s budget, 1,985,088 states left on the queue | | |
+| `OlapStream.live` (2 workers, 1 client, all faults), Actions run 45800777105 | pass, safety and liveness, exhaustive | 210,676 | 16 |
+| `OlapStreamJoin.cfg` (plan rule), Actions run 45805193196 at b46b0e5c | pass, exhaustive | 18,401 | 14 |
+| `OlapStreamJoin.fanout.cfg` (candidate fix), same run | pass, exhaustive | 18,001 | 14 |
+| `OlapStreamJoin.repair.cfg` (candidate fix), same run | pass, exhaustive | 23,421 | 14 |
+| `OlapStreamJoin.live.cfg`, same run | pass, exhaustive | 192,840 | 14 |
+| `OlapStream` with a 5-hour budget (`olap-stream-olap-stream-long`) | pending | | |
+
+Every mutant of both specs was caught on its expected property in run 45800777105, except `no_client_retry`, which
+deadlocked before its liveness check with several TLC workers (and `seal_never_released` the same way in the join
+spec). Both now run without deadlock checking; the join spec's mutants all pass in run 45805193196.
+
+### Mutants
+
+Every property has a mutant. Counterexample lengths are in states. Local, unattested until the T check runs.
+
+| Property | Mutant | Length |
+| --- | --- | --- |
+| `G01_OracleOrder` | `scan_latest_catalog` | 5 |
+| `G01_FreshPin` | `stale_capture` | 4 |
+| `G02_OneHandle` | `reopen_new_handle` (planted bug `ReplayNewHandle`) | 5 |
+| `G03_ReplyMatchesOracle` | `checkpoint_prev_sequence` (planted bug `GapAfterKill`) | 6 |
+| `G03_AckFence` | `replay_acked_from_history` | 6 |
+| `G04_ReplyImpliesReplicated` | `reply_before_replicate` | 3 |
+| `G04_NoSpuriousFailure` | `reply_before_replicate_visible` | 5 |
+| `G04_HolderMonotone` | `install_last_writer_wins` | 6 |
+| `G04_HoldersAgree` | `install_last_writer_wins_agree` (3 workers) | 6 |
+| `G05_OldRunNeverServed` | `no_run_check` | 6 |
+| `G06_NoRescan` | `rescan_from_first` (planted bug `RescanOnReconnect`) | 5 |
+| `Termination` | `no_client_retry` | 4 (lasso) |
+| `G04_ReadyHoldsReplied` (join) | `prefix_join_seal_expiry` (the shipped code) | 5 |
+| `G04_ServingIsCurrent` (join) | `prefix_join_seal_expiry_serving` | 6 |
+| `JoinProgress` (join) | `seal_never_released` | 4 (lasso) |
+
+Recovery that keeps the coordinator's own copy instead of merging is not distinguishable here: every ready worker
+already holds every replied entry, so the merge matters only for unreplied entries, which the ORM's retry rebuilds
+deterministically. This is an equivalent mutant, not a weaker property.
+
+### Counterexamples
+
+One design finding. It is a code bug against the plan's join rule, and a plan gap.
+
+**F1, a stream joiner can turn ready without the latest stream entry.** Record
+`docs/testing/bugs/2026-11-24-design-stream-join-seal-expiry.toml`. `Command::Join` copies the stream registry to a
+joiner under `lock_stream_changes` and keeps the lock as a 30 s seal (`retain_seal`). The controller publishes
+readiness later without checking that the seal is still live (`server/src/cluster/runtime.rs`, publish then a
+failing `Unseal`). If the seal expires first, commits resume without the joiner, and the joiner then becomes ready
+with an older entry. Stream recovery is lazy, so nothing repairs the joiner until the next stream request. In the
+join spec, the shipped publication (`prefix_join_seal_expiry`) violates `G04_ReadyHoldsReplied` in 5 states:
+
+1. `JoinCopy(n2)`: the scheduler n1 copies its registry to the joiner n2 and holds the seal.
+2. `SealExpire`: the 30 s deadline passes.
+3. `Commit(n1, k1)`: n1 commits a new entry for key k1. n2 is not Ready, so the fan-out does not include it.
+4. `PublishReady(n2)`: the controller publishes n2 as Ready. n2 does not hold the replied entry.
+
+Once the current holders fail, the next demand is answered from n2's older copy. The trace is visible to a
+client: with one ready worker and a second joining, the seal expires, an open commits on the first worker and is
+replied, the second turns ready, the first crashes, and the client's demand gets `stream_expired` within the same
+run. An earlier version of the data-protocol spec, which included joins, found this in 15 states with
+`G04_NoSpuriousFailure`. A joiner that already holds an earlier checkpoint would answer with `conflict` instead.
+
+The plan's rule ("copy before readiness", R03) forbids this. The plan is silent on commits that race the copy.
+Candidate fixes, all checked in `OlapStreamJoin` and all passing: (a) publication must not succeed after the seal
+expired, as the plan requires (`Variant = "plan"`); (b) commits also go to workers that hold a Join copy
+(`fanout_joiner`); (c) publication re-copies the joiner from the scheduler (`repair_publish`). The fix is a code
+change with no public contract. The reverted fix is the mutant `prefix_join_seal_expiry`.
+
+### Cost
+
+Counted from the spec's actions. The plan gives no RPC, fsync or round-trip targets, so this is a baseline for
+`scripts/testing/ab.py`.
+
+| Operation | Round trips and transfers | Authority reads | Fsyncs |
+| --- | --- | --- | --- |
+| Open or reopen | 1 client request; 1 StreamInstall and acknowledgement per other ready worker | 2 fence reads per commit (before and after the transfers) | 0 |
+| Demand, first delivery | 1 client request, the same transfers | 2 | 0 |
+| Demand, replay in the same term | 1 client request, the same transfers of the same entry | 2 | 0 |
+| Takeover | 1 recovery page per ready peer, then 1 repair transfer per ready peer | 1 | 0 |
+| Join | 1 copy per entry under the seal, then 1 readiness CAS | 1 | 0 |
+
+The batch work (one scan step and its GETs) is per demand and is not counted as protocol messages. The plan's
+400 MiB output budget is a resource bound that no spec action counts.
+
+### Independent read
+
+The read (`wave-dr/reads/olap-stream.md`) lists 17 scenarios. Encoding:
+
+| Read ID | Encoding |
+| --- | --- |
+| R-01 | `DriverCommit`, `CommitPartial`, `CrashMidCommit`; `reply_before_replicate`; `G04_ReplyImpliesReplicated` |
+| R-02 | `CommitPartial` with a delayed transfer, then a takeover and `DeliverInstall` under the sender, term and version fence; `G04_HolderMonotone`; `install_last_writer_wins` |
+| R-03 | `OlapStreamJoin`; `prefix_join_seal_expiry` (finding F1) |
+| R-04 | `Settle` merges the highest version and repairs every ready holder; keeping a lower copy is an equivalent mutant (see Mutants) |
+| R-05 | Not modelled: byte-level encoding across versions. Replay identity is content identity. |
+| R-06 | Not modelled as a separate outcome: retryable errors commit nothing, and non-retryable errors are committed like batches in the code but the spec has no error frame. A gap. |
+| R-07 | A stale demand (duplicate or delayed) processed after the client advanced; `G03_AckFence` |
+| R-08 | Covered by A1 and A3: a takeover cannot fall inside a commit; `CrashMidCommit` covers the crash cut; recovery takes the highest version |
+| R-09 | `ColdStart`, `G05_OldRunNeverServed`, `no_run_check` |
+| R-10 | `G02_OneHandle` for the same ID; the body conflict is not modelled (pure comparison) |
+| R-11, R-12, R-16 | Not modelled: shared snapshots, pin lifetime and shard arithmetic |
+| R-13, R-14 | Prefetch is not modelled; `G06_NoRescan` covers the cursor, and the sim's file counter covers files |
+| R-15 | The checkpoint is one tuple (sequence, cursor before, cursor after, outcome); `checkpoint_prev_sequence` |
+| R-17 | Not modelled: the ORM accepts only complete frames (client encoding) |
+
+Gaps: the terminal-error frame (R-06), byte-level replay across mixed versions (R-05), reclamation of pinned files
+(R-11, R-12), and the trace corpus. No simulation workload emits traces yet, and none exercises `distributed.rs`, so
+no `-trace` check exists. The draft trace spec used the trace helpers that the tooling has since removed, so it is
+not carried over; the first implementation change on the stream protocol writes it against `TraceStep` and adds
+trace output. The mapping is in the review wave's `sim-mapping/olap-stream.md`.
+
+Performance (review 2026-11-26): every stream batch in the cluster is committed by the scheduler under one lock per
+worker, with a sequential transfer to every other ready worker and about four control-root and catalog reads on the
+scheduler plus two per holder, so the cluster's stream throughput falls as workers are added (finding OLAPS-2). A
+join stalls admission and every stream commit for the whole copy (OLAPS-3). Neither changes the protocol steps above.
+
+Simulation coverage of the same design stays partial: the in-process workload has one worker registry, so it cannot
+reproduce F1 or any transfer loss.
+
+### Fenced join implementation and rollout
+
+The join lock covers both stream replicas and accepted queue records. Copy them at an exact
+control-root base identified by cluster, revision and change ID. The controller submits readiness
+with the captured backend Match token. Worker timeout, transport timeout and a controller crash
+cannot invalidate the token. The coordinator keeps the join seal until a fresh storage observation
+shows a strictly newer root from the same cluster. If publication is ambiguous and the root is
+still the base, the controller races it with a metadata-only conditional renewal on that base
+using a new change ID. Either conditional can win. Both outcomes invalidate the old Match.
+Subsequent controller acquisition also advances the root. If a read or competing write remains
+ambiguous, preserve the seal and retry observation. An elapsed time alone releases only the
+separate drain seal.
+
+The coordinator refreshes the ready members from the successor and confirms its own authority
+before reopening work. If the coordinator changed, the previous one can retire its seal after it
+observes the successor. The new coordinator uses the existing recovery procedure before admitting
+operations. Commands that waited behind a seal must re-read authority before mutating the queue or
+stream state. A published join must use the exact candidate corresponding to the copied worker
+incarnation and session. A failed join retries the copy with a new observation.
+
+The following sequence supports rolling workers and APIs that share the existing root format:
+
+1. Roll workers through the existing handoff while the old API is still active. Before activating
+   the new protocol, ensure the coordinator and workers eligible to take over can handle the
+   fenced join command. A new API uses a distinct signed join command and accepts a fenced reply
+   only. An old worker rejects the distinct command, so joins pause if it is coordinator.
+2. Quiesce admissions and legacy joins before transferring controller ownership. Stop every legacy
+   controller incarnation eligible to reacquire control. The new controller's acquisition must
+   advance the control root by Match before it enables fenced joins. It must observe the root that
+   won, because a pending legacy readiness write can race acquisition. Verify the current ready
+   copy set and repair its queue and stream state from surviving current holders before resuming
+   admitted work. If that state cannot be recovered, leave admission closed and use the existing
+   recovery procedure.
+3. Resume under the new API. Keep the old join command for workers talking to an old API before
+   activation. Return to a legacy controller only from a stopped, fenced deployment through an
+   explicit recovery procedure. Running old controllers may not compete for ownership after
+   activation.
+
+This adds an internal command discriminant and binds the reply to the captured base. It needs no
+extra round trip for a successful join or on ordinary client traffic. Resolution of an ambiguous
+join can add a control read and conditional metadata write. ST04 and R03 cover stream and queue
+continuity. The runtime regression must delay readiness at the object store, roll the seal clock
+past its deadline, and hold admissions until either readiness or a competing CAS resolves. Resume
+the old write after the competing CAS and assert a conditional conflict. Also test the case where
+readiness wins and the controller loses the reply. The joiner must have the accepted request and
+stream copies before the coordinator reopens either path.
+
+The rollout refinement is `specs/olap-stream/join/rollout/OlapJoinRollout.tla`. It covers one
+coordinator, a ready peer, a joiner, mixed-version coordination, the controller activation fence
+and an ambiguous readiness write. Its initial committed prefix is recoverable. Worker crash and
+controller takeover after activation are covered by `OlapJoinFence`. Eventual coordinator upgrade
+follows the operator's rollout, and the controller drives conditional resolution and retry.
+Local TLC completed both safety and liveness over 570 distinct states at depth 16, with 14 covered
+actions and minimum coverage 12. Mutant traces have 8 states for legacy fallback, 7 for a reused
+activation base, 4 for a legacy controller returning, and a 7-state lasso for missing coordinator
+upgrade. The `olap-join-rollout` check is pending attestation on this revision.
+**Runtime coverage boundary.** The focused regression exercises the worker's two local guards and
+both conditional write winners independently. Lost-reply end-to-end admission, deployed mixed
+binaries and simulator replay still require an integrated fixture. Delayed receiver-side copy RPCs
+are a separate candidate: a legacy-shaped Bootstrap or StreamReset may authenticate against its
+old root and wait before applying. Verify whether an old copy can erase newer data across a join
+retry, including on an already-ready target. A future fix should bind destructive copy steps to
+the copy generation at the receiver without adding control reads to successful ordinary operations.

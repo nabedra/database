@@ -453,6 +453,8 @@ fn storage_pauses_and_clock_freezes_are_logged() {
             r#""action":"StoragePaused","vars":{},"msg":{"op":"SyncData","path":"/data/log","side":"after"}}"#,
             r#""action":"StorageResumed","vars":{}}"#,
             r#""action":"ClockFrozen","vars":{}}"#,
+            // The thaw that ends the freeze is logged too.
+            r#""action":"Thaw","vars":{}}"#,
         ]
     );
 }

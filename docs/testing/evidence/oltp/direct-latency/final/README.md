@@ -61,7 +61,7 @@ The queued snapshot between phases keeps `w1` busy when the next phase starts. I
 
 | System | Binary | Notes |
 | --- | --- | --- |
-| Candidate | `nabedra-db-5eb80fb`, SHA-256 `f2a27de0…55ea6c`, `nabedra-db 0.1.1 oltp` | `[ci bench]` job of [run 44878990620](https://github.com/zPy52/nabedra-database/actions/runs/44878990620), `rust:1.94.1-bookworm`, glibc 2.36, built in 390 s; `--direct-oltp on` and `off` |
+| Candidate | `nabedra-db-5eb80fb`, SHA-256 `f2a27de0…55ea6c`, `nabedra-db 0.1.1 oltp` | `[ci bench]` job of [run 44878990620](https://github.com/nabedra/database/actions/runs/44878990620), `rust:1.94.1-bookworm`, glibc 2.36, built in 390 s; `--direct-oltp on` and `off` |
 | Main (PR #20) | `nabedra-db-c74c2d4`, SHA-256 `bf370a7e…2015ac2` | OLTP sources equal `1ea4622`, which is main `ec0dd55` apart from Events; ORM tree of `c74c2d4` (CLI 0.2.1); `--direct-oltp on` |
 | Baseline | `nabedra-db-b29a178`, SHA-256 `953a35f3…e1012e` | `--pool-format-version 1`, the `b29a178` Python ORM tree |
 | ScyllaDB | `scylladb/scylla:6.2.3@sha256:a9d90408…` | RF3, QUORUM, `--commitlog-sync=batch`, `--smp=1`, `--memory=1700M`, driver 3.29.13 |

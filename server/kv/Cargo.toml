@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94.1"
 description = "Nabedra's in-tree storage engine: an LSM with a group-committed journal"
 license = "MIT"
-repository = "https://github.com/zPy52/nabedra-database"
+repository = "https://github.com/nabedra/database"
 publish = ["crates-io"]
 
 [features]

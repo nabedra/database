@@ -8,9 +8,9 @@ evidence file.
 Several failures share a fix commit.
 
 [OLTP test evidence]: ../oltp-evidence.md
-[#27]: https://github.com/zPy52/nabedra-database/pull/27
-[#23]: https://github.com/zPy52/nabedra-database/pull/23
-[#20]: https://github.com/zPy52/nabedra-database/pull/20
+[#27]: https://github.com/nabedra/database/pull/27
+[#23]: https://github.com/nabedra/database/pull/23
+[#20]: https://github.com/nabedra/database/pull/20
 
 ## Schema
 

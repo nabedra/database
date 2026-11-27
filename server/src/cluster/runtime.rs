@@ -7,7 +7,9 @@ use super::{
     },
     heartbeat::{HeartbeatBinding, Observations, load_heartbeat},
     member::{Node, NodeState, Registration},
-    membership::{ReadinessInput, RegistrationPlan, ready_candidate, registration_plan},
+    membership::{
+        ReadinessInput, RegistrationPlan, fence_readiness, ready_candidate, registration_plan,
+    },
     startup_material::composition::prepare_api,
     state::{Config, Control, Controller, LeaseState, Policy, PolicyMode, Provisioning, Scheduler},
     store::{LoadedControl, OwnershipOutcome, PreparedMembership},
@@ -319,6 +321,19 @@ impl Api {
             _ => Err(unavailable()),
         }
     }
+    async fn abort_readiness(&self, loaded: LoadedControl, owner: Owner) {
+        let root = loaded.root().clone();
+        let abort = cpu(&self.pool, move |_| {
+            fence_readiness(&root, owner, ids::uuid_v4()).map_err(|_| unavailable())
+        })
+        .await;
+        if let Ok(abort) = abort {
+            // Match the exact old token. If readiness already won, this
+            // loses. The worker observes whichever root won.
+            let _ = self.publish(loaded, abort).await;
+        }
+    }
+
     async fn enroll(&self, bytes: Vec<u8>) -> Result<Vec<u8>> {
         let proof = cpu(&self.pool, move |_| {
             auth::verify_enrollment(&bytes).map_err(|_| failure(ErrorCode::Unauthorized))
@@ -422,67 +437,64 @@ impl Api {
             .check(sample())
             .map_err(|_| unavailable())?;
         let root = loaded.root().clone();
-        let join = if let Ok(scheduler) = crate::node::queue_runtime::scheduler(&root) {
-            let bytes = serde_json::to_vec(&crate::node::queue_runtime::Command::Join {
-                node_id: node.node_id,
-            })
-            .map_err(|_| invalid())?;
-            let result = crate::node::queue_transport::exchange(
-                &self.client,
-                &self.signer,
-                &root,
-                scheduler,
-                bytes,
-            )
-            .await?;
-            match serde_json::from_slice::<crate::node::queue_runtime::Reply>(&result)
-                .map_err(|_| invalid())?
-            {
-                crate::node::queue_runtime::Reply::Joined { token } => {
-                    Some((scheduler.clone(), token))
-                }
-                crate::node::queue_runtime::Reply::Error { error } => return Err(error),
-                _ => return Err(invalid()),
-            }
-        } else {
-            None
-        };
+        use crate::node::queue_runtime::{Command, JoinBase, Reply, scheduler};
+        let node_id = node.node_id;
         let observation = reply.observation().clone();
-        let candidate = cpu(&self.pool, move |_| {
-            let input = ReadinessInput {
-                cluster_id: root.cluster_id,
-                member: node,
-                observation,
-                challenge,
-                verified_challenge: challenge,
-                initialized: true,
-            };
-            ready_candidate(&root, owner, &input, ids::uuid_v4()).map_err(|_| unavailable())
+        let candidate = cpu(&self.pool, {
+            let root = root.clone();
+            move |_| {
+                let input = ReadinessInput {
+                    cluster_id: root.cluster_id,
+                    member: node,
+                    observation,
+                    challenge,
+                    verified_challenge: challenge,
+                    initialized: true,
+                };
+                ready_candidate(&root, owner, &input, ids::uuid_v4()).map_err(|_| unavailable())
+            }
         })
         .await?;
-        let publication = self.publish(loaded, candidate).await;
-        if publication.is_ok() {
-            self.ensure_catalog_fence(owner).await?;
-        }
-        if let Some((scheduler, token)) = join {
-            let current = self.load().await?;
-            let bytes = serde_json::to_vec(&crate::node::queue_runtime::Command::Unseal { token })
-                .map_err(|_| invalid())?;
-            let response = crate::node::queue_transport::exchange(
-                &self.client,
-                &self.signer,
-                current.root(),
-                &scheduler,
-                bytes,
-            )
-            .await?;
-            if let crate::node::queue_runtime::Reply::Error { error } =
-                serde_json::from_slice(&response).map_err(|_| invalid())?
-            {
+
+        let sealed = if let Ok(scheduler) = scheduler(&root) {
+            let base = JoinBase::of(&root);
+            let result = async {
+                let bytes = serde_json::to_vec(&Command::FencedJoin { node_id, base })
+                    .map_err(|_| invalid())?;
+                let result = crate::node::queue_transport::exchange(
+                    &self.client,
+                    &self.signer,
+                    &root,
+                    scheduler,
+                    bytes,
+                )
+                .await?;
+                match serde_json::from_slice::<Reply>(&result).map_err(|_| invalid())? {
+                    Reply::FencedJoined { base: copied } if copied == base => Ok(()),
+                    Reply::Error { error } => Err(error),
+                    // A legacy expiry-based reply cannot authorize readiness.
+                    _ => Err(unavailable()),
+                }
+            }
+            .await;
+            if let Err(error) = result {
+                // A lost reply may hide a sealed copy. Change the old base
+                // even when we did not receive proof of that seal.
+                self.abort_readiness(loaded, owner).await;
                 return Err(error);
             }
+            true
+        } else {
+            false
+        };
+
+        if let Err(error) = self.publish(loaded.clone(), candidate).await {
+            if sealed {
+                self.abort_readiness(loaded, owner).await;
+            }
+            return Err(error);
         }
-        publication?;
+        self.ensure_catalog_fence(owner).await?;
         self.new_run.store(false, Ordering::Release);
         Ok(())
     }

@@ -1,0 +1,15 @@
+# Small design spec of readiness and queue copies of the OLAP cluster's request queue
+# (specs/scheduler/QueueReady.tla). Its mutant prefix_ready_without_join restores the shipped probe,
+# which publishes a joiner Ready without a Join copy when no Ready scheduler exists (finding SCHED-1,
+# docs/testing/bugs/2026-11-26-design-olap-ready-without-queue-copy.toml).
+id = "scheduler-queue-ready"
+module = "scheduler"
+kinds = ["T"]
+guarantees = ["OLAP-G07"]
+scenarios = ["R03"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/scheduler", "QueueReady"]
+cwd = "."
+timeout_s = 1800
+needs = ["tlc"]
+result_parser = "tlc"

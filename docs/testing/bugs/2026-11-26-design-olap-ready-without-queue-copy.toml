@@ -1,0 +1,21 @@
+# Evidence: specs/scheduler/QueueReady.tla (design review, rv-olap, a small model of the shipped probe) and code
+# reading of server/src/cluster/runtime.rs (probe 425-485, observe_losses 489-561, ensure_catalog_fence 196-260) and
+# server/src/node/queue_runtime.rs (scheduler 480-490, refresh_queue 917-941). The window needs the controller's
+# reassignment step to fail or stop after it published the owner's loss. No test or simulator seed reproduces it yet.
+id = "DESIGN-olap-ready-without-queue-copy"
+title = "A joiner is published Ready without a queue copy while no Ready scheduler exists, and can become the owner"
+class = "membership-replacement-trust"
+module = "scheduler"
+guarantees = ["OLAP-G07"]
+scenarios = ["R03"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/scheduler/mutants/prefix_ready_without_join.cfg"
+seed = "unknown"
+why_not_caught = "The join tests always have a Ready scheduler; no test fails the coordinator reassignment after a loss publication and then probes a joiner."
+invariant_added = "G07_ReadyHoldsAccepted: every Ready worker holds every acknowledged request."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"
