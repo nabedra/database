@@ -1,3 +1,15 @@
+# CONTROL-1 (fx-control, 5fc0e978, b18c2d89): BeginOwnerFence no longer answers Busy for a Claimed or Published
+# move; PublishFence cancels a Claimed move, and for a Published one releases ct/replica-move-active and records the
+# new owner as the steward of its retirement (tests/control1.rs, manager/data_factory/placement.rs drives_move).
+# Still open (deferred): a Moving move keeps BeginOwnerFence Busy (specs/oltp/control mutant code_moving_busy,
+# plans/oltp-shard-refactor.md "Ownership and memory"). Needed: (1) a new Control command that turns a Moving move
+# into a rollback owned by the new owner and, on its completion proof, clears the claim, the occupied target node and
+# ct/replica-move-active; (2) runtime membership reconciliation in the placement driver
+# (manager/data_factory/placement.rs): read the group's committed voters, remove the target learner or voter if the
+# configuration without it can still commit (else hand the committed target on the lost worker to damage
+# replacement), release the move's Catalog guard under the new authority, then send the rollback proof. Also open: a
+# Published move whose removed replica was on the lost worker can be retired only by that worker (needs retirement by
+# process exclusion); BeginColdFence is still Busy while any move is active.
 id = "OLTP-sim-move-owner-loss"
 title = "Losing the worker that runs a replica move stops the cluster from dropping it, and a cold start does not end it"
 class = "fence-lifecycle-order"

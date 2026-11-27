@@ -81,7 +81,34 @@ pub struct ReadyPending {
     pub next: Option<ReadyMembership>,
     pub phase: ReadyPhase,
     pub timestamp_fence: Option<ReadyFenceReceipt>,
+    /// OQ-2 (`specs/oltp/queue`, AbortJoinSealed): the transition id of the
+    /// sealed join this removal abandons. Its `expected` is that join's
+    /// fenced `next` view, which was never published, and its `next` is the
+    /// published set under a later revision (the keys of the published
+    /// `ready_generation`). It publishes once the Timestamp group is fenced to
+    /// `next`: the joiner never held a verified queue copy, so there is no
+    /// queue proof. Admissions stay closed while it is pending.
+    pub abandoned_join: Option<Uuid>,
 }
+impl ReadyPending {
+    /// The Timestamp group's ready view while this transition is pending:
+    /// `next` once Control recorded `TimestampFenced`, `expected` before the
+    /// seal. `None` in `AwaitingTimestampFence`, where either is possible
+    /// until the idempotent FenceReady is driven again.
+    #[doc(hidden)]
+    pub fn timestamp_ready(&self) -> Option<ReadyMembership> {
+        match self.phase {
+            ReadyPhase::Building => Some(self.expected),
+            ReadyPhase::AwaitingTimestampFence => None,
+            ReadyPhase::AwaitingQueueProof => self.next,
+        }
+    }
+}
+/// The Control state format (`State::format`). A store or peer of another
+/// format is refused, never read (the wave dropped compatibility, 2026-11-27).
+/// 2: `ReadyPending::abandoned_join`, `FencePending::carried` (OQ-2,
+/// CONTROL-1).
+pub const CONTROL_STATE_FORMAT: u32 = 2;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupBuild {
@@ -116,6 +143,25 @@ pub struct FencePending {
     pub excluded_workers: u64,
     #[serde(default)]
     pub extra_exclusion: Option<WorkerIdentity>,
+    /// OQ-2 and CONTROL-1: the ready-set transition this owner fence
+    /// superseded, rebased on the new owner term. `PublishFence` installs it
+    /// as the pending transition, so the new owner finishes it. `next` is the
+    /// Timestamp group's ready view after the fence (the superseded
+    /// transition's fenced view under the new term); Control publishes
+    /// `expected` under the new term, so a sealed join is never published.
+    pub carried: Option<ReadyPending>,
+}
+impl FencePending {
+    /// The ready view Control publishes with this fence.
+    #[doc(hidden)]
+    pub fn published(&self) -> ReadyMembership {
+        if self.cold {
+            return self.next;
+        }
+        let mut ready = self.expected;
+        ready.view.owner_term = self.next.view.owner_term;
+        ready
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -128,6 +174,9 @@ pub enum Pending {
 #[serde(deny_unknown_fields)]
 #[doc(hidden)]
 pub struct State {
+    /// `CONTROL_STATE_FORMAT`. No default: a state of an older format fails
+    /// to decode.
+    pub format: u32,
     pub policy: Digest,
     pub ready: ReadyMembership,
     pub owner: Option<WorkerIdentity>,

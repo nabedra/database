@@ -5,7 +5,7 @@ use crate::oltp_runtime::authority_fence::{fence_groups, publish_fence, transiti
 use crate::oltp_replication::{
     authority::control::{
         ControlReply, FencePending, InventoryPage, Pending, ReadyChange, ReadyPending,
-        ReadyPhase, ServiceAction,
+        ReadyPhase, ServiceAction, State as ControlState,
     },
     service_rpc::TimestampClient,
 };
@@ -119,12 +119,19 @@ impl WorkerRuntime {
                 {
                     return self.advance_removal(pending).await;
                 }
-                // OQ-2: a join that has not sealed does not stop the probes. If
-                // a member (the owner included) is lost meanwhile, its removal
-                // or the owner fence supersedes the join, which Control allows.
+                // OQ-2 (route 1'): the owner watches the joiner of a sealed join.
                 Pending::Ready(pending)
                     if pending.change == ReadyChange::Join
-                        && pending.phase == ReadyPhase::Building => {}
+                        && pending.phase != ReadyPhase::Building
+                        && state.owner == Some(self.services.local) =>
+                {
+                    return self.supervise_sealed_join(&state, pending).await;
+                }
+                // OQ-2 and CONTROL-1: a pending join or removal does not stop the
+                // probes. If a member (the owner included) is lost meanwhile,
+                // the owner fence supersedes the transition, which Control
+                // allows once the transition's Timestamp fence is settled.
+                Pending::Ready(_) => {}
                 _ => return Ok(()),
             }
         }
@@ -174,6 +181,7 @@ impl WorkerRuntime {
                     PeerReachability::Unreachable => {}
                 }
                 if !owns_fenced_view {
+                    self.settle_timestamp_fence(&state).await?;
                     let applied = self
                         .services
                         .control
@@ -285,6 +293,7 @@ impl WorkerRuntime {
         )?;
         self.recovery_probe.lock().map_err(|_| unknown())?.removal =
             Some((transition, target, current.ready));
+        self.settle_timestamp_fence(&state).await?;
         let reply = self
             .services
             .control
@@ -296,6 +305,88 @@ impl WorkerRuntime {
             )
             .await?;
         accepted_control(reply.reply)
+    }
+
+    /// OQ-2 (AbortJoinSealed, route 1'): the owner removes the joiner of a
+    /// sealed join that stopped answering, through its own owner fence. The
+    /// fence carries the join as the removal of its joiner (Control
+    /// `supersede_ready`), so the join is never published.
+    async fn supervise_sealed_join(
+        &self,
+        state: &ControlState,
+        join: &ReadyPending,
+    ) -> Result<(), ProtocolError> {
+        let peer = QueuePeerClient::new(
+            self.services.manager.client(),
+            self.services.shared.clone(),
+            self.services.control.identity().clone(),
+        )?;
+        let live = peer
+            .probe(join.target, self.services.scope.clone(), state.ready)
+            .await;
+        let failures = self
+            .recovery_probe
+            .lock()
+            .map_err(|_| unknown())?
+            .observe(join.target, live);
+        if failures.is_none_or(|failures| failures < 3) {
+            return Ok(());
+        }
+        tracing::debug!(worker=%join.target.worker_id, transition=%join.transition_id,
+            "sealed queue join abandoned: the joiner stopped answering");
+        self.settle_timestamp_fence(state).await?;
+        let transition = transition_id("abandon-join", &(join.transition_id, self.services.local))?;
+        let reply = self
+            .services
+            .control
+            .begin_owner_fence_local(
+                &self.services.operator,
+                transition,
+                state.ready,
+                self.services.local,
+            )
+            .await?;
+        accepted_control(reply.reply)
+    }
+
+    /// OQ-2 (FenceTso, route 1'): before an owner fence supersedes a sealed
+    /// ready-set transition, drive the transition's own Timestamp fence again
+    /// (FenceReady is idempotent by transition id) and record TimestampFenced
+    /// if Control lacks it. A rejection means another actor recorded it.
+    async fn settle_timestamp_fence(&self, state: &ControlState) -> Result<(), ProtocolError> {
+        let Some(Pending::Ready(pending)) = &state.pending else {
+            return Ok(());
+        };
+        if pending.phase != ReadyPhase::AwaitingTimestampFence {
+            return Ok(());
+        }
+        let receipt = self.fence_ready_timestamps(pending).await?;
+        let op = transition_id("supersede-tso-fence", &(pending.transition_id, self.services.local))?;
+        let _ = self.services.control.timestamp_fenced(op, receipt).await?;
+        Ok(())
+    }
+
+    async fn fence_ready_timestamps(
+        &self,
+        pending: &ReadyPending,
+    ) -> Result<crate::oltp_replication::authority::timestamp::ReadyFenceReceipt, ProtocolError> {
+        let group = self.services.timestamps.identity().clone();
+        let client = TimestampClient::new(
+            group,
+            self.services.shared.clone(),
+            self.services.manager.client(),
+            self.services.control_client.clone(),
+            ServiceAction::ControlFence {
+                transition_id: pending.transition_id,
+            },
+        )?;
+        client
+            .fence_ready(
+                pending.transition_id,
+                pending.expected,
+                pending.next.ok_or_else(unknown)?,
+            )
+            .await
     }
 
     async fn advance_owner_fence(&self, fence: &FencePending) -> Result<(), ProtocolError> {
@@ -353,23 +444,9 @@ impl WorkerRuntime {
                 Ok(())
             }
             ReadyPhase::AwaitingTimestampFence => {
-                let group = self.services.timestamps.identity().clone();
-                let client = TimestampClient::new(
-                    group,
-                    self.services.shared.clone(),
-                    self.services.manager.client(),
-                    self.services.control_client.clone(),
-                    ServiceAction::ControlFence {
-                        transition_id: pending.transition_id,
-                    },
-                )?;
-                let receipt = client
-                    .fence_ready(
-                        pending.transition_id,
-                        pending.expected,
-                        pending.next.ok_or_else(unknown)?,
-                    )
-                    .await?;
+                // For a removal that abandons a sealed join (OQ-2), Control
+                // publishes on this record.
+                let receipt = self.fence_ready_timestamps(pending).await?;
                 accepted_control(
                     control
                         .timestamp_fenced(

@@ -40,6 +40,10 @@ mod group_damage;
 #[cfg(test)]
 mod growth;
 #[cfg(test)]
+mod oq2;
+#[cfg(test)]
+mod control1;
+#[cfg(test)]
 mod pool_drain;
 #[cfg(test)]
 mod restart;
