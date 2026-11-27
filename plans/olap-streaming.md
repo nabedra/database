@@ -172,8 +172,8 @@ and the join seal. The interface between them is one invariant: every ready work
 Not modelled: idle and absolute expiry, close, output slots and memory caps (timing or resources), shared snapshots
 and shards (pure row-range arithmetic), table drop or recreate, prefetch, and reclamation of pinned files. No OLAP
 code in this repository deletes table objects today, so pin lifetime has nothing to race, but the plan states the
-rule without naming a reclaimer. Legacy peers without the stream route are also out of scope: while any ready peer
-is legacy, streams are unavailable, so no protocol step changes.
+rule without naming a reclaimer. There are no legacy peers: a worker of another queue
+protocol version is refused at authentication.
 
 ### Topology
 

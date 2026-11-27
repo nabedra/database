@@ -27,8 +27,6 @@ use std::{
 };
 use uuid::Uuid;
 
-// The last possible cursor has no successor in a legacy queue snapshot.
-pub(super) const STREAM_CAPABILITY_CURSOR: u64 = u64::MAX;
 
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -230,7 +228,6 @@ pub(crate) enum Reply {
         snapshot: QueueSnapshot,
         done: bool,
     },
-    StreamCapable,
     Stats {
         pending: u64,
         running: u64,
@@ -1802,9 +1799,6 @@ impl Worker {
                     done: true,
                 })
             }
-            Command::Snapshot {
-                after: Some(STREAM_CAPABILITY_CURSOR),
-            } => Ok(Reply::StreamCapable),
             Command::Snapshot { after } => {
                 let q = self.queue.queue.lock().unwrap();
                 let (snapshot, done) =
