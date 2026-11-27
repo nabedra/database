@@ -1086,6 +1086,45 @@ fn vs10_a_stable_record_reads_back_while_its_page_changes_under_every_read() {
 
 // ----- Review rv-dense suspicions (task fix-dense, 2026-11-27).
 
+/// Puts of one extension key that race take one place and one charge: exactly one succeeds, the
+/// key is held once, the code memory holds what RAM holds, and releasing the key gives every byte
+/// back. With room for many in RAM the racers meet there; with room for one more, they split
+/// between RAM and NVMe.
+#[test]
+#[ignore = "VEC-BUG-racing-extension-puts-double-charge"]
+fn vs17_racing_puts_of_one_extension_take_one_place_and_one_charge() {
+    for room in [1u64, 1000] {
+        let f = files("ext-race", Backend::Pread, 1);
+        let memory = Arc::new(Memory::new(40 * 64));
+        let ext = Extensions::new(64, memory.clone(), f.disks.clone()).unwrap();
+        // Others hold all of RAM but `room` extensions.
+        let others = 40u64.saturating_sub(room);
+        for id in 0..others {
+            ext.put(ExtKey { part: 1, id }, &[0; 64]).unwrap();
+        }
+        let start = std::sync::Barrier::new(4);
+        for id in 0..300u64 {
+            let k = ExtKey { part: 0, id };
+            let ok = std::thread::scope(|s| {
+                let put = || {
+                    start.wait();
+                    ext.put(k, &[id as u8; 64]).is_ok()
+                };
+                let all: Vec<_> = (0..4).map(|_| s.spawn(put)).collect();
+                all.into_iter().filter_map(|t| t.join().ok()).filter(|ok| *ok).count()
+            });
+            let (ram, nvme) = ext.counts();
+            let held = ram + nvme - others as usize;
+            assert_eq!((ok, held), (1, 1), "room {room}, key {id}: {ok} puts succeeded, held {held} times");
+            assert_eq!(memory.used().1, ram as u64 * 64, "room {room}, key {id}: memory against RAM");
+            assert_eq!(&*ext.get(&k).unwrap(), &[id as u8; 64]);
+            ext.release(&k);
+            assert_eq!(memory.used().1, others * 64, "room {room}, key {id}: released, still charged");
+            assert_eq!(ext.tier(&k), None);
+        }
+    }
+}
+
 /// A file whose reads panic, as a buggy filesystem layer might.
 struct PanickyFile;
 
