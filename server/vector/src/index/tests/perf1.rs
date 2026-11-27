@@ -347,7 +347,9 @@ fn vs07_the_stop_rule_reads_on_while_a_unit_may_reach_the_result() {
     let excess: Vec<f32> = (0..32).map(|i| 0.05 + 0.002 * i as f32).collect();
     let at = |r| excess_bound(&excess, 32, r);
     assert!(at(0.5) < at(0.9) && at(0.9) < at(0.95) && at(0.95) < at(0.99));
-    assert!((at(0.5) - 0.097).abs() < 1e-3, "the mean of the last 16 at 0.5: {}", at(0.5));
+    // At 0.95 a unit may miss a quarter as often: the bound is at least the largest of the last 16.
+    assert!(at(0.95) >= 0.05 + 0.002 * 31.0 - 1e-6, "{}", at(0.95));
+    assert!(at(0.5) > 0.097 && at(0.5) < at(0.95), "above the mean of the last 16: {}", at(0.5));
     assert_eq!(at(1.0), f64::INFINITY);
     assert_eq!(excess_bound(&[], 32, 0.9), f64::INFINITY, "nothing measured yet");
     for (p, z) in [(0.5, 0.0), (0.95, 1.645), (0.99, 2.326), (0.05, -1.645)] {

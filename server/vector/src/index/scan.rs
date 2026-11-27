@@ -88,11 +88,13 @@ pub trait StopRule: Send {
 /// Units read before an approximate scan may stop, and the least window of recent units.
 const WINDOW: usize = 16;
 
-/// Stops once the units still to read are unlikely to hold a row of the result. Every unit read
-/// tells how far its best matching row lies above the cosine of its centroid, by the codes. Over
-/// the recent window of units (the larger of 16 and half of what was read), that excess has a mean
-/// `m` and a deviation `s`. The next unit of every length band would reach the goodness of
-/// `cos + m + z s`, with `z` the normal quantile of the recall asked, so a higher recall reads on.
+/// Stops once the units still to read are unlikely to hold a row of the result. A unit is read in
+/// the order of its promise, the goodness of a row at its centroid's cosine with the longest length
+/// of its band. Every unit read tells how far the goodness of its best matching row, by the codes and
+/// its own length, lies above that promise. Over the recent window of units (the larger of 16 and
+/// half of what was read), that excess has a mean `m` and a deviation `s`. The next unit of every
+/// length band would reach its promise plus `m + z s`, with `z` the normal quantile of the recall
+/// asked, so a higher recall reads on.
 /// The scan stops when none of them reaches the `limit`-th row, and none of that row came
 /// from the window either (`1 - hits(window) / limit >= recall`). It is a heuristic without a
 /// guarantee: the recall gates measure it.
@@ -127,7 +129,8 @@ pub(super) fn normal_quantile(p: f64) -> f64 {
     if p < 0.5 { -tail(p) } else { tail(1.0 - p) }
 }
 
-/// `m + z s` of the recent excesses: what the best row of a unit adds to its centroid's cosine.
+/// What the best row of a unit adds to its promise, at `recall`: the larger of `m + z s` and the
+/// `recall` quantile of the recent excesses themselves, whose tail is longer than a normal one.
 pub(super) fn excess_bound(excess: &[f32], units: usize, recall: f64) -> f64 {
     let window = (units / 2).max(WINDOW);
     let recent = &excess[excess.len().saturating_sub(window)..];
@@ -137,11 +140,17 @@ pub(super) fn excess_bound(excess: &[f32], units: usize, recall: f64) -> f64 {
     let n = recent.len() as f64;
     let mean = recent.iter().map(|&x| f64::from(x)).sum::<f64>() / n;
     let var = recent.iter().map(|&x| (f64::from(x) - mean).powi(2)).sum::<f64>() / n;
-    let z = normal_quantile(recall);
+    // Units still to read add their chances of a miss, so each one must miss less often than
+    // the scan may: a quarter of `1 - recall`, which the benchmark sets reach (perf1).
+    let tail = 1.0 - (1.0 - recall) / 4.0;
+    let z = normal_quantile(tail);
     if !z.is_finite() {
         return z;
     }
-    mean + z * var.sqrt()
+    let mut sorted = recent.to_vec();
+    let rank = ((tail * n).ceil() as usize).clamp(1, recent.len()) - 1;
+    let (_, &mut quantile, _) = sorted.select_nth_unstable_by(rank, f32::total_cmp);
+    (mean + z * var.sqrt()).max(f64::from(quantile))
 }
 
 struct Ranked {
@@ -214,10 +223,11 @@ pub struct Scan {
     pub(super) rescored: usize,
     /// Units that held a match.
     units: usize,
-    /// Per unit read through codes: its best matching estimate above its centroid's cosine.
+    /// Per unit read through codes: the goodness of its best matching row by the codes, above
+    /// its promise.
     excess: Vec<f32>,
-    /// The best matching estimate of the unit being read.
-    unit_cos: f32,
+    /// The best goodness by the codes of a matching row of the unit being read.
+    unit_best: f64,
     /// Units read so far, or skipped because nothing in them could enter the result.
     pub visited: usize,
     /// The budget it runs within, if any.
@@ -351,18 +361,17 @@ impl Stream {
         Some(())
     }
 
-    /// The best goodness that the next unit of any band reaches if its best row lies `excess`
-    /// above its centroid's cosine. Minus infinity when no unit is left.
+    /// The best promise of the next unit of any band, plus `excess`. Minus infinity when no unit
+    /// is left.
     fn reach(&mut self, op: Op, len: f64, excess: f64) -> f64 {
         if self.meet().is_none() {
             return f64::NEG_INFINITY;
         }
         let met = &self.met;
         let next = self.bands.iter().filter_map(|b| {
-            let cos = (f64::from(met.get(b.3)?.1) + excess).clamp(-1.0, 1.0);
-            Some(best(op, cos, b.1, b.2, len))
+            Some(best(op, f64::from(met.get(b.3)?.1), b.1, b.2, len))
         });
-        next.fold(f64::NEG_INFINITY, f64::max)
+        next.fold(f64::NEG_INFINITY, f64::max) + excess
     }
 
     /// The next unit, the band that it is limited to, and the cosine of its centroid.
@@ -435,7 +444,7 @@ impl<C: Codec> Index<C> {
             rescored: 0,
             units: 0,
             excess: Vec::new(),
-            unit_cos: f32::NEG_INFINITY,
+            unit_best: f64::NEG_INFINITY,
             visited: 0,
             meter: None,
         })
@@ -543,11 +552,13 @@ impl<C: Codec> Index<C> {
         let Some((part, band, cos)) = stream.next(scan.op, scan.len) else {
             return Ok(false);
         };
-        scan.unit_cos = f32::NEG_INFINITY;
+        scan.unit_best = f64::NEG_INFINITY;
         if self.visit_part(scan, part, band, true)? {
             scan.units += 1;
-            if scan.unit_cos.is_finite() {
-                scan.excess.push(scan.unit_cos - cos);
+            if scan.unit_best.is_finite() {
+                let (lo, hi) = band.map_or((0.0, 0.0), band_span);
+                let promise = best(scan.op, f64::from(cos), lo, hi, scan.len);
+                scan.excess.push((scan.unit_best - promise) as f32);
             }
             if let Some(floor) = scan.floor() {
                 let excess = excess_bound(&scan.excess, scan.units, scan.recall);
@@ -690,15 +701,18 @@ impl<C: Codec> Index<C> {
             }
             return Ok(any);
         }
-        // From NVMe in batches: one round of reads for many rows.
+        // From NVMe in batches: one round of reads for many rows. The reads are charged before
+        // the batch, and memory row by row as from RAM, so a budget counts alike on every store
+        // but for I/O (nr18); the batch itself, at most 64 vectors, is not charged.
         let bytes = self.vector_bytes();
         for batch in shown.chunks(READ_BATCH) {
             for _ in batch {
-                scan.charge(0, self.read_cost(), bytes)?;
+                scan.charge(0, self.read_cost(), 0)?;
             }
             let keys: Vec<(Slot, Pos)> = batch.iter().map(|(_, e)| (e.slot, e.at)).collect();
             let read = self.shared.rows.vectors(&keys);
             for (&(i, e), vec) in batch.iter().zip(read) {
+                scan.charge(0, 0, bytes)?;
                 scan.charge_score()?;
                 let key = self.shared.rows.key(e.slot).ok_or(GONE)?;
                 any |= self.score_read(scan, e, b.lens[i], key, vec?.ok_or(GONE)?, bytes);
@@ -752,10 +766,11 @@ impl<C: Codec> Index<C> {
         scan.charge(n * (dim / 8 + 1), 0, held)?;
         let mut coarse = Vec::with_capacity(b.entries.len());
         self.codec.scan(q, &b.codes, &mut coarse);
-        for &(i, _) in &shown {
-            scan.unit_cos = scan.unit_cos.max(coarse[i].cos);
-        }
         let (op, len) = (scan.op, scan.len);
+        for &(i, _) in &shown {
+            let cos = f64::from(coarse[i].cos).clamp(-1.0, 1.0);
+            scan.unit_best = scan.unit_best.max(best(op, cos, b.lens[i], b.lens[i], len));
+        }
         let hope = |est, i: usize| optimistic(op, est, b.lens[i], len);
         let mut order: Vec<_> = shown
             .iter()

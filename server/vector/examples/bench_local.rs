@@ -492,7 +492,13 @@ fn build(
         let s = ix.stats();
         3 + (s.ready + s.draining + s.retired) / a.settle_parts.max(1)
     };
-    while idle < round(ix) && settle_calls < 10_000_000 {
+    // `stats` walks every row, so it is asked only when the round may be over.
+    let mut need = round(ix);
+    while (idle < need || {
+        need = round(ix);
+        idle < need
+    }) && settle_calls < 10_000_000
+    {
         settle_calls += 1;
         idle = if ix.maintain(a.settle_parts) {
             0
