@@ -524,7 +524,6 @@ struct OlapEngine {
 impl OlapEngine {
     async fn start() -> Self {
         let storage = Storage::new(Fake::default(), Namespace::new("logic/").unwrap());
-        storage.initialize_catalog().await.unwrap();
         let (pool, workers) = WorkerPool::start(
             NonZeroUsize::new(2).unwrap(),
             tokio::runtime::Handle::current(),

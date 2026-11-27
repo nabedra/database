@@ -128,7 +128,6 @@ async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicit
         std::env::temp_dir().join(format!("nabedra-engine-http-{}", uuid::Uuid::new_v4()));
     let mut service = Service::start(directory.clone());
     let storage = service.storage();
-    storage.initialize_catalog().await.unwrap();
     let (pool, workers) = WorkerPool::start(
         NonZeroUsize::new(2).unwrap(),
         tokio::runtime::Handle::current(),
