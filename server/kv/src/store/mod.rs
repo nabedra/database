@@ -56,7 +56,6 @@ use crate::iter::MergingIterator;
 use crate::journal::service::Condvar;
 pub use crate::journal::{Commit, Durability, JournalOptions};
 use crate::journal::{Journal, JournalSink, RecordKind};
-use crate::mac::JournalKey;
 use crate::manifest::{
     self, AppendError, JOURNAL_DIR, ManifestState, ManifestWriter, RUNS_DIR, RunDesc, VersionEdit,
 };
@@ -89,20 +88,6 @@ pub fn store_wide(_: &[u8]) -> usize {
     0
 }
 
-/// Which journal frame a store writes (LSM-1; plan section 2, "Journal format", and
-/// section 9).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum JournalIntegrity {
-    /// Create format 1 stores and keep format 1 stores in format 1, so a release that
-    /// knows only format 1 can still open them. A format 2 store stays in format 2.
-    #[default]
-    Legacy,
-    /// Create format 2 stores and upgrade format 1 stores at open: journal segments
-    /// created from then on use the authenticated frame. A release that knows only
-    /// format 1 refuses the store afterwards, before it changes any file.
-    Authenticated,
-}
-
 #[derive(Clone)]
 pub struct Options {
     pub fs: Arc<dyn Fs>,
@@ -129,8 +114,6 @@ pub struct Options {
     /// journal's live segments exceed this (plan section 2, "Journal values").
     pub max_journal_bytes: u64,
     pub run_writer: RunWriterOptions,
-    /// The journal frame of new stores, and whether open upgrades a format 1 store.
-    pub journal_integrity: JournalIntegrity,
 }
 
 impl Options {
@@ -156,7 +139,6 @@ impl Options {
             max_replay_bytes: 64 << 20,
             max_journal_bytes: 512 << 20,
             run_writer: RunWriterOptions::default(),
-            journal_integrity: JournalIntegrity::Legacy,
         }
     }
 }
@@ -428,49 +410,12 @@ enum Stall {
 
 impl Store {
     /// Opens or creates the store in `dir` and recovers it (plan section 3).
-    ///
-    /// With [`JournalIntegrity::Authenticated`], a new store is created in format 2 and a
-    /// format 1 store is upgraded (LSM-1, plan section 9): a complete format 1 open first
-    /// validates it, then, while that open still holds the lock, `JOURNAL_KEY` and then
-    /// `FORMAT` 2 are made durable, the store closes cleanly and opens again in format 2.
-    /// A crash anywhere in between leaves a store that opens: format 1, or format 2 with
-    /// only format 1 segments, which the next open fences. The returned `quarantined_now`
-    /// and `recovery` are those of the validating open.
     pub fn open(dir: &Path, mut options: Options) -> Result<Opened> {
-        if options.journal_integrity == JournalIntegrity::Authenticated
-            && recovery::is_format1_store(&*options.fs, dir)?
-        {
-            let fs = options.fs.clone();
-            options.journal_integrity = JournalIntegrity::Legacy;
-            let first = Store::open_once(dir, options.clone())?;
-            let key = JournalKey::generate()?;
-            manifest::write_journal_key(&*fs, dir, &key)?;
-            manifest::write_format(&*fs, dir, manifest::FORMAT_CONTENT_V2)?;
-            let Opened {
-                store,
-                quarantined_now,
-                recovery,
-                ..
-            } = first;
-            store.close()?;
-            options.journal_integrity = JournalIntegrity::Authenticated;
-            let mut second = Store::open_once(dir, options)?;
-            second.quarantined_now = quarantined_now;
-            second.recovery = recovery;
-            return Ok(second);
-        }
-        Store::open_once(dir, options)
-    }
-
-    fn open_once(dir: &Path, mut options: Options) -> Result<Opened> {
         let started = time::now_std();
         let fs = options.fs.clone();
-        let opened = recovery::prepare(
-            &*fs,
-            dir,
-            options.journal_integrity == JournalIntegrity::Authenticated,
-        )?;
-        options.journal.auth_key = opened.key;
+        let opened = recovery::prepare(&*fs, dir)?;
+        // The store's key, never the caller's (LSM-1).
+        options.journal.key = opened.key;
         let runs_dir = dir.join(RUNS_DIR);
         let ctx = RunReadContext::new(options.cache.clone());
         let run_stats = ctx.stats.clone();

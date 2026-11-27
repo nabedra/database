@@ -24,6 +24,10 @@
 (*    edit; their crash points are covered by the directory-entry choice   *)
 (*    and by the manifest's all-or-nothing final record (plan case L3)     *)
 (*  - segment numbers are never reused, so a segment has no epoch          *)
+(*  - record headers are tagged under the store's journal key (LSM-1),    *)
+(*    so bytes a client wrote never pass for a record: a torn slot holds   *)
+(*    no forged header. The mutant unauthenticated_frames lets a torn      *)
+(*    client record carry one, as an unkeyed checksum did                  *)
 (*  - two levels, L0 and L1 (the bottom); no trivial moves, no range       *)
 (*    deletes, no journal GC relocation, no ENOSPC or fsync errors         *)
 (* Values are integers: 0 is "no value", a positive value is the sequence  *)
@@ -74,6 +78,9 @@ Slot(st, lo, hi, k, op, dm, pg) ==
     [st |-> st, lo |-> lo, hi |-> hi, key |-> k, op |-> op, dm |-> dm, pg |-> pg]
 ZeroSlot == Slot("zero", 0, 0, NoKey, "none", 0, 0)
 TornSlot == Slot("torn", 0, 0, NoKey, "none", 0, 0)
+\* Mutant unauthenticated_frames only: a torn client record whose later bytes
+\* hold a header an unkeyed checksum accepts, claiming a later sync (LSM-1).
+ForgedSlot == Slot("torn", MaxSeq, MaxSeq, NoKey, "forged", MaxSeq, 0)
 
 \* An LSM entry: user key, sequence, kind, and for a journal value the
 \* segment its locator points into (0 otherwise).
@@ -296,8 +303,10 @@ Walk(s, i, nx, q, m, F) ==
         \* the roll point of this segment: no sequence is lost
         Walk(NextLive(s), 1, nx, q, m, F)
     ELSE
-    LET ev == Evidence(s, i) IN
+    LET ev == Max2(Evidence(s, i), IF sl.op = "forged" THEN sl.dm ELSE 0) IN
     IF ev < nx \/ Mutant = "no_evidence_check" THEN Done(s, i, nx, q, m)   \* L1, L2
+    ELSE IF sl.op = "forged" /\ LaterValid(s, i) = {} THEN Refuse("R1")
+        \* the forged header names a record past seq(P): scope unknown, R1
     ELSE IF sl.st = "dmg" THEN
         IF sl.hi <= F THEN Walk(s, i + 1, sl.hi + 1, q, m, F)
         ELSE Walk(s, i + 1, sl.hi + 1, q \cup {sl.key}, m, F)      \* G1
@@ -335,6 +344,8 @@ SlotOptions(s, i, D) ==
     IF SlotAt(s, i).st = "ok" /\ SlotAt(s, i).pg \in D THEN {TornSlot}
     ELSE IF Synced(s, i) \/ SlotAt(s, i) = OldSlot(s, i) THEN {SlotAt(s, i)}
     ELSE {SlotAt(s, i), OldSlot(s, i), TornSlot}
+         \cup (IF Mutant = "unauthenticated_frames" /\ SlotAt(s, i).op \in {"put", "del", "jput"}
+               THEN {ForgedSlot} ELSE {})
 
 RECURSIVE Trim(_)
 Trim(q) == IF q /= <<>> /\ q[Len(q)] = ZeroSlot THEN Trim(SubSeq(q, 1, Len(q) - 1)) ELSE q
@@ -1149,7 +1160,7 @@ LiveSpec == Spec /\ Fairness
 (* Properties. Each names the register guarantee it checks.                *)
 
 SlotT == [st : {"ok", "torn", "dmg", "eio", "zero"}, lo : 0..MaxSeq, hi : 0..MaxSeq,
-          key : Keys \cup {NoKey}, op : Ops \cup {"void", "pad", "none"}, dm : 0..MaxSeq,
+          key : Keys \cup {NoKey}, op : Ops \cup {"void", "pad", "none", "forged"}, dm : 0..MaxSeq,
           pg : 0..(SegCap + 2)]
 
 TypeOK ==

@@ -195,19 +195,7 @@ impl Writer {
         let fs = &*shared.fs;
         let dir = &shared.dir;
         let options = &shared.options;
-        let key = options.auth_key;
-        let keyed = key.is_some();
-        let seg_key = |seg: &LiveSeg| if seg.auth { key } else { None };
-        // A store with a journal key never appends to a segment in the CRC frame (one
-        // written before its upgrade, LSM-1): it fences that segment after its clean-close
-        // pad and continues in a new authenticated segment.
-        let end = match end {
-            End::Append { idx, pos } if keyed && !live[idx].auth => End::Fence {
-                idx,
-                pad_at: Some(pos),
-            },
-            other => other,
-        };
+        let key = &options.key;
 
         // Unused segment files (L4) hold nothing; delete them first.
         if !discard.is_empty() {
@@ -250,7 +238,7 @@ impl Writer {
             }
             End::Reepoch { idx } => {
                 sync_range(&live, idx)?;
-                segment::reepoch(&mut live[idx], key.as_ref())?;
+                segment::reepoch(&mut live[idx], key)?;
                 RECORDS_START
             }
             End::Fence { idx, pad_at } => {
@@ -269,7 +257,7 @@ impl Writer {
                         },
                         &[],
                         Payload::Zeros(0),
-                        seg_key(seg).as_ref(),
+                        key,
                     );
                     seg.file.write_all_at(&pad, at).map_err(segment::io)?;
                 }
@@ -288,17 +276,11 @@ impl Writer {
                     options.segment_bytes,
                     options.zero_fill,
                     None,
+                    &options.key,
                 )?,
             };
             let number = shared.next_number.fetch_add(1, Ordering::Relaxed);
-            live.push(segment::activate(
-                fs,
-                dir,
-                spare,
-                number,
-                next_seq,
-                key.as_ref(),
-            )?);
+            live.push(segment::activate(fs, dir, spare, number, next_seq, key)?);
         } else {
             // The inventory saw the names of the process that stopped, which may not be
             // durable yet: a Kill between a roll's rename and its directory sync leaves the
@@ -493,13 +475,12 @@ impl Writer {
                 count: batch.count(),
                 durable_seq: self.durable,
             };
-            let key = self.frame_key();
             format::encode_record(
                 &mut self.buf,
                 &fields,
                 batch.scope(),
                 Payload::Bytes(batch.data()),
-                key.as_ref(),
+                &self.shared.options.key,
             );
             self.placements.push(Placement {
                 item: i,
@@ -660,7 +641,11 @@ impl Writer {
         if !self.placements.is_empty() {
             let durable = self.shared.durable.load(Ordering::Acquire);
             crate::sim_trace::report(if synced {
-                crate::sim_trace::JournalStep::Synced { synced: self.durable, visible, durable }
+                crate::sim_trace::JournalStep::Synced {
+                    synced: self.durable,
+                    visible,
+                    durable,
+                }
             } else {
                 crate::sim_trace::JournalStep::Published { visible, durable }
             });
@@ -762,24 +747,13 @@ impl Writer {
             count,
             durable_seq: self.durable,
         };
-        let key = self.frame_key();
         format::encode_record(
             &mut self.buf,
             &fields,
             &[],
             Payload::Zeros(payload),
-            key.as_ref(),
+            &self.shared.options.key,
         );
-    }
-
-    /// The key the active segment's records are tagged with: the journal key in the
-    /// authenticated frame, none in the CRC frame.
-    fn frame_key(&self) -> Option<crate::mac::JournalKey> {
-        if self.active.auth {
-            self.shared.options.auth_key
-        } else {
-            None
-        }
     }
 
     /// Makes room for `len` more bytes in the active segment, rolling to the next one
@@ -806,14 +780,13 @@ impl Writer {
         }
         let number = self.shared.next_number.fetch_add(1, Ordering::Relaxed);
         let fs = &*self.shared.fs;
-        let key = self.shared.options.auth_key;
         let new = segment::activate(
             fs,
             &self.shared.dir,
             next,
             number,
             self.next_write_seq,
-            key.as_ref(),
+            &self.shared.options.key,
         )?;
         {
             let mut table = lock(&self.shared.table);
@@ -859,6 +832,7 @@ impl Writer {
             options.segment_bytes,
             options.zero_fill,
             None,
+            &options.key,
         )
     }
 
@@ -1159,6 +1133,7 @@ fn prepare_spare(shared: &Shared) {
         options.segment_bytes,
         options.zero_fill,
         Some(&shared.prep_cancel),
+        &options.key,
     );
     let failed = made.is_err();
     if let Ok(free) = made {

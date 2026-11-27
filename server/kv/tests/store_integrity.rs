@@ -1,6 +1,5 @@
-//! LSM-1: format 2 stores (authenticated journal frames) and the upgrade from format 1
-//! (plans/native-storage-engine.md, section 2 "Journal format" and section 9; the
-//! design is checked by specs/lsm/integrity/JournalIntegrity.tla). Every case runs on
+//! LSM-1: stores whose journal record headers are tagged under a per-store key
+//! (plans/native-storage-engine.md, section 2 "Journal format"). Every case runs on
 //! `FaultFs`, a fault model.
 
 #![allow(clippy::disallowed_methods)] // integration tests are outside the phase 7 conversion, which covers kv/src
@@ -14,22 +13,17 @@ use std::sync::Arc;
 use common::*;
 use nabedra_kv::fs::{FaultFs, Fs, OpenMode};
 use nabedra_kv::journal::format::{HeaderCopy, SegmentHeader};
-use nabedra_kv::{Background, Durability, Error, JournalIntegrity, Options, Store, WriteBatch};
+use nabedra_kv::{Background, Durability, Error, Options, Store, WriteBatch};
 
-const V1: &[u8] = b"nabedra-kv 1\n";
-const V2: &[u8] = b"nabedra-kv 2\n";
-
-fn options(fs: &FaultFs, bg: &Arc<Background>, integrity: JournalIntegrity) -> Options {
-    let mut o = small_options(Arc::new(fs.clone()), bg.clone());
-    o.journal_integrity = integrity;
-    o
+fn options(fs: &FaultFs, bg: &Arc<Background>) -> Options {
+    small_options(Arc::new(fs.clone()), bg.clone())
 }
 
 fn open(dir: &Path, o: Options) -> Store {
     Store::open(dir, o).expect("open").store
 }
 
-/// Writes `n` batches tagged `tag`, synced, alternating inline and journal values, and
+/// Writes `n` synced batches tagged `tag`, alternating inline and journal values, and
 /// records them in `model`.
 fn write_some(store: &Store, model: &mut BTreeMap<Vec<u8>, Vec<u8>>, tag: &str, n: usize) {
     for i in 0..n {
@@ -65,42 +59,8 @@ fn check(store: &Store, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
     }
 }
 
-fn format_of(fs: &FaultFs, dir: &Path) -> Option<Vec<u8>> {
-    fs.contents(&dir.join("FORMAT")).ok()
-}
-
-/// `(file, auth)` for every journal file with a valid header copy.
-fn segment_frames(fs: &FaultFs, dir: &Path) -> Vec<(PathBuf, bool)> {
-    let mut out = Vec::new();
-    let mut files = fs.list(&dir.join("journal")).unwrap_or_default();
-    files.sort();
-    for path in files {
-        let bytes = fs.contents(&path).unwrap();
-        let copies = SegmentHeader::decode_blocks(&bytes[..bytes.len().min(8192)]);
-        if let Some(h) = copies
-            .iter()
-            .filter_map(|c| match c {
-                HeaderCopy::Valid(h) => Some(*h),
-                _ => None,
-            })
-            .max_by_key(|h| h.epoch)
-        {
-            out.push((path, h.auth));
-        }
-    }
-    out
-}
-
-fn live_frames(fs: &FaultFs, dir: &Path) -> Vec<bool> {
-    segment_frames(fs, dir)
-        .into_iter()
-        .filter(|(p, _)| p.extension().is_some_and(|e| e == "jnl"))
-        .map(|(_, a)| a)
-        .collect()
-}
-
 /// Every file under `dir` with its contents.
-fn image(fs: &FaultFs, dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+fn files_of(fs: &FaultFs, dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -116,188 +76,111 @@ fn image(fs: &FaultFs, dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     out
 }
 
+fn find_at(fs: &FaultFs, dir: &Path, needle: &[u8]) -> (PathBuf, u64) {
+    let mut hits = Vec::new();
+    for path in fs.list(dir).unwrap() {
+        let Ok(data) = fs.contents(&path) else {
+            continue;
+        };
+        for (i, w) in data.windows(needle.len()).enumerate() {
+            if w == needle {
+                hits.push((path.clone(), i as u64));
+            }
+        }
+    }
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    hits.pop().unwrap()
+}
+
 #[test]
-fn lsm1_new_store_is_format2_and_reopens() {
+fn lsm1_new_store_has_a_key_and_reopens_after_crashes() {
     let (fs, dir) = fault_fs();
     let bg = Background::new(2).unwrap();
     let mut model = BTreeMap::new();
-    let store = open(&dir, options(&fs, &bg, JournalIntegrity::Authenticated));
+    let store = open(&dir, options(&fs, &bg));
     write_some(&store, &mut model, "a", 40);
     store.flush().unwrap();
     write_some(&store, &mut model, "b", 40);
     drop(store);
-    assert_eq!(format_of(&fs, &dir).as_deref(), Some(V2));
-    assert!(fs.contents(&dir.join("JOURNAL_KEY")).is_ok());
-    let frames = live_frames(&fs, &dir);
-    assert!(
-        !frames.is_empty() && frames.iter().all(|&a| a),
-        "{frames:?}"
+    assert_eq!(
+        fs.contents(&dir.join("FORMAT")).unwrap(),
+        b"nabedra-kv 2\n".to_vec()
     );
-
-    // Crash (durable state only), reopen with either option: a format 2 store stays one.
-    for integrity in [JournalIntegrity::Legacy, JournalIntegrity::Authenticated] {
-        let image = fs.crash();
-        let store = open(&dir, options(&image, &bg, integrity));
+    let key = fs.contents(&dir.join("JOURNAL_KEY")).unwrap();
+    for image in [fs.crash(), fs.kill()] {
+        let store = open(&dir, options(&image, &bg));
         check(&store, &model);
         drop(store);
-        assert_eq!(format_of(&image, &dir).as_deref(), Some(V2));
+        assert_eq!(image.contents(&dir.join("JOURNAL_KEY")).unwrap(), key);
     }
+    // Two stores get different keys.
+    let (other, odir) = fault_fs();
+    drop(open(&odir, options(&other, &bg)));
+    assert_ne!(other.contents(&odir.join("JOURNAL_KEY")).unwrap(), key);
 }
 
+/// LSM-10 and LSM-1: creation is crash-safe at every step. JOURNAL_KEY is durable before
+/// FORMAT exists, so a crash never leaves a store with FORMAT and no key. A kill right
+/// after the store directory is created used to leave its entry unsynced, and the next
+/// open, seeing the directory, never synced it: its synced writes were lost to the next
+/// power loss (LSM-10). The next open now creates or opens, durably.
 #[test]
-fn lsm1_upgrade_keeps_data_and_writes_authenticated_segments() {
-    let (fs, dir) = fault_fs();
+fn lsm10_creation_survives_a_crash_at_every_step() {
     let bg = Background::new(2).unwrap();
-    let mut model = BTreeMap::new();
-    let store = open(&dir, options(&fs, &bg, JournalIntegrity::Legacy));
-    write_some(&store, &mut model, "a", 60);
-    store.flush().unwrap();
-    write_some(&store, &mut model, "b", 30);
-    drop(store);
-    assert_eq!(format_of(&fs, &dir).as_deref(), Some(V1));
-    assert!(live_frames(&fs, &dir).iter().all(|&a| !a));
-
-    let opened = Store::open(&dir, options(&fs, &bg, JournalIntegrity::Authenticated)).unwrap();
-    assert!(opened.quarantined_now.is_empty());
-    check(&opened.store, &model);
-    write_some(&opened.store, &mut model, "c", 30);
-    drop(opened);
-    assert_eq!(format_of(&fs, &dir).as_deref(), Some(V2));
-    let frames = live_frames(&fs, &dir);
-    assert!(frames.last() == Some(&true), "{frames:?}");
-
-    let image = fs.crash();
-    let store = open(&dir, options(&image, &bg, JournalIntegrity::Legacy));
-    check(&store, &model);
-}
-
-/// Partial upgrade: a kill or a power loss at every mutating filesystem operation of the
-/// upgrading open. The next open (either option) opens with every acknowledged write; an
-/// authenticated segment exists only where FORMAT is 2 and JOURNAL_KEY is there; a store
-/// FORMAT still calls format 1 holds no authenticated segment, so a release that knows
-/// only format 1 can open it (JournalIntegrity.tla: KeyCoversFrames, FormatHasKey).
-#[test]
-fn lsm1_upgrade_survives_a_crash_at_every_step() {
-    let bg = Background::new(2).unwrap();
-    let (fs, dir) = fault_fs();
-    let mut model = BTreeMap::new();
-    let store = open(&dir, options(&fs, &bg, JournalIntegrity::Legacy));
-    write_some(&store, &mut model, "a", 20);
-    store.flush().unwrap();
-    write_some(&store, &mut model, "b", 10);
-    drop(store);
-    let base = fs.crash();
-
-    let mut steps = 0;
-    for n in 1.. {
-        let attempt = base.kill();
-        let start = attempt.mutating_ops();
-        attempt.crash_after(start + n);
-        let result = Store::open(
-            &dir,
-            options(&attempt, &bg, JournalIntegrity::Authenticated),
-        );
-        let finished = !attempt.is_crashed();
-        drop(result);
-        for (cut, image) in [("kill", attempt.kill()), ("power", attempt.crash())] {
-            let format = format_of(&image, &dir);
-            let frames = live_frames(&image, &dir);
-            if frames.iter().any(|&a| a) {
-                assert_eq!(format.as_deref(), Some(V2), "step {n} {cut}: {frames:?}");
-                assert!(image.durable_contents(&dir.join("JOURNAL_KEY")).is_some());
-            }
-            if format.as_deref() == Some(V2) {
+    for n in 1..60 {
+        let (fs, dir) = fault_fs();
+        fs.crash_after(fs.mutating_ops() + n);
+        let created = Store::open(&dir, options(&fs, &bg)).is_ok() && !fs.is_crashed();
+        for (_cut, image) in [("kill", fs.kill()), ("power", fs.crash())] {
+            if image.contents(&dir.join("FORMAT")).is_ok() {
                 assert!(
-                    image.contents(&dir.join("JOURNAL_KEY")).is_ok(),
-                    "step {n} {cut}"
+                    image.durable_contents(&dir.join("JOURNAL_KEY")).is_some(),
+                    "step {n}: FORMAT without a durable key"
                 );
             }
-            for integrity in [JournalIntegrity::Legacy, JournalIntegrity::Authenticated] {
-                let again = image.kill();
-                let opened = Store::open(&dir, options(&again, &bg, integrity))
-                    .unwrap_or_else(|e| panic!("step {n} {cut} {integrity:?}: {e}"));
-                check(&opened.store, &model);
-                drop(opened);
-                if integrity == JournalIntegrity::Authenticated {
-                    assert_eq!(format_of(&again, &dir).as_deref(), Some(V2), "step {n}");
-                }
-            }
+            let mut model = BTreeMap::new();
+            let store = Store::open(&dir, options(&image, &bg))
+                .unwrap_or_else(|e| panic!("step {n}: {e}"))
+                .store;
+            write_some(&store, &mut model, "c", 3);
+            drop(store);
+            let again = image.crash();
+            check(&open(&dir, options(&again, &bg)), &model);
         }
-        steps = n;
-        if finished {
-            break;
+        if created {
+            return;
         }
     }
-    assert!(steps > 10, "the upgrade took {steps} steps");
+    panic!("creation did not finish in 60 steps");
 }
 
-/// A store the format 1 open refuses is not upgraded: FORMAT stays 1 and no key is
-/// written (JournalIntegrity.tla: UpgradeValidated).
-#[test]
-fn lsm1_upgrade_needs_a_store_that_opens() {
-    let (fs, dir) = fault_fs();
-    let bg = Background::new(2).unwrap();
-    let mut model = BTreeMap::new();
-    let store = open(&dir, options(&fs, &bg, JournalIntegrity::Legacy));
-    write_some(&store, &mut model, "a", 10);
-    store.flush().unwrap();
-    drop(store);
-    let image = fs.crash();
-    // The manifest records the journal segment: without it the open refuses (R3).
-    let journal = dir.join("journal");
-    for p in image.list(&journal).unwrap() {
-        if p.extension().is_some_and(|e| e == "jnl") {
-            image.remove(&p).unwrap();
-        }
-    }
-    let before = image_of(&image, &dir);
-    assert!(Store::open(&dir, options(&image, &bg, JournalIntegrity::Authenticated)).is_err());
-    assert_eq!(format_of(&image, &dir).as_deref(), Some(V1));
-    assert!(image.contents(&dir.join("JOURNAL_KEY")).is_err());
-    assert_eq!(
-        image_of(&image, &dir),
-        before,
-        "the refused upgrade changed files"
-    );
-}
-
-fn image_of(fs: &FaultFs, dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-    image(fs, dir)
-}
-
-/// A format 2 store without its key, with a damaged key, or with another store's key
-/// refuses to open before it changes any file.
+/// A missing, damaged or foreign JOURNAL_KEY refuses the store before any file changes.
 #[test]
 fn lsm1_missing_damaged_or_foreign_key_refuses_before_changes() {
     let bg = Background::new(2).unwrap();
     let (fs, dir) = fault_fs();
     let mut model = BTreeMap::new();
-    let store = open(&dir, options(&fs, &bg, JournalIntegrity::Authenticated));
+    let store = open(&dir, options(&fs, &bg));
     write_some(&store, &mut model, "a", 10);
     drop(store);
     let (other, _) = fault_fs();
-    drop(open(
-        &dir,
-        options(&other, &bg, JournalIntegrity::Authenticated),
-    ));
+    drop(open(&dir, options(&other, &bg)));
     let foreign = other.contents(&dir.join("JOURNAL_KEY")).unwrap();
-    let key_path = dir.join("JOURNAL_KEY");
 
-    type Edit = Box<dyn Fn(&FaultFs)>;
-    let (k1, k2) = (dir.join("JOURNAL_KEY"), dir.join("JOURNAL_KEY"));
+    type Edit = Box<dyn Fn(&FaultFs, &Path)>;
     let cases: Vec<(&str, Edit)> = vec![
         (
             "missing",
-            Box::new(move |fs: &FaultFs| fs.remove(&k1).unwrap()),
+            Box::new(|fs: &FaultFs, k: &Path| fs.remove(k).unwrap()),
         ),
         (
             "damaged",
-            Box::new(move |fs: &FaultFs| fs.flip_bit(&k2, 12, 3).unwrap()),
+            Box::new(|fs: &FaultFs, k: &Path| fs.flip_bit(k, 12, 3).unwrap()),
         ),
         (
             "foreign",
-            Box::new(move |fs: &FaultFs| {
-                let f = fs.open(&key_path, OpenMode::ReadWrite).unwrap();
+            Box::new(move |fs: &FaultFs, k: &Path| {
+                let f = fs.open(k, OpenMode::ReadWrite).unwrap();
                 f.write_all_at(&foreign, 0).unwrap();
                 f.sync_all().unwrap();
             }),
@@ -305,84 +188,190 @@ fn lsm1_missing_damaged_or_foreign_key_refuses_before_changes() {
     ];
     for (name, edit) in cases {
         let image = fs.crash();
-        edit(&image);
-        let before = image_of(&image, &dir);
-        for integrity in [JournalIntegrity::Legacy, JournalIntegrity::Authenticated] {
-            let err = Store::open(&dir, options(&image, &bg, integrity)).err();
-            assert!(
-                matches!(err, Some(Error::Corruption { .. })),
-                "{name} {integrity:?}: {err:?}"
-            );
-        }
+        edit(&image, &dir.join("JOURNAL_KEY"));
+        let before = files_of(&image, &dir);
+        let err = Store::open(&dir, options(&image, &bg)).err();
+        assert!(
+            matches!(err, Some(Error::Corruption { .. })),
+            "{name}: {err:?}"
+        );
         assert_eq!(
-            image_of(&image, &dir),
+            files_of(&image, &dir),
             before,
             "{name}: refusal changed files"
         );
     }
 }
 
-/// A FORMAT this build does not know refuses before any change, the way a release that
-/// knows only format 1 refuses a format 2 store (rollback, plan section 9).
+/// A store of format 1 (CRC frames, before LSM-1) is refused, not migrated, and left
+/// unchanged; so is one whose FORMAT says 2 but which holds a version 1 segment.
 #[test]
-fn lsm1_unknown_format_refuses_before_changes() {
+fn lsm1_format1_store_is_refused_untouched() {
     let bg = Background::new(2).unwrap();
     let (fs, dir) = fault_fs();
-    drop(open(
-        &dir,
-        options(&fs, &bg, JournalIntegrity::Authenticated),
-    ));
+    drop(open(&dir, options(&fs, &bg)));
     let image = fs.crash();
     let f = image
         .open(&dir.join("FORMAT"), OpenMode::ReadWrite)
         .unwrap();
-    f.write_all_at(b"nabedra-kv 3\n", 0).unwrap();
+    f.write_all_at(b"nabedra-kv 1\n", 0).unwrap();
     f.sync_all().unwrap();
     drop(f);
-    let before = image_of(&image, &dir);
-    let err = Store::open(&dir, options(&image, &bg, JournalIntegrity::Authenticated)).err();
+    let before = files_of(&image, &dir);
+    let err = Store::open(&dir, options(&image, &bg)).err();
     assert!(
         matches!(err, Some(Error::UnsupportedFormat { .. })),
         "{err:?}"
     );
-    assert_eq!(image_of(&image, &dir), before);
-    // The format 1 check is byte equality with "nabedra-kv 1\n": format 2 never passes it.
-    assert_ne!(V2, V1);
+    assert_eq!(files_of(&image, &dir), before);
+
+    let image = fs.crash();
+    let seg = image
+        .list(&dir.join("journal"))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.extension().is_some_and(|e| e == "jnl"))
+        .unwrap();
+    let bytes = image.contents(&seg).unwrap();
+    let [HeaderCopy::Valid(h), _] = SegmentHeader::decode_blocks(&bytes[..8192]) else {
+        panic!("segment header")
+    };
+    let mut block = h.encode_block();
+    block[8..12].copy_from_slice(&1u32.to_le_bytes());
+    let crc = nabedra_kv::crc::mask(nabedra_kv::crc::crc32c(&block[..40]));
+    block[40..44].copy_from_slice(&crc.to_le_bytes());
+    let f = image.open(&seg, OpenMode::ReadWrite).unwrap();
+    f.write_all_at(&block, 0).unwrap();
+    f.write_all_at(&block, 4096).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    let before = files_of(&image, &dir);
+    let err = Store::open(&dir, options(&image, &bg)).err();
+    assert!(
+        matches!(err, Some(Error::UnsupportedFormat { .. })),
+        "{err:?}"
+    );
+    assert_eq!(files_of(&image, &dir), before);
 }
 
-/// File-level backup and restore: a crash-consistent copy of a format 2 store (a volume
-/// snapshot) opens with all synced writes; a logical copy into a new store (what the
-/// pool's archive restore does) works into either format.
+/// File-level backup and restore: a crash-consistent copy of a store (a volume snapshot)
+/// opens with all synced writes and its key; a logical copy into a new store (what the
+/// pool's archive restore does) gets its own key and reads the same.
 #[test]
 fn lsm1_backup_and_restore() {
     let bg = Background::new(2).unwrap();
     let (fs, dir) = fault_fs();
     let mut model = BTreeMap::new();
-    let store = open(&dir, options(&fs, &bg, JournalIntegrity::Authenticated));
+    let store = open(&dir, options(&fs, &bg));
     write_some(&store, &mut model, "a", 30);
     store.flush().unwrap();
     write_some(&store, &mut model, "b", 30);
-    // The snapshot is taken while the store runs.
     let copy = fs.crash();
     let snap = store.snapshot();
-    for integrity in [JournalIntegrity::Legacy, JournalIntegrity::Authenticated] {
-        let (target, tdir) = fault_fs();
-        let restored = open(&tdir, options(&target, &bg, integrity));
-        for (k, v) in &model {
-            assert_eq!(snap.get(k).unwrap().as_deref(), Some(&v[..]));
-            let mut b = WriteBatch::new();
-            b.put(k, v);
-            drop(
-                restored
-                    .submit(b, Durability::NoSync, Box::new(()))
-                    .unwrap(),
-            );
-        }
-        restored.sync().unwrap().wait().unwrap();
-        check(&restored, &model);
+    let (target, tdir) = fault_fs();
+    let restored = open(&tdir, options(&target, &bg));
+    for (k, v) in &model {
+        assert_eq!(snap.get(k).unwrap().as_deref(), Some(&v[..]));
+        let mut b = WriteBatch::new();
+        b.put(k, v);
+        drop(
+            restored
+                .submit(b, Durability::NoSync, Box::new(()))
+                .unwrap(),
+        );
     }
+    restored.sync().unwrap().wait().unwrap();
+    check(&restored, &model);
     drop(snap);
     drop(store);
-    let restored = open(&dir, options(&copy, &bg, JournalIntegrity::Legacy));
+    let restored = open(&dir, options(&copy, &bg));
     check(&restored, &model);
+}
+
+/// The case that the CRC frame left open after LSM-2 even with mitigation (b): silent
+/// media damage zeroes the header of a flushed record (seq 1); a flushed journal value
+/// (seq 2) that a client wrote holds, at a 4 KiB boundary, a forged batch for seq 3 with
+/// a plausible `durable_seq`. Recovery may cross covered damage without evidence
+/// (LSM-2), so on the CRC frame it would take the forged header as its resync point,
+/// replay the forged store-wide batch and truncate the genuine, synced seq 3 as a torn
+/// tail. The forged header has no valid tag: recovery resyncs at seq 3 and replays it.
+#[test]
+fn lsm1_media_damage_never_lets_a_forged_batch_replay() {
+    let bg = Background::new(2).unwrap();
+    let (fs, dir) = fault_fs();
+    let store = open(&dir, options(&fs, &bg));
+    let journal = dir.join("journal");
+    let write = |store: &Store, key: &[u8], value: &[u8], jv: bool, d: Durability| {
+        let mut b = WriteBatch::new();
+        if jv {
+            b.put_journal(key, value);
+        } else {
+            b.put(key, value);
+        }
+        store.submit(b, d, Box::new(())).unwrap().wait().unwrap();
+    };
+    write(&store, b"s/one", b"<<seq-one>>", false, Durability::NoSync);
+    // seq 2: a journal value whose bytes the client chose. A dry layout run on another
+    // store gives the offset of the next 4 KiB boundary inside the value.
+    let mut value = b"<<client-value>>".to_vec();
+    value.resize(9000, 0);
+    let (probe_fs, probe_dir) = fault_fs();
+    {
+        let probe = open(&probe_dir, options(&probe_fs, &bg));
+        write(&probe, b"s/one", b"<<seq-one>>", false, Durability::NoSync);
+        write(&probe, b"s/two", &value, true, Durability::Sync);
+    }
+    let (seg, at) = find_at(&probe_fs, &probe_dir.join("journal"), b"<<client-value>>");
+    let bytes = probe_fs.contents(&seg).unwrap();
+    let [HeaderCopy::Valid(h), _] = SegmentHeader::decode_blocks(&bytes[..8192]) else {
+        panic!("segment header")
+    };
+    let boundary = (at / 4096 + 1) * 4096;
+    let mut batch = WriteBatch::new();
+    batch.put(b"s/forged", b"x");
+    let guess = nabedra_kv::mac::JournalKey::from_bytes(*b"a guessed key!!!");
+    let mut forged = Vec::new();
+    nabedra_kv::journal::format::encode_record(
+        &mut forged,
+        &nabedra_kv::journal::format::RecordFields {
+            kind: nabedra_kv::journal::format::RecordType::Batch,
+            flags: 0,
+            epoch: h.epoch,
+            first_seq: 3,
+            count: 1,
+            durable_seq: 2,
+        },
+        &[],
+        nabedra_kv::journal::format::Payload::Bytes(batch.data()),
+        &guess,
+    );
+    let off = (boundary - at) as usize;
+    value[off..off + forged.len()].copy_from_slice(&forged);
+    write(&store, b"s/two", &value, true, Durability::Sync);
+    store.flush().unwrap();
+    write(
+        &store,
+        b"s/three",
+        b"<<seq-three-acked>>",
+        false,
+        Durability::Sync,
+    );
+    drop(store);
+    let image = fs.crash();
+    let (seg, one_at) = find_at(&image, &journal, b"<<seq-one>>");
+    let f = image.open(&seg, OpenMode::ReadWrite).unwrap();
+    f.write_all_at(&[0u8; 48], one_at / 4096 * 4096).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    let opened = Store::open(&dir, options(&image, &bg)).unwrap();
+    let snap = opened.store.snapshot();
+    assert!(
+        snap.get(b"s/forged").unwrap().is_none(),
+        "forged batch replayed"
+    );
+    assert_eq!(
+        snap.get(b"s/three").unwrap().as_deref(),
+        Some(&b"<<seq-three-acked>>"[..]),
+        "the acknowledged seq 3 was lost"
+    );
 }

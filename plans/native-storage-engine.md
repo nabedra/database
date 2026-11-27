@@ -24,7 +24,7 @@ The user (Q1 to Q5) and the lead settled these on 2026-11-19. Do not reopen them
 | Memtable | 16 shards by the scope prefix, each `RwLock<BTreeMap<InternalKey, Bytes>>`, inserted by the journal thread alone. Cross-group scans merge the shards. | Safe Rust with a single writer. A lock-free arena skiplist is a follow-up only if NS18 shows contention. |
 | Compression | None. | Same as today's `DBCompressionType::None`, and no dependency. |
 | Tuning | Today's RocksDB knobs: 10-bit whole-key bloom filter, index and filter blocks in the block cache, 128 open files, L0 trigger 4, slowdown 20, stop 36, 64 MiB target run, 256 MiB level base, ratio 10. | The comparison then measures structure, not tuning. |
-| Checksums | In-tree CRC32C (`crc.rs`): SSE4.2 on x86_64 and ARMv8 CRC on aarch64, chosen at run time, slicing-by-8 otherwise. Masked CRCs cover every journal record header and payload, block, run footer and manifest record. Snapshot files keep SHA-256. In a format 2 store (LSM-1) the record headers of new journal segments carry a 64-bit SipHash-2-4 tag under a per-store random key instead of the header CRC (`mac.rs`, in-tree, checked against the reference vectors and `std`'s `SipHasher`); payload CRCs stay CRC32C. | No new crate. `crc32fast` computes plain CRC32, not CRC32C. CRC32C is a checksum, not cryptography; TLS and hashing stay on vetted crates. |
+| Checksums | In-tree CRC32C (`crc.rs`): SSE4.2 on x86_64 and ARMv8 CRC on aarch64, chosen at run time, slicing-by-8 otherwise. Masked CRCs cover every journal record payload, block, run footer and manifest record. Snapshot files keep SHA-256. Journal record headers carry a 64-bit SipHash-2-4 tag under a per-store random key instead of a CRC (LSM-1; `mac.rs`, in-tree, checked against the reference vectors and `std`'s `SipHasher`), so bytes a client wrote cannot pass for a record; payload CRCs stay CRC32C. | No new crate. `crc32fast` computes plain CRC32, not CRC32C. CRC32C is a checksum, not cryptography; TLS and hashing stay on vetted crates. |
 | fsync | Linux: `fdatasync` on journal segments, which are preallocated and zero-filled so an overwrite changes no metadata, and `fsync` on runs, manifests and directories. macOS: `F_FULLFSYNC` for every sync, which `std`'s `sync_data` and `sync_all` already do. Never `F_BARRIERFSYNC` for an acknowledgment. | macOS `fsync` does not flush the drive cache. Docker Desktop durability depends on the VM disk; B01 and B02 already label that. |
 | fsync errors | The first failed `write`, `fdatasync` or `fsync` latches `RecoveryRequired`. Nothing retries. Pending and later commits fail as ambiguous until the store is reopened. | After a failed fsync Linux may drop the dirty pages ("fsyncgate"). It keeps today's `recovery_unknown()` latch (O29). |
 | Events | Events uses the same `Store` with its own resources (64 MiB cache, 48 MiB memtables, 2 background threads) and `put_journal` for log entries (section 6). | One engine to test. Its access pattern is a subset of the pool's. |
@@ -110,8 +110,8 @@ flowchart LR
 ```text
 <pool>/NABEDRA_OLTP_POOL.json   identity, pool_format_version 2, engine "nabedra-kv-1"
 <pool>/kv/LOCK                  flock held while open
-<pool>/kv/FORMAT                "nabedra-kv 1" or "nabedra-kv 2", fsynced with the directory
-<pool>/kv/JOURNAL_KEY           format 2 only: the 128-bit journal key with a CRC, durable before FORMAT says 2
+<pool>/kv/FORMAT                "nabedra-kv 2", written once, fsynced with the directory
+<pool>/kv/JOURNAL_KEY           the 128-bit journal key with a CRC, durable before FORMAT exists
 <pool>/kv/CURRENT               names the live MANIFEST (temp file, rename, directory fsync)
 <pool>/kv/MANIFEST-<n>          CRC'd edits: runs added and removed with key ranges, flushed_seq,
                                 next file number, segment set, quarantined scopes
@@ -127,15 +127,14 @@ A segment starts with a 4 KiB header block: magic `NBKVJNL1`, format version, se
 
 ```text
 record = header(48) ‖ scope(scope_len) ‖ payload(payload_len)
-header = header_crc u32 | payload_crc u32 | payload_len u32 | kind u8 | flags u8 | scope_len u8 | 0 u8
-       | epoch u64 | first_seq u64 | count u32 | 0 u32 | durable_seq u64
+header = tag u64 | payload_crc u32 | payload_len u32 | kind u8 | flags u8 | scope_len u8 | 0 u8
+       | count u32 | epoch u64 | first_seq u64 | durable_seq u64
 ```
 
-- `header_crc` covers header bytes 4 to 47 and the scope, so the scope stays trustworthy when only the payload is torn. `payload_crc` covers the payload, which is the `WriteBatch` encoding from `batch.rs`.
+- `tag` is a SipHash-2-4 tag, under the store's journal key (`JOURNAL_KEY`), of header bytes 8 to 47 and the scope (LSM-1). Bytes a client wrote into a payload cannot carry a valid tag, so after a damaged header they pass neither as evidence (which refused the pool) nor as a resync point (which replayed a client-chosen batch). The scope stays trustworthy when only the payload is torn. `payload_crc` covers the payload, which is the `WriteBatch` encoding from `batch.rs`; the tag covers `payload_crc`. The segment header holds a 32-bit check value of the key, so a store whose `JOURNAL_KEY` is not the one its segments were written under refuses to open instead of reading every record as damage. Segment version 2 and `FORMAT` 2 are the only formats: a format 1 store (CRC frames) is refused with `UnsupportedFormat`, not migrated.
 - `kind` is `Batch`, `Relocate` (journal GC) or `Pad`. `flags` has `SYNC`, set when the submitter asked for `Durability::Sync`.
 - `epoch` grows each time a segment file is reused. A record of an older epoch is leftover data and reads as the end of the log.
-- `durable_seq` is the highest sequence a completed fsync covered when the record was written. Recovery uses it as evidence (section 3). Every record has `durable_seq < first_seq`; recovery never takes a header that breaks it for evidence or for a resync point (LSM-1).
-- **Frames (LSM-1).** The segment header's version names the frame of its records. Version 1, the CRC frame, is the layout above. Version 2, the authenticated frame, keeps the same 48 bytes, but `header_crc` and the reserved word after `count` hold the two halves of a 64-bit SipHash-2-4 tag, under the store's journal key, of the other header bytes and the scope. Client bytes inside a payload cannot carry a valid tag, so after a damaged header they can neither pass as evidence (which refused the pool) nor as a resync point (which replayed a client-chosen batch). A version 2 segment header also holds a 32-bit check value of the key, so a store whose `JOURNAL_KEY` is not the one its segments were written under refuses to open instead of reading every record as damage. Version 2 segments exist only in a format 2 store; a format 2 store keeps reading the version 1 segments written before its upgrade, never writes a version 2 record into one (it fences the segment and continues in a new one), and makes its `FORMAT` and `JOURNAL_KEY` durable before it activates a version 2 segment.
+- `durable_seq` is the highest sequence a completed fsync covered when the record was written. Recovery uses it as evidence (section 3). Every record has `durable_seq < first_seq`; recovery also requires it of evidence and resync points (defense in depth: a forged header already fails its tag).
 - A clean close syncs, then writes and syncs one `Pad` record whose `durable_seq` covers every earlier record. After a clean shutdown, damage to any earlier record therefore has evidence and can never pass as a torn tail.
 - A scope is a promise that every key of the batch lies under that prefix. The empty scope allows any key.
 
@@ -224,7 +223,7 @@ point. Use the existing synced void pad in the fresh segment to bridge a gap thr
 new write takes a sequence at least one past the flush, and a reader replaying from an older sequence still sees a
 contiguous journal. The new directory entry and header follow the existing durable segment activation order.
 
-Only a valid record with `durable_seq < first_seq` counts as evidence or as a resync point. In a version 2 segment, valid means the header's tag checks under the journal key. In a version 1 segment the header is only CRC-checked, so client bytes at a 4 KiB boundary can still forge a plausible pad there: after a torn unsynced header such a pad can refuse the pool (R1) instead of letting it truncate (L2). That is the format 1 residual of LSM-1; it ends once the store is in format 2 and its version 1 segments have retired.
+Only a valid record counts as evidence or as a resync point: its tag checks under the journal key, and it has `durable_seq < first_seq`. Client bytes cannot produce one (LSM-1).
 
 Before repair writes, derive the proposed post-repair segment identities from the scan. Validate that each segment
 number and epoch recorded by the manifest exists both on disk and in that result. A missing identity returns R3
@@ -471,7 +470,7 @@ The candidate also contains T2 and whatever else has merged since `b29a178`, so 
 - Wire protocols, Raft log entries, snapshot files, HTTP and the ORM interface do not change (O01). Mixed releases inside one cluster are still impossible in practice, because an older binary cannot open a native pool and the other way round.
 - `nabedra-kv` publishes to crates.io before `nabedra-database`, since the server depends on it with a version.
 - Rollback is fix-forward. An older release cannot read native pools, so going back means restoring from a backup on that release. Risk R1 covers this.
-- **Journal integrity, format 1 to format 2 (LSM-1).** `Options::journal_integrity` chooses the frame. `Legacy` (the default) creates format 1 stores and keeps format 1 stores in format 1, so every release that knows only format 1 still opens what this release writes: a rollback is safe. `Authenticated` creates format 2 stores and upgrades a format 1 store at open. The upgrade first runs a complete format 1 open, which validates the store (manifest, run footers, journal replay, recorded segments); a store that open refuses is not upgraded. Still holding the lock, it makes `JOURNAL_KEY` durable, then `FORMAT` 2, closes cleanly and opens again, now writing only authenticated segments. A crash at any step leaves a store that opens: format 1, or format 2 with only version 1 segments. A release that knows only format 1 refuses a format 2 store with `UnsupportedFormat` before it changes any file, so after the upgrade a rollback is refused, never served; a format 2 store never goes back to format 1. A missing, damaged or foreign `JOURNAL_KEY` refuses the store (R3) before any change. Backups are logical (`read_archive`), so archives restore into either format; a volume snapshot restores the key with the store, and one restored without `JOURNAL_KEY` is refused. The server enables `Authenticated` for pools and Events stores in a later release, once every release a rollback can reach reads format 2 (an expand-then-contract rollout). Checked by `specs/lsm/integrity/JournalIntegrity.tla`.
+- **Journal integrity (LSM-1).** `FORMAT` 2 with authenticated record headers is the only format. A store of format 1 (CRC frames) fails to open with `UnsupportedFormat` and is not changed; there is no migration (user decision, 2026-11-27: no system uses the database yet, breaking changes are allowed). A missing, damaged or foreign `JOURNAL_KEY` refuses the store (R3) before any change. Backups are logical (`read_archive`), so archives restore into a new store, which gets its own key; a volume snapshot carries the key with the store.
 - The release notes state the clean break, the new `UnsupportedFormat` error, the quarantine and re-sync behavior, and the new stats fields.
 
 ---
@@ -611,22 +610,13 @@ in four, cleanup before validation in five, and accepting a certified unflushed 
 baselines remain applicable for liveness, multiple scopes, physical file cuts and reopening. Phase 2 needs
 an NS07 regression against the recovery implementation.
 
-### Journal integrity upgrade (LSM-1)
+### Authenticated journal frames (LSM-1)
 
-`specs/lsm/integrity/JournalIntegrity.tla` checks the format 1 to format 2 upgrade of section 9 (T check
-`lsm-journal-integrity`). Its state is one store directory: `FORMAT` and `JOURNAL_KEY`, each with an OS view and a
-durable view, and the frame of each live segment. Two binaries run on it, one that knows only format 1 and the new
-one with either option, with kills and power losses at every step, two redeploys in either direction (upgrade and
-rollback), a restored volume copy with or without `JOURNAL_KEY`, and key damage. Properties: an authenticated
-segment exists only once `FORMAT` 2 is durable (`KeyCoversFrames`); `FORMAT` 2 is durable only after the key is
-(`FormatHasKey`); the old binary serves only a store with only CRC segments (`OldOpensOnlyV1`); no record is written
-in another frame than its segment's (`NoMixedSegment`); only a store a complete format 1 open accepted is upgraded
-(`UpgradeValidated`); a refused open changes no file (`RefusalLeavesDisk`); with the new binary on "auth" and faults
-stopped, the store ends open in format 2 (`L_UpgradeCompletes`). Local pinned TLC (unattested): the safety baseline
-9,188 distinct states, depth 17; the liveness baseline 453 states; every action covered. Mutants: authenticated
-segment before `FORMAT` 2 is durable (3 states), no store directory sync at a format 2 open (5), `FORMAT` before the
-key (2), old binary ignoring `FORMAT` (6), authenticated records appended to a format 1 segment (8), upgrade without
-the validating open (2), refusal after a write (6), reopening in the CRC frame after the upgrade (7, lasso). The
-`no_open_dir_sync` counterexample is a design fix: a kill between the rename of `FORMAT` and its directory sync
-leaves a name that a later power loss undoes, so a format 2 open syncs the store directory before it writes.
-Byte-level forgery is checked by the NS05 and NS25 tests in `journal/crash_tests.rs` and `tests/store_integrity.rs`.
+`Lsm.tla` abstracts records as slots, so it models the tag as a property of torn slots: a torn client record never
+holds a header recovery accepts. The mutant `unauthenticated_frames` (`specs/lsm/mutants/unauthenticated_frames.cfg`)
+lets a power loss turn an unsynced client record into a torn slot that carries a forged header claiming a later
+sync, as the unkeyed header CRC allowed; it breaks `G03_NoFalseDamage` (a power loss alone refuses the store). The
+byte-level cases (a forged pad after a torn header, a forged batch, a forged resync point after media damage of a
+flushed header, a foreign key, a format 1 store) are the NS05 and NS25 tests in `journal/crash_tests.rs` and
+`tests/store_integrity.rs`. The upgrade model that an earlier revision of this fix needed
+(`specs/lsm/integrity/JournalIntegrity.tla`) is gone with the format 1 reader.

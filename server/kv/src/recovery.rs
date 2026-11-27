@@ -9,8 +9,8 @@ use crate::error::{Error, FileId, Result};
 use crate::fs::{Fs, FsLock};
 use crate::mac::JournalKey;
 use crate::manifest::{
-    self, CURRENT_FILE, CURRENT_TMP, FORMAT_CONTENT, FORMAT_CONTENT_V2, FORMAT_FILE, FORMAT_TMP,
-    JOURNAL_DIR, JOURNAL_KEY_FILE, JOURNAL_KEY_TMP, LOCK_FILE, ManifestState, RUNS_DIR,
+    self, CURRENT_FILE, CURRENT_TMP, FORMAT_CONTENT, FORMAT_FILE, FORMAT_TMP, JOURNAL_DIR,
+    JOURNAL_KEY_FILE, JOURNAL_KEY_TMP, LOCK_FILE, ManifestState, RUNS_DIR,
 };
 use crate::run::parse_run_file_name;
 
@@ -18,29 +18,19 @@ pub(crate) struct Prepared {
     pub lock: FsLock,
     pub state: ManifestState,
     pub manifest_torn_tail: bool,
-    /// The journal key of a format 2 store; `None` for format 1.
-    pub key: Option<JournalKey>,
+    /// The key journal record headers are tagged with.
+    pub key: JournalKey,
 }
 
-/// True when `dir` holds a format 1 store (its `FORMAT` says so), the case
-/// [`crate::JournalIntegrity::Authenticated`] upgrades.
-pub(crate) fn is_format1_store(fs: &dyn Fs, dir: &Path) -> Result<bool> {
-    let format = dir.join(FORMAT_FILE);
-    if !fs.exists(&format)? {
-        return Ok(false);
-    }
-    Ok(manifest::read_file(fs, &format)? == FORMAT_CONTENT)
-}
-
-/// The key of a format 2 store. Without it no authenticated record can be read, so a
-/// missing or damaged key refuses the store (R3).
+/// The store's journal key. Without it no record can be read, so a missing or damaged
+/// key refuses the store (R3) before anything changes.
 fn read_journal_key(fs: &dyn Fs, dir: &Path) -> Result<JournalKey> {
     let path = dir.join(JOURNAL_KEY_FILE);
     if !fs.exists(&path)? {
         return Err(Error::Corruption {
             file: FileId::Other,
             offset: 0,
-            what: "FORMAT names format 2 but JOURNAL_KEY is missing",
+            what: "JOURNAL_KEY is missing",
         });
     }
     JournalKey::decode_file(&manifest::read_file(fs, &path)?)
@@ -64,28 +54,22 @@ fn unsupported(dir: &Path, what: String) -> Error {
 ///
 /// A directory without `FORMAT` must be empty apart from the leftovers of an interrupted
 /// creation (`LOCK`, `FORMAT.tmp`); anything else (another engine's store, for instance) is
-/// refused before anything in it is touched. A new store is created in format 2 when
-/// `create_auth`: its key is durable before `FORMAT` names format 2.
-pub(crate) fn prepare(fs: &dyn Fs, dir: &Path, create_auth: bool) -> Result<Prepared> {
+/// refused before anything in it is touched. A new store's key is durable before its
+/// `FORMAT` is written.
+pub(crate) fn prepare(fs: &dyn Fs, dir: &Path) -> Result<Prepared> {
     if !fs.exists(dir)? {
         fs.create_dir_all(dir)?;
-        if let Some(parent) = dir.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs.sync_dir(parent)?;
-        }
     }
     let entries = names(fs, dir)?;
     let mut key = None;
     let has_format = entries.iter().any(|n| n == FORMAT_FILE);
     if has_format {
         let content = manifest::read_file(fs, &dir.join(FORMAT_FILE))?;
-        if content == FORMAT_CONTENT_V2 {
-            key = Some(read_journal_key(fs, dir)?);
-        } else if content != FORMAT_CONTENT {
+        if content != FORMAT_CONTENT {
             let shown = String::from_utf8_lossy(&content[..content.len().min(64)]).into_owned();
             return Err(unsupported(dir, format!("FORMAT holds {shown:?}")));
         }
+        key = Some(read_journal_key(fs, dir)?);
     } else {
         // Leftovers of an interrupted creation: the lock, temp files, and a key that no
         // FORMAT names yet.
@@ -108,34 +92,32 @@ pub(crate) fn prepare(fs: &dyn Fs, dir: &Path, create_auth: bool) -> Result<Prep
         }
     }
     let lock = fs.lock(&dir.join(LOCK_FILE))?;
-    if key.is_some() {
-        // A kill between the rename of FORMAT (or JOURNAL_KEY) and its directory sync
-        // leaves a name the OS shows but a power loss would undo. Make both durable
-        // before this open writes an authenticated segment, which a store that loses its
-        // FORMAT 2 could not read (JournalIntegrity.tla, mutant no_open_dir_sync).
-        fs.sync_dir(dir)?;
+    // LSM-10: make the store directory's entry durable on every open, not only on the
+    // one that created it. A kill between the creation of `dir` (or of `journal/` or
+    // `runs/` below) and its directory sync leaves a name the OS shows; the next open
+    // saw it, skipped the sync, wrote synced records, and a power loss then took the
+    // whole store with them. One directory sync per open, twice.
+    if let Some(parent) = dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs.sync_dir(parent)?;
     }
-    if !has_format {
-        if create_auth {
-            let new_key = JournalKey::generate()?;
-            manifest::write_journal_key(fs, dir, &new_key)?;
-            manifest::write_format(fs, dir, FORMAT_CONTENT_V2)?;
-            key = Some(new_key);
-        } else {
-            manifest::write_format(fs, dir, FORMAT_CONTENT)?;
+    let key = match key {
+        Some(key) => key,
+        None => {
+            let key = JournalKey::generate()?;
+            manifest::write_journal_key(fs, dir, &key)?;
+            manifest::write_format(fs, dir)?;
+            key
         }
-    }
-    let mut created = false;
+    };
     for sub in [JOURNAL_DIR, RUNS_DIR] {
         let path = dir.join(sub);
         if !fs.exists(&path)? {
             fs.create_dir_all(&path)?;
-            created = true;
         }
     }
-    if created {
-        fs.sync_dir(dir)?;
-    }
+    fs.sync_dir(dir)?;
     let (state, manifest_torn_tail) = if fs.exists(&dir.join(CURRENT_FILE))? {
         let number = manifest::read_current(fs, dir)?;
         let (state, report) = manifest::read_manifest(fs, dir, number)?;

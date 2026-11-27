@@ -71,16 +71,7 @@ pub fn small_options(fs: Arc<dyn Fs>, background: Arc<Background>) -> Options {
         shards: 4,
     };
     o.scope_of = scope4;
-    if test_auth() {
-        o.journal_integrity = nabedra_kv::JournalIntegrity::Authenticated;
-    }
     o
-}
-
-/// `NABEDRA_KV_TEST_AUTH=1` runs the store tests with format 2 stores (authenticated
-/// journal frames, LSM-1) instead of format 1.
-pub fn test_auth() -> bool {
-    std::env::var_os("NABEDRA_KV_TEST_AUTH").is_some_and(|v| v == "1")
 }
 
 pub fn fault_fs() -> (FaultFs, PathBuf) {

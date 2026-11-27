@@ -2,16 +2,12 @@
 //!
 //! # Files
 //!
-//! - `FORMAT` holds `nabedra-kv 1\n` (format 1: journal records in the CRC frame) or
-//!   `nabedra-kv 2\n` (format 2: journal segments created from then on use the
-//!   authenticated frame, LSM-1). It is written by a temp file, a sync, a rename and a
-//!   directory sync, once at creation and once more by the upgrade from format 1 to 2.
-//!   Anything else, or a non-empty directory without it, is [`Error::UnsupportedFormat`]:
-//!   a release that knows only format 1 refuses a format 2 store this way, before it
-//!   changes any file.
-//! - `JOURNAL_KEY` (format 2 only) holds the 128-bit journal key with a CRC
-//!   ([`crate::mac`]). It is durable before `FORMAT` names format 2 and never rewritten
-//!   after that.
+//! - `FORMAT` holds `nabedra-kv 2\n`, written once at creation (temp file, rename,
+//!   directory sync). Anything else, including the format 1 of stores written before
+//!   LSM-1, or a non-empty directory without it, is [`Error::UnsupportedFormat`], before
+//!   any file changes.
+//! - `JOURNAL_KEY` holds the 128-bit key that journal record headers are tagged with, with
+//!   a CRC ([`crate::mac`]). It is durable before `FORMAT` exists and never rewritten.
 //! - `CURRENT` names the live manifest: `MANIFEST-<n> <crc>\n`, where `<crc>` is the masked
 //!   CRC32C of `MANIFEST-<n>` in hex. It is replaced by writing `CURRENT.tmp`, syncing it,
 //!   renaming it over `CURRENT` and syncing the directory. Any other content is R3.
@@ -45,9 +41,8 @@ use crate::mac::JournalKey;
 use crate::types::Seq;
 
 pub const FORMAT_FILE: &str = "FORMAT";
-pub const FORMAT_CONTENT: &[u8] = b"nabedra-kv 1\n";
-/// `FORMAT` of a store whose journal uses authenticated frames (LSM-1).
-pub const FORMAT_CONTENT_V2: &[u8] = b"nabedra-kv 2\n";
+/// Format 2: journal records in the authenticated frame (LSM-1). Format 1 is refused.
+pub const FORMAT_CONTENT: &[u8] = b"nabedra-kv 2\n";
 pub const JOURNAL_KEY_FILE: &str = "JOURNAL_KEY";
 pub(crate) const JOURNAL_KEY_TMP: &str = "JOURNAL_KEY.tmp";
 pub const CURRENT_FILE: &str = "CURRENT";
@@ -587,14 +582,13 @@ pub fn switch_current(
     fs.sync_dir(dir).map_err(after)
 }
 
-/// Writes `FORMAT` (`content` is [`FORMAT_CONTENT`] or [`FORMAT_CONTENT_V2`]): temp
-/// file, sync, rename (over an older `FORMAT`), directory sync.
-pub fn write_format(fs: &dyn Fs, dir: &Path, content: &[u8]) -> Result<()> {
-    replace_file(fs, dir, FORMAT_TMP, FORMAT_FILE, content)
+/// Writes `FORMAT` once: temp file, sync, rename, directory sync.
+pub fn write_format(fs: &dyn Fs, dir: &Path) -> Result<()> {
+    replace_file(fs, dir, FORMAT_TMP, FORMAT_FILE, FORMAT_CONTENT)
 }
 
-/// Writes `JOURNAL_KEY` the same way. Called only while `FORMAT` still names format 1
-/// (or does not exist), so nothing depends on an earlier key file it replaces.
+/// Writes `JOURNAL_KEY` the same way, at creation, before `FORMAT`: a key file without
+/// `FORMAT` is a leftover of an interrupted creation that nothing depends on.
 pub(crate) fn write_journal_key(fs: &dyn Fs, dir: &Path, key: &JournalKey) -> Result<()> {
     replace_file(
         fs,

@@ -38,8 +38,8 @@ pub use quarantine::QuarantineLimit;
 pub use run::{Run, RunMeta, RunReadContext, RunWriter, RunWriterOptions, TableCache};
 pub use source::{InternalIterator, RangeTombstone};
 pub use store::{
-    Background, Commit, Durability, Iter, JournalIntegrity, JournalOptions, Opened, Options,
-    RecoveryReport, Snapshot, Store, StoreStats, THREAD_STACK_BYTES,
+    Background, Commit, Durability, Iter, JournalOptions, Opened, Options, RecoveryReport,
+    Snapshot, Store, StoreStats, THREAD_STACK_BYTES,
 };
 pub use types::{Kind, Locator, Seq};
 pub use version::LevelOptions;

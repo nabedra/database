@@ -129,7 +129,7 @@ fn small() -> JournalOptions {
         segment_bytes: 64 << 10,
         max_group_bytes: 4 << 20,
         zero_fill: true,
-        auth_key: None,
+        key: JournalOptions::default().key,
     }
 }
 

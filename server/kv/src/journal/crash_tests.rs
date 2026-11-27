@@ -72,7 +72,7 @@ fn opts() -> JournalOptions {
         segment_bytes: 64 << 10,
         max_group_bytes: 4 << 20,
         zero_fill: true,
-        auth_key: None,
+        key: JournalOptions::default().key,
     }
 }
 
@@ -709,7 +709,8 @@ fn ns07_damaged_fence_pad_with_evidence_never_resumes_in_leftovers() {
     assert_eq!(run2[3].at.unwrap().0, seg_b);
 
     let bytes = std::fs::read(&path).unwrap();
-    let format::HeaderCheck::Valid(pad) = format::check_header(&bytes[u0_at as usize..], None)
+    let format::HeaderCheck::Valid(pad) =
+        format::check_header(&bytes[u0_at as usize..], &opts().key)
     else {
         panic!("expected the fence pad at {u0_at}")
     };
@@ -717,9 +718,10 @@ fn ns07_damaged_fence_pad_with_evidence_never_resumes_in_leftovers() {
     // Leftovers of A's epoch (copies of U1 and U2) at the next 4 KiB boundary.
     let leftover_at = format::align_up(u0_at + 1);
     overwrite(&path, leftover_at, &leftovers);
-    let format::HeaderCheck::Valid(l) =
-        format::check_header(&std::fs::read(&path).unwrap()[leftover_at as usize..], None)
-    else {
+    let format::HeaderCheck::Valid(l) = format::check_header(
+        &std::fs::read(&path).unwrap()[leftover_at as usize..],
+        &opts().key,
+    ) else {
         panic!("planted leftover must parse")
     };
     assert_eq!(l.first_seq, run1[4].first_seq);
@@ -821,7 +823,9 @@ fn synced_records(dir: &Path, n: usize) -> (u64, Vec<u64>, std::path::PathBuf) {
     let bytes = std::fs::read(&path).unwrap();
     let mut offsets = Vec::new();
     let mut pos = format::RECORDS_START;
-    while let format::HeaderCheck::Valid(h) = format::check_header(&bytes[pos as usize..], None) {
+    while let format::HeaderCheck::Valid(h) =
+        format::check_header(&bytes[pos as usize..], &opts().key)
+    {
         if !h.is_pad() {
             offsets.push(pos);
         }
@@ -831,16 +835,16 @@ fn synced_records(dir: &Path, n: usize) -> (u64, Vec<u64>, std::path::PathBuf) {
     (seg, offsets, path)
 }
 
-/// Rewrites the header of the record at `at` through `edit`, keeping its CRCs valid.
+/// Rewrites the header of the record at `at` through `edit`, keeping its tag valid (the
+/// journal wrote it: these cases are structural damage, not forgery).
 fn rewrite_header(path: &Path, at: u64, edit: impl FnOnce(&mut [u8])) {
     let mut bytes = std::fs::read(path).unwrap();
     let at = at as usize;
-    let scope_len = usize::from(bytes[at + 14]);
+    let scope_len = usize::from(bytes[at + 18]);
     edit(&mut bytes[at..at + RECORD_HEADER_LEN]);
-    let crc = crc::mask(crc::crc32c(
-        &bytes[at + 4..at + RECORD_HEADER_LEN + scope_len],
-    ));
-    bytes[at..at + 4].copy_from_slice(&crc.to_le_bytes());
+    let scope = bytes[at + RECORD_HEADER_LEN..at + RECORD_HEADER_LEN + scope_len].to_vec();
+    let tag = format::record_tag(&opts().key, &bytes[at..at + RECORD_HEADER_LEN], &scope);
+    bytes[at..at + 8].copy_from_slice(&tag.to_le_bytes());
     overwrite(path, at as u64, &bytes[at..at + RECORD_HEADER_LEN]);
 }
 
@@ -868,7 +872,7 @@ fn ns07_r3_sequence_gap_between_valid_records_refuses() {
     let dir = TempDir::new("r3-gap");
     let (seg, offsets, path) = synced_records(dir.path(), 3);
     rewrite_header(&path, offsets[1], |h| {
-        h[24..32].copy_from_slice(&7u64.to_le_bytes())
+        h[32..40].copy_from_slice(&7u64.to_le_bytes())
     });
     assert_r3(dir.path(), seg, "discontinuity");
 }
@@ -877,7 +881,7 @@ fn ns07_r3_sequence_gap_between_valid_records_refuses() {
 fn ns07_r3_unknown_record_kind_refuses() {
     let dir = TempDir::new("r3-kind");
     let (seg, offsets, path) = synced_records(dir.path(), 3);
-    rewrite_header(&path, offsets[1], |h| h[12] = 9);
+    rewrite_header(&path, offsets[1], |h| h[16] = 9);
     assert_r3(dir.path(), seg, "unknown journal record kind");
 }
 
@@ -886,8 +890,8 @@ fn ns07_r3_record_from_a_future_epoch_refuses() {
     let dir = TempDir::new("r3-epoch");
     let (seg, offsets, path) = synced_records(dir.path(), 3);
     rewrite_header(&path, offsets[1], |h| {
-        let epoch = u64::from_le_bytes(h[16..24].try_into().unwrap());
-        h[16..24].copy_from_slice(&(epoch + 1).to_le_bytes());
+        let epoch = u64::from_le_bytes(h[24..32].try_into().unwrap());
+        h[24..32].copy_from_slice(&(epoch + 1).to_le_bytes());
     });
     assert_r3(dir.path(), seg, "future epoch");
 }
@@ -919,13 +923,12 @@ fn ns07_r3_segments_that_do_not_chain_refuse() {
     assert!(segs.len() >= 3, "{segs:?}");
     // Rewrite the second segment's header (both copies) with a wrong first sequence.
     let second = &segs[1];
-    let header = format::SegmentHeader {
-        segment: second.segment,
-        epoch: second.epoch,
-        first_seq: second.first_seq + 1,
-        auth: false,
-        key_check: 0,
-    };
+    let header = format::SegmentHeader::new(
+        second.segment,
+        second.epoch,
+        second.first_seq + 1,
+        &options.key,
+    );
     let path = segment::path_of(dir, second.segment, segment::LIVE_EXT);
     overwrite(&path, 0, &header.encode_blocks());
     let err = Journal::open(fs, dir, options, 0, Arc::new(Sink::default()))
@@ -1201,7 +1204,7 @@ fn g7_zero_fill_drops_its_pages_as_it_goes() {
     let dir = Path::new("/db/journal");
     fs.create_dir_all_durable(dir);
     let segment_bytes = 3 * segment::ZERO_DROP_BYTES + (1 << 20);
-    segment::create_free(&fs, dir, 7, segment_bytes, true, None).unwrap();
+    segment::create_free(&fs, dir, 7, segment_bytes, true, None, &opts().key).unwrap();
     let mut unsynced = 0u64;
     let mut synced_dirty = 0u64;
     let mut most = 0u64;
@@ -1346,28 +1349,30 @@ fn check_reopened_segment_name_is_durable() {
 
 // ---------------------------------------------------------------------------------------
 // LSM-1 (rv-lsm, fx-lsm): client bytes inside a value must never count as a journal
-// record. Reproductions from wave-rv/reports/rv-lsm-patches/rv-lsm-lsm1-test.patch.
+// record. The reproductions from wave-rv/reports/rv-lsm-patches/rv-lsm-lsm1-test.patch,
+// now against tagged headers: on the CRC frame of `e6b4040b` the pad case refused the
+// journal (R1) and the batch case replayed the forged batch.
 
-fn keyed_opts(key: Option<crate::mac::JournalKey>) -> JournalOptions {
-    JournalOptions {
-        auth_key: key,
-        ..opts()
-    }
+fn test_key() -> crate::mac::JournalKey {
+    crate::mac::JournalKey::from_bytes(*b"journal-key-0001")
+}
+
+fn keyed_opts(key: crate::mac::JournalKey) -> JournalOptions {
+    JournalOptions { key, ..opts() }
 }
 
 /// Writes one synced record, then an unsynced record whose value holds `forged` at the
 /// next 4 KiB boundary (as a client could), crashes, and tears the unsynced record's
-/// header as a power loss can. Returns the journal's open result. `key` is the journal
-/// key (format 2) or `None` (format 1); the forger never knows the key.
+/// header as a power loss can. Returns the journal's open result. The forger does not
+/// know the journal key.
 fn forged_tail(
     name: &str,
-    key: Option<crate::mac::JournalKey>,
     forge: impl FnOnce(u64) -> Vec<u8>,
 ) -> (TempDir, Result<(Journal, RecoveryReport, Arc<Sink>)>) {
     let dir = TempDir::new(name);
     let fs: Arc<dyn Fs> = Arc::new(RealFs);
     let sink = Arc::new(Sink::default());
-    let (j, _) = Journal::open(fs, dir.path(), keyed_opts(key), 0, sink).unwrap();
+    let (j, _) = Journal::open(fs, dir.path(), keyed_opts(test_key()), 0, sink).unwrap();
     j.submit(plain(b"a", 100), Durability::Sync, Box::new(()))
         .unwrap()
         .wait()
@@ -1392,7 +1397,7 @@ fn forged_tail(
     drop(j);
     let path = segment::path_of(dir.path(), info.segment, segment::LIVE_EXT);
     let bytes = std::fs::read(&path).unwrap();
-    match format::check_header(&bytes[victim_at as usize..], key.as_ref()) {
+    match format::check_header(&bytes[victim_at as usize..], &test_key()) {
         format::HeaderCheck::Valid(h) => assert_eq!(h.first_seq, 2, "victim record placed"),
         other => panic!("victim record not at {victim_at}: {other:?}"),
     }
@@ -1402,7 +1407,7 @@ fn forged_tail(
     let opened = Journal::open(
         Arc::new(RealFs),
         dir.path(),
-        keyed_opts(key),
+        keyed_opts(test_key()),
         0,
         sink.clone(),
     )
@@ -1410,208 +1415,73 @@ fn forged_tail(
     (dir, opened)
 }
 
-/// A pad a client could write: CRC frame, plausible fields (below its own first_seq,
-/// above seq(P)).
-fn forged_pad(epoch: u64) -> Vec<u8> {
+/// What a client can write without the key: a record tagged under a guessed key, with
+/// any fields, here a pad that names a durable sequence past the torn record.
+fn forged(epoch: u64, kind: RecordType, first_seq: u64, payload: &[u8]) -> Vec<u8> {
+    let guess = crate::mac::JournalKey::from_bytes(*b"journal-key-0002");
     let mut f = Vec::new();
     format::encode_record(
         &mut f,
         &format::RecordFields {
-            kind: RecordType::Pad,
+            kind,
             flags: 0,
             epoch,
-            first_seq: 1000,
-            count: 0,
-            durable_seq: 999,
+            first_seq,
+            count: u32::from(kind != RecordType::Pad),
+            durable_seq: first_seq - 1,
         },
         &[],
-        format::Payload::Zeros(0),
-        None,
+        if payload.is_empty() {
+            format::Payload::Zeros(0)
+        } else {
+            format::Payload::Bytes(payload)
+        },
+        &guess,
     );
     f
 }
 
-/// A batch a client could write, with any `durable_seq` it likes. The header check field
-/// is redone by hand because the journal itself never writes `durable_seq >= first_seq`.
-fn forged_batch(epoch: u64, durable_seq: u64, key: Option<&crate::mac::JournalKey>) -> Vec<u8> {
-    let mut forged = WriteBatch::new();
-    forged.put(b"forged", b"x");
-    let mut f = Vec::new();
-    format::encode_record(
-        &mut f,
-        &format::RecordFields {
-            kind: RecordType::Batch,
-            flags: 0,
-            epoch,
-            first_seq: 2,
-            count: 1,
-            durable_seq: 0,
-        },
-        &[],
-        format::Payload::Bytes(forged.data()),
-        key,
-    );
-    f[40..48].copy_from_slice(&durable_seq.to_le_bytes());
-    match key {
-        None => {
-            let crc = crate::crc::mask(crate::crc::crc32c(&f[4..RECORD_HEADER_LEN]));
-            f[..4].copy_from_slice(&crc.to_le_bytes());
-        }
-        Some(k) => {
-            let tag = k.tag(&[&f[4..36], &f[40..48]]);
-            f[..4].copy_from_slice(&(tag as u32).to_le_bytes());
-            f[36..40].copy_from_slice(&((tag >> 32) as u32).to_le_bytes());
-        }
-    }
-    f
-}
-
-fn replayed_forged(sink: &Sink) -> usize {
-    sink.data()
-        .into_iter()
-        .filter(|d| d.windows(6).any(|w| w == b"forged"))
-        .count()
-}
-
-fn test_key() -> crate::mac::JournalKey {
-    crate::mac::JournalKey::from_bytes(*b"journal-key-0001")
-}
-
-/// Format 2: a forged pad is not evidence, so the torn unsynced tail is L2 and the
-/// journal opens with seq 1 (plan section 3). Format 1 refuses (the residual below).
+/// A forged pad is not evidence, so the torn unsynced tail is L2 and the journal opens
+/// with seq 1 (plan section 3).
 #[test]
 fn lsm1_forged_pad_in_a_value_is_not_evidence() {
-    let (_dir, opened) = forged_tail("lsm1-pad-v2", Some(test_key()), forged_pad);
+    let (_dir, opened) = forged_tail("lsm1-pad", |epoch| {
+        forged(epoch, RecordType::Pad, 1000, &[])
+    });
     let (_j, report, sink) = opened.expect("a torn unsynced tail must open (L2), not refuse (R1)");
     assert_eq!(sink.records().len(), 1);
     assert_eq!(report.tail_truncations, 1);
 }
 
-/// Format 2: a forged batch tagged under a guessed key is never replayed, whatever its
-/// `durable_seq`.
+/// A forged batch is never replayed.
 #[test]
 fn lsm1_forged_batch_in_a_value_is_never_replayed() {
-    let guess = crate::mac::JournalKey::from_bytes(*b"journal-key-0002");
-    for durable in [0, 1, u64::MAX] {
-        let (_dir, opened) = forged_tail("lsm1-batch-v2", Some(test_key()), |epoch| {
-            forged_batch(epoch, durable, Some(&guess))
-        });
-        let (_j, report, sink) = opened.expect("a torn unsynced tail must open (L2)");
-        assert_eq!(replayed_forged(&sink), 0, "durable_seq {durable}");
-        assert_eq!(report.tail_truncations, 1);
-    }
-}
-
-/// Format 1, mitigation (b): a forged batch whose `durable_seq` reaches its own
-/// `first_seq` (what evidence after a torn header needs) is not a record, so it is never
-/// replayed and the tail is L2.
-#[test]
-fn lsm1_legacy_frame_never_replays_a_forged_batch_as_evidence() {
-    let (_dir, opened) = forged_tail("lsm1-batch-v1", None, |epoch| {
-        forged_batch(epoch, u64::MAX, None)
+    let mut forged_batch = WriteBatch::new();
+    forged_batch.put(b"forged", b"x");
+    let (_dir, opened) = forged_tail("lsm1-batch", |epoch| {
+        forged(epoch, RecordType::Batch, 2, forged_batch.data())
     });
     let (_j, report, sink) = opened.expect("a torn unsynced tail must open (L2)");
-    assert_eq!(replayed_forged(&sink), 0);
+    let replayed = sink
+        .data()
+        .into_iter()
+        .filter(|d| d.windows(6).any(|w| w == b"forged"))
+        .count();
+    assert_eq!(
+        replayed, 0,
+        "replay applied a batch only a client value held"
+    );
     assert_eq!(report.tail_truncations, 1);
 }
 
-/// Format 1 residual (plan section 3, LSM-1): a plausible forged pad still passes as
-/// evidence in the CRC frame, so the pool is refused (R1) instead of opening with an L2
-/// truncation. Format 2 closes it (`lsm1_forged_pad_in_a_value_is_not_evidence`). This
-/// test pins the residual so that a change to it is seen.
+/// A journal opened with another key than its segments were written under is refused
+/// before it changes anything, instead of reading every record as damage.
 #[test]
-fn lsm1_legacy_frame_residual_forged_pad_refuses() {
-    let (_dir, opened) = forged_tail("lsm1-pad-v1", None, forged_pad);
-    assert!(
-        matches!(
-            opened.as_ref().err(),
-            Some(Error::Corruption {
-                what: "synced journal record damaged (scope unknown)",
-                ..
-            })
-        ),
-        "{:?}",
-        opened.as_ref().err()
-    );
-}
-
-/// A keyed journal fences a CRC-frame segment instead of appending to it: after a clean
-/// close in format 1, an open with the key writes only into a new authenticated
-/// segment, and the records of both reopen.
-#[test]
-fn lsm1_keyed_open_never_appends_to_a_crc_segment() {
-    let dir = TempDir::new("lsm1-fence");
-    let fs: Arc<dyn Fs> = Arc::new(RealFs);
-    let (j, _, _) = open(fs.clone(), dir.path()).unwrap();
-    j.submit(plain(b"a", 100), Durability::Sync, Box::new(()))
-        .unwrap()
-        .wait()
-        .unwrap();
-    let old = j.segments().last().unwrap().clone();
-    drop(j); // clean close
-    let old_path = segment::path_of(dir.path(), old.segment, segment::LIVE_EXT);
-    let old_bytes = std::fs::read(&old_path).unwrap();
-
-    let sink = Arc::new(Sink::default());
-    let (j, _) = Journal::open(
-        fs.clone(),
-        dir.path(),
-        keyed_opts(Some(test_key())),
-        0,
-        sink,
-    )
-    .unwrap();
-    j.submit(plain(b"b", 100), Durability::Sync, Box::new(()))
-        .unwrap()
-        .wait()
-        .unwrap();
-    let segs = j.segments();
-    let new = segs.last().unwrap().clone();
-    assert_ne!(new.segment, old.segment, "{segs:?}");
-    j.crash();
-    drop(j);
-    let new_bytes =
-        std::fs::read(segment::path_of(dir.path(), new.segment, segment::LIVE_EXT)).unwrap();
-    let [format::HeaderCopy::Valid(h), _] = format::SegmentHeader::decode_blocks(&new_bytes) else {
-        panic!("new segment header")
-    };
-    assert!(h.auth, "the new segment uses the authenticated frame");
-    // The old segment changed only after its clean-close pad (by the fence pad).
-    let after = std::fs::read(&old_path).unwrap();
-    let first_change = old_bytes
-        .iter()
-        .zip(&after)
-        .position(|(a, b)| a != b)
-        .unwrap_or(after.len());
-    assert!(first_change >= (format::RECORDS_START + 2 * format::BLOCK) as usize);
-
-    let sink = Arc::new(Sink::default());
-    let (_j, _) = Journal::open(
-        fs,
-        dir.path(),
-        keyed_opts(Some(test_key())),
-        0,
-        sink.clone(),
-    )
-    .unwrap();
-    assert_eq!(sink.data().len(), 2, "both records reopen");
-}
-
-/// A journal without the key refuses an authenticated segment, and one with a wrong key
-/// refuses its synced records, both before changing anything.
-#[test]
-fn lsm1_authenticated_segment_needs_the_key() {
-    let dir = TempDir::new("lsm1-nokey");
+fn lsm1_journal_under_another_key_refuses_untouched() {
+    let dir = TempDir::new("lsm1-other-key");
     let fs: Arc<dyn Fs> = Arc::new(RealFs);
     let sink = Arc::new(Sink::default());
-    let (j, _) = Journal::open(
-        fs.clone(),
-        dir.path(),
-        keyed_opts(Some(test_key())),
-        0,
-        sink,
-    )
-    .unwrap();
+    let (j, _) = Journal::open(fs.clone(), dir.path(), keyed_opts(test_key()), 0, sink).unwrap();
     j.submit(plain(b"a", 100), Durability::Sync, Box::new(()))
         .unwrap()
         .wait()
@@ -1632,15 +1502,14 @@ fn lsm1_authenticated_segment_needs_the_key() {
         v
     };
     let before = listing(dir.path());
-    assert!(matches!(
-        open(fs.clone(), dir.path()).err(),
-        Some(Error::UnsupportedFormat { .. })
-    ));
-    let wrong = crate::mac::JournalKey::from_bytes(*b"journal-key-9999");
+    let other = crate::mac::JournalKey::from_bytes(*b"journal-key-9999");
     let sink = Arc::new(Sink::default());
-    assert!(
-        Journal::open(fs, dir.path(), keyed_opts(Some(wrong)), 0, sink).is_err(),
-        "a wrong key must not open the journal"
-    );
-    assert_eq!(listing(dir.path()), before, "refusals change nothing");
+    assert!(matches!(
+        Journal::open(fs, dir.path(), keyed_opts(other), 0, sink).err(),
+        Some(Error::Corruption {
+            what: "journal segment written under another journal key",
+            ..
+        })
+    ));
+    assert_eq!(listing(dir.path()), before, "the refusal changed nothing");
 }
