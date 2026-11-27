@@ -23,11 +23,11 @@ class PublicServeTests(unittest.TestCase):
         callbacks = (lambda value: called.append(value), lambda value: called.append(value), lambda: [])
         records = []
 
-        def run(config, startup, *, prepared, stop, _receipt, cold_start, migrate_catalog):
+        def run(config, startup, *, prepared, stop, _receipt, cold_start):
             records.append(startup)
             self.assertEqual(startup['provisioning'], 'managed')
             self.assertEqual(startup['initial_policy']['mode'], 'autoscale')
-            self.assertEqual((cold_start, migrate_catalog), (True, True))
+            self.assertTrue(cold_start)
             prepared(dict(cluster_id=C, authorize_url='http://127.0.0.1:1234/private/v1/authorize'))
             stop()
 
@@ -38,7 +38,7 @@ class PublicServeTests(unittest.TestCase):
                 # Repeated ownership after cleanup proves the first bridge stopped.
                 for _ in range(2):
                     module.serve('cluster', (1, 3), start_node=callbacks[0], stop_node=callbacks[1],
-                                 list_nodes=callbacks[2], cold_start=True, migrate_catalog=True)
+                                 list_nodes=callbacks[2], cold_start=True)
         self.assertEqual(called, [])
         self.assertNotEqual(records[0]['bridge']['callback_token'], records[0]['bridge']['authorize_token'])
 

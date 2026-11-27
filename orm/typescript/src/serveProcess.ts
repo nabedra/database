@@ -32,7 +32,6 @@ interface PreparedMessage extends Omit<ReadyMessage, "type"> {
 export interface SuperviseOptions {
   binary?: string
   coldStart?: boolean
-  migrateCatalog?: boolean
   announcement?: string
   onPrepared?: (message: PreparedMessage) => void
   onReady?: (message: ReadyMessage) => void | Promise<void>
@@ -242,7 +241,7 @@ function watchExit(child: ChildProcess): Promise<Exit> {
 export async function superviseApi(configPath: string, startup: ServeStartup, options: SuperviseOptions = {}):
   Promise<{ signal: NodeJS.Signals | null }> {
   const {
-    binary, coldStart = false, migrateCatalog = false, announcement = "nabedra.serve.ready",
+    binary, coldStart = false, announcement = "nabedra.serve.ready",
     onPrepared, onReady, onStop, failureSignal,
   } = options
   ensureSupervisorAvailable()
@@ -285,7 +284,6 @@ export async function superviseApi(configPath: string, startup: ServeStartup, op
     const deadline = performance.now() + startupMs
     const args = ["api", "--config", resolve(configPath)]
     if (coldStart) args.push("--cold-start")
-    if (migrateCatalog) args.push("--migrate-catalog")
     child = spawn(binary ?? resolveServerBinary(), args, {
       env: { ...process.env, NABEDRA_SUPERVISOR_FD: "3" },
       detached: true, stdio: ["ignore", "pipe", "pipe", "pipe"],

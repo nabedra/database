@@ -151,16 +151,11 @@ class ManagementTests(unittest.TestCase):
             expected = json.loads(Path(config['auth_file']).read_text())['admin_token']
             self.assertEqual(transport.call_args.args[1], expected)
 
-    def test_migration_delegates_confirmed_command(self):
+    def test_migrate_is_not_a_command(self):
+        # Catalog format 6 is the only format; there is nothing to migrate.
         with self.assertRaises(SystemExit) as error:
             self.run_cli('migrate', '--storage', 's3://test-bucket/db/', '--region', 'eu-west-1')
         self.assertEqual(error.exception.code, 2)
-        with patch('nabedra.cli.resolve_server_binary', return_value='/binary'), patch('os.execv') as execute:
-            self.run_cli('migrate', '--storage', 's3://test-bucket/db/', '--region', 'eu-west-1', '--cluster-id', '11111111-1111-4111-8111-111111111111', '--confirm-writers-stopped')
-            self.assertEqual(execute.call_args.args[1][-3:], ['--cluster-id', '11111111-1111-4111-8111-111111111111', '--confirm-writers-stopped'])
-            execute.reset_mock()
-            self.assertEqual(self.run_cli('migrate', '--storage', 's3://test-bucket/db/', '--region', 'eu-west-1', '--cluster-id', 'invalid', '--confirm-writers-stopped')[0], 2)
-            execute.assert_not_called()
 
     def test_environment_binary_precedes_path_and_override_is_final(self):
         import sys

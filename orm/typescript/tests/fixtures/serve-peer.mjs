@@ -7,7 +7,7 @@ import { Socket } from "node:net"
 
 // Independent, native peer for the Rust supervisor and provider wire protocols.
 assert.deepEqual(process.argv.slice(2, 4), ["api", "--config"])
-assert.deepEqual(process.argv.slice(5), ["--cold-start", "--migrate-catalog"])
+assert.deepEqual(process.argv.slice(5), ["--cold-start"])
 const env = process.env
 const channel = new Socket({ fd: Number(env.NABEDRA_SUPERVISOR_FD), readable: true, writable: true })
 const messages = channel[Symbol.asyncIterator]()

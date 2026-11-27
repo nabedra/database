@@ -208,7 +208,7 @@ test("managed serve negotiates the provider bridge and reaps startup failures", 
     const module = new URL("../dist/serve.js", import.meta.url).href
     const script = "import { serve } from " + JSON.stringify(module)
       + "; try { await serve('Fixture', [1, 3], { startNode: () => 'resource', stopNode: () => {},"
-      + " listNodes: async () => [], coldStart: true, migrateCatalog: true }); }"
+      + " listNodes: async () => [], coldStart: true }); }"
       + " catch (error) { console.log(JSON.stringify({code:error.code})); process.exitCode = 1; }"
     const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
       env: { ...process.env, PATH: dirname(process.execPath) + delimiter + (process.env.PATH ?? ""),
