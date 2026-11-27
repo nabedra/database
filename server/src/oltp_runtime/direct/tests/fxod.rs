@@ -146,3 +146,57 @@ async fn d11_od7_a_retained_result_precedes_validation() {
     );
     cluster.shutdown().await;
 }
+
+/// OD-2 cost: a delete of a missing row now writes like a delete, never
+/// more. Each proposes one entry with one dedup record and expiry key; a
+/// real delete also tombstones its index entry, a miss has none. Neither
+/// tombstone is reclaimed later: Data groups have no row-version GC yet (no
+/// code deletes `'v'` keys), so a miss grows storage exactly as a delete or
+/// an update of the same key does. Prints the mean latency of both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d02_od2_cost_a_missed_delete_writes_no_more_than_a_delete() {
+    const N: i64 = 50;
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    for id in 1..=N {
+        let row = serde_json::json!({"row": {"id": id, "value": id, "tag": "c", "score": 0.0}});
+        assert_eq!(cluster.op(leader, "table.insert", row).await, done("null"));
+    }
+    async fn counts(cluster: &Cluster, leader: usize) -> [usize; 4] {
+        [
+            cluster.keys_with(leader, b'v').await,
+            cluster.keys_with(leader, b'h').await,
+            cluster.keys_with(leader, b'D').await,
+            cluster.keys_with(leader, b'E').await,
+        ]
+    }
+    let mut measured = Vec::new();
+    for (label, first, expected) in [("delete", 1, "true"), ("miss", 1_001, "false")] {
+        let before = counts(&cluster, leader).await;
+        let entries = cluster.last_index(leader);
+        let started = nabedra_rt::time::now_std();
+        for id in first..first + N {
+            let response = cluster
+                .op(leader, "table.delete", serde_json::json!({"key": id}))
+                .await;
+            assert_eq!(response, done(expected), "{label} {id}");
+        }
+        let elapsed = nabedra_rt::time::elapsed(started);
+        let after = counts(&cluster, leader).await;
+        let delta: Vec<usize> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+        measured.push((label, delta, cluster.last_index(leader) - entries, elapsed));
+    }
+    for (label, delta, entries, elapsed) in &measured {
+        eprintln!(
+            "od2 cost {label}: {entries} entries, new keys v/h/D/E {delta:?}, mean {:.3} ms",
+            elapsed.as_secs_f64() * 1e3 / N as f64
+        );
+    }
+    let (_, delete, delete_entries, _) = &measured[0];
+    let (_, miss, miss_entries, _) = &measured[1];
+    let n = N as usize;
+    assert_eq!(*delete_entries, *miss_entries, "one entry per request on both");
+    assert_eq!(delete, &vec![2 * n, 0, n, n], "row and index tombstones, record, expiry");
+    assert_eq!(miss, &vec![n, n, n, n], "one tombstone and a new head per absent key");
+    cluster.shutdown().await;
+}
