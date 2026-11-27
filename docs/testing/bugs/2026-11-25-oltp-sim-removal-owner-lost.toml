@@ -1,8 +1,10 @@
 # CONTROL-1 (fx-control, 5fc0e978): fixed in code, pending the simulator check. An owner fence now carries a pending
 # removal under the new term (Control supersede_ready, Building or sealed, after its Timestamp fence settles), and
 # supervise_membership keeps probing while a transition is pending, so a live worker fences a lost owner
-# (r05_control1_an_owner_fence_carries_a_pending_removal). Verify with oltp-sim-membership-thaw and -wipe at the fix
-# head before marking it fixed.
+# (r05_control1_an_owner_fence_carries_a_pending_removal). The simulator cannot confirm it yet: oltp-sim-membership-thaw
+# and -wipe show no LostWorkerListed in any seed at the base fc896b3d (Actions run 46016758591) nor at the fix
+# 18116676 (run 46010990267), so the current schedule no longer reaches the owner kill during the removal. A seed or
+# fault schedule that kills the new owner while its removal is pending is needed before marking it fixed.
 id = "OLTP-sim-removal-owner-lost"
 title = "A ready-set removal whose owner is killed stays pending, and the two surviving workers make no progress"
 class = "fence-lifecycle-order"
