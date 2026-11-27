@@ -1,3 +1,5 @@
+# Fixed (Sol continuation, df48cfca and 09a85433), verified 2026-11-27 by fx-oltp-direct with the rewritten
+# regression direct/tests/fixa.rs d05_unknown_proposal_keeps_range_clock_pending_until_apply.
 # Design review 2026-11-26 (wave-rv, rv-oltp-direct, finding OD-1). Found in TLC: specs/oltp/direct, mutant
 # prefix_settle_unknown, 6 states, no fault. The shipped executor removes a commit from the RangeClock after any
 # proposal error (direct/executor.rs, the Err arm after propose: clock.settle(commit_ts)), including the `by` deadline,
@@ -16,8 +18,5 @@ lowest_regression = "specs/oltp/direct/mutants/prefix_settle_unknown.cfg"
 seed = "unknown"
 why_not_caught = "No simulator checker repeats a snapshot read at one timestamp, and no fault schedule lets a direct proposal outlive its executor's deadline and then commit."
 invariant_added = "G02_SnapshotStable: the versions at or below a served snapshot timestamp never change afterwards; a proposal whose outcome is unknown stays pending until it applies or leadership changes."
-fix_commits = []
-revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-24"
+fix_commits = ["09a854330f4c60cbca8bead5e89c7fb96cc6be48", "df48cfcab9e0a9da0d3e98cd988c70a7f7b9652d"]
+revert_patch_ok = true
