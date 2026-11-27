@@ -235,6 +235,7 @@ async fn r05_control1_an_owner_fence_releases_a_published_move_for_retirement() 
     assert_eq!(owner, moves.peer);
     assert!(moves.get(b"ct/replica-move-active".to_vec()).await.is_none());
     assert!(moves.get(key(b"ct/group-replacement/", plan.request.group.group_id)).await.is_some());
+    assert!(moves.get(key(b"ct/replica-move-steward/", plan.id)).await.is_some(), "the new owner is the steward");
     let proof = ReplicaRetiredStamp {
         group: plan.request.group.clone(),
         generation: plan.id,
@@ -263,6 +264,7 @@ async fn r05_control1_an_owner_fence_releases_a_published_move_for_retirement() 
     );
     assert!(moves.get(key(b"ct/group-replacement/", plan.request.group.group_id)).await.is_none());
     assert_eq!(moves.fixture.state().await.ready, ready);
+    assert!(moves.get(key(b"ct/replica-move-steward/", plan.id)).await.is_none());
 }
 
 /// Moving: still refused (Busy). The rollback is the planned design

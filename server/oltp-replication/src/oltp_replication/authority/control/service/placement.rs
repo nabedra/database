@@ -285,6 +285,20 @@ impl ControlHandle {
         machine::decode(raw.as_ref())
     }
 
+    /// CONTROL-1: the run owner that retires a published move after an owner
+    /// fence released its slot (`machine::placement::resolve_on_owner_fence`).
+    #[doc(hidden)]
+    pub async fn replica_move_steward(&self, id: Uuid) -> Result<Option<WorkerIdentity>, ProtocolError> {
+        let raw = self
+            .read(move |view| {
+                let value: Option<(WorkerIdentity, Authority)> =
+                    load(view, &machine::placement::steward_key(id))?;
+                view.encode(&value.map(|(owner, _)| owner))
+            })
+            .await?;
+        machine::decode(raw.as_ref())
+    }
+
     #[doc(hidden)]
     pub async fn active_replica_move(&self) -> Result<Option<ReplicaMove>, ProtocolError> {
         let raw = self

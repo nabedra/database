@@ -185,7 +185,7 @@ pub(super) fn arm(
 
 /// CONTROL-1: the run owner that retires a published move after an owner
 /// fence released its cluster slot, and the authority it holds.
-fn steward_key(id: Uuid) -> Vec<u8> {
+pub(in crate::oltp_replication::authority::control) fn steward_key(id: Uuid) -> Vec<u8> {
     key(b"ct/replica-move-steward/", id)
 }
 
