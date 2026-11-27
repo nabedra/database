@@ -1,0 +1,25 @@
+# Suspected by the rv-dense review (2026-11-27), confirmed by task fix-dense. Extensions::put checks
+# the key and inserts it under separate holds of the RAM map, so racing puts of one key both pass
+# the check: both take RAM and charge the code memory twice for one entry (one release gives half
+# back), or one takes RAM and one NVMe and the key is held twice. Evidence: `cargo-slot test -p
+# nabedra-vector --lib -- --ignored vs17_racing_puts` fails with "room ..., key ...: N puts
+# succeeded" (store/tests.rs), log /home/dev/logs/oltp-vector/w3/fix-dense/red.log. store/ext.rs
+# belongs to perf1; the proposed fix is /home/dev/logs/oltp-vector/w3/fix-dense/perf1-ext.diff,
+# with which the test passed (green.log) and the double-charge mutant was killed (red.log).
+id = "VECTOR-racing-extension-puts-double-charge"
+title = "Racing puts of one code extension both succeed and charge the code memory twice"
+class = "resource-release-order"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS17"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/vector/src/store/tests.rs::vs17_racing_puts_of_one_extension_take_one_place_and_one_charge"
+seed = "unknown"
+why_not_caught = "The extension tests put from one thread."
+invariant_added = "Intended, not met: of racing puts of one key exactly one succeeds; the key is held once, the code memory holds what RAM holds, and its release gives every byte back."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "perf1"
+expires = "2026-12-11"

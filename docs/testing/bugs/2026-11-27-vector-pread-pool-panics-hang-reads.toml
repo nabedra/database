@@ -1,0 +1,20 @@
+# Suspected by the rv-dense review (2026-11-27), confirmed by task fix-dense. A PreadDisk pool
+# thread that runs a panicking read dies (disk.rs `work` called the job bare). The panicked job
+# drops its reply sender, but a batch with more requests than live threads keeps jobs queued that
+# no thread runs, and `read` waits on their senders for ever. Evidence: `cargo-slot test -p
+# nabedra-vector --lib -- vs10_a_pool_whose_reads_all_panic` with the fix taken out: "read 0 of a
+# pool whose reads panicked" (no answer in 10 s), log /home/dev/logs/oltp-vector/w3/fix-dense/red.log.
+id = "VECTOR-pread-pool-panics-hang-reads"
+title = "A positioned-read pool whose reads panicked hangs every later batch read"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS10"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/vector/src/store/tests.rs::vs10_a_pool_whose_reads_all_panic_still_answers_every_read"
+seed = "unknown"
+why_not_caught = "The fault tests fail reads with errors, never with a panic below the store."
+invariant_added = "A read that panics on a pool thread fails its request and leaves the thread serving; every batch read answers, with an error for each request that did not run."
+fix_commits = ["907f5d278ab09a9c836148c46a341dcbe6a6f25f"]
+revert_patch_ok = false
