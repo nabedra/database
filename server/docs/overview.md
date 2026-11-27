@@ -246,7 +246,9 @@ orphan objects.
 
 Requests and responses are limited to 8 MiB each, including their JSON envelope.
 Batches and collected results are limited to 10,000 rows; tables are limited to
-100,000 rows and 64 MiB of decoded row payload. Byte limits may be reached first.
+100,000 rows and 64 MiB of decoded row payload. Byte limits may be reached first, and
+one partition must decode within a task's memory budget, which limits wide tables to fewer
+rows (see [storage behavior and limits](reference.md#storage-behavior-and-limits)).
 Partitions do not multiply these limits. Oversized results fail rather than
 truncate. There is no pagination or streaming.
 

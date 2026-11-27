@@ -2491,6 +2491,12 @@ impl Worker {
             .await
             .map_err(|_| unavailable())?
             .to_vec();
+        // The coordinator answers 429 when a partition job was refused for
+        // memory and not executed. The record retries with backoff instead
+        // of settling a transient overload as its terminal result.
+        if status == 429 {
+            return Err(http::failure(crate::protocol::ErrorCode::Overloaded));
+        }
         if status == 503 {
             let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
             let error = value

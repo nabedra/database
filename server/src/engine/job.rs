@@ -122,6 +122,74 @@ fn captured_file(job: &JobEnvelope) -> Option<ReadFile> {
         }),
     })
 }
+/// Memory one captured job needs: its decoded input partition plus the rows a
+/// mutation adds. The coordinator charges this estimate to the worker in its
+/// remote ledger before it sends the job, and the worker reserves the same.
+pub(crate) fn job_memory_bytes(job: &JobEnvelope) -> Result<u64, ProtocolError> {
+    let limit = || {
+        ProtocolError::new(
+            ErrorCode::LimitExceeded,
+            "job memory estimate overflow",
+            Outcome::NotApplied,
+        )
+    };
+    let file = match &job.task {
+        Task::Get { file, .. } | Task::Collect { file, .. } | Task::Count { file, .. } => {
+            Some(file)
+        }
+        Task::Prepare { file, .. } => file.as_ref(),
+    };
+    let (mut count, mut payload, encoded) = match file {
+        Some(FileInput::Partition {
+            row_count,
+            payload_bytes,
+            byte_size,
+            ..
+        }) => (*row_count, *payload_bytes, *byte_size),
+        // A legacy manifest contains no encoded or decoded byte counts. Use
+        // only its known lower bound; the worker reserves its whole task budget.
+        Some(FileInput::Legacy { row_count, .. }) => (*row_count, 0, 0),
+        None => (0, 0, 0),
+    };
+    if let Task::Prepare { mutation, .. } = &job.task {
+        let rows = match mutation {
+            RowMutation::Insert(p) | RowMutation::Upsert(p) => std::slice::from_ref(&p.row),
+            RowMutation::InsertMany(p) => p.rows.as_slice(),
+            RowMutation::Update(p) => std::slice::from_ref(&p.values),
+            _ => &[],
+        };
+        count = count.checked_add(rows.len() as u64).ok_or_else(limit)?;
+        for row in rows {
+            payload = payload
+                .checked_add(snapshot::row_payload(row) as u64)
+                .ok_or_else(limit)?;
+        }
+    }
+    snapshot::memory_shape(
+        &job.table,
+        usize::try_from(count).map_err(|_| limit())?,
+        usize::try_from(payload).map_err(|_| limit())?,
+        usize::try_from(encoded).map_err(|_| limit())?,
+    )
+    .map(|n| n.max(4096))
+}
+
+/// What a captured job reserves on its worker. A read (get, collect, count)
+/// reserves its estimate, at most the task budget: its output never exceeds
+/// its decoded input. Reserving the whole budget for every partition read let
+/// two small reads refuse each other on a small worker, although the
+/// coordinator's ledger, which charges the estimate, had placed both there.
+/// A mutation also encodes replacement partitions up to their target size,
+/// and a legacy file has no byte counts: both reserve the whole budget.
+fn captured_reservation(job: &JobEnvelope, task_limit: u64) -> u64 {
+    if matches!(job.task, Task::Prepare { .. })
+        || matches!(captured_file(job), Some(ReadFile::Legacy { .. }))
+    {
+        return task_limit;
+    }
+    job_memory_bytes(job).map_or(task_limit, |bytes| bytes.min(task_limit))
+}
+
 pub(crate) async fn prepare_captured<B: ObjectStore>(
     storage: &Storage<B>,
     pool: &crate::worker_pool::WorkerPool,
@@ -129,10 +197,12 @@ pub(crate) async fn prepare_captured<B: ObjectStore>(
 ) -> Result<(CapturedInput, crate::scheduling::MemoryCharge), JobError> {
     encode_job(job)?;
     let request = job.scheduler_request_id();
+    let reserve = captured_reservation(job, pool.resources().task_memory_limit_bytes);
     if let Some(file) = captured_file(job) {
-        let prepared = partition::download_file(storage, pool, request, &job.table, file)
-            .await
-            .map_err(|e| failure(e.code))?;
+        let prepared =
+            partition::download_file_reserving(storage, pool, request, &job.table, file, reserve)
+                .await
+                .map_err(|e| failure(e.code))?;
         let (file, bytes, charge) = prepared.into_parts();
         Ok((
             CapturedInput {
@@ -144,7 +214,7 @@ pub(crate) async fn prepare_captured<B: ObjectStore>(
     } else {
         let charge = pool
             .scheduler()
-            .reserve_memory(request, 0, pool.resources().task_memory_limit_bytes)
+            .reserve_memory(request, 0, reserve)
             .await
             .map_err(|e| failure(e.code))?;
         Ok((

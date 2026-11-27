@@ -333,6 +333,14 @@ duplicate-key validation.
 | Decoded logical row payload per table | 64 MiB |
 | Closed bytes per new partition file, including metadata | 64 MiB = 67,108,864 bytes |
 
+One partition file is decoded within one task's memory budget
+(`task_memory_limit_bytes`, 512 MiB by default). The budget is estimated as 768 bytes per cell,
+256 bytes per row, four times the decoded payload and four times the encoded file. A partition
+larger than that fails with `limit_exceeded`, so a wide table reaches fewer rows than the table
+limit: at the default budget, about 95,000 rows of 7 columns or 67,000 rows of 10 columns, fewer
+with large values. A collect is charged by the rows it retains for its result, not by the rows it
+scans, so a filtered collect over a large table is bounded by its matches.
+
 Partitioning does not multiply table, request, batch or result limits.
 Limits produce `limit_exceeded`, without truncation. Only server-generated
 Parquet snapshots are supported; this is not a general Parquet file importer.

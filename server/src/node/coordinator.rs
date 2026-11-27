@@ -270,7 +270,7 @@ impl Peers<'_> {
         )?;
         let response = self.worker.client.request(request, deadline).await?;
         if response.status() != 200 {
-            return Err(unavailable());
+            return Err(job_status_error(response.status().as_u16()));
         }
         http::framing(response.headers(), 0, true)?;
         if http::one(response.headers(), "content-type")? != "application/octet-stream" {
@@ -320,6 +320,25 @@ impl Peers<'_> {
         Ok(*result)
     }
 }
+/// Memory a coordinator charges for rows it retains until the reduction.
+fn retained_charge(table: &TableDescriptor, rows: &[protocol::Row]) -> Result<u64> {
+    let payload = rows.iter().try_fold(0usize, |sum, row| {
+        sum.checked_add(crate::snapshot::row_payload(row))
+            .ok_or_else(|| error(ErrorCode::LimitExceeded))
+    })?;
+    crate::snapshot::memory_shape(table, rows.len(), payload, 0)
+}
+
+/// A worker answers 429 only for a job it did not execute (its memory was
+/// short): a definite, retryable overload. Any other failure stays unknown.
+fn job_status_error(status: u16) -> ProtocolError {
+    if status == 429 {
+        http::failure(ErrorCode::Overloaded)
+    } else {
+        unavailable()
+    }
+}
+
 impl Peers<'_> {
     async fn dispatch_job(
         &self,
@@ -841,12 +860,16 @@ async fn calculate(
                             source_payload_bytes,
                             ..
                         } => {
-                            let charge_bytes = crate::snapshot::memory_shape(
-                                &table,
-                                source_rows as usize,
-                                source_payload_bytes as usize,
-                                0,
-                            )?;
+                            let Reply::Rows(part) = child
+                                .command(Command::TakeRows)
+                                .await
+                                .map_err(|_| unavailable())?
+                            else {
+                                return Err(invalid());
+                            };
+                            // Charge the rows this coordinator retains for the
+                            // reduction, not every row the job scanned (OLAP-7).
+                            let charge_bytes = retained_charge(&table, &part)?;
                             retained = retained
                                 .checked_add(charge_bytes)
                                 .ok_or_else(|| error(ErrorCode::LimitExceeded))?;
@@ -860,13 +883,6 @@ async fn calculate(
                                     .scheduler()
                                     .charge_memory(0, charge_bytes)?,
                             );
-                            let Reply::Rows(part) = child
-                                .command(Command::TakeRows)
-                                .await
-                                .map_err(|_| unavailable())?
-                            else {
-                                return Err(invalid());
-                            };
                             ordered_rows.insert(index, part);
                             (source_rows, source_payload_bytes)
                         }

@@ -39,7 +39,20 @@ pub(crate) enum OwnerError {
     Invalid,
     Cancelled,
     FailedDrain,
+    /// The job was not executed: its worker lacked the memory to prepare it.
+    Overloaded,
 }
+/// A captured job that could not reserve its memory or its download budget
+/// was not executed: a definite, retryable refusal, not an invalid payload.
+pub(in crate::node) fn prepare_refusal(code: crate::protocol::ErrorCode) -> OwnerError {
+    match code {
+        crate::protocol::ErrorCode::LimitExceeded | crate::protocol::ErrorCode::Overloaded => {
+            OwnerError::Overloaded
+        }
+        _ => OwnerError::Invalid,
+    }
+}
+
 impl fmt::Display for OwnerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -47,6 +60,7 @@ impl fmt::Display for OwnerError {
             Self::Invalid => "invalid payload command",
             Self::Cancelled => "payload cancelled",
             Self::FailedDrain => "payload drain failed",
+            Self::Overloaded => "payload preparation overloaded",
         })
     }
 }
@@ -1504,15 +1518,16 @@ async fn run(pool: &WorkerPool, slot: &Arc<Slot>, work: Work) -> Result<Reply> {
             };
             let (input, charge) = crate::engine::prepare_captured(&storage, pool, &job)
                 .await
-                .map_err(|_| OwnerError::Invalid)?;
+                .map_err(|error| prepare_refusal(error.code))?;
             let request = job.scheduler_request_id();
             let cell = slot.clone();
+            let budget = charge.bytes();
             let (reply, mut charge) = pool
                 .submit_buffered(
                     request,
                     1,
                     vec![charge],
-                    pool.resources().task_memory_limit_bytes,
+                    budget,
                     move |_, runtime| {
                         Ok(execute(
                             &cell,
@@ -2361,17 +2376,18 @@ impl PayloadOwners {
                     let (input, charge) =
                         crate::engine::prepare_captured(&storage, &partition, &job)
                             .await
-                            .map_err(|_| OwnerError::Invalid)?;
+                            .map_err(|error| prepare_refusal(error.code))?;
                     let request = job.scheduler_request_id();
                     let worker_slot = slot.clone();
                     let worker_job = job.clone();
+                    let budget = charge.bytes();
                     // Keep this future and every accepted Job until settlement, even after cancellation.
                     let submitted = partition
                         .submit_buffered(
                             request,
                             1,
                             vec![charge],
-                            partition.resources().task_memory_limit_bytes,
+                            budget,
                             move |_, _| {
                                 let _execution = execution;
                                 Ok(produce(&worker_slot, &parent, &worker_job, input))
