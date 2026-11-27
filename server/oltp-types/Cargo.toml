@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94.1"
 description = "Shared OLTP metadata, identities and wire records"
 license = "MIT"
-repository = "https://github.com/zPy52/nabedra-database"
+repository = "https://github.com/nabedra/database"
 publish = ["crates-io"]
 
 [features]

@@ -3,7 +3,7 @@
 Reviewed on 2026-11-16, finally at `62516527dda3f02f7615488938eba5ded0c8a9af`, against
 the current [code-review skill](../../.agents/skills/code-review/SKILL.md), its
 [examples](../../.agents/skills/code-review/references/example.md),
-[the repository instructions at the reviewed commit](https://github.com/zPy52/nabedra-database/blob/62516527dda3f02f7615488938eba5ded0c8a9af/AGENTS.md), the scheduling plan and
+[the repository instructions at the reviewed commit](https://github.com/nabedra/database/blob/62516527dda3f02f7615488938eba5ded0c8a9af/AGENTS.md), the scheduling plan and
 [scheduler test contract](scheduler-contract.md).
 
 The review does not support deleting most of the suite. It identifies eight

@@ -120,7 +120,7 @@ Rules for the implementation:
 - Release jobs restore no caches. A cache written by another run must not reach a published binary.
 - Pin every action by commit SHA. Pass inputs through `env:`.
 - Publish crates one at a time, in dependency order, skipping a version whose registry checksum equals the local one. A rerun then continues where it stopped.
-- Attest every archive and image with `actions/attest`. Users check one with `gh attestation verify <file> -R zPy52/nabedra-database`.
+- Attest every archive and image with `actions/attest`. Users check one with `gh attestation verify <file> -R nabedra/database`.
 - Create the release as a draft, attach everything, then publish, so that release immutability covers all of it.
 - The `macos-15` runner has 3 CPUs and 7 GB. Set `CARGO_BUILD_JOBS=2`. The OLTP release build there is unmeasured, so measure it first in REL4.
 - macOS binaries are not signed or notarized. The notes say so.

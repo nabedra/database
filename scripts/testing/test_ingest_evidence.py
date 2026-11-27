@@ -31,7 +31,11 @@ import sys
 fixture = Path(os.environ["EVIDENCE_FIXTURE"])
 args = sys.argv[1:]
 if args[0] == "api":
-    if args[-1].endswith("/artifacts?per_page=100"):
+    if args[1] == "--paginate" and args[2].startswith("repos/nabedra/database/attestations/sha256:"):
+        assert args[-1] == ".attestations[].bundle | @json"
+        assert args[2].split(":")[-1] in json.loads((fixture / "signed.json").read_text())
+        print("{}")
+    elif args[-1].endswith("/artifacts?per_page=100"):
         assert args[1:3] == ["--paginate", "--slurp"]
         print((fixture / "artifacts.json").read_text())
     elif args[-1].endswith("/zip"):
@@ -48,6 +52,15 @@ elif args[:2] == ["attestation", "verify"]:
     if "--signer-workflow" in args:
         assert args[args.index("--signer-workflow") + 1].endswith("/.github/workflows/nabedra-build.yml")
         assert args[args.index("--source-digest") + 1] == json.loads((fixture / "run.json").read_text())["head_sha"]
+        if isinstance(signature, dict):
+            signer = signature["signer"]
+            assert args[args.index("--signer-workflow") + 1].startswith(signer + "/")
+            assert args[args.index("--repo") + 1] == signer
+            assert Path(args[args.index("--bundle") + 1]).read_text().strip() == "{}"
+            if 'select(.sourceRepositoryIdentifier == "' + signature["repository_id"] + '")' not in args[-1]:
+                print("[]")
+                sys.exit(0)
+            signature = signature["invocation"]
         print(json.dumps([signature]))
 elif args[:2] == ["auth", "setup-git"]:
     pass
@@ -137,6 +150,19 @@ class IngestTests(EvidenceFixture):
         self.assertTrue(matrix["verified_attestations"])
         self.assertTrue((self.matrix_dir / "coverage-matrix.md").is_file())
         self.assertIn("Accepted: 0 (attested), rejected: 0, duplicates: 1", self.ingest().stdout)
+
+    def test_pre_transfer_evidence_requires_the_original_repository_id(self):
+        signer = evidence.PRE_TRANSFER_REPOSITORY
+        url = RUN_URL.replace(REPO, signer)
+        data = self.record("legacy", run={"url": url, "attempt": 1, "request_id": REQUEST_ID,
+                                         "date": "2026-11-01T00:30:00+01:00", "runner": "fixture"})
+        certificate = {"signer": signer, "invocation": f"{url}/attempts/1", "repository_id": "123"}
+        self.artifact({"evidence/legacy.json": data}, [(data, certificate)])
+        self.assertIn("Accepted: 0 (attested), rejected: 1", self.ingest().stdout)
+        certificate["repository_id"] = evidence.GITHUB_REPOSITORY_ID
+        self.artifact({"evidence/legacy.json": data}, [(data, certificate)])
+        self.assertIn("Accepted: 1 (attested), rejected: 0", self.ingest().stdout)
+        self.assertEqual(next(self.dest.rglob("*.json")).read_bytes(), data)
 
     def test_rejects_tampered_record(self):
         original = self.record("tampered")

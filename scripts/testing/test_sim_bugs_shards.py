@@ -34,8 +34,10 @@ bundle = json.loads(Path(args[args.index("--bundle") + 1]).read_text())
 if bundle["digest"] != hashlib.sha256(Path(args[0]).read_bytes()).hexdigest():
     sys.exit("no matching attestations")
 certificate = bundle["certificate"]
-assert args[args.index("--repo") + 1] == "zPy52/nabedra-database"
-assert args[args.index("--signer-workflow") + 1].endswith("/.github/workflows/nabedra-build.yml")
+record_url = json.loads(Path(args[0]).read_bytes())["run"]["url"]
+signer_repo = record_url.removeprefix("https://github.com/").split("/actions/runs/")[0]
+assert args[args.index("--repo") + 1] == signer_repo
+assert args[args.index("--signer-workflow") + 1] == signer_repo + "/.github/workflows/nabedra-build.yml"
 assert args[args.index("--source-digest") + 1] == json.loads(Path(args[0]).read_text())["sha"]
 assert "--deny-self-hosted-runners" in args and args[args.index("--format") + 1] == "json"
 print(json.dumps([{"verificationResult": {"signature": {"certificate": certificate}}}]))
@@ -155,20 +157,23 @@ class ShardCase(HarnessCase):
         path.mkdir(exist_ok=True)
         return path
 
-    def keep(self, n, log, run=7, attempt=1, name=None, record=None, certificate=None, bundle=True, run_changes=None, job=None):
+    def keep(self, n, log, run=7, attempt=1, name=None, record=None, certificate=None, bundle=True, run_changes=None,
+             job=None, slug=REPO):
         """The evidence of one shard as it is downloaded: the record, its log and its attestation. GitHub lists its job."""
         name = name or f"{run}-{attempt}-{n}"
         (self.records / f"{name}.log").write_text(log)
         sha = sh(self.f.repo, "rev-parse", "HEAD").strip()
-        url = f"https://github.com/{REPO}/actions/runs/{run}"
+        home = f"https://github.com/{slug}"
+        url = f"{home}/actions/runs/{run}"
         record = {"schema": "nabedra.evidence/1", "check": f"oltp-sim-bugs-fix-one-{n}", "sha": sha, "tree_clean": True,
                   "result": "pass", "run": {"url": url, "attempt": attempt, "request_id": f"req-{run}"},
                   "artifacts": [{"name": f"{name}.log", "sha256": sha256(log)}], **(record or {})}
         text = json.dumps(record)
         (self.records / f"{name}.json").write_text(text)
         if bundle:
-            certificate = {"sourceRepositoryURI": f"https://github.com/{REPO}", "sourceRepositoryDigest": record["sha"],
-                           "buildSignerURI": f"{WORKFLOW}@refs/heads/main", "runnerEnvironment": "github-hosted",
+            certificate = {"sourceRepositoryURI": home, "sourceRepositoryDigest": record["sha"],
+                           "buildSignerURI": f"{home}/{sim_bugs.BUILD_WORKFLOW}@refs/heads/main",
+                           "runnerEnvironment": "github-hosted",
                            "buildTrigger": "workflow_dispatch", "runInvocationURI": f"{url}/attempts/{attempt}",
                            **(certificate or {})}
             (self.records / f"sha256-{sha256(text)}.jsonl").write_text(
@@ -506,6 +511,15 @@ class ShardTest(ShardCase):
 
 class MergeTest(ShardCase):
     """The answer of one target's attested shards."""
+
+    def test_pre_transfer_shard_requires_the_original_repository_id(self):
+        slug = sim_bugs.PRE_TRANSFER_REPOSITORY
+        status, log, _ = self.shard(1, script={"hit": 1}, GITHUB_REPOSITORY=slug)
+        self.assertEqual(status, 0, log)
+        self.keep(1, log, slug=slug, certificate={"sourceRepositoryIdentifier": "123"})
+        self.assert_merge("incomplete", "its attestation is of another repository")
+        self.keep(1, log, slug=slug, certificate={"sourceRepositoryIdentifier": sim_bugs.GITHUB_REPOSITORY_ID})
+        self.assert_merge("candidate")
 
     def test_the_lowest_hit_of_complete_ranges(self):
         self.run_shards(1, 2, script={"hit": 6})
