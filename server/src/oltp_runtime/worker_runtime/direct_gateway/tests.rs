@@ -631,7 +631,8 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
         // answered by the queued path, and the two misses record their
         // answers as entries (OD-2).
         assert!(stats.direct_done >= 12, "{stats:?}");
-        assert_eq!(stats.forwards, 1, "{stats:?}");
+        // The gateway and then the queue owner settle it (two forwards).
+        assert_eq!(stats.forwards, 2, "{stats:?}");
         assert_eq!(leader()["entries_applied"], json!(8));
 
         // A body without a declared length still takes the queued path with

@@ -271,6 +271,7 @@ async fn d05_gc2_a_failed_batch_proposal_reaches_every_member() {
     .await;
     let leader = cluster.leader().await;
     let followers: Vec<usize> = (0..3).filter(|v| *v != leader).collect();
+    let versions = cluster.keys_with(leader, b'v').await;
     cluster.stop(followers[0]).await;
     cluster.stop(followers[1]).await;
     let cluster = Arc::new(cluster);
@@ -302,17 +303,15 @@ async fn d05_gc2_a_failed_batch_proposal_reaches_every_member() {
             assert!(matches!(outcome, Outcome::Unknown | Outcome::NotApplied));
         }
     }
-    for id in 1..=24 {
-        assert_eq!(
-            cluster.latest(leader, cluster.row_key(id)).await,
-            (None, None),
-            "row {id} never applied"
-        );
-    }
-    assert_eq!(
-        cluster.clock(leader).pending_len(),
-        0,
-        "every member settled"
-    );
+    // No row applied. A member whose batch reached Raft may still commit, so
+    // it stays pending until it applies or leadership changes (OD-1); every
+    // other member settled.
+    assert_eq!(cluster.keys_with(leader, b'v').await, versions, "no row applied");
+    let pending = cluster.clock(leader).pending_len();
+    let metrics = cluster.voters[leader].consensus.raft.metrics().borrow_watched().clone();
+    let unapplied = metrics.last_log_index.unwrap_or(0)
+        - metrics.last_applied.map_or(0, |id| id.index);
+    assert!(pending <= 24, "{pending}");
+    assert!(pending == 0 || unapplied > 0, "pending {pending} without an unapplied entry");
     Arc::try_unwrap(cluster).ok().unwrap().shutdown().await;
 }

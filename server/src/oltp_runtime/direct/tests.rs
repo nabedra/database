@@ -1611,6 +1611,7 @@ async fn d05_one_stopped_follower_keeps_writes_and_two_stop_every_success() {
         );
     }
     let before = cluster.latest(leader, cluster.row_key(1)).await;
+    let versions = cluster.keys_with(leader, b'v').await;
     cluster.stop(followers[1]).await;
     let id = nabedra_rt::ids::uuid_v4();
     let body = cluster.body(
@@ -1645,9 +1646,13 @@ async fn d05_one_stopped_follower_keeps_writes_and_two_stop_every_success() {
             "{stats:?}"
         );
     }
+    // OD-1: a proposal that may still commit stays pending, so a latest
+    // read waits for it instead of reading around it. The applied state
+    // gained no version.
+    assert!(before.0.is_some());
     assert_eq!(
-        cluster.latest(leader, cluster.row_key(1)).await,
-        before,
+        cluster.keys_with(leader, b'v').await,
+        versions,
         "row unchanged"
     );
     cluster.shutdown().await;

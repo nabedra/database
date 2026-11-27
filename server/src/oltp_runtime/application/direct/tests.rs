@@ -1399,7 +1399,10 @@ async fn d02_q05_rv_final_l2_uncertain_resend_never_reports_a_definite_failure()
     );
     let stats = gateway.stats();
     assert_eq!(stats.resends, 1, "{stats:?}");
-    assert_eq!(stats.forward_replayed, 1, "{stats:?}");
+    // OD-7: the leader replays the retained result before it validates the
+    // resend against the changed descriptor, so no anchor settlement runs.
+    assert_eq!(stats.forward_replayed, 0, "{stats:?}");
+    assert_eq!(stats.direct_done, 1, "{stats:?}");
     // One committed version of the row.
     let (version, row) = cluster.latest(group, 0, 7).await;
     assert!(version.is_some());
