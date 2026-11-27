@@ -7,9 +7,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::{
-    File, OpenOptions, canonicalize, create_dir, euid, metadata, read, read_dir, read_to_string,
-    remove_dir, remove_dir_all, remove_file, rename, rename_noreplace, set_mode, symlink_metadata,
-    sync_dir, try_exists, write,
+    File, OpenOptions, canonicalize, create_dir, create_dir_with_mode, euid, hard_link, metadata,
+    read, read_dir, read_to_string, remove_dir, remove_dir_all, remove_file, rename,
+    rename_noreplace, set_mode, symlink_metadata, sync_dir, try_exists, write,
 };
 
 fn show<T: Debug>(result: io::Result<T>) -> String {
@@ -232,6 +232,82 @@ pub(crate) fn scenario(root: &Path) -> Vec<String> {
             space.block_size > 0 && space.available <= space.blocks && space.blocks > 0
         ),
     );
+
+    // Descriptor-relative calls, as a TOCTOU-safe caller uses them.
+    let at = File::open(&d).unwrap();
+    let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    log("mkdirat", show(at.create_dir_at("s", 0o700)));
+    log("mkdirat again", show(at.create_dir_at("s", 0o700)));
+    log("mkdirat orphan", show(at.create_dir_at("x/y", 0o700)));
+    log(
+        "mkdirat mode",
+        show(metadata(d.join("s")).map(|m| (m.is_dir(), m.mode() & 0o7777))),
+    );
+    log(
+        "openat missing",
+        show(at.open_at("missing", dir_flags, 0).map(|_| ())),
+    );
+    let s = at.open_at("s", dir_flags, 0).unwrap();
+    log("openat dir", show(s.metadata().map(|m| m.is_dir())));
+    let create = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let t = s.open_at("t", create, 0o600).unwrap();
+    log("openat write", show((&t).write_all(b"tt")));
+    log("fchmod", show(t.set_mode(0o400)));
+    log(
+        "openat fstat",
+        show(
+            t.metadata()
+                .map(|m| (m.is_file(), m.len(), m.mode() & 0o7777, m.nlink())),
+        ),
+    );
+    log(
+        "openat create_new again",
+        show(s.open_at("t", create, 0o600).map(|_| ())),
+    );
+    log(
+        "openat file as dir",
+        show(s.open_at("t", dir_flags, 0).map(|_| ())),
+    );
+    log(
+        "openat through dir",
+        show(
+            at.open_at("s/t", libc::O_RDONLY | libc::O_CLOEXEC, 0)
+                .and_then(|f| {
+                    let mut bytes = Vec::new();
+                    (&f).read_to_end(&mut bytes).map(|_| bytes)
+                }),
+        ),
+    );
+    log("linkat", show(s.hard_link_at("t", "u")));
+    log("linkat onto file", show(s.hard_link_at("t", "u")));
+    log("linkat missing", show(s.hard_link_at("missing", "w")));
+    log(
+        "linked",
+        show(metadata(d.join("s/u")).map(|m| (m.nlink(), m.ino() == t.metadata().unwrap().ino()))),
+    );
+    log("link", show(hard_link(d.join("s/u"), d.join("s/v"))));
+    log(
+        "link onto file",
+        show(hard_link(d.join("s/u"), d.join("s/v"))),
+    );
+    log("link read", show(read(d.join("s/v"))));
+    log("unlinkat", show(s.remove_file_at("t")));
+    log("unlinkat missing", show(s.remove_file_at("t")));
+    log("after unlinkat", show(t.metadata().map(|m| m.nlink())));
+    log("dir sync at", show(s.sync_all()));
+    log(
+        "mkdir mode",
+        show(
+            create_dir_with_mode(d.join("m"), 0o700)
+                .and_then(|()| metadata(d.join("m")))
+                .map(|m| m.mode() & 0o7777),
+        ),
+    );
+    log(
+        "mkdir mode again",
+        show(create_dir_with_mode(d.join("m"), 0o700)),
+    );
+    drop((at, s, t));
     log(
         "create truncates",
         show(File::create(&b).and_then(|f| f.metadata()).map(|m| m.len())),
@@ -274,6 +350,15 @@ fn the_scenario_runs_on_the_host() {
         "O_DIRECTORY file: err NotADirectory",
         "dir for write: err IsADirectory",
         "noreplace onto file: err AlreadyExists",
+        "mkdirat again: err AlreadyExists",
+        "mkdirat mode: ok (true, 448)",
+        "openat fstat: ok (true, 2, 256, 1)",
+        "openat create_new again: err AlreadyExists",
+        "openat file as dir: err NotADirectory",
+        "linkat onto file: err AlreadyExists",
+        "linked: ok (2, true)",
+        "after unlinkat: ok 2",
+        "mkdir mode: ok 448",
         "rmdir non-empty: err DirectoryNotEmpty",
         "gone: ok false",
     ] {

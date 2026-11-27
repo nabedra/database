@@ -132,6 +132,7 @@ pub enum FsOp {
     RemoveDirAll,
     SetMode,
     Stat,
+    Link,
 }
 
 /// One logged call. `offset` and `len` are zero where they do not apply; for `Open`,
@@ -1322,6 +1323,12 @@ impl FaultFs {
     /// exists, `NotFound` if its parent does not. A pending directory operation until its
     /// parent is synced.
     pub fn create_dir(&self, dir: &Path) -> io::Result<()> {
+        self.create_dir_with_mode(dir, DEFAULT_DIR_MODE)
+    }
+
+    /// [`FaultFs::create_dir`] with the permission bits `mode`, in the same operation, as
+    /// `mkdir(dir, mode)` does (there is no umask).
+    pub fn create_dir_with_mode(&self, dir: &Path, mode: u32) -> io::Result<()> {
         let mut state = self.state();
         let result = (|| {
             state.admit(FsOp::CreateDir, dir, true)?;
@@ -1329,11 +1336,40 @@ impl FaultFs {
                 return Err(io::ErrorKind::AlreadyExists.into());
             }
             state.require_dir(&parent(dir))?;
-            let meta = state.new_dir_meta();
+            let meta = DirMeta {
+                mode: mode & 0o7777,
+                ..state.new_dir_meta()
+            };
             state.record(vec![Effect::Dir(dir.to_path_buf(), Some(meta))]);
             Ok(())
         })();
         state.log(FsOp::CreateDir, dir, None, 0, 0, result.is_ok());
+        result
+    }
+
+    /// Links the file `from` at `to` as well, as `link`: `NotFound` if `from` or the parent
+    /// of `to` is missing, `PermissionDenied` for a directory (`EPERM`), `AlreadyExists` if
+    /// `to` exists. The new name is a pending directory operation until the parent of `to`
+    /// is synced; both names reach the same inode.
+    pub fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let mut state = self.state();
+        let result = (|| {
+            state.admit(FsOp::Link, from, true)?;
+            let Some(&ino) = state.os.files.get(from) else {
+                return Err(if state.os.dirs.contains_key(from) {
+                    io::ErrorKind::PermissionDenied.into()
+                } else {
+                    not_found()
+                });
+            };
+            state.require_dir(&parent(to))?;
+            if state.os.files.contains_key(to) || state.os.dirs.contains_key(to) {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            state.record(vec![Effect::File(to.to_path_buf(), Some(ino))]);
+            Ok(())
+        })();
+        state.log(FsOp::Link, from, Some(to), 0, 0, result.is_ok());
         result
     }
 
@@ -2746,6 +2782,70 @@ mod tests {
         );
         fs.sync_dir(&p("/db")).unwrap();
         assert!(!fs.crash().exists(&p("/db/b")).unwrap());
+    }
+
+    #[test]
+    fn hard_link_is_a_second_name_durable_with_its_parent() {
+        let fs = with_db();
+        let error = |r: io::Result<()>| r.unwrap_err().kind();
+        durable_file(&fs, "/db/a", b"x");
+        fs.create_dir_all_durable(&p("/db/sub"));
+        assert_eq!(
+            error(fs.hard_link(&p("/db/missing"), &p("/db/b"))),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            error(fs.hard_link(&p("/db/a"), &p("/db/none/b"))),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            error(fs.hard_link(&p("/db/sub"), &p("/db/b"))),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            error(fs.hard_link(&p("/db/a"), &p("/db/sub"))),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            error(fs.hard_link(&p("/db/a"), &p("/db/a"))),
+            io::ErrorKind::AlreadyExists
+        );
+        fs.hard_link(&p("/db/a"), &p("/db/sub/b")).unwrap();
+        assert_eq!(fs.stat(&p("/db/a")).unwrap().nlink, 2);
+        assert_eq!(
+            fs.stat(&p("/db/a")).unwrap().ino,
+            fs.stat(&p("/db/sub/b")).unwrap().ino
+        );
+        assert_eq!(read_all(&fs, "/db/sub/b").unwrap(), b"x");
+
+        // The new name is pending in its own parent; the old one is unaffected.
+        assert!(fs.sync_dir(&p("/db")).is_ok());
+        let crashed = fs.crash();
+        assert!(!crashed.exists(&p("/db/sub/b")).unwrap());
+        assert_eq!(read_all(&crashed, "/db/a").unwrap(), b"x");
+        fs.sync_dir(&p("/db/sub")).unwrap();
+        let crashed = fs.crash();
+        assert_eq!(read_all(&crashed, "/db/sub/b").unwrap(), b"x");
+        assert_eq!(crashed.stat(&p("/db/a")).unwrap().nlink, 2);
+
+        // Removing one name keeps the inode under the other, also across a crash.
+        Fs::remove(&fs, &p("/db/a")).unwrap();
+        fs.sync_dir(&p("/db")).unwrap();
+        let crashed = fs.crash();
+        assert!(!crashed.exists(&p("/db/a")).unwrap());
+        assert_eq!(read_all(&crashed, "/db/sub/b").unwrap(), b"x");
+        assert_eq!(crashed.stat(&p("/db/sub/b")).unwrap().nlink, 1);
+    }
+
+    #[test]
+    fn create_dir_with_mode_sets_the_mode_in_one_operation() {
+        let fs = with_db();
+        let before = fs.mutating_ops();
+        fs.create_dir_with_mode(&p("/db/m"), 0o750).unwrap();
+        assert_eq!(fs.mutating_ops() - before, 1);
+        assert_eq!(fs.stat(&p("/db/m")).unwrap().mode, 0o750);
+        fs.sync_dir(&p("/db")).unwrap();
+        assert_eq!(fs.crash().stat(&p("/db/m")).unwrap().mode, 0o750);
     }
 
     #[test]
