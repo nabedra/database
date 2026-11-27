@@ -293,7 +293,6 @@ impl crate::store::Vectors for Flaky {
 /// that `put_version` took, so after the range fails and is dropped its slot and stored vector stay
 /// forever. The same holds for a copy in `Shard::land`.
 #[test]
-#[ignore = "VEC-BUG-unreadable-append-leaks-its-version"]
 fn vs04_an_unreadable_append_releases_its_version_once_the_range_is_gone() {
     let store = Arc::new(Flaky::default());
     let cfg = Config {

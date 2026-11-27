@@ -114,11 +114,16 @@ impl<C: Codec> Shard<C> {
         }
     }
 
+    /// Places an entry, which takes over the name of its version. An entry that cannot be placed
+    /// (its vector cannot be read, or its partition is gone) forgets that name, so that the version
+    /// can go once nothing else names it.
     pub fn put(&mut self, sh: &mut Shared, codec: &C, part: PartId, e: Entry) {
         let Some((row, dir, len)) = row_of(sh, e.slot, e.at) else {
+            sh.forget(e.generation, e.slot, e.at);
             return;
         };
         let Some(meta) = sh.dir.get_mut(&part) else {
+            sh.forget(e.generation, e.slot, e.at);
             return;
         };
         let p = self.parts.entry(part).or_insert_with(|| Partition {
