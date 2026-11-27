@@ -322,7 +322,6 @@ fn vs17_a_meter_refuses_before_the_limit_and_stays_refused() {
 /// `u64::MAX`. `pop` must still not overflow while it sums the work served: it runs outside the
 /// core's `catch_unwind`, so a panic there kills the core's thread.
 #[test]
-#[ignore = "VEC-BUG-scheduler-served-sum-overflow"]
 fn vs50_a_pop_after_costs_near_the_limit_does_not_overflow() {
     let mut s = Scheduler::new(limits(16, u64::MAX));
     s.submit(Class::Apply, u64::MAX, 0u8).unwrap();
@@ -335,7 +334,6 @@ fn vs50_a_pop_after_costs_near_the_limit_does_not_overflow() {
 /// The same through the cores: after such a pop the core's thread is gone, and a later call
 /// waits for ever instead of answering.
 #[test]
-#[ignore = "VEC-BUG-scheduler-served-sum-overflow"]
 fn vs51_a_core_answers_after_a_task_of_huge_declared_cost() {
     let cores = Arc::new(Cores::start(1, limits(16, u64::MAX), false, |_| 3u32).unwrap());
     assert_eq!(cores.call(0, Class::Apply, u64::MAX, |s, _| *s).unwrap(), 3);
