@@ -87,7 +87,10 @@ pub(super) fn apply(tx: &mut Transaction<'_>, head: &mut Head, command: Command)
                 ));
             }
             if through > sub.checkpoint {
-                if sub.checkpoint < head.first_checkpoint() {
+                // EVENTS-8: retention may have passed the checkpoint since the poll. A
+                // token that starts at the checkpoint covers only offsets this generation
+                // delivered, so its ack still advances; an older token spans the gap.
+                if sub.checkpoint < head.first_checkpoint() && after != sub.checkpoint {
                     return Err(head.expired());
                 }
                 sub.checkpoint = through;

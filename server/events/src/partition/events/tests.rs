@@ -129,3 +129,125 @@ async fn retention_frees_capacity_without_consuming_rejected_offsets() -> Result
     broker.close_group("capacity").await?;
     Ok(())
 }
+
+async fn rf1_group(name: &str) -> Result<(tempfile::TempDir, Arc<Broker>, Arc<Group>)> {
+    let disk = tempfile::tempdir()?;
+    let broker = Broker::open(BrokerConfig {
+        id: 1,
+        cluster_id: Uuid::new_v4(),
+        data_dir: disk.path().into(),
+        peer_token: "local-testing-peer-token-with-32-bytes".into(),
+        peer_ca: None,
+        peer_identity: None,
+        allow_plaintext: true,
+    })?;
+    let group = broker.open_group(name, Arc::new(Machine)).await?;
+    group
+        .initialize(BTreeMap::from([(1, "http://127.0.0.1:8081".into())]))
+        .await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while group.leader() != Some(1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    committed(
+        &group,
+        Command::Init {
+            topic_id: Uuid::new_v4(),
+            partition: 0,
+        },
+    )
+    .await?;
+    Ok((disk, broker, group))
+}
+
+fn ack(generation: u64, after: u64, last: u64, through: u64) -> Command {
+    Command::Ack {
+        name: "s".into(),
+        owner: "c1".into(),
+        generation,
+        after,
+        last,
+        through,
+        now_ms: 1_000,
+    }
+}
+
+/// EVENTS-8 (approved policy; `specs/events-delivery/ack/EventsAckGap.tla`): retention
+/// passes the checkpoint after a poll. An ack whose token starts at the checkpoint covers
+/// only delivered offsets and still advances; before the fix it got 410
+/// `checkpoint_expired`. An older token across the gap, another generation and an offset
+/// beyond the delivered page are still refused.
+#[tokio::test]
+async fn events_8_ack_of_a_delivered_page_advances_after_retention_passes_the_checkpoint()
+-> Result<()> {
+    let (_disk, broker, group) = rf1_group("ackgap").await?;
+    committed(
+        &group,
+        Command::OpenSubscription {
+            name: "s".into(),
+            start: crate::partition::Start::Earliest,
+        },
+    )
+    .await?;
+    let events = (0..4)
+        .map(|n| PublishEvent {
+            event_id: Uuid::new_v4(),
+            data: json!(n),
+        })
+        .collect();
+    committed(&group, Command::Publish { now_ms: 1, events }).await?;
+    let Reply::Lease(lease) = committed(
+        &group,
+        Command::Claim {
+            name: "s".into(),
+            owner: "c1".into(),
+            claim_id: Uuid::new_v4(),
+            now_ms: 1_000,
+            ttl_ms: 60_000,
+        },
+    )
+    .await?
+    else {
+        anyhow::bail!("expected a lease");
+    };
+    // The first page: offsets 1 to 4, delivered after checkpoint 0. Ack offset 1 only.
+    let generation = lease.generation;
+    let advanced = committed(&group, ack(generation, 0, 4, 1)).await?;
+    ensure!(matches!(advanced, Reply::Checkpoint { offset: 1 }));
+    // Retention removes offsets 1 to 3 (cutoff above their publish time), so the
+    // checkpoint 1 now lies behind the retention floor (earliest offset 4).
+    let retained = committed(
+        &group,
+        Command::Retain {
+            cutoff_ms: 2,
+            limit: 3,
+        },
+    )
+    .await?;
+    ensure!(matches!(
+        retained,
+        Reply::Retained {
+            removed: 3,
+            earliest_offset: 4
+        }
+    ));
+    // An older token (after 0) spans the gap: refused as expired.
+    let old = apply(&group, ack(generation, 0, 4, 3)).await?.unwrap_err();
+    assert_eq!(old.code, ErrorCode::CheckpointExpired);
+    // Another generation is fenced, and a page end beyond the tail is invalid.
+    let stale = apply(&group, ack(generation + 1, 1, 4, 3)).await?.unwrap_err();
+    assert_eq!(stale.code, ErrorCode::LeaseLost);
+    let beyond = apply(&group, ack(generation, 1, 5, 5)).await?.unwrap_err();
+    assert_eq!(beyond.code, ErrorCode::InvalidRequest);
+    // A page polled at checkpoint 1, before retention ran, delivered offsets 2 to 4: its
+    // ack advances.
+    let advanced = committed(&group, ack(generation, 1, 4, 4)).await?;
+    ensure!(
+        matches!(advanced, Reply::Checkpoint { offset: 4 }),
+        "{advanced:?}"
+    );
+    broker.close_group("ackgap").await?;
+    Ok(())
+}
