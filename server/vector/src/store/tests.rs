@@ -929,3 +929,75 @@ fn vs19_micro_store_reads() {
         );
     }
 }
+
+// ----- Reads under rewrites.
+
+/// Rewrites the page of record 1 on another thread whenever the reader thread reads, and waits up
+/// to 300 ms for that rewrite, so that every read of a page meets a change.
+#[derive(Debug)]
+struct ChurnDisk {
+    inner: Arc<dyn Disk>,
+    file: std::sync::OnceLock<std::sync::Weak<RecordFile<u32>>>,
+    reader: Mutex<Option<std::thread::ThreadId>>,
+    next: AtomicU64,
+    writers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl Disk for ChurnDisk {
+    fn kind(&self) -> &'static str {
+        self.inner.kind()
+    }
+
+    fn read(&self, reqs: &mut [Req]) {
+        let me = Some(std::thread::current().id());
+        let file = self.file.get().and_then(std::sync::Weak::upgrade);
+        if let Some(file) = file.filter(|_| *self.reader.lock().unwrap() == me) {
+            let n = self.next.fetch_add(1, Ordering::SeqCst) as u32;
+            let (done, wait) = std::sync::mpsc::channel();
+            let rewrite = move || {
+                let old = if n == 0 { 1 } else { 1000 + n - 1 };
+                file.release(&old);
+                file.put(1000 + n, &[n as u8 + 1; 2048]).unwrap();
+                file.flush().unwrap();
+                let _ = done.send(());
+            };
+            let writer = nabedra_rt::task::spawn_service(format!("churn-{n}"), rewrite).unwrap();
+            let _ = wait.recv_timeout(std::time::Duration::from_millis(300));
+            self.writers.lock().unwrap().push(writer);
+        }
+        self.inner.read(reqs);
+    }
+
+    fn write(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, buf)
+    }
+}
+
+/// A record that never changes reads back exactly however often the page it shares is rewritten
+/// while it is read: retries end in a read that no writer can change, never in an error. An error
+/// here fails the whole range in the index (task B2b found `a page kept changing` under load).
+#[test]
+fn vs10_a_stable_record_reads_back_while_its_page_changes_under_every_read() {
+    let f = files("churn", Backend::Pread, 1);
+    let disk = Arc::new(ChurnDisk {
+        inner: f.disks[0].clone(),
+        file: std::sync::OnceLock::new(),
+        reader: Mutex::new(None),
+        next: AtomicU64::new(0),
+        writers: Mutex::new(Vec::new()),
+    });
+    // Two records of 2 KiB to a page: 0 and 1 share one.
+    let file = Arc::new(RecordFile::new("churn", disk.clone() as Arc<dyn Disk>, 2048).unwrap());
+    file.put(0, &[7; 2048]).unwrap();
+    file.put(1, &[9; 2048]).unwrap();
+    file.flush().unwrap();
+    disk.file.set(Arc::downgrade(&file)).unwrap();
+    *disk.reader.lock().unwrap() = Some(std::thread::current().id());
+    let got = file.get(&0);
+    *disk.reader.lock().unwrap() = None;
+    for w in std::mem::take(&mut *disk.writers.lock().unwrap()) {
+        w.join().unwrap();
+    }
+    assert_eq!(got.map(|v| v == [7; 2048]).map_err(|e| e.to_string()), Ok(true));
+    assert!(disk.next.load(Ordering::SeqCst) >= 2, "the page changed under the reads");
+}

@@ -263,17 +263,19 @@ impl<K: Copy + Eq + Hash> RecordFile<K> {
     /// Reads records in one batch of I/O. One result per key, in order.
     pub fn get_many(&self, keys: &[K]) -> Vec<Result<Vec<u8>>> {
         let mut out: Vec<Option<Result<Vec<u8>>>> = keys.iter().map(|_| None).collect();
-        for _ in 0..RETRIES {
+        for round in 0..RETRIES {
             if out.iter().all(Option::is_some) {
                 break;
             }
-            self.read_round(keys, &mut out);
+            // The last round keeps writers out while it reads, so a busy page cannot fail it.
+            self.read_round(keys, &mut out, round + 1 == RETRIES);
         }
         let changing = || Err(Error::Store(format!("{}: a page kept changing", self.name)));
         out.into_iter().map(|r| r.unwrap_or_else(changing)).collect()
     }
 
-    fn read_round(&self, keys: &[K], out: &mut [Option<Result<Vec<u8>>>]) {
+    /// One read of the records still missing. With `hold`, the state stays locked across the I/O.
+    fn read_round(&self, keys: &[K], out: &mut [Option<Result<Vec<u8>>>], hold: bool) {
         struct Plan {
             key: usize,
             record: u64,
@@ -284,7 +286,7 @@ impl<K: Copy + Eq + Hash> RecordFile<K> {
         }
         let mut plans = Vec::new();
         let mut reqs = Vec::new();
-        {
+        let held = {
             let st = self.lock();
             for (k, key) in keys.iter().enumerate() {
                 if out[k].is_some() {
@@ -331,11 +333,12 @@ impl<K: Copy + Eq + Hash> RecordFile<K> {
                     req,
                 });
             }
-        }
+            hold.then_some(st)
+        };
         if !reqs.is_empty() {
             self.disk.read(&mut reqs);
         }
-        let mut st = self.lock();
+        let mut st = held.unwrap_or_else(|| self.lock());
         st.page_reads += reqs.iter().map(|r| (r.buf.len() / PAGE) as u64).sum::<u64>();
         for mut plan in plans {
             if st.map.get(&keys[plan.key]) != Some(&plan.record) {
