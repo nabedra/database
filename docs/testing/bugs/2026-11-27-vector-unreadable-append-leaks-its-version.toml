@@ -1,0 +1,17 @@
+id = "VECTOR-unreadable-append-leaks-its-version"
+title = "An append or copy whose vector cannot be read keeps its row version and stored vector forever"
+class = "resource-release-order"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS17"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/vector/src/index/tests/rv_dense.rs::vs04_an_unreadable_append_releases_its_version_once_the_range_is_gone"
+seed = "unknown"
+why_not_caught = "Store-damage tests check that the range goes out of service, not that the row map and the vector store are empty once the failed range is dropped."
+invariant_added = "Intended, not met: once a range whose store read failed is dropped, the row map holds no slot of it and the vector store no vector of it. Shard::put returns without an entry when row_of fails, and neither append_entry nor land forgets the name that put_version or send took, so the dead slot keeps refs 1 (index/shard.rs put, append_entry, land)."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-11"
