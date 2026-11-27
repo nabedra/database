@@ -1,0 +1,23 @@
+# Evidence: wave-rv findings OLAP-6 (code reading). Starting a request holds the queue-wide change lock across a
+# control-root read, the encoding of the full catalog pin and its copy to every member in turn
+# (server/src/node/queue_runtime.rs, replicate_record). Replicated bytes per read request are the root size times
+# (W - 1): with a 1 MiB root on 8 workers, 7 MiB per point get, and starts serialize at about 20 to 30 per second.
+# Deferred: the start lock and the serial copy are SCHED-7 (fx-sched, #174); pins by reference need an immutable
+# per-revision root object (plans/olap-commit.md, "Capacity plan").
+id = "REVIEW-olap-start-lock-pin-copy"
+title = "Each OLAP request start holds the queue-wide lock while it copies the whole catalog pin to every member, so starts serialize and replicated bytes grow with catalog size"
+class = "other"
+module = "olap"
+guarantees = ["OLAP-G07"]
+scenarios = []
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "unknown"
+seed = "unknown"
+why_not_caught = "The queue tests use small catalogs and count no replicated bytes per request."
+invariant_added = "Intended: replicated bytes per started request do not grow with catalog size, and starts are not serialized across replication I/O."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-26"
