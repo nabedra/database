@@ -508,3 +508,92 @@ fn vs19_direction_codes_measure_recall_at_the_default_target() {
         }
     }
 }
+
+// ----- Review rv-b2b.
+
+/// Extensions take only what the 1-bit codes leave (plan section 5, "Extension in RAM while the
+/// budget lasts, otherwise NVMe"; VEC-G11). Codes that grow later shrink what is left, so
+/// extensions already in RAM go to NVMe: the code memory never holds more than its limit beyond
+/// what the 1-bit codes alone need.
+#[test]
+#[ignore = "VEC-BUG-ext-ram-beyond-code-memory"]
+fn vs17_extensions_in_ram_leave_when_1_bit_codes_grow_into_the_code_memory() {
+    let dim = 64;
+    let codec = DirectionCodec::new(dim, 5).unwrap();
+    let ext = codec.ext_bytes() as u64;
+    let probe = {
+        let mut block = codec.block();
+        let d = codec.rotate(&vec![0.125f32; dim]);
+        codec.push_detached(&mut block, &d, &d, 1.0);
+        codec.held(&block)
+    };
+    // Room for the 1-bit codes of 100 rows and 40 extensions.
+    let limit = 100 * probe + 40 * ext;
+    let (_d, store) = codes("grow", &codec, 3, limit);
+    // Partitions of the plan's size, so that no split encodes the rows again.
+    let cfg = Config {
+        part_max: 512,
+        ..config(dim, Some(store.clone()))
+    };
+    let mut ix = serving(cfg, codec, None);
+    let mut all = clustered(&mut Gen::from_seed(3), 100, dim, false).into_iter();
+    let first: Vec<(u64, Vec<f32>)> = (0..60).zip(all.by_ref()).collect();
+    feed(&mut ix, RANGE, &upserts(0, &first));
+    settle(&mut ix);
+    charges(&ix).unwrap();
+    let (c, e) = store.memory().used();
+    assert!(c + e <= limit, "first batch within the limit: {:?}", held(&ix));
+    assert_eq!(held(&ix).ram, 60, "all 60 extensions fit in RAM");
+    let more: Vec<(u64, Vec<f32>)> = (60..100).zip(all).collect();
+    feed(&mut ix, RANGE, &upserts(60, &more));
+    settle(&mut ix);
+    charges(&ix).unwrap();
+    let (c, e) = store.memory().used();
+    assert!(
+        e <= limit.saturating_sub(c),
+        "codes {c} and extensions {e} in RAM, limit {limit}: {:?}",
+        held(&ix)
+    );
+}
+
+/// The code memory and the extension store outlive an index (decision L8: a worker's store lives
+/// as long as its process), so an index that goes gives back what it holds. A recovery handed the
+/// same configuration is then charged exactly what it holds, and stays brute force.
+#[test]
+#[ignore = "VEC-BUG-ext-charges-outlive-index"]
+fn vs17_an_index_recovered_over_the_same_extension_store_is_charged_only_what_it_holds() {
+    use nabedra_rt::fs::FaultFs;
+    let dim = 8;
+    let codec = DirectionCodec::new(dim, 21).unwrap();
+    let (_d, store) = codes("recover", &codec, 3, 4000);
+    let fs = FaultFs::new();
+    fs.create_dir_all_durable(std::path::Path::new("/data"));
+    let ck = Store::new(Arc::new(fs.clone()), "/data/ck");
+    let cfg = config(dim, Some(store.clone()));
+    let mut ix = serving(cfg.clone(), codec.clone(), Some(ck.clone()));
+    let g = &mut Gen::from_seed(9);
+    let rows: Vec<(u64, Vec<f32>)> = (0..40).map(|k| (k, vector(g, dim))).collect();
+    let mut model = Model::new();
+    for (k, v) in &rows {
+        model.insert(*k, row(v, vec![Value::Int(*k as i64 % 5)], *k));
+    }
+    feed(&mut ix, RANGE, &upserts(0, &rows));
+    settle(&mut ix);
+    ix.checkpoint().unwrap();
+    let applied = ix.status(RANGE).unwrap().applied;
+    assert!(store.counts().0 > 0, "extensions in RAM");
+    drop(ix);
+    let (mut back, damage) = Index::recover(cfg, codec, ck).unwrap();
+    assert_eq!(damage.len(), 0);
+    back.caught_up(RANGE, applied).unwrap();
+    settle(&mut back);
+    assert_eq!(back.status(RANGE).unwrap().damage, None);
+    let pin = latest(&mut back, None);
+    let q = Query {
+        exact: true,
+        ..query(Op::L2, &[0.5; 8], 10)
+    };
+    let got = keys(&back.search(&pin, &q).unwrap());
+    assert_eq!(got, brute(&model, &q));
+    charges(&back).unwrap();
+}

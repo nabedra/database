@@ -1,0 +1,26 @@
+# Found by review rv-b2b of nabedra/oltp-vector-b2b (2666694b). Extensions::put takes RAM for an
+# extension while the code memory has room, and the 1-bit codes are charged before it. Codes keep
+# growing as rows arrive, but an extension in RAM never goes to NVMe again, so the code memory ends
+# above its limit by up to everything the extensions took. Plan section 5 keeps extensions in RAM
+# only "while the budget lasts". 64 dims, limit = 1-bit codes of 100 rows + 40 extensions (4,080 B),
+# 60 rows then 40 more, partitions of 512: codes 2,800 B and extensions 2,176 B in RAM (68 of 100),
+# 4,976 B in all. b2b's vs17 stayed within the limit only because part_max = 8 makes splits
+# re-encode every entry. Command: cargo-slot test -p nabedra-vector --lib -- --include-ignored
+# vs17_extensions_in_ram_leave (log /home/dev/logs/oltp-vector/w3/rv-b2b/probe3.log).
+id = "VECTOR-ext-ram-beyond-code-memory"
+title = "Extensions stay in RAM when the 1-bit codes grow, so the code memory exceeds its limit"
+class = "resource-release-order"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS17"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/vector/src/index/tests/codes.rs::vs17_extensions_in_ram_leave_when_1_bit_codes_grow_into_the_code_memory"
+seed = 3
+why_not_caught = "The budget test used partitions of 8 rows, whose splits put every extension again after the codes had grown."
+invariant_added = "Extensions in RAM never exceed what the code memory's limit leaves after the 1-bit codes."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-04"
