@@ -13,8 +13,12 @@ use std::time::Duration;
 use nabedra_sim::Plan;
 use tokio::sync::oneshot;
 
-use super::{current_node, harness};
+use super::{Harness, current_node, harness};
 use crate::raft::Broker;
+
+fn delivery_open(sim: &Harness, from: u64, to: u64) -> bool {
+    sim.is_up(to) && !sim.lock().net.is_blocked(from, to)
+}
 
 /// Sends one RPC from the current node to `to`. `handler` runs on the target broker and
 /// returns `None` when the target refuses (no such group, votes disabled). Returns `None`
@@ -54,7 +58,9 @@ where
             let copy = async move {
                 nabedra_rt::time::sleep(Duration::from_millis(delay_ms + 1)).await;
                 copy_sim.wait_unpaused(to).await;
-                let _ = handler(broker).await;
+                if delivery_open(&copy_sim, from, to) {
+                    let _ = handler(broker).await;
+                }
             };
             sim.world().spawn_node(to, copy);
         }
@@ -63,7 +69,9 @@ where
             let (sim, handler) = (sim.clone(), handler.clone());
             async move {
                 sim.wait_unpaused(to).await;
-                let _ = send.send(handler(broker).await);
+                if delivery_open(&sim, from, to) {
+                    let _ = send.send(handler(broker).await);
+                }
             }
         };
         sim.world().spawn_node(to, serve);
@@ -81,7 +89,7 @@ where
         };
         nabedra_rt::time::sleep(Duration::from_millis(delay_ms)).await;
         sim.wait_unpaused(from).await;
-        if !sim.is_up(from) {
+        if !delivery_open(&sim, to, from) {
             return pending().await;
         }
         reply

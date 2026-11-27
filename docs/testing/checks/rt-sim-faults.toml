@@ -5,7 +5,11 @@ id = "rt-sim-faults"
 # storage pauses (an acknowledgement before its fsync, one wider than its fsync), clock
 # freezes (a lease check without a fencing epoch), the timer floor (a timer fence without a
 # drift margin), mkfs inode numbers (a volume recognised by device and inode) and wipes of
-# a live node. Tooling for the simulators, so it proves no product guarantee by itself.
+# a live node; and, in sim/fault_classes.rs, torn power loss, wipes and stale restores
+# under the same identity, freezes after a sample read in an extension slot, dials to a
+# powered-off host, the RST after a reboot, a killed process's last frames, a full or
+# failing disk, seeded listing order, sleeps that suspend one job, and a declared drift
+# bound. Tooling for the simulators, so it proves no product guarantee by itself.
 module = "sim"
 kinds = ["U"]
 guarantees = []
@@ -21,6 +25,11 @@ for attempt in $(seq 20); do
     "${test[@]}" timer_floor
     "${test[@]}" sim::volumes::
 done
+# One planted bug and clean twin per fault class of the fidelity work (SIM-4 to SIM-20),
+# and the stream network's opt-in behaviours. Seeded runs inside each test, so once.
+"${test[@]}" sim::fault_classes:: -- --test-threads=2
+"${test[@]}" sim::net::tests::with_fidelity
+"${test[@]}" sim::net::tests::stream_faults
 ''']
 cwd = "server"
 timeout_s = 1800
