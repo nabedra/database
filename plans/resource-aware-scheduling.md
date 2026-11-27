@@ -85,7 +85,7 @@ Keep the queue and execution progress in RAM. Do not add S3 pending-request file
 
 `max_pending_requests` covers queued and running nonterminal requests, including reconciliation. Queue byte limits apply independently on every replica. At capacity, wait only within a bounded ingress deadline or return explicit `429 overloaded` before acceptance; no finite system promises to accept unlimited arrivals. No accepted request may disappear on ordinary saturation, a transport timeout, or an API restart. Result retention expires explicitly; an unknown or expired receipt must never be fabricated as successful. Mutation decisions remain reconcilable from durable commit history.
 
-Use the existing controller lease mechanism for one scheduler owner, extending its authority to worker-hosted scheduling. A scheduler takeover must fence the old owner before issuing attempts. Bind every queue record/job to `run_id`, scheduler term, membership revision, request digest, job ID, and attempt ID. Recover from a surviving replica; re-establish copies on all ready members before new admissions. An interrupted join never blocks recovery: a removal or owner fence supersedes a join that Control has not published, and the owner's join seal ends with that view change. Do not re-acknowledge every existing request during takeover. Transfer request copies before draining/removing the last holder. A one-worker deployment has one memory copy and cannot survive losing that worker.
+Use the existing controller lease mechanism for one scheduler owner, extending its authority to worker-hosted scheduling. A scheduler takeover must fence the old owner before issuing attempts. Bind every queue record/job to `run_id`, scheduler term, membership revision, request digest, job ID, and attempt ID. Recover from a surviving replica; re-establish copies on all ready members before new admissions. An interrupted join never blocks recovery: a removal or owner fence supersedes a join that Control has not published, and the owner's join seal ends with that view change. Before Control seals the join, the change simply replaces it. After the seal, the change first completes the join's own Timestamp fence (an idempotent FenceReady to the join's next view), rebases on that next view without publishing the join to the queue, so admissions stay closed, and then removes the joiner; an owner fence expects the join's next view. Do not re-acknowledge every existing request during takeover. Transfer request copies before draining/removing the last holder. A one-worker deployment has one memory copy and cannot survive losing that worker.
 
 A rolling API/worker restart keeps the run while a surviving worker retains its queue. A deliberate cold start after all queue holders have stopped creates a fresh `run_id`, abandons outstanding old-run work, and opens the committed catalog. Never reconstruct pending requests from object listings or decision history, and never automatically resubmit an abandoned request. A missed heartbeat or network partition alone does not prove every worker stopped; pause or perform an explicitly authorized cold-start transition after fencing old authority. Safety can require waiting for authoritative storage/ownership even when a queue copy survives.
 
@@ -218,7 +218,9 @@ controls passed.
 | `o07_lane_fails` | `QueueRetention` | 9 |
 | `prefix_o14_ready_view` | `O14_RetryAttaches` | 8 |
 | `prefix_f1_receipt_regress` | `Receipt_Monotone` | 12 |
-| `prefix_join_never_aborted` | Deadlock | 7 |
+| `prefix_join_never_aborted` | Deadlock | 9 (7 before the phase split) |
+| `abort_expects_old_view` | Deadlock | 9 |
+| `publish_join_before_removal` | `G07_NoStaleAdmission` | 9 |
 | `no_reconcile` | `L_CommittedFinishes` | 16 (lasso) |
 | `no_remove_crashed` | `L_AcceptedTerminates` | 12 (lasso) |
 | `no_settle_superseded` | `L_ReservationsSettle` | 16 (lasso) |
@@ -229,7 +231,7 @@ controls passed.
   removal and owner fence while a join is pending, and only publication or a cold fence ends one. Trace
   (`prefix_join_never_aborted`, 7 states): 1 submit r1; 2 partition w1; 3 remove w1; 4 heal; 5 w1 begins its rejoin;
   6 the owner crashes; 7 no step is enabled. The plan now says an interrupted join never blocks recovery (plan fixed,
-  code pending). The spec's `AbortJoin`, and `RemoveMember` superseding a pending join, model the fix. The coverage
+  code pending). The spec's `AbortJoinBuilding` and `AbortJoinSealed`, and `RemoveMember` superseding a pending join, model the fix; since phase 2 the join has Control's seal (`SealJoin`) and the Timestamp fence (`FenceTso`, variable `tso`) as steps, so a crash before or after the fence is checked. A superseding change that expects the old view at the Timestamp group deadlocks (`abort_expects_old_view`, 9 states), and one that publishes the join before removing the joiner admits work against an unverified ready set (`publish_join_before_removal`, 9 states). The coverage
   gap was that the draft spec let a crashed joiner release the join, which the code does not do.
 - **Receipt regression (OQ-1, record `2026-11-26-design-queue-receipt-regress`).** Trace (`prefix_f1_receipt_regress`,
   12 states, no fault): r1 is accepted, copied, started and decided; a same-ID POST answers the durable terminal; a GET

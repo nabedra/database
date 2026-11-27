@@ -41,10 +41,11 @@
 \*    are dropped.
 \* A6 All modelled requests are valid mutations. A failed terminal record
 \*    can only come from a transient fault, which the design forbids.
-\* A7 The Timestamp group's ready fence is not a variable: it holds the
-\*    pending join's next view exactly while that join is past Building
-\*    (jcopied, Control's SealReady and TimestampFenced precede the owner's
-\*    copy), and the published view otherwise.
+\* A7 Control's join phases are Building (cseal FALSE), sealed and waiting
+\*    for the Timestamp fence (cseal, tso = "pub"), and waiting for the
+\*    queue proof (tso = "next"). The Timestamp group's ready fence is the
+\*    published view ("pub") or the pending join's next view ("next");
+\*    FenceReady is idempotent, so a repeated fence is the same step.
 \* Out of scope: queries and pinned read grants, the scoped RF3 protocol
 \* (O30, O31), byte and count limits (SCHED-G01), scheduling fairness.
 
@@ -73,8 +74,9 @@ VARIABLES
     owner,      \* fenced queue owner, or NoW
     joining,    \* worker holding a join ticket, or NoW
     sealed,     \* the owner sealed its join export: no queue mutation
-    jcopied,    \* Control's pending join is past Building (sealed in Control,
-                \* the Timestamp group fenced to its next view): the owner copies
+    jcopied,    \* the owner copied the joiner's queue (AwaitingQueueProof)
+    cseal,      \* Control sealed the pending join (past Building)
+    tso,        \* the Timestamp group's ready fence: "pub" or the join's "next" view
     \* Status (durable): identity reservation and decision, cold fence.
     ident,      \* [st |-> "none" | "reserved" | "committed", run |-> n]
     fenceRun,   \* run whose attempts Status still admits
@@ -100,16 +102,17 @@ VARIABLES
     everAcc,    \* the accepted version once reached every ready member
     regress,    \* a client saw a non-terminal answer after a terminal one
     lostHeld,   \* a cold start abandoned work a live worker still held
-    spurious    \* a same-run retry of accepted work was refused (503)
+    spurious,   \* a same-run retry of accepted work was refused (503)
+    staleAdmit  \* an admission ran while the ready set held a joiner not yet verified
 
-control == <<run, ready, owner, joining, sealed, jcopied>>
+control == <<run, ready, owner, joining, sealed, jcopied, cseal, tso>>
 durable == <<ident, fenceRun>>
 worker  == <<up, conn, view, q, acks, held>>
 faults  == <<nCrash, nPart, nStop, nLane, nRcpt, nLostAck>>
 ghost   == <<applied, commitRun, firstRun, ackRun, obs, everAb, everNA,
-             everAcc, regress, lostHeld, spurious>>
+             everAcc, regress, lostHeld, spurious, staleAdmit>>
 ghostNoAcc == <<applied, commitRun, firstRun, ackRun, obs, everAb, everNA,
-                regress, lostHeld, spurious>>
+                regress, lostHeld, spurious, staleAdmit>>
 vars    == <<control, durable, worker, atts, faults, ghost>>
 
 -----------------------------------------------------------------------------
@@ -127,12 +130,22 @@ Has(w, r)   == q[w][r] # "none"
 Live(w)     == up[w] /\ conn[w]
 \* A worker whose queue installed the published view.
 Current(w)  == w \in Workers /\ Live(w) /\ w \in ready /\ view[w] = "cur"
-\* OQ-2, route 1: a removal that supersedes a join past Building sends its
-\* Timestamp FenceReady from the join's fenced next view, which the
-\* Timestamp group holds (A7). Mutant abort_expects_old_view: it expects the
-\* published view, the Timestamp group refuses it as stale, and the removal
-\* never completes.
-SupersedeOK == ~(Mutant = "abort_expects_old_view" /\ joining # NoW /\ jcopied)
+\* OQ-2, route 1' (fx-oltp-ranges, 368271a2 for Building): a removal or an
+\* owner fence supersedes a pending join. In Building it simply replaces
+\* it. Once Control sealed the join, the superseding change first drives the
+\* join's own Timestamp fence (FenceTso, idempotent), rebases on the join's
+\* next view and generation without publishing the join to the queue, and
+\* then removes the joiner from there, so its FenceReady expects the view the
+\* Timestamp group holds. Mutant abort_expects_old_view: it expects the old
+\* published view, which the Timestamp group refuses once fenced.
+SupersedeOK ==
+    \/ joining = NoW \/ ~cseal \/ joining \in ready
+    \/ IF Mutant = "abort_expects_old_view" THEN tso = "pub" ELSE tso = "next"
+\* The pending join is abandoned; the Timestamp group follows the view the
+\* superseding change publishes.
+EndJoin ==
+    /\ joining' = NoW /\ jcopied' = FALSE /\ sealed' = FALSE
+    /\ cseal' = FALSE /\ tso' = "pub"
 \* The owner may mutate its queue (replica.rs mutating_owner).
 OwnerOK     == owner # NoW /\ Current(owner) /\ ~sealed
 Copied(r)   == acks[r] = ready
@@ -199,6 +212,7 @@ TypeOK ==
     /\ everAb \in [Reqs -> BOOLEAN] /\ everNA \in [Reqs -> BOOLEAN]
     /\ everAcc \in [Reqs -> BOOLEAN]
     /\ regress \in BOOLEAN /\ lostHeld \in BOOLEAN /\ spurious \in BOOLEAN
+    /\ staleAdmit \in BOOLEAN /\ cseal \in BOOLEAN /\ tso \in {"pub", "next"}
 
 -----------------------------------------------------------------------------
 \* Initial state: a running cluster, every worker ready with an empty queue.
@@ -207,7 +221,7 @@ Init ==
     /\ run = 1
     /\ ready = Workers
     /\ owner \in Workers
-    /\ joining = NoW /\ sealed = FALSE /\ jcopied = FALSE
+    /\ joining = NoW /\ sealed = FALSE /\ jcopied = FALSE /\ cseal = FALSE /\ tso = "pub"
     /\ ident = [r \in Reqs |-> [st |-> "none", run |-> 0]]
     /\ fenceRun = 1
     /\ up = [w \in Workers |-> TRUE] /\ conn = [w \in Workers |-> TRUE]
@@ -223,7 +237,7 @@ Init ==
     /\ obs = [r \in Reqs |-> "none"]
     /\ everAb = [r \in Reqs |-> FALSE] /\ everNA = [r \in Reqs |-> FALSE]
     /\ everAcc = [r \in Reqs |-> FALSE]
-    /\ regress = FALSE /\ lostHeld = FALSE /\ spurious = FALSE
+    /\ regress = FALSE /\ lostHeld = FALSE /\ spurious = FALSE /\ staleAdmit = FALSE
 
 -----------------------------------------------------------------------------
 \* Admission (plan "Workflow" and "Keep the queue ... in RAM";
@@ -236,6 +250,10 @@ Init ==
 \* retry of a held identity attaches to it, which changes no state here.
 SubmitRequest(r) ==
     /\ OwnerOK
+    \* A Timestamp group fenced to a pending join's next view refuses the
+    \* published view (A7): admissions stay closed until a view publishes.
+    /\ tso = "pub"
+    /\ staleAdmit' = (staleAdmit \/ joining \in ready)
     /\ LET o == owner IN
        \/ \* Fresh identity: Status reservation, then a local unaccepted copy.
           /\ \/ ident[r].st = "none"
@@ -282,7 +300,7 @@ RetryDuringViewLag(r) ==
     /\ spurious' = (Mutant = "prefix_o14_ready_view")
     /\ UNCHANGED <<control, durable, worker, atts, faults, applied, commitRun,
                    firstRun, ackRun, obs, everAb, everNA, everAcc, regress,
-                   lostHeld>>
+                   lostHeld, staleAdmit>>
 
 \* One copy of the owner's current version to a ready holder
 \* (coordinator.rs ensure_phase; replica.rs install_prepared,
@@ -340,7 +358,7 @@ ReplyClient(r) ==
           /\ Observe(r, ans)
           /\ ackRun' = [ackRun EXCEPT ![r] = IF @ = 0 THEN run ELSE @]
     /\ UNCHANGED <<control, durable, worker, atts, faults, applied, commitRun,
-                   firstRun, everAcc, lostHeld, spurious>>
+                   firstRun, everAcc, lostHeld, spurious, staleAdmit>>
 
 -----------------------------------------------------------------------------
 \* Execution, decision and settlement (plan: "Settlement owns the original
@@ -415,7 +433,7 @@ CommitDecision(a) ==
           /\ atts' = IF a.w = NoW THEN atts \ {a}
                      ELSE (atts \ {a}) \cup {[a EXCEPT !.st = "res"]}
     /\ UNCHANGED <<control, fenceRun, worker, faults, firstRun, ackRun, obs,
-                   everAb, everNA, everAcc, regress, lostHeld, spurious>>
+                   everAb, everNA, everAcc, regress, lostHeld, spurious, staleAdmit>>
 
 \* The worker learns the outcome and releases the reservation once. The
 \* current owner records the terminal version; otherwise reconciliation
@@ -477,7 +495,7 @@ OldRunReceipt(r) ==
     /\ obs[r] \notin TermObs
     /\ Observe(r, IF ident[r].st = "committed" THEN "succeeded" ELSE "abandoned")
     /\ UNCHANGED <<control, durable, worker, atts, faults, applied, commitRun,
-                   firstRun, ackRun, everAcc, lostHeld, spurious>>
+                   firstRun, ackRun, everAcc, lostHeld, spurious, staleAdmit>>
 
 \* ACC3-receipt: a transient lookup failure while the synchronous API waits.
 \* The design keeps the original ID and reports uncertainty; the mutant ends
@@ -488,7 +506,7 @@ ReceiptFault(r) ==
     /\ nRcpt' = nRcpt + 1
     /\ Observe(r, IF Mutant = "acc3_receipt_early" THEN "notapplied" ELSE "unknown")
     /\ UNCHANGED <<control, durable, worker, atts, nCrash, nPart, nStop, nLane,
-                   nLostAck, applied, commitRun, firstRun, ackRun, everAcc, lostHeld, spurious>>
+                   nLostAck, applied, commitRun, firstRun, ackRun, everAcc, lostHeld, spurious, staleAdmit>>
 
 -----------------------------------------------------------------------------
 \* Membership: view installation, removal, rejoin and join (plan: "Recover
@@ -536,7 +554,7 @@ RemoveMember(x, o) ==
        /\ view' = [w \in Workers |->
                     IF w = joining THEN "none" ELSE Publish(S, o, lag)[w]]
        /\ acks' = [r \in Reqs |-> IF ~lag /\ q'[o][r] # "none" THEN {o} ELSE {}]
-    /\ joining' = NoW /\ jcopied' = FALSE /\ sealed' = FALSE
+    /\ EndJoin
     /\ owner' = o
     /\ atts' = IF o # owner THEN {[a EXCEPT !.cur = FALSE] : a \in atts} ELSE atts
     /\ UNCHANGED <<run, durable, up, conn, held, faults, ghostNoAcc>>
@@ -550,20 +568,29 @@ RemoveMember(x, o) ==
 \* nothing outside Control saw its next view) and after (the Timestamp group
 \* is fenced to the join's next view and the owner may hold its seal).
 AbortEffect ==
-    /\ joining' = NoW /\ jcopied' = FALSE /\ sealed' = FALSE
+    /\ EndJoin
     /\ q' = [q EXCEPT ![joining] = [r \in Reqs |-> "none"]]
     /\ view' = [view EXCEPT ![joining] = "none"]
     /\ UNCHANGED <<run, ready, owner, durable, up, conn, acks, held, atts,
                    faults, ghost>>
 AbortJoinBuilding ==
     /\ Mutant # "prefix_join_never_aborted"
-    /\ joining # NoW /\ ~jcopied /\ ~Live(joining)
+    /\ joining # NoW /\ ~cseal /\ ~Live(joining)
     /\ AbortEffect
+\* Mutant publish_join_before_removal: the superseding change publishes the
+\* join's next view to the queue first (the owner's seal ends, the dead
+\* joiner is a ready member) and removes the joiner later, so admissions
+\* reopen with a ready set that holds an unverified member.
 AbortJoinSealed ==
     /\ Mutant # "prefix_join_never_aborted"
-    /\ joining # NoW /\ jcopied /\ ~Live(joining)
+    /\ joining # NoW /\ joining \notin ready /\ cseal /\ ~Live(joining)
     /\ SupersedeOK
-    /\ AbortEffect
+    /\ IF Mutant = "publish_join_before_removal"
+       THEN /\ ready' = ready \cup {joining}
+            /\ sealed' = FALSE /\ tso' = "pub"
+            /\ UNCHANGED <<run, owner, joining, jcopied, cseal, durable, worker, atts,
+                           faults, ghost>>
+       ELSE AbortEffect
 AbortJoin == AbortJoinBuilding \/ AbortJoinSealed
 
 \* A worker outside the ready set starts a join (Control BeginJoin): a live
@@ -574,14 +601,31 @@ AbortJoin == AbortJoinBuilding \/ AbortJoinSealed
 \* Building phase, before the owner's copy began (jcopied FALSE).
 Rejoin(w) ==
     /\ w \notin ready /\ conn[w]
-    /\ joining = NoW \/ (joining = w /\ ~jcopied /\ view[w] = "none")
+    /\ joining = NoW \/ (joining = w /\ ~cseal /\ view[w] = "none")
     /\ OwnerOK
     /\ up' = [up EXCEPT ![w] = TRUE]
     /\ joining' = w
     /\ q' = IF Mutant = "rejoin_keeps_stale" THEN q
             ELSE [q EXCEPT ![w] = [r \in Reqs |-> "none"]]
     /\ view' = [view EXCEPT ![w] = IF Mutant = "ready_before_copy" THEN "cur" ELSE "none"]
-    /\ UNCHANGED <<run, ready, owner, sealed, jcopied, durable, conn, acks, held,
+    /\ UNCHANGED <<run, ready, owner, sealed, jcopied, cseal, tso, durable, conn, acks, held,
+                   atts, faults, ghost>>
+
+\* Control seals the joiner's ready pages (seal_ready): past Building.
+SealJoin ==
+    /\ joining # NoW /\ joining \notin ready /\ ~cseal /\ Live(joining)
+    /\ cseal' = TRUE
+    /\ UNCHANGED <<run, ready, owner, joining, sealed, jcopied, tso, durable, worker,
+                   atts, faults, ghost>>
+
+\* The Timestamp group applies FenceReady (expected -> the join's next) and
+\* Control records TimestampFenced. The joiner's membership actor drives it,
+\* and so does a change that supersedes the join (route 1').
+FenceTso ==
+    /\ joining # NoW /\ joining \notin ready /\ cseal /\ tso = "pub"
+    /\ Mutant # "abort_expects_old_view" \/ Live(joining)
+    /\ tso' = "next"
+    /\ UNCHANGED <<run, ready, owner, joining, sealed, jcopied, cseal, durable, worker,
                    atts, faults, ghost>>
 
 \* The owner exports its queue (snapshot and delta pages) and seals it: no
@@ -591,6 +635,7 @@ Rejoin(w) ==
 JoinCopy ==
     /\ Mutant # "ready_before_copy"
     /\ joining # NoW /\ Live(joining) /\ view[joining] = "none" /\ ~jcopied
+    /\ tso = "next"
     /\ OwnerOK
     /\ q' = [q EXCEPT ![joining] =
                 [r \in Reqs |-> IF Mutant = "rejoin_keeps_stale" /\ ~Has(owner, r)
@@ -598,7 +643,7 @@ JoinCopy ==
     /\ view' = [view EXCEPT ![joining] = "cur"]
     /\ sealed' = (Mutant # "join_no_seal")
     /\ jcopied' = TRUE
-    /\ UNCHANGED <<run, ready, owner, joining, durable, up, conn, acks, held,
+    /\ UNCHANGED <<run, ready, owner, joining, cseal, tso, durable, up, conn, acks, held,
                    atts, faults, ghost>>
 
 \* Control publishes the larger ready view once the copy is verified.
@@ -611,7 +656,7 @@ PublishJoin ==
        /\ acks' = FreshAcks(owner, ~lag)
     /\ ready' = ready \cup {joining}
     /\ joining' = NoW /\ jcopied' = FALSE
-    /\ sealed' = FALSE
+    /\ sealed' = FALSE /\ cseal' = FALSE /\ tso' = "pub"
     /\ UNCHANGED <<run, owner, durable, up, conn, q, held, atts, faults, ghostNoAcc>>
     /\ AccSeen
 
@@ -633,7 +678,7 @@ Crash(w) ==
     \* Control's pending join is durable: a crashed joiner keeps it, and
     \* only the owner's own crash ends the seal it holds in RAM.
     /\ sealed' = IF w = owner THEN FALSE ELSE sealed
-    /\ UNCHANGED <<run, ready, owner, joining, jcopied, durable, conn, nPart, nStop, nLane, nRcpt, nLostAck, ghost>>
+    /\ UNCHANGED <<run, ready, owner, joining, jcopied, cseal, tso, durable, conn, nPart, nStop, nLane, nRcpt, nLostAck, ghost>>
 
 Partition(w) ==
     /\ up[w] /\ conn[w] /\ nPart < MaxPartition /\ FaultRoom
@@ -659,7 +704,7 @@ StopAll ==
     /\ atts' = {[a EXCEPT !.w = NoW] : a \in {b \in atts : b.st = "put"}}
     /\ acks' = [r \in Reqs |-> {}]
     /\ sealed' = FALSE
-    /\ UNCHANGED <<run, ready, owner, joining, jcopied, durable, conn, nCrash, nPart, nLane, nRcpt, nLostAck, ghost>>
+    /\ UNCHANGED <<run, ready, owner, joining, jcopied, cseal, tso, durable, conn, nCrash, nPart, nLane, nRcpt, nLostAck, ghost>>
 
 -----------------------------------------------------------------------------
 \* Cold start (plan: "A deliberate cold start after all queue holders have
@@ -676,12 +721,12 @@ ColdStart ==
        ELSE \A w \in Workers : ~up[w]
     /\ run' = run + 1
     /\ ready' = {} /\ owner' = NoW /\ joining' = NoW /\ sealed' = FALSE
-    /\ jcopied' = FALSE
+    /\ jcopied' = FALSE /\ cseal' = FALSE /\ tso' = "pub"
     /\ atts' = {[a EXCEPT !.cur = FALSE] : a \in atts}
     /\ lostHeld' = (lostHeld \/ \E w \in Workers, r \in Reqs :
                         up[w] /\ q[w][r] \in AccPh /\ ident[r].st # "committed")
     /\ UNCHANGED <<durable, worker, faults, applied, commitRun, firstRun,
-                   ackRun, obs, everAb, everNA, everAcc, regress, spurious>>
+                   ackRun, obs, everAb, everNA, everAcc, regress, spurious, staleAdmit>>
 
 \* The new run fences Status (and the allocator and Data groups) before any
 \* old-run receipt is answered or new work is admitted.
@@ -698,7 +743,7 @@ Bootstrap(w) ==
     /\ up' = [up EXCEPT ![w] = TRUE]
     /\ view' = [view EXCEPT ![w] = "cur"]
     /\ ready' = {w} /\ owner' = w
-    /\ UNCHANGED <<run, joining, sealed, jcopied, durable, conn, q, acks, held, atts,
+    /\ UNCHANGED <<run, joining, sealed, jcopied, cseal, tso, durable, conn, q, acks, held, atts,
                    faults, ghost>>
 
 -----------------------------------------------------------------------------
@@ -740,6 +785,8 @@ Next ==
     \/ \E w \in Workers : ApplyView(w)
     \/ \E x, o \in Workers : RemoveMember(x, o)
     \/ \E w \in Workers : Rejoin(w)
+    \/ SealJoin
+    \/ FenceTso
     \/ JoinCopy
     \/ PublishJoin
     \/ AbortJoin
@@ -760,7 +807,8 @@ Next ==
 \* - SubmitDecision, CommitDecision: the attempt task and Status Raft
 \*   progress with a quorum;
 \* - Settle, CancelAttempt: the Settlement guard and the term check;
-\* - ApplyView, JoinCopy, PublishJoin: the membership actor's 250 ms poll
+\* - ApplyView, SealJoin, FenceTso, JoinCopy, PublishJoin: the membership
+\*   actor's 250 ms poll (FenceTso also by a superseding change, route 1')
 \*   (registered.rs spawn_membership);
 \* - RemoveMember: Control's heartbeat timeout;
 \* - FenceGroups: the cold-start procedure, which fences before serving.
@@ -776,6 +824,7 @@ Fairness ==
     /\ WF_vars(SettleAny) /\ WF_vars(CancelAttemptAny)
     /\ \A w \in Workers : WF_vars(ApplyView(w))
     /\ WF_vars(\E x, o \in Workers : RemoveMember(x, o))
+    /\ WF_vars(SealJoin) /\ WF_vars(FenceTso)
     /\ WF_vars(JoinCopy) /\ WF_vars(PublishJoin) /\ WF_vars(AbortJoin)
     /\ WF_vars(FenceGroups)
     /\ \A w \in Workers : WF_vars(Heal(w))
@@ -834,6 +883,10 @@ QueueRetention == \A w \in Workers, r \in Reqs : q[w][r] # "failed"
 \* O14, PR #103: a same-run retry of accepted work is never refused while
 \* its owner holds the record.
 O14_RetryAttaches == ~spurious
+
+\* OLTP-G07, OQ-2 (route 1'): no request is admitted while the ready set
+\* holds a joiner whose copy was never verified.
+G07_NoStaleAdmission == ~staleAdmit
 
 \* Finding OQ-1 (old F1), OLTP-G04, Q04, Q06: once a client saw a terminal
 \* answer, no later answer is non-terminal. The shipped receipt
