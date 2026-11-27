@@ -109,8 +109,8 @@ impl CodeBlock {
         };
         let (mut scale, mut scale1) = (0.0, 0.0);
         if r2 > 0.0 {
-            scale = best_scale(&residual, r2);
-            let code = Fit::new(&residual, scale);
+            let code;
+            (scale, code) = best_fit(&residual, r2);
             let length2 = r2 / code.cosine2(r2);
             factors.scale5 = (r2 / code.dot) as f32;
             factors.var5 = ((length2 - r2).max(0.0) / (self.padded as f64 - 1.0)) as f32;
@@ -173,8 +173,19 @@ fn swap_remove_row<T: Copy>(rows: &mut Vec<T>, i: usize, width: usize) {
 
 /// The level of a magnitude in the 5-bit code, 0 to 15: the code value is `level + 1/2`.
 #[inline]
-fn level(magnitude: f32, scale: f32) -> i32 {
+pub(super) fn level(magnitude: f32, scale: f32) -> i32 {
     (magnitude * scale).min(15.0) as i32
+}
+
+/// [`level`] as a float, without the integer conversion, which does not vectorize. For the
+/// magnitudes and scales of a code, `x` is in `[0, 15]`, where adding and taking away 2^23 rounds
+/// to the nearest integer, which is the floor or one more.
+#[inline]
+pub(super) fn level_f(magnitude: f32, scale: f32) -> f32 {
+    let x = magnitude * scale;
+    let x = if x < 15.0 { x } else { 15.0 };
+    let near = (x + 8_388_608.0) - 8_388_608.0;
+    if near > x { near - 1.0 } else { near }
 }
 
 /// How well the 5-bit code of one scale fits a residual `r`.
@@ -186,11 +197,23 @@ pub(super) struct Fit {
 }
 
 impl Fit {
+    /// Both sums in one pass, in the lanes of [`sum`], so the bits are those of two calls of it.
     pub(super) fn new(residual: &[f32], scale: f32) -> Self {
-        let y = |r: f64| f64::from(level(r.abs() as f32, scale)) + 0.5;
+        debug_assert!(residual.len().is_multiple_of(8), "only whole lanes");
+        let (mut dot, mut norm2) = ([0.0f64; 8], [0.0f64; 8]);
+        for values in residual.as_chunks::<8>().0 {
+            // The levels in f32 first, then the sums: two loops that vectorize.
+            let magnitudes = values.map(f32::abs);
+            let levels = magnitudes.map(|m| level_f(m, scale));
+            for lane in 0..8 {
+                let y = f64::from(levels[lane]) + 0.5;
+                dot[lane] += y * f64::from(magnitudes[lane]);
+                norm2[lane] += y * y;
+            }
+        }
         Self {
-            dot: sum(residual, |r| y(r) * r.abs()),
-            norm2: sum(residual, |r| y(r) * y(r)),
+            dot: dot.iter().sum(),
+            norm2: norm2.iter().sum(),
         }
     }
 
@@ -202,17 +225,48 @@ impl Fit {
 
 /// The scale whose code points closest to `residual`, of squared length `r2`. Scale 0 gives the
 /// direction of the 1-bit code, so the 5-bit one is never worse.
+#[cfg(test)]
 pub(super) fn best_scale(residual: &[f32], r2: f64) -> f32 {
+    best_fit(residual, r2).0
+}
+
+/// [`best_scale`] and its [`Fit`]. Scales are compared by [`quick_cosine2`], and only the winner
+/// gets the f64 sums that its codes keep.
+fn best_fit(residual: &[f32], r2: f64) -> (f32, Fit) {
     let rms = (r2 / residual.len() as f64).sqrt();
-    let mut best = (0.0, Fit::new(residual, 0.0).cosine2(r2));
+    let magnitudes = sum(residual, f64::abs);
+    let abs: Vec<f32> = residual.iter().map(|r| r.abs()).collect();
+    // Scale 0, every level 0: the direction of the 1-bit code, `(sum |r|)^2 / (n r2)`.
+    let mut best = (0.0, magnitudes * magnitudes / (residual.len() as f64 * r2));
     for clip in CLIPS {
         let scale = (16.0 / (clip * rms)) as f32;
-        let cosine2 = Fit::new(residual, scale).cosine2(r2);
+        let cosine2 = quick_cosine2(&abs, scale, magnitudes, r2);
         if cosine2 > best.1 {
             best = (scale, cosine2);
         }
     }
-    best.0
+    (best.0, Fit::new(residual, best.0))
+}
+
+/// [`Fit::cosine2`] in f32 lanes, which vectorize on every target: with `y = l + 1/2`,
+/// `y . |r| = l . |r| + sum |r| / 2` and `|y|^2 = sum (l^2 + l) + n / 4`. The second sum is of small
+/// integers and exact; the first is off by f32 rounding, about 1e-6 of it, so only scales that fit
+/// equally well within that may swap. `abs` holds `|r|` and `magnitudes` its sum.
+pub(super) fn quick_cosine2(abs: &[f32], scale: f32, magnitudes: f64, r2: f64) -> f64 {
+    // 16 lanes: four of the baseline vector unit, and enough sums in flight.
+    let (mut dot, mut norm2) = ([0.0f32; 16], [0.0f32; 16]);
+    for values in abs.as_chunks::<16>().0 {
+        for lane in 0..16 {
+            let magnitude = values[lane];
+            let l = level_f(magnitude, scale);
+            dot[lane] += l * magnitude;
+            norm2[lane] += l * l + l;
+        }
+    }
+    let total = |lanes: [f32; 16]| lanes.iter().map(|&x| f64::from(x)).sum::<f64>();
+    let dot = total(dot) + 0.5 * magnitudes;
+    let norm2 = total(norm2) + 0.25 * abs.len() as f64;
+    dot * dot / (norm2 * r2)
 }
 
 /// The sum of `f` over `values`, in lanes that the compiler vectorizes. In f64, so its rounding

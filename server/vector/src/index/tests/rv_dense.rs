@@ -134,7 +134,6 @@ fn vs01_direction_codes_under_churn_padded_dimension() {
 /// which scoring 300 rows of 2 dimensions takes 600, should end it. Today filters are never
 /// charged, so it returns `Ok`.
 #[test]
-#[ignore = "VEC-BUG-filter-work-uncharged"]
 fn vs02_filter_evaluation_counts_against_the_cpu_budget() {
     use crate::runtime::Budget;
 

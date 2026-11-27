@@ -7,6 +7,7 @@ mod codes;
 mod crash;
 mod diff;
 mod model;
+mod perf1;
 mod rv_dense;
 mod unit;
 

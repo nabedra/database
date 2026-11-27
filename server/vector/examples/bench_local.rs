@@ -485,10 +485,14 @@ fn build(
         maint_time += time::elapsed(t);
     }
     let fed = time::elapsed(started);
-    // Settle: maintenance until a few calls in a row find nothing to do.
+    // Settle: maintenance until enough calls in a row to visit every partition find nothing to do.
     let t = time::now_std();
     let (mut idle, mut settle_calls) = (0, 0u64);
-    while idle < 3 && settle_calls < 10_000_000 {
+    let round = |ix: &Ix| {
+        let s = ix.stats();
+        3 + (s.ready + s.draining + s.retired) / a.settle_parts.max(1)
+    };
+    while idle < round(ix) && settle_calls < 10_000_000 {
         settle_calls += 1;
         idle = if ix.maintain(a.settle_parts) {
             0
@@ -500,6 +504,21 @@ fn build(
     let settle = time::elapsed(t);
     let status = ix.status(RANGE).map_err(e)?;
     let (rss, peak) = memory();
+    let s = ix.stats();
+    let stats = format!(
+        "\"partitions\":[{},{},{}],\"entries\":{},\"code_bytes\":{},\"ext_ram_bytes\":{},\
+         \"ext_nvme_bytes\":{},\"raw_ram_bytes\":{},\"raw_nvme_bytes\":{},\"column_bytes\":{}",
+        s.ready,
+        s.draining,
+        s.retired,
+        s.entries,
+        s.code_bytes,
+        s.ext_ram_bytes,
+        s.ext_nvme_bytes,
+        s.raw_ram_bytes,
+        s.raw_nvme_bytes,
+        s.column_bytes,
+    );
     let secs = fed.as_secs_f64();
     let total = secs + settle.as_secs_f64();
     out.line(
@@ -509,7 +528,7 @@ fn build(
              \"feed_seconds\":{secs:.3},\"rows_per_second\":{:.0},\"maintain_seconds\":{:.3},\
              \"maintain_calls\":{maintenance},\"settle_seconds\":{:.3},\"settle_calls\":{settle_calls},\
              \"rows_per_second_with_settle\":{:.0},\"applied\":{},\"rss_bytes\":{rss},\
-             \"peak_rss_bytes\":{peak}",
+             \"peak_rss_bytes\":{peak},{stats}",
             a.page,
             a.maintain,
             a.settle_parts,

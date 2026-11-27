@@ -80,8 +80,10 @@ fn adv20_a_superseded_version_lives_until_retention_passes_its_successor() {
 
 // ----- The stop rule.
 
+/// The window rule alone: no unread unit is expected to reach the result.
 fn enough(limit: usize, recall: f64, units: usize, origins: &[usize]) -> bool {
-    RecallEstimate.enough(&Progress { limit, recall, units, origins })
+    let (floor, reach) = (0.0, f64::NEG_INFINITY);
+    RecallEstimate.enough(&Progress { limit, recall, units, origins, floor, reach })
 }
 
 /// The estimate is `1 - hits of the last window / limit` and the scan stops when it reaches the recall,

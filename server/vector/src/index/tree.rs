@@ -98,9 +98,15 @@ impl Tree {
     pub fn near(&self, dir: &[f32], not: Option<PartId>, n: usize) -> Vec<(PartId, f32)> {
         let mut walk = Walk::new(dir.to_vec(), ASSIGN_BEAM);
         walk.add(self);
-        let leaves = std::iter::from_fn(|| walk.next());
-        let ready = leaves.filter(|(l, _)| l.ready && Some(l.part) != not);
-        ready.take(n).map(|(l, cos)| (l.part, cos)).collect()
+        let mut out = Vec::new();
+        while out.len() < n
+            && let Some((l, cos)) = walk.next()
+        {
+            if l.ready && Some(l.part) != not {
+                out.push((l.part, cos));
+            }
+        }
+        out
     }
 
     /// The first of them.
@@ -238,6 +244,8 @@ pub struct Walk {
     /// The roots, until the walk starts.
     roots: Vec<Arc<Node>>,
     heap: BinaryHeap<Item>,
+    /// Opened nodes of leaves, which the leaves in the heap point into.
+    opened: Vec<Arc<Node>>,
     seq: usize,
 }
 
@@ -249,7 +257,8 @@ struct Item {
 
 enum What {
     Node(Arc<Node>),
-    Leaf(Leaf),
+    /// A node of `opened` and a leaf of it.
+    Leaf(usize, usize),
 }
 
 impl Walk {
@@ -259,6 +268,7 @@ impl Walk {
             beam,
             roots: Vec::new(),
             heap: BinaryHeap::new(),
+            opened: Vec::new(),
             seq: 0,
         }
     }
@@ -280,11 +290,11 @@ impl Walk {
                 && let Some(item) = self.heap.pop()
             {
                 match item.what {
-                    What::Leaf(_) => leaves.push(item),
+                    What::Leaf(..) => leaves.push(item),
                     What::Node(n) => {
                         opened += 1;
                         match &n.kids {
-                            Kids::Leaves(_) => self.open(&n),
+                            Kids::Leaves(_) => self.open(n),
                             Kids::Nodes(nodes) => level.extend(nodes.iter().cloned()),
                         }
                     }
@@ -294,12 +304,14 @@ impl Walk {
         }
     }
 
-    fn open(&mut self, node: &Node) {
+    fn open(&mut self, node: Arc<Node>) {
         match &node.kids {
             Kids::Leaves(leaves) => {
-                for l in leaves {
-                    self.push(dot(&l.centroid, &self.dir), What::Leaf(l.clone()));
+                let at = self.opened.len();
+                for (i, l) in leaves.iter().enumerate() {
+                    self.push(dot(&l.centroid, &self.dir), What::Leaf(at, i));
                 }
+                self.opened.push(node);
             }
             Kids::Nodes(nodes) => {
                 for n in nodes {
@@ -315,13 +327,19 @@ impl Walk {
         self.heap.push(Item { cos, seq, what });
     }
 
-    pub fn next(&mut self) -> Option<(Leaf, f32)> {
+    /// The next leaf, and the cosine of its centroid.
+    pub fn next(&mut self) -> Option<(&Leaf, f32)> {
         self.start();
         loop {
             let item = self.heap.pop()?;
             match item.what {
-                What::Leaf(leaf) => return Some((leaf, item.cos)),
-                What::Node(node) => self.open(&node),
+                What::Leaf(at, i) => {
+                    let Kids::Leaves(leaves) = &self.opened.get(at)?.kids else {
+                        return None;
+                    };
+                    return Some((leaves.get(i)?, item.cos));
+                }
+                What::Node(node) => self.open(node),
             }
         }
     }

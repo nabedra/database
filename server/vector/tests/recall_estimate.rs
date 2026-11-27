@@ -161,7 +161,6 @@ fn recall(
 
 /// A scan that asks for recall 0.99 reaches at least 0.95, for every operation.
 #[test]
-#[ignore = "VEC-BUG-recall-estimate-unequal-lengths"]
 fn vs07_an_approximate_scan_reaches_its_recall_on_unequal_lengths() {
     let mut rng = SplitMix64::new(20_261_127);
     let centres: Vec<Vec<f64>> = (0..40)

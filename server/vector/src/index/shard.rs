@@ -13,6 +13,9 @@ use super::{Append, Copy, Msg, Shared, State};
 use crate::store::ExtKey;
 use crate::types::{PartId, Pos, Row};
 
+/// Partitions near its own that a recheck compares each entry with.
+const STRAY_TARGETS: usize = 8;
+
 /// An entry instance. A removal names `id`, never the row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Entry {
@@ -479,6 +482,10 @@ impl<C: Codec> Shard<C> {
 
     /// `Collect`: a superseded entry goes once no pin and no retained cut can see it.
     pub fn collect(&mut self, sh: &mut Shared, codec: &C, part: PartId) -> usize {
+        if !sh.rows.any_superseded() {
+            // Only a version with a successor is ever collectable.
+            return 0;
+        }
         let dead = self.ids(part, |p, e| {
             !p.removing(e) && sh.collectable(e.generation, e.slot, e.at)
         });
@@ -530,24 +537,59 @@ impl<C: Codec> Shard<C> {
             .collect()
     }
 
-    /// Entries of a ready partition that are clearly nearer to another one, and to which.
-    pub fn strays(&self, sh: &Shared, part: PartId, n: usize) -> Vec<(u64, PartId)> {
+    /// Entries of a ready partition that are clearly nearer to another one, and to which. It asks
+    /// the codes, not the raw vectors, and only about the partitions nearest to its centroid: an
+    /// entry moves when the worst case of its estimate to another centroid beats the best case of
+    /// the one to its own.
+    pub fn strays(&self, sh: &Shared, codec: &C, part: PartId, n: usize) -> Vec<(u64, PartId)> {
         const MARGIN: f32 = 1e-3;
         let ready = sh.dir.get(&part).filter(|m| m.state == State::Ready);
         let Some((meta, p)) = ready.zip(self.parts.get(&part)) else {
             return Vec::new();
         };
-        let Some(root) = sh.roots.get(&meta.group) else {
+        let (Some(root), Some(own)) = (sh.roots.get(&meta.group), &p.centroid) else {
             return Vec::new();
         };
-        let stray = |e: &Entry| {
-            let (_, dir, _) = row_of(sh, e.slot, e.at)?;
-            let (to, cos) = root.tree.nearest(&dir, Some(part))?;
-            (cos > super::codec::dot(&dir, &meta.centroid) + MARGIN).then_some((e.id, to))
-        };
-        let here = p
-            .entries()
-            .filter(|e| !p.removing(e) && sh.wanted(e.generation, e.slot, e.at));
-        here.filter_map(stray).take(n).collect()
+        let near = root.tree.near(&meta.centroid, Some(part), STRAY_TARGETS);
+        let queries: Vec<(PartId, C::Query)> = near
+            .iter()
+            .filter_map(|(t, _)| {
+                let centroid = &sh.dir.get(t)?.centroid;
+                Some((*t, codec.query(&codec.rotate(centroid), own)))
+            })
+            .collect();
+        if queries.is_empty() {
+            return Vec::new();
+        }
+        let here = codec.query(own, own);
+        let (mut out, mut est) = (Vec::new(), Vec::new());
+        for b in &p.bands {
+            est.clear();
+            codec.scan(&here, &b.codes, &mut est);
+            let mut best: Vec<(f32, Option<PartId>)> = est
+                .iter()
+                .map(|e| (e.cos + e.err + MARGIN, None))
+                .collect();
+            for (t, q) in &queries {
+                est.clear();
+                codec.scan(q, &b.codes, &mut est);
+                for (best, e) in best.iter_mut().zip(&est) {
+                    if e.cos - e.err > best.0 {
+                        *best = (e.cos - e.err, Some(*t));
+                    }
+                }
+            }
+            let moved = b.entries.iter().zip(best).filter_map(|(e, (_, to))| {
+                let to = to?;
+                let keep = p.removing(e) || !sh.wanted(e.generation, e.slot, e.at);
+                (!keep).then_some((e.id, to))
+            });
+            out.extend(moved);
+            if out.len() >= n {
+                break;
+            }
+        }
+        out.truncate(n);
+        out
     }
 }

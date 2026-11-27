@@ -504,6 +504,33 @@ pub struct RangeStatus {
     pub damage: Option<String>,
 }
 
+/// What an index holds, per kind and tier. Bytes count the values, not allocator overhead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Stats {
+    /// Partitions by state, the lists of vectors without a direction among the ready ones.
+    pub ready: usize,
+    pub draining: usize,
+    /// Retired, waiting for the scans that listed them.
+    pub retired: usize,
+    pub undirected: usize,
+    /// Entries in partitions: superseded versions and copies of a move count too.
+    pub entries: usize,
+    /// Rows (slots) and their versions in the row map.
+    pub rows: usize,
+    pub versions: usize,
+    /// 1-bit codes and their factors in RAM, with the extensions that blocks keep inline.
+    pub code_bytes: u64,
+    /// 4-bit extensions in the extension store, in RAM and on NVMe.
+    pub ext_ram_bytes: u64,
+    pub ext_nvme_bytes: u64,
+    /// Raw vectors in the rows (RAM), in the vector store's pages in RAM, and on NVMe.
+    pub raw_ram_bytes: u64,
+    pub raw_cached_bytes: u64,
+    pub raw_nvme_bytes: u64,
+    /// Filter column values in the partitions, at their inline size.
+    pub column_bytes: u64,
+}
+
 #[cfg_attr(test, derive(Clone))]
 pub struct Index<C: Codec = ExactCodec> {
     cfg: Config,
@@ -555,6 +582,40 @@ impl<C: Codec> Index<C> {
             checkpoint: None,
             cursor: PartId(0),
         })
+    }
+
+    /// What the index holds now. It walks every partition and slot, so it is for monitoring, not
+    /// for each query.
+    pub fn stats(&self) -> Stats {
+        let mut s = Stats::default();
+        for meta in self.shared.dir.values() {
+            match meta.state {
+                State::Ready => s.ready += 1,
+                State::Draining => s.draining += 1,
+                State::Retired => s.retired += 1,
+            }
+            s.undirected += usize::from(meta.undirected);
+        }
+        let value = size_of::<crate::types::Value>() as u64;
+        let bands = self.shards.iter().flat_map(|sh| sh.parts.values()).flat_map(|p| &p.bands);
+        for b in bands {
+            s.entries += b.entries.len();
+            s.code_bytes += self.codec.held(&b.codes);
+            s.column_bytes += (b.entries.len() * b.cols.len()) as u64 * value;
+        }
+        let (rows, versions, values) = self.shared.rows.census_counts();
+        (s.rows, s.versions) = (rows, versions);
+        s.raw_ram_bytes = (values * size_of::<f32>()) as u64;
+        if let Some(store) = self.shared.rows.store() {
+            let st = store.stats();
+            (s.raw_cached_bytes, s.raw_nvme_bytes) = (st.ram_bytes, st.disk_bytes);
+        }
+        if let Some(ext) = &self.cfg.codes {
+            let (ram, nvme) = ext.counts();
+            let bytes = ext.bytes() as u64;
+            (s.ext_ram_bytes, s.ext_nvme_bytes) = (ram as u64 * bytes, nvme as u64 * bytes);
+        }
+        s
     }
 
     // ----- Ranges: install, feed, retention, drop.
@@ -1138,27 +1199,33 @@ impl<C: Codec> Index<C> {
         same && shard.reassign(sh, codec, part, id, to)
     }
 
-    /// Moves entries that a split left nearer to another partition. One partition per call.
-    fn recheck(&mut self) -> bool {
-        let Some(part) = self.shared.recheck.pop_first() else {
-            return false;
-        };
+    /// Moves entries that a split left nearer to another partition, in up to `parts` partitions,
+    /// and up to `reassigns` entries of each.
+    fn recheck(&mut self, parts: usize) -> bool {
         let n = self.cfg.reassigns;
-        let (sh, shard, _) = self.owner(part);
-        let strays = shard.strays(sh, part, n);
-        let more = strays.len() == n && n > 0;
-        for (id, to) in strays {
-            self.reassign(part, id, to);
+        let mut todo = Vec::new();
+        while todo.len() < parts.max(1)
+            && let Some(part) = self.shared.recheck.pop_first()
+        {
+            todo.push(part);
         }
-        if more {
-            self.shared.recheck.insert(part);
+        for &part in &todo {
+            let (sh, shard, codec) = self.owner(part);
+            let strays = shard.strays(sh, codec, part, n);
+            let more = strays.len() == n && n > 0;
+            for (id, to) in strays {
+                self.reassign(part, id, to);
+            }
+            if more {
+                self.shared.recheck.insert(part);
+            }
         }
-        true
+        !todo.is_empty()
     }
 
     /// Background work on up to `parts` partitions. Returns whether anything was done.
     pub fn maintain(&mut self, parts: usize) -> bool {
-        let mut done = self.recheck();
+        let mut done = self.recheck(parts);
         for _ in 0..parts.min(self.shared.dir.len()) {
             let after = self
                 .shared

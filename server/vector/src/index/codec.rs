@@ -161,8 +161,11 @@ impl Codec for ExactCodec {
     }
 }
 
+/// The f32 dot product of the common prefix, by the SIMD kernel: the same bits on every CPU. It only
+/// chooses partitions and candidates, never a result score.
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    let n = a.len().min(b.len());
+    nabedra_simd::dot(&a[..n], &b[..n])
 }
 
 fn dot64(a: &[f32], b: &[f32]) -> f64 {
@@ -180,7 +183,11 @@ pub fn length(v: &[f32]) -> f64 {
 /// length is no positive normal f32.
 pub fn direction(v: &[f32]) -> Option<(Vec<f32>, f64)> {
     let len = length(v);
-    let dir = || v.iter().map(|&x| (f64::from(x) / len) as f32).collect();
+    // A product vectorizes better than a quotient; it only moves the codes, never a score.
+    let dir = || {
+        let inverse = len.recip();
+        v.iter().map(|&x| (f64::from(x) * inverse) as f32).collect()
+    };
     (len as f32).is_normal().then(|| (dir(), len))
 }
 
@@ -209,6 +216,12 @@ pub fn exact(op: Op, a: &[f32], b: &[f32]) -> Option<f32> {
         }
     };
     Some(round(value))
+}
+
+/// [`exact`] of a cosine whose lengths are known: `la = length(a)` and `lb = length(b)`, both
+/// positive. The same sums in the same order, so the same bits, with one pass over the values.
+pub fn cosine_with(a: &[f32], b: &[f32], la: f64, lb: f64) -> f32 {
+    round((dot64(a, b) / la / lb).clamp(-1.0, 1.0))
 }
 
 /// A score, or a score back, as "higher is better".

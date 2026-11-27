@@ -78,12 +78,23 @@ impl Rotation {
             if blocks > 1 {
                 DEALT.with_borrow_mut(|dealt| {
                     dealt.resize(self.padded, 0.0);
-                    for (r, block) in out.chunks_exact(self.block).enumerate() {
-                        for (x, hand) in block.iter().zip(dealt.chunks_exact_mut(blocks)) {
-                            hand[r] = *x;
+                    let dealt = &mut dealt[..self.padded];
+                    if blocks == 3 {
+                        // 768 and 1536 values: three hands of fixed size, without index checks.
+                        let (a, rest) = out.split_at(self.block);
+                        let (b, c) = rest.split_at(self.block);
+                        let hands = dealt.as_chunks_mut::<3>().0.iter_mut();
+                        for (hand, ((a, b), c)) in hands.zip(a.iter().zip(b).zip(c)) {
+                            *hand = [*a, *b, *c];
+                        }
+                    } else {
+                        for (r, block) in out.chunks_exact(self.block).enumerate() {
+                            for (x, hand) in block.iter().zip(dealt.chunks_exact_mut(blocks)) {
+                                hand[r] = *x;
+                            }
                         }
                     }
-                    out.copy_from_slice(&dealt[..self.padded]);
+                    out.copy_from_slice(dealt);
                 });
             }
         }

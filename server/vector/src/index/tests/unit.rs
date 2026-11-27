@@ -55,9 +55,10 @@ fn vs07_a_tree_is_balanced_and_a_pinned_one_does_not_change() {
         let q = unit(g, 6);
         let mut walk = Walk::new(q.clone(), 4);
         walk.add(tree);
-        let order: Vec<(PartId, f32)> = std::iter::from_fn(|| walk.next())
-            .map(|(l, _)| (l.part, dot(&l.centroid, &q)))
-            .collect();
+        let mut order: Vec<(PartId, f32)> = Vec::new();
+        while let Some((l, _)) = walk.next() {
+            order.push((l.part, dot(&l.centroid, &q)));
+        }
         assert_eq!(
             &order.iter().map(|(p, _)| *p).collect::<BTreeSet<_>>(),
             want

@@ -1030,3 +1030,43 @@ fn vs07_a_detached_extension_refines_like_one_in_the_block() {
         assert!(refuses(|| query.refine_with(&detached, 0, &exts[0][1..])));
     }
 }
+
+/// Task perf1: the level without an integer conversion is the level, on whole levels, just below
+/// them, at the cap and beyond it, so the stored codes do not change.
+#[test]
+fn vs07_the_float_level_is_the_level() {
+    let mut rng = SplitMix64::new(28);
+    let mut cases: Vec<(f32, f32)> = (0..=16).flat_map(|k| {
+        let k = k as f32;
+        [(k, 1.0), (k.next_down().max(0.0), 1.0), (k.next_up(), 1.0), (k / 4.0, 4.0)]
+    }).collect();
+    cases.extend([(0.0, 0.0), (-0.0, 3.0), (2.0, f32::MAX), (1e-30, 1e-30), (1.0, 1e9)]);
+    cases.extend((0..100_000).map(|_| (uniform(&mut rng) as f32 * 2.0, (uniform(&mut rng) * 500.0) as f32)));
+    for (m, s) in cases {
+        assert_eq!(code::level_f(m, s), code::level(m, s) as f32, "{m} * {s}");
+    }
+}
+
+/// Task perf1: the f32 scale search ranks scales as the f64 fit does. Its levels are those of the
+/// code exactly, integers and halves included, and its cosine is within 1e-5 of the fit's, so
+/// only scales that fit as well within that may swap.
+#[test]
+fn vs07_the_quick_scale_search_agrees_with_the_fit() {
+    let mut rng = SplitMix64::new(27);
+    for dim in [64, 768, 4096] {
+        let mut residual: Vec<f32> = (0..dim).map(|_| (gaussian(&mut rng) * 0.03) as f32).collect();
+        // Magnitudes that land on whole levels at scale 100, and at the cap.
+        residual[0] = 0.07;
+        residual[1] = -0.15;
+        residual[2] = 0.5;
+        let r2 = wide::norm_sq(&residual);
+        let abs: Vec<f32> = residual.iter().map(|x| x.abs()).collect();
+        let magnitudes: f64 = abs.iter().map(|&x| f64::from(x)).sum();
+        let rms = (r2 / dim as f64).sqrt();
+        for scale in [0.0, 100.0, 7.25, (16.0 / (3.0 * rms)) as f32, (16.0 / rms) as f32] {
+            let quick = code::quick_cosine2(&abs, scale, magnitudes, r2);
+            let fit = code::Fit::new(&residual, scale).cosine2(r2);
+            assert!((quick - fit).abs() <= 1e-5 * fit, "{dim} {scale}: {quick} vs {fit}");
+        }
+    }
+}
