@@ -1,0 +1,23 @@
+# Found by review rv-b2b of nabedra/oltp-vector-b2b (2666694b). Config.codes is an Arc<Extensions>
+# that outlives the Index: dropping an Index releases neither its extensions nor its code-memory
+# charges (b2b's report names this as a concern). Index::recover takes a Config, so a recovery handed
+# the same configuration runs over a store that still holds the old index's extensions. 8 dims,
+# 40 rows, checkpoint, drop, recover with the same Config: charged (1568, 1792) bytes, store holds
+# 56 extensions in RAM, while the recovered index holds 784 bytes of codes and 28 extensions. The
+# leaked RAM and budget never come back, and later extensions go to NVMe. Exact results are still
+# right. Command: cargo-slot test -p nabedra-vector --lib -- --include-ignored vs17_an_index_recovered
+# (log /home/dev/logs/oltp-vector/w3/rv-b2b/probe2.log).
+id = "VECTOR-ext-charges-outlive-index"
+title = "A dropped index keeps its extensions and code-memory charges in a store that outlives it"
+class = "resource-release-order"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS17", "VS10"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/vector/src/index/tests/codes.rs::vs17_an_index_recovered_over_the_same_extension_store_is_charged_only_what_it_holds"
+seed = 9
+why_not_caught = "Every test made a new store per index and dropped both together."
+invariant_added = "The code memory is charged exactly what the live indexes over it hold, also after an index is dropped and recovered."
+fix_commits = ["1b6f37c5d41ee0138809f5b61dafca32e3c1264e"]
+revert_patch_ok = false

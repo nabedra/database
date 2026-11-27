@@ -989,3 +989,84 @@ fn measure_recall() {
         rows * per_query / scan_time / 1e6,
     );
 }
+
+/// A block that hands its extensions back estimates as one that keeps them, through pushes and
+/// removals, and holds exactly the extension bytes less.
+#[test]
+fn vs07_a_detached_extension_refines_like_one_in_the_block() {
+    let mut rng = SplitMix64::new(41);
+    for dim in [1, 3, 64, 100, 768] {
+        let rotation = Rotation::new(dim, 7);
+        let centroid = rotated(&rotation, &random_unit(dim, &mut rng));
+        let (mut inline, mut detached) = (CodeBlock::new(rotation.padded()), CodeBlock::new(rotation.padded()));
+        let mut exts: Vec<Vec<u8>> = Vec::new();
+        for i in 0..20 {
+            let dir = rotated(&rotation, &random_unit(dim, &mut rng));
+            let len = 0.5 + i as f32;
+            inline.push(&dir, &centroid, len);
+            exts.push(detached.push_detached(&dir, &centroid, len));
+        }
+        for i in [3, 0, 17, 5] {
+            inline.swap_remove(i);
+            detached.swap_remove(i);
+            exts.swap_remove(i);
+        }
+        assert_eq!(inline.len(), detached.len());
+        assert_eq!(inline.held(), detached.held() + inline.len() * inline.ext_bytes(), "dim {dim}");
+        let query = QueryCode::new(&rotated(&rotation, &random_unit(dim, &mut rng)), &centroid);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        query.scan(&inline, &mut a);
+        query.scan(&detached, &mut b);
+        assert_eq!(a, b);
+        for (i, ext) in exts.iter().enumerate() {
+            assert_eq!(ext.len(), detached.ext_bytes());
+            assert_eq!(query.refine(&inline, i), query.refine_with(&detached, i, ext), "dim {dim} entry {i}");
+            assert_eq!(inline.length(i), detached.length(i));
+        }
+        // A block holds every extension or none.
+        let dir = rotated(&rotation, &random_unit(dim, &mut rng));
+        assert!(refuses(|| detached.clone().push(&dir, &centroid, 1.0)));
+        assert!(refuses(|| inline.clone().push_detached(&dir, &centroid, 1.0)));
+        assert!(refuses(|| query.refine_with(&detached, 0, &exts[0][1..])));
+    }
+}
+
+/// Task perf1: the level without an integer conversion is the level, on whole levels, just below
+/// them, at the cap and beyond it, so the stored codes do not change.
+#[test]
+fn vs07_the_float_level_is_the_level() {
+    let mut rng = SplitMix64::new(28);
+    let mut cases: Vec<(f32, f32)> = (0..=16).flat_map(|k| {
+        let k = k as f32;
+        [(k, 1.0), (k.next_down().max(0.0), 1.0), (k.next_up(), 1.0), (k / 4.0, 4.0)]
+    }).collect();
+    cases.extend([(0.0, 0.0), (-0.0, 3.0), (2.0, f32::MAX), (1e-30, 1e-30), (1.0, 1e9)]);
+    cases.extend((0..100_000).map(|_| (uniform(&mut rng) as f32 * 2.0, (uniform(&mut rng) * 500.0) as f32)));
+    for (m, s) in cases {
+        assert_eq!(code::level_f(m, s), code::level(m, s) as f32, "{m} * {s}");
+    }
+}
+
+/// Task perf1: the f32 scale search ranks scales as the f64 fit does. Its levels are those of the
+/// code exactly, integers and halves included, and its cosine is within 1e-5 of the fit's, so
+/// only scales that fit as well within that may swap.
+#[test]
+fn vs07_the_quick_scale_search_agrees_with_the_fit() {
+    let mut rng = SplitMix64::new(27);
+    for dim in [64, 768, 4096] {
+        let mut residual: Vec<f32> = (0..dim).map(|_| (gaussian(&mut rng) * 0.03) as f32).collect();
+        // Magnitudes that land on whole levels at scale 100, and at the cap.
+        residual[0] = 0.07;
+        residual[1] = -0.15;
+        residual[2] = 0.5;
+        let r2 = wide::norm_sq(&residual);
+        let abs: Vec<f32> = residual.iter().map(|x| x.abs()).collect();
+        let magnitudes: f64 = abs.iter().map(|&x| f64::from(x)).sum();
+        let rms = (r2 / dim as f64).sqrt();
+        for scale in [0.0, 100.0, 7.25, (16.0 / (3.0 * rms)) as f32, (16.0 / rms) as f32] {
+            let quick = code::quick_cosine2(&abs, scale, magnitudes, r2);
+            let fit = code::Fit::new(&residual, scale).cosine2(r2);
+            assert!((quick - fit).abs() <= 1e-5 * fit, "{dim} {scale}: {quick} vs {fit}");
+        }
+    }
+}

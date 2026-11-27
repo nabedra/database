@@ -1,0 +1,17 @@
+id = "VECTOR-forged-centroid-panics-recovery"
+title = "Recovery with the direction codec panics on a checkpoint centroid that is not a unit vector"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G10", "VEC-G11"]
+scenarios = ["VS10", "VS17"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/vector/src/index/tests/rv_dense.rs::vs03_a_forged_centroid_fails_recovery_without_a_panic"
+seed = "unknown"
+why_not_caught = "adv17_checkpoints_with_right_checksums_and_wrong_contents_never_panic recovers with ExactCodec only, which accepts any centroid. The production DirectionCodec asserts unit directions in CodeBlock::push and QueryCode::new."
+invariant_added = "Intended, not met: a checkpoint frame with a right checksum and a centroid that is not a unit vector makes recovery report damage for its ranges and never panics. load_frame checks rows with fits but takes the centroid as read."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-11"

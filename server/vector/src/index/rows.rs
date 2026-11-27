@@ -57,6 +57,8 @@ pub struct Rows {
     vectors: Option<Arc<dyn Vectors>>,
     /// Generations with a vector the store could not read.
     damage: Arc<Mutex<BTreeSet<Gen>>>,
+    /// Some slot ever held two versions. Until then no version has a successor.
+    superseded: bool,
 }
 
 impl Rows {
@@ -106,6 +108,31 @@ impl Rows {
         got.map(Some)
     }
 
+    /// [`Rows::vector`] of several versions, with one batch of store reads.
+    pub fn vectors(&self, keys: &[(Slot, Pos)]) -> Vec<Result<Option<Arc<[f32]>>>> {
+        let Some(store) = &self.vectors else {
+            return keys.iter().map(|&(s, at)| self.vector(s, at)).collect();
+        };
+        let (mut out, mut ask, mut from) = (Vec::with_capacity(keys.len()), Vec::new(), Vec::new());
+        for (i, &(slot, at)) in keys.iter().enumerate() {
+            let row = self.version(slot, at).and_then(|v| v.row.as_ref());
+            out.push(Ok(row.and_then(|r| r.vec.clone())));
+            if row.is_some_and(|r| r.vec.is_none()) {
+                ask.push(VecKey { slot, at });
+                from.push(i);
+            }
+        }
+        for ((i, key), got) in from.into_iter().zip(&ask).zip(store.get_many(&ask)) {
+            if got.is_err()
+                && let Some(generation) = self.generation(key.slot)
+            {
+                self.log_damage(generation);
+            }
+            out[i] = got.map(Some);
+        }
+        out
+    }
+
     /// The row of a version with the vector already read during scoring.
     pub fn full_row(&self, slot: Slot, at: Pos, vector: Arc<[f32]>) -> Option<Arc<Row>> {
         let row = self.version(slot, at)?.row.as_ref()?;
@@ -122,6 +149,12 @@ impl Rows {
     /// Whether reading a vector costs I/O.
     pub fn on_disk(&self) -> bool {
         self.vectors.as_ref().is_some_and(|v| v.on_disk())
+    }
+
+    /// Logs that the store failed a version of a generation, so that its range fails.
+    pub fn log_damage(&self, generation: Gen) {
+        let mut damage = self.damage.lock().unwrap_or_else(PoisonError::into_inner);
+        damage.insert(generation);
     }
 
     /// The generations logged as damaged since the last call.
@@ -151,6 +184,24 @@ impl Rows {
 
     pub fn key(&self, slot: Slot) -> Option<&Key> {
         Some(&self.data(slot)?.key)
+    }
+
+    /// Live slots, their versions, and the raw vectors kept in RAM, as (slots, versions, values).
+    pub fn census_counts(&self) -> (usize, usize, usize) {
+        let live = self.slots.iter().flatten();
+        live.fold((0, 0, 0), |(s, v, x), d| {
+            let held = d.versions.iter().filter_map(|v| v.row.as_ref()?.vec.as_ref());
+            (s + 1, v + d.versions.len(), x + held.map(|vec| vec.len()).sum::<usize>())
+        })
+    }
+
+    pub fn store(&self) -> Option<&Arc<dyn Vectors>> {
+        self.vectors.as_ref()
+    }
+
+    /// Whether any version may have a successor.
+    pub fn any_superseded(&self) -> bool {
+        self.superseded
     }
 
     /// The version that superseded `(slot, at)`.
@@ -208,6 +259,7 @@ impl Rows {
                 return None;
             }
             versions.push(new);
+            self.superseded = true;
             return Some((slot, true));
         }
         let data = SlotData {
@@ -255,6 +307,7 @@ impl Rows {
                 },
             ),
         }
+        self.superseded |= versions.len() > 1;
         Some(slot)
     }
 

@@ -3,17 +3,44 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet, VecDeque};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
-use super::codec::{Codec, best, direction, dot, exact, goodness, optimistic};
+use super::codec::{Codec, best, cosine_with, direction, dot, exact, goodness, length, optimistic};
 use super::filter::{Bits, Filter, Scalar, evaluate};
 use super::mutant::mutant;
-use super::rows::Slot;
-use super::shard::{Band, Entry, band_span};
+use super::rows::{Gen, Point, Slot};
+use super::shard::{Band, Entry, band_span, ext_key};
 use super::tree::{SCAN_BEAM, Walk};
 use super::{Index, Meta, Pin, parts_of};
-use crate::runtime::{Budget, Meter, Usage};
+use crate::runtime::{Budget, Meter, Tier, Usage};
 use crate::types::{CommitTs, Error, Key, MAX_LIMIT, Op, PartId, Pos, RangeId, Result, Row};
+
+/// Raw vectors that one batch of store reads asks for.
+const READ_BATCH: usize = 64;
+
+const GONE: Error = Error::Internal("an entry without its row");
+
+/// Slots are small integers that the index hands out, so a multiplication spreads them well
+/// enough, and no input chooses them.
+#[derive(Clone, Copy, Default)]
+pub struct SlotHasher(u64);
+
+impl Hasher for SlotHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(*b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (self.0 ^ u64::from(n)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+pub type Slots = HashSet<Slot, BuildHasherDefault<SlotHasher>>;
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Query {
@@ -46,6 +73,11 @@ pub struct Progress<'a> {
     pub units: usize,
     /// For each of the best `limit` rows, the unit that it came from.
     pub origins: &'a [usize],
+    /// The goodness of the `limit`-th row.
+    pub floor: f64,
+    /// What the best row of an unread unit is expected to reach, at the scan's recall: see
+    /// [`RecallEstimate`]. Minus infinity once every unit was read.
+    pub reach: f64,
 }
 
 /// Decides when an approximate scan has read enough. It is asked only while `limit` rows are there.
@@ -53,22 +85,72 @@ pub trait StopRule: Send {
     fn enough(&mut self, progress: &Progress<'_>) -> bool;
 }
 
-/// Estimates recall as if the units that were not read held as many of the best rows as the last
-/// units did: `1 - hits(last w units) / limit`, where `w` is the larger of 16 and half of what was
-/// read. Units come nearest first, so hits thin out and the estimate is on the safe side for
-/// clustered data. It is a heuristic without a guarantee: the recall gates measure it.
+/// Units read before an approximate scan may stop, and the least window of recent units.
+const WINDOW: usize = 16;
+
+/// Stops once the units still to read are unlikely to hold a row of the result. A unit is read in
+/// the order of its promise, the goodness of a row at its centroid's cosine with the longest length
+/// of its band. Every unit read tells how far the goodness of its best matching row, by the codes and
+/// its own length, lies above that promise. Over the recent window of units (the larger of 16 and
+/// half of what was read), that excess has a mean `m` and a deviation `s`. The next unit of every
+/// length band would reach its promise plus `m + z s`, with `z` the normal quantile of the recall
+/// asked, so a higher recall reads on.
+/// The scan stops when none of them reaches the `limit`-th row, and none of that row came
+/// from the window either (`1 - hits(window) / limit >= recall`). It is a heuristic without a
+/// guarantee: the recall gates measure it.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct RecallEstimate;
 
 impl StopRule for RecallEstimate {
     fn enough(&mut self, p: &Progress<'_>) -> bool {
-        let window = (p.units / 2).max(16);
+        let window = (p.units / 2).max(WINDOW);
         let Some(before) = p.units.checked_sub(window) else {
             return false;
         };
         let late = p.origins.iter().filter(|u| **u >= before).count();
-        1.0 - late as f64 / p.limit.max(1) as f64 >= p.recall
+        1.0 - late as f64 / p.limit.max(1) as f64 >= p.recall && p.reach < p.floor
     }
+}
+
+/// The quantile of the standard normal distribution at `p`, within 5e-4 (Abramowitz and Stegun
+/// 26.2.23); infinite at 0 and 1.
+pub(super) fn normal_quantile(p: f64) -> f64 {
+    if p <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if p >= 1.0 {
+        return f64::INFINITY;
+    }
+    let tail = |q: f64| {
+        let t = (-2.0 * q.ln()).sqrt();
+        t - (2.515_517 + 0.802_853 * t + 0.010_328 * t * t)
+            / (1.0 + 1.432_788 * t + 0.189_269 * t * t + 0.001_308 * t * t * t)
+    };
+    if p < 0.5 { -tail(p) } else { tail(1.0 - p) }
+}
+
+/// What the best row of a unit adds to its promise, at `recall`: the larger of `m + z s` and the
+/// `recall` quantile of the recent excesses themselves, whose tail is longer than a normal one.
+pub(super) fn excess_bound(excess: &[f32], units: usize, recall: f64) -> f64 {
+    let window = (units / 2).max(WINDOW);
+    let recent = &excess[excess.len().saturating_sub(window)..];
+    if recent.is_empty() {
+        return f64::INFINITY;
+    }
+    let n = recent.len() as f64;
+    let mean = recent.iter().map(|&x| f64::from(x)).sum::<f64>() / n;
+    let var = recent.iter().map(|&x| (f64::from(x) - mean).powi(2)).sum::<f64>() / n;
+    // Units still to read add their chances of a miss, so each one must miss less often than
+    // the scan may: a quarter of `1 - recall`, which the benchmark sets reach (perf1).
+    let tail = 1.0 - (1.0 - recall) / 4.0;
+    let z = normal_quantile(tail);
+    if !z.is_finite() {
+        return z;
+    }
+    let mut sorted = recent.to_vec();
+    let rank = ((tail * n).ceil() as usize).clamp(1, recent.len()) - 1;
+    let (_, &mut quantile, _) = sorted.select_nth_unstable_by(rank, f32::total_cmp);
+    (mean + z * var.sqrt()).max(f64::from(quantile))
 }
 
 struct Ranked {
@@ -123,16 +205,29 @@ pub struct Scan {
     vec: Vec<f32>,
     dir: Vec<f32>,
     len: f64,
+    /// `length(vec)`, also when it has no direction.
+    norm: f64,
     limit: usize,
     filter: Option<Filter>,
+    /// Work units of evaluating the filter once.
+    filter_work: u64,
+    /// Work of the plan, charged by the first visit.
+    planned: u64,
     recall: f64,
     stop: Box<dyn StopRule>,
     plan: Plan,
     top: BinaryHeap<Ranked>,
     /// Rows that were scored.
-    pub(super) seen: HashSet<Slot>,
+    pub(super) seen: Slots,
+    /// Rows that got the f64 score: the kernel's score did not rule them out.
+    pub(super) rescored: usize,
     /// Units that held a match.
     units: usize,
+    /// Per unit read through codes: the goodness of its best matching row by the codes, above
+    /// its promise.
+    excess: Vec<f32>,
+    /// The best goodness by the codes of a matching row of the unit being read.
+    unit_best: f64,
     /// Units read so far, or skipped because nothing in them could enter the result.
     pub visited: usize,
     /// The budget it runs within, if any.
@@ -170,6 +265,30 @@ impl Scan {
         self.charge(self.vec.len() as u64, 0, fresh)
     }
 
+    /// Whether the SIMD kernel's score of a row, with its stated slack, stays below `floor` (L1).
+    /// Only rows of normal lengths: the slack is stated for them.
+    fn out_of_reach(&self, vec: &[f32], len: f64, floor: f32) -> bool {
+        let (la, lq) = (len as f32, self.norm as f32);
+        let normal = |l: f32| l.is_normal() && l > 0.0;
+        if !normal(la) || !normal(lq) {
+            return false;
+        }
+        use crate::quant::{self, Op as Q};
+        let op = match self.op {
+            Op::Cosine => Q::Cosine,
+            Op::Dot => Q::Dot,
+            Op::L2 => Q::L2,
+        };
+        let Some(fast) = quant::exact(op, vec, &self.vec) else {
+            return false;
+        };
+        let (lo, hi) = quant::exact_bounds(op, fast, vec.len(), la, lq);
+        let best = goodness(self.op, if self.op == Op::L2 { lo } else { hi });
+        // The bounds are of `quant::score`. `exact` sums alike but divides a cosine in another
+        // order, which may round it one step off.
+        best.next_up().next_up() < floor
+    }
+
     /// The least goodness that still enters the result.
     fn floor(&self) -> Option<f32> {
         (self.top.len() >= self.limit).then(|| self.top.peek().map_or(f32::INFINITY, |r| r.good))
@@ -195,12 +314,23 @@ impl Scan {
         }
     }
 
-    /// Scores a visible row exactly. Returns whether it ranks at all.
-    fn offer(&mut self, key: &Key, e: &Entry, vec: Arc<[f32]>) -> bool {
+    /// Scores a visible row exactly. Returns whether it ranks at all. `len` is the row's length as
+    /// its band keeps it, or 0 without a direction.
+    fn offer(&mut self, key: &Key, e: &Entry, len: f64, vec: Arc<[f32]>) -> bool {
         if !self.seen.insert(e.slot) && !mutant("no_slot_dedup") {
             return true;
         }
-        let Some(score) = exact(self.op, &vec, &self.vec) else {
+        if self.floor().is_some_and(|f| self.out_of_reach(&vec, len, f)) {
+            return true;
+        }
+        let score = match self.op {
+            Op::Cosine if len > 0.0 && self.norm > 0.0 => {
+                Some(cosine_with(&vec, &self.vec, len, self.norm))
+            }
+            _ => exact(self.op, &vec, &self.vec),
+        };
+        self.rescored += 1;
+        let Some(score) = score else {
             return false;
         };
         let good = goodness(self.op, score);
@@ -220,14 +350,33 @@ impl Scan {
 }
 
 impl Stream {
-    /// The next unit, and the band that it is limited to.
-    fn next(&mut self, op: Op, len: f64) -> Option<(PartId, Option<i32>)> {
+    /// Walks the tree until every band has its next partition, or the walk ends.
+    fn meet(&mut self) -> Option<()> {
         let need = self.bands.iter().map(|b| b.3 + 1).max()?;
         while self.met.len() < need
             && let Some((leaf, cos)) = self.walk.next()
         {
             self.met.push((leaf.part, cos));
         }
+        Some(())
+    }
+
+    /// The best promise of the next unit of any band, plus `excess`. Minus infinity when no unit
+    /// is left.
+    fn reach(&mut self, op: Op, len: f64, excess: f64) -> f64 {
+        if self.meet().is_none() {
+            return f64::NEG_INFINITY;
+        }
+        let met = &self.met;
+        let next = self.bands.iter().filter_map(|b| {
+            Some(best(op, f64::from(met.get(b.3)?.1), b.1, b.2, len))
+        });
+        next.fold(f64::NEG_INFINITY, f64::max) + excess
+    }
+
+    /// The next unit, the band that it is limited to, and the cosine of its centroid.
+    fn next(&mut self, op: Op, len: f64) -> Option<(PartId, Option<i32>, f32)> {
+        self.meet()?;
         let met = &self.met;
         let promise = |b: &(Option<i32>, f64, f64, usize)| {
             met.get(b.3)
@@ -241,7 +390,8 @@ impl Stream {
             .max_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)))?;
         let band = &mut self.bands[i];
         band.3 += 1;
-        Some((met[band.3 - 1].0, band.0))
+        let (part, cos) = met[band.3 - 1];
+        Some((part, band.0, cos))
     }
 }
 
@@ -273,20 +423,28 @@ impl<C: Codec> Index<C> {
             return Err(Error::InvalidQuery("the pin holds another tree"));
         }
         let (dir, len) = direction.unwrap_or_else(|| (query.vec.clone(), 0.0));
+        let filter_work = query.filter.as_ref().map_or(0, Filter::nodes);
+        let (plan, planned) = self.plan(pin, query, &dir, len, filter_work);
         Ok(Scan {
-            plan: self.plan(pin, query, &dir, len),
+            plan,
+            planned,
             pin: pin.clone(),
             op: query.op,
             vec: query.vec.clone(),
             dir,
             len,
+            norm: length(&query.vec),
             limit: query.limit,
             filter: query.filter.clone(),
+            filter_work,
             recall: query.recall,
             stop,
             top: BinaryHeap::new(),
-            seen: HashSet::new(),
+            seen: Slots::default(),
+            rescored: 0,
             units: 0,
+            excess: Vec::new(),
+            unit_best: f64::NEG_INFINITY,
             visited: 0,
             meter: None,
         })
@@ -322,15 +480,18 @@ impl<C: Codec> Index<C> {
         }
     }
 
-    fn plan(&self, pin: &Pin, query: &Query, dir: &[f32], len: f64) -> Plan {
+    /// The plan and the work of making it: the filter's estimate looks at each partition.
+    fn plan(&self, pin: &Pin, query: &Query, dir: &[f32], len: f64, filter: u64) -> (Plan, u64) {
         let summary = &self.shared.summary;
         let entries: usize = pin.0.roots.iter().map(|r| r.entries).sum();
+        let work = filter.saturating_mul(self.shared.dir.len() as u64 + 1);
         let few = query
             .filter
             .as_ref()
             .is_some_and(|f| summary.estimate(f) <= self.cfg.flat as f64);
         if query.exact || entries < self.cfg.flat || few || len == 0.0 {
-            return Plan::All(parts_of(pin.0.roots.iter()).into_iter().collect());
+            let all = Plan::All(parts_of(pin.0.roots.iter()).into_iter().collect());
+            return (all, work);
         }
         let mut walk = Walk::new(dir.to_vec(), SCAN_BEAM);
         let mut exps: Vec<i32> = Vec::new();
@@ -350,11 +511,12 @@ impl<C: Codec> Index<C> {
                 })
                 .collect(),
         };
-        Plan::Stream(Stream {
+        let stream = Plan::Stream(Stream {
             walk,
             met: Vec::new(),
             bands,
-        })
+        });
+        (stream, work)
     }
 
     /// `Visit`: reads one partition. Returns whether there is more to do.
@@ -362,6 +524,8 @@ impl<C: Codec> Index<C> {
         if scan.pin.0.failed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::PinFailed);
         }
+        let planned = std::mem::take(&mut scan.planned);
+        scan.charge(planned, 0, 0)?;
         if let Plan::All(todo) = &mut scan.plan {
             return match todo.pop_front() {
                 Some(part) => self.visit_part(scan, part, None, false).map(|_| true),
@@ -385,19 +549,31 @@ impl<C: Codec> Index<C> {
         let Plan::Stream(stream) = &mut scan.plan else {
             return Ok(false);
         };
-        let Some((part, band)) = stream.next(scan.op, scan.len) else {
+        let Some((part, band, cos)) = stream.next(scan.op, scan.len) else {
             return Ok(false);
         };
+        scan.unit_best = f64::NEG_INFINITY;
         if self.visit_part(scan, part, band, true)? {
             scan.units += 1;
-            if scan.top.len() >= scan.limit {
+            if scan.unit_best.is_finite() {
+                let (lo, hi) = band.map_or((0.0, 0.0), band_span);
+                let promise = best(scan.op, f64::from(cos), lo, hi, scan.len);
+                scan.excess.push((scan.unit_best - promise) as f32);
+            }
+            if let Some(floor) = scan.floor() {
+                let excess = excess_bound(&scan.excess, scan.units, scan.recall);
+                let Plan::Stream(stream) = &mut scan.plan else {
+                    return Ok(false);
+                };
+                let reach = stream.reach(scan.op, scan.len, excess);
                 let origins: Vec<usize> = scan.top.iter().map(|r| r.unit).collect();
-                let (limit, recall, units) = (scan.limit, scan.recall, scan.units);
                 let progress = Progress {
-                    limit,
-                    recall,
-                    units,
+                    limit: scan.limit,
+                    recall: scan.recall,
+                    units: scan.units,
                     origins: &origins,
+                    floor: f64::from(floor),
+                    reach,
                 };
                 return Ok(!scan.stop.enough(&progress));
             }
@@ -414,6 +590,9 @@ impl<C: Codec> Index<C> {
         codes: bool,
     ) -> Result<bool> {
         let sh = &self.shared;
+        if scan.filter.is_some() {
+            scan.charge(scan.filter_work, 0, 0)?;
+        }
         if let Some(f) = &scan.filter
             && !sh.summary.may_match(f, part)
         {
@@ -454,13 +633,17 @@ impl<C: Codec> Index<C> {
             .iter()
             .filter(|b| band.is_none_or(|exp| b.exp == exp))
         {
+            if scan.filter.is_some() {
+                let work = scan.filter_work.saturating_mul(b.entries.len() as u64);
+                scan.charge(work, 0, 0)?;
+            }
             let bits = scan
                 .filter
                 .as_ref()
                 .map(|f| evaluate(f, &b.cols, b.entries.len()));
             match &query {
                 None => any |= self.offer_all(scan, b, bits)?,
-                Some(q) => any |= self.offer_best(scan, b, bits, q)?,
+                Some(q) => any |= self.offer_best(scan, part, b, bits, q)?,
             }
         }
         drop(query);
@@ -475,43 +658,95 @@ impl<C: Codec> Index<C> {
         b: &'a Band<B>,
         bits: Option<Bits>,
     ) -> Vec<(usize, &'a Entry)> {
-        let shows = |e: &Entry| {
-            let point = pin.0.points.get(&e.generation);
-            let applied = self.shared.range_of(e.generation).map_or(0, |r| r.app);
-            point.is_some_and(|p| self.shared.rows.shows(e.slot, e.at, *p, applied))
-        };
-        let matching = |i: &usize| bits.as_ref().is_none_or(|bits| bits.get(*i));
-        let all = b.entries.iter().enumerate();
-        all.filter(|(i, e)| matching(i) && shows(e)).collect()
+        // Entries of a band mostly share a generation: its read point is looked up once.
+        let mut last: Option<(Gen, Option<(Point, Pos)>)> = None;
+        let mut out = Vec::new();
+        for (i, e) in b.entries.iter().enumerate() {
+            if bits.as_ref().is_some_and(|bits| !bits.get(i)) {
+                continue;
+            }
+            let at = match last {
+                Some((generation, at)) if generation == e.generation => at,
+                _ => {
+                    let point = pin.0.points.get(&e.generation).copied();
+                    let applied = self.shared.range_of(e.generation).map_or(0, |r| r.app);
+                    let at = point.map(|p| (p, applied));
+                    last = Some((e.generation, at));
+                    at
+                }
+            };
+            if at.is_some_and(|(p, applied)| self.shared.rows.shows(e.slot, e.at, p, applied)) {
+                out.push((i, e));
+            }
+        }
+        out
     }
 
     fn live(&self, e: &Entry) -> Result<(&Key, Arc<[f32]>)> {
-        const GONE: Error = Error::Internal("an entry without its row");
         let key = self.shared.rows.key(e.slot).ok_or(GONE)?;
         Ok((key, self.shared.rows.vector(e.slot, e.at)?.ok_or(GONE)?))
     }
 
+    /// Bytes of one raw vector that a scan holds while it scores it.
+    fn vector_bytes(&self) -> u64 {
+        (self.cfg.schema.dim * size_of::<f32>()) as u64
+    }
+
     fn offer_all<B>(&self, scan: &mut Scan, b: &Band<B>, bits: Option<Bits>) -> Result<bool> {
+        let shown = self.shown(&scan.pin, b, bits);
         let mut any = false;
-        for (_, e) in self.shown(&scan.pin, b, bits) {
-            any |= self.score_entry(scan, e)?;
+        if !self.shared.rows.on_disk() {
+            for (i, e) in shown {
+                any |= self.score_entry(scan, e, b.lens[i])?;
+            }
+            return Ok(any);
+        }
+        // From NVMe in batches: one round of reads for many rows. The reads are charged before
+        // the batch, and memory row by row as from RAM, so a budget counts alike on every store
+        // but for I/O (nr18); the batch itself, at most 64 vectors, is not charged.
+        let bytes = self.vector_bytes();
+        for batch in shown.chunks(READ_BATCH) {
+            for _ in batch {
+                scan.charge(0, self.read_cost(), 0)?;
+            }
+            let keys: Vec<(Slot, Pos)> = batch.iter().map(|(_, e)| (e.slot, e.at)).collect();
+            let read = self.shared.rows.vectors(&keys);
+            for (&(i, e), vec) in batch.iter().zip(read) {
+                scan.charge(0, 0, bytes)?;
+                scan.charge_score()?;
+                let key = self.shared.rows.key(e.slot).ok_or(GONE)?;
+                any |= self.score_read(scan, e, b.lens[i], key, vec?.ok_or(GONE)?, bytes);
+            }
         }
         Ok(any)
     }
 
-    fn score_entry(&self, scan: &mut Scan, e: &Entry) -> Result<bool> {
+    fn score_entry(&self, scan: &mut Scan, e: &Entry, len: f64) -> Result<bool> {
         // Keep the winning vectors for the response. A replacement occupies the same
         // space, but the incoming vector needs room while we score it.
-        let bytes = (self.cfg.schema.dim * size_of::<f32>()) as u64;
+        let bytes = self.vector_bytes();
         scan.charge(0, self.read_cost(), bytes)?;
         scan.charge_score()?;
         let (key, vec) = self.live(e)?;
+        Ok(self.score_read(scan, e, len, key, vec, bytes))
+    }
+
+    /// Offers a row whose vector was read and charged as `bytes`, and lets them go unless it ranks.
+    fn score_read(
+        &self,
+        scan: &mut Scan,
+        e: &Entry,
+        len: f64,
+        key: &Key,
+        vec: Arc<[f32]>,
+        bytes: u64,
+    ) -> bool {
         let before = scan.top.len();
-        let offered = scan.offer(key, e, vec);
+        let offered = scan.offer(key, e, len, vec);
         if scan.top.len() == before {
             scan.release(bytes);
         }
-        Ok(offered)
+        offered
     }
 
     /// Coarse estimates first. A row whose best case is below the result's worst is not looked at
@@ -519,6 +754,7 @@ impl<C: Codec> Index<C> {
     fn offer_best(
         &self,
         scan: &mut Scan,
+        part: PartId,
         b: &Band<C::Block>,
         bits: Option<Bits>,
         q: &C::Query,
@@ -531,6 +767,10 @@ impl<C: Codec> Index<C> {
         let mut coarse = Vec::with_capacity(b.entries.len());
         self.codec.scan(q, &b.codes, &mut coarse);
         let (op, len) = (scan.op, scan.len);
+        for &(i, _) in &shown {
+            let cos = f64::from(coarse[i].cos).clamp(-1.0, 1.0);
+            scan.unit_best = scan.unit_best.max(best(op, cos, b.lens[i], b.lens[i], len));
+        }
         let hope = |est, i: usize| optimistic(op, est, b.lens[i], len);
         let mut order: Vec<_> = shown
             .iter()
@@ -542,16 +782,43 @@ impl<C: Codec> Index<C> {
             if floor.is_some_and(|f| good < f) {
                 break;
             }
-            if floor.is_some() {
-                scan.charge(dim / 2 + 1, 0, 0)?;
-            }
-            if floor.is_some_and(|f| hope(self.codec.refine(q, &b.codes, i), i) < f) {
+            if let Some(f) = floor
+                && hope(self.refine(scan, part, b, q, i, e)?, i) < f
+            {
                 continue;
             }
-            self.score_entry(scan, e)?;
+            self.score_entry(scan, e, b.lens[i])?;
         }
         scan.release(held);
         Ok(!order.is_empty())
+    }
+
+    /// The finer estimate of entry `i`, through its extension where the store keeps it: in RAM, or
+    /// read from NVMe, which counts as I/O. A store that cannot read it fails the scan and the range.
+    fn refine(
+        &self,
+        scan: &mut Scan,
+        part: PartId,
+        b: &Band<C::Block>,
+        q: &C::Query,
+        i: usize,
+        e: &Entry,
+    ) -> Result<super::codec::Estimate> {
+        scan.charge(scan.vec.len() as u64 / 2 + 1, 0, 0)?;
+        let Some(store) = self.shared.codes.as_ref().filter(|_| self.codec.ext_bytes() > 0) else {
+            return Ok(self.codec.refine(q, &b.codes, i));
+        };
+        let key = ext_key(part, e.id);
+        if store.tier(&key) != Some(Tier::Ram) {
+            scan.charge(0, store.bytes() as u64, 0)?;
+        }
+        match store.get(&key) {
+            Ok(ext) => Ok(self.codec.refine_with(q, &b.codes, i, &ext)),
+            Err(error) => {
+                self.shared.rows.log_damage(e.generation);
+                Err(error)
+            }
+        }
     }
 
     /// `FinishScan`: the rows, best first and then by key.

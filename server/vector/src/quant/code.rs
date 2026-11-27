@@ -79,8 +79,24 @@ impl CodeBlock {
     /// the exact length of the vector.
     ///
     /// Panics unless both have the padded length and are unit within 1e-3, and `len` is a positive
-    /// normal number: zero-length vectors have no direction and never reach this module.
+    /// normal number: zero-length vectors have no direction and never reach this module. Panics on
+    /// a block that keeps its extensions elsewhere.
     pub fn push(&mut self, dir: &[f32], centroid: &[f32], len: f32) {
+        assert_eq!(self.ext.len(), self.len() * self.ext_bytes(), "a detached block");
+        let ext = self.encode(dir, centroid, len);
+        self.ext.extend_from_slice(&ext);
+    }
+
+    /// [`CodeBlock::push`] without keeping the 4-bit extension, which it returns: the caller keeps
+    /// it and hands it to [`QueryCode::refine_with`]. A block holds every extension or none, so this
+    /// panics on a block that holds some.
+    pub fn push_detached(&mut self, dir: &[f32], centroid: &[f32], len: f32) -> Vec<u8> {
+        assert!(self.ext.is_empty(), "a block holds every extension or none");
+        self.encode(dir, centroid, len)
+    }
+
+    /// Appends everything but the extension, which it returns.
+    fn encode(&mut self, dir: &[f32], centroid: &[f32], len: f32) -> Vec<u8> {
         assert_direction(dir, self.padded);
         assert_direction(centroid, self.padded);
         assert!(super::is_length(len), "vector length {len}");
@@ -93,8 +109,8 @@ impl CodeBlock {
         };
         let (mut scale, mut scale1) = (0.0, 0.0);
         if r2 > 0.0 {
-            scale = best_scale(&residual, r2);
-            let code = Fit::new(&residual, scale);
+            let code;
+            (scale, code) = best_fit(&residual, r2);
             let length2 = r2 / code.cosine2(r2);
             factors.scale5 = (r2 / code.dot) as f32;
             factors.var5 = ((length2 - r2).max(0.0) / (self.padded as f64 - 1.0)) as f32;
@@ -112,17 +128,30 @@ impl CodeBlock {
             level => 15 - level,
         };
         let pairs = residual.chunks_exact(2);
-        self.ext
-            .extend(pairs.map(|p| nibble(p[0]) | nibble(p[1]) << 4));
+        pairs.map(|p| nibble(p[0]) | nibble(p[1]) << 4).collect()
     }
 
     /// Replaces entry `i` with the last one, which it removes. Panics when there is no entry `i`.
     pub fn swap_remove(&mut self, i: usize) {
+        let inline = !self.ext.is_empty();
         self.factors.swap_remove(i);
         self.r2.swap_remove(i);
         self.scale1.swap_remove(i);
         swap_remove_row(&mut self.bits, i, self.padded / 64);
-        swap_remove_row(&mut self.ext, i, self.padded / 2);
+        if inline {
+            swap_remove_row(&mut self.ext, i, self.padded / 2);
+        }
+    }
+
+    /// Bytes of the 4-bit extension of one entry.
+    pub fn ext_bytes(&self) -> usize {
+        self.padded / 2
+    }
+
+    /// Bytes of codes and factors the block holds, extensions included when it keeps them.
+    pub fn held(&self) -> usize {
+        let per = 2 * size_of::<f32>() + size_of::<Factors>();
+        self.bits.len() * size_of::<u64>() + self.ext.len() + self.len() * per
     }
 
     fn bits(&self, i: usize) -> &[u64] {
@@ -144,8 +173,19 @@ fn swap_remove_row<T: Copy>(rows: &mut Vec<T>, i: usize, width: usize) {
 
 /// The level of a magnitude in the 5-bit code, 0 to 15: the code value is `level + 1/2`.
 #[inline]
-fn level(magnitude: f32, scale: f32) -> i32 {
+pub(super) fn level(magnitude: f32, scale: f32) -> i32 {
     (magnitude * scale).min(15.0) as i32
+}
+
+/// [`level`] as a float, without the integer conversion, which does not vectorize. For the
+/// magnitudes and scales of a code, `x` is in `[0, 15]`, where adding and taking away 2^23 rounds
+/// to the nearest integer, which is the floor or one more.
+#[inline]
+pub(super) fn level_f(magnitude: f32, scale: f32) -> f32 {
+    let x = magnitude * scale;
+    let x = if x < 15.0 { x } else { 15.0 };
+    let near = (x + 8_388_608.0) - 8_388_608.0;
+    if near > x { near - 1.0 } else { near }
 }
 
 /// How well the 5-bit code of one scale fits a residual `r`.
@@ -157,11 +197,23 @@ pub(super) struct Fit {
 }
 
 impl Fit {
+    /// Both sums in one pass, in the lanes of [`sum`], so the bits are those of two calls of it.
     pub(super) fn new(residual: &[f32], scale: f32) -> Self {
-        let y = |r: f64| f64::from(level(r.abs() as f32, scale)) + 0.5;
+        debug_assert!(residual.len().is_multiple_of(8), "only whole lanes");
+        let (mut dot, mut norm2) = ([0.0f64; 8], [0.0f64; 8]);
+        for values in residual.as_chunks::<8>().0 {
+            // The levels in f32 first, then the sums: two loops that vectorize.
+            let magnitudes = values.map(f32::abs);
+            let levels = magnitudes.map(|m| level_f(m, scale));
+            for lane in 0..8 {
+                let y = f64::from(levels[lane]) + 0.5;
+                dot[lane] += y * f64::from(magnitudes[lane]);
+                norm2[lane] += y * y;
+            }
+        }
         Self {
-            dot: sum(residual, |r| y(r) * r.abs()),
-            norm2: sum(residual, |r| y(r) * y(r)),
+            dot: dot.iter().sum(),
+            norm2: norm2.iter().sum(),
         }
     }
 
@@ -173,17 +225,48 @@ impl Fit {
 
 /// The scale whose code points closest to `residual`, of squared length `r2`. Scale 0 gives the
 /// direction of the 1-bit code, so the 5-bit one is never worse.
+#[cfg(test)]
 pub(super) fn best_scale(residual: &[f32], r2: f64) -> f32 {
+    best_fit(residual, r2).0
+}
+
+/// [`best_scale`] and its [`Fit`]. Scales are compared by [`quick_cosine2`], and only the winner
+/// gets the f64 sums that its codes keep.
+fn best_fit(residual: &[f32], r2: f64) -> (f32, Fit) {
     let rms = (r2 / residual.len() as f64).sqrt();
-    let mut best = (0.0, Fit::new(residual, 0.0).cosine2(r2));
+    let magnitudes = sum(residual, f64::abs);
+    let abs: Vec<f32> = residual.iter().map(|r| r.abs()).collect();
+    // Scale 0, every level 0: the direction of the 1-bit code, `(sum |r|)^2 / (n r2)`.
+    let mut best = (0.0, magnitudes * magnitudes / (residual.len() as f64 * r2));
     for clip in CLIPS {
         let scale = (16.0 / (clip * rms)) as f32;
-        let cosine2 = Fit::new(residual, scale).cosine2(r2);
+        let cosine2 = quick_cosine2(&abs, scale, magnitudes, r2);
         if cosine2 > best.1 {
             best = (scale, cosine2);
         }
     }
-    best.0
+    (best.0, Fit::new(residual, best.0))
+}
+
+/// [`Fit::cosine2`] in f32 lanes, which vectorize on every target: with `y = l + 1/2`,
+/// `y . |r| = l . |r| + sum |r| / 2` and `|y|^2 = sum (l^2 + l) + n / 4`. The second sum is of small
+/// integers and exact; the first is off by f32 rounding, about 1e-6 of it, so only scales that fit
+/// equally well within that may swap. `abs` holds `|r|` and `magnitudes` its sum.
+pub(super) fn quick_cosine2(abs: &[f32], scale: f32, magnitudes: f64, r2: f64) -> f64 {
+    // 16 lanes: four of the baseline vector unit, and enough sums in flight.
+    let (mut dot, mut norm2) = ([0.0f32; 16], [0.0f32; 16]);
+    for values in abs.as_chunks::<16>().0 {
+        for lane in 0..16 {
+            let magnitude = values[lane];
+            let l = level_f(magnitude, scale);
+            dot[lane] += l * magnitude;
+            norm2[lane] += l * l + l;
+        }
+    }
+    let total = |lanes: [f32; 16]| lanes.iter().map(|&x| f64::from(x)).sum::<f64>();
+    let dot = total(dot) + 0.5 * magnitudes;
+    let norm2 = total(norm2) + 0.25 * abs.len() as f64;
+    dot * dot / (norm2 * r2)
 }
 
 /// The sum of `f` over `values`, in lanes that the compiler vectorizes. In f64, so its rounding
@@ -331,9 +414,16 @@ impl QueryCode {
     /// The 5-bit estimate of entry `i`. Panics when there is no entry `i`, or when the block has
     /// other padded dimensions.
     pub fn refine(&self, block: &CodeBlock, i: usize) -> Estimate {
+        self.refine_with(block, i, block.ext(i))
+    }
+
+    /// [`QueryCode::refine`] of an entry whose extension [`CodeBlock::push_detached`] returned.
+    /// Panics when there is no entry `i`, or on dimensions or an extension of another size.
+    pub fn refine_with(&self, block: &CodeBlock, i: usize, ext: &[u8]) -> Estimate {
         assert_eq!(self.padded, block.padded, "padded dimensions");
+        assert_eq!(ext.len(), block.ext_bytes(), "extension bytes");
         let (f, r2, d) = (block.factors[i], block.r2[i], self.padded as f32);
-        let dot = Kernels::detect().code_dot(block.bits(i), block.ext(i), &self.levels);
+        let dot = Kernels::detect().code_dot(block.bits(i), ext, &self.levels);
         let dot = f.scale5 * self.step8 * (f64::from(dot) - self.center8) as f32;
         let var = self.q2 * f.var5 + (r2 + f.var5 * (d - 1.0)) * self.error8 / d;
         self.estimate(r2, dot, var)

@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
-use crate::store::Vectors;
+use crate::store::{Extensions, Vectors};
 use crate::types::{
     Change, ColumnType, CommitTs, Error, Key, MAX_DIM, Page, PartId, Pos, RangeId, Result, Row,
     Schema,
@@ -67,6 +67,9 @@ pub struct Config {
     pub summary_pairs: usize,
     /// Where raw vectors live. `None` keeps them in the rows, in RAM.
     pub vectors: Option<Arc<dyn Vectors>>,
+    /// Where 4-bit extensions live: in RAM while its code memory lasts, which every code block is
+    /// charged to as well, and on NVMe after. `None` keeps extensions in the blocks, uncharged.
+    pub codes: Option<Arc<Extensions>>,
 }
 
 impl Config {
@@ -84,6 +87,7 @@ impl Config {
             reassigns: 8,
             summary_pairs: 1 << 22,
             vectors: None,
+            codes: None,
         }
     }
 
@@ -304,6 +308,7 @@ struct Shared {
     next_gen: Gen,
     shards: usize,
     partition_by: Option<usize>,
+    codes: Option<Arc<Extensions>>,
 }
 
 impl Shared {
@@ -499,6 +504,33 @@ pub struct RangeStatus {
     pub damage: Option<String>,
 }
 
+/// What an index holds, per kind and tier. Bytes count the values, not allocator overhead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Stats {
+    /// Partitions by state, the lists of vectors without a direction among the ready ones.
+    pub ready: usize,
+    pub draining: usize,
+    /// Retired, waiting for the scans that listed them.
+    pub retired: usize,
+    pub undirected: usize,
+    /// Entries in partitions: superseded versions and copies of a move count too.
+    pub entries: usize,
+    /// Rows (slots) and their versions in the row map.
+    pub rows: usize,
+    pub versions: usize,
+    /// 1-bit codes and their factors in RAM, with the extensions that blocks keep inline.
+    pub code_bytes: u64,
+    /// 4-bit extensions in the extension store, in RAM and on NVMe.
+    pub ext_ram_bytes: u64,
+    pub ext_nvme_bytes: u64,
+    /// Raw vectors in the rows (RAM), in the vector store's pages in RAM, and on NVMe.
+    pub raw_ram_bytes: u64,
+    pub raw_cached_bytes: u64,
+    pub raw_nvme_bytes: u64,
+    /// Filter column values in the partitions, at their inline size.
+    pub column_bytes: u64,
+}
+
 #[cfg_attr(test, derive(Clone))]
 pub struct Index<C: Codec = ExactCodec> {
     cfg: Config,
@@ -509,6 +541,33 @@ pub struct Index<C: Codec = ExactCodec> {
     checkpoint: Option<Running>,
     /// Where `maintain` goes on.
     cursor: PartId,
+    /// Shared by the copies of a test index: the last one that goes gives the store back.
+    owner: Arc<()>,
+}
+
+/// An index that goes gives back what it holds of the extension store and the code memory, which
+/// outlive it (L8), so that a recovery over the same configuration is charged only what it holds.
+impl<C: Codec> Drop for Index<C> {
+    fn drop(&mut self) {
+        let Some(store) = &self.cfg.codes else {
+            return;
+        };
+        if Arc::strong_count(&self.owner) > 1 {
+            return;
+        }
+        for shard in &self.shards {
+            for (part, p) in &shard.parts {
+                for b in &p.bands {
+                    store.memory().release_codes(self.codec.held(&b.codes));
+                    if p.centroid.is_some() {
+                        for e in &b.entries {
+                            store.release(&shard::ext_key(*part, e.id));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl<C: Codec> Index<C> {
@@ -517,6 +576,10 @@ impl<C: Codec> Index<C> {
         cfg.check()?;
         if !codec.fits(cfg.schema.dim) {
             return Err(Error::Internal("code dimension does not match the index"));
+        }
+        let ext = codec.ext_bytes();
+        if cfg.codes.as_ref().is_some_and(|c| ext > 0 && c.bytes() != ext) {
+            return Err(Error::Internal("extensions of another size"));
         }
         let shared = Shared {
             ranges: BTreeMap::new(),
@@ -535,6 +598,7 @@ impl<C: Codec> Index<C> {
             next_gen: 0,
             shards: cfg.shards,
             partition_by: cfg.schema.partition_by,
+            codes: cfg.codes.clone(),
         };
         Ok(Index {
             shards: vec![Shard::new(); cfg.shards],
@@ -544,7 +608,42 @@ impl<C: Codec> Index<C> {
             store,
             checkpoint: None,
             cursor: PartId(0),
+            owner: Arc::new(()),
         })
+    }
+
+    /// What the index holds now. It walks every partition and slot, so it is for monitoring, not
+    /// for each query.
+    pub fn stats(&self) -> Stats {
+        let mut s = Stats::default();
+        for meta in self.shared.dir.values() {
+            match meta.state {
+                State::Ready => s.ready += 1,
+                State::Draining => s.draining += 1,
+                State::Retired => s.retired += 1,
+            }
+            s.undirected += usize::from(meta.undirected);
+        }
+        let value = size_of::<crate::types::Value>() as u64;
+        let bands = self.shards.iter().flat_map(|sh| sh.parts.values()).flat_map(|p| &p.bands);
+        for b in bands {
+            s.entries += b.entries.len();
+            s.code_bytes += self.codec.held(&b.codes);
+            s.column_bytes += (b.entries.len() * b.cols.len()) as u64 * value;
+        }
+        let (rows, versions, values) = self.shared.rows.census_counts();
+        (s.rows, s.versions) = (rows, versions);
+        s.raw_ram_bytes = (values * size_of::<f32>()) as u64;
+        if let Some(store) = self.shared.rows.store() {
+            let st = store.stats();
+            (s.raw_cached_bytes, s.raw_nvme_bytes) = (st.ram_bytes, st.disk_bytes);
+        }
+        if let Some(ext) = &self.cfg.codes {
+            let (ram, nvme) = ext.counts();
+            let bytes = ext.bytes() as u64;
+            (s.ext_ram_bytes, s.ext_nvme_bytes) = (ram as u64 * bytes, nvme as u64 * bytes);
+        }
+        s
     }
 
     // ----- Ranges: install, feed, retention, drop.
@@ -1116,33 +1215,45 @@ impl<C: Codec> Index<C> {
         shard.collect(sh, codec, part)
     }
 
+    fn promote(&mut self, part: PartId) -> usize {
+        let n = self.cfg.copies;
+        let (sh, shard, _) = self.owner(part);
+        shard.promote(sh, part, n)
+    }
+
     fn reassign(&mut self, part: PartId, id: u64, to: PartId) -> bool {
         let (sh, shard, codec) = self.owner(part);
         let same = sh.dir.get(&part).map(|m| &m.group) == sh.dir.get(&to).map(|m| &m.group);
         same && shard.reassign(sh, codec, part, id, to)
     }
 
-    /// Moves entries that a split left nearer to another partition. One partition per call.
-    fn recheck(&mut self) -> bool {
-        let Some(part) = self.shared.recheck.pop_first() else {
-            return false;
-        };
+    /// Moves entries that a split left nearer to another partition, in up to `parts` partitions,
+    /// and up to `reassigns` entries of each.
+    fn recheck(&mut self, parts: usize) -> bool {
         let n = self.cfg.reassigns;
-        let (sh, shard, _) = self.owner(part);
-        let strays = shard.strays(sh, part, n);
-        let more = strays.len() == n && n > 0;
-        for (id, to) in strays {
-            self.reassign(part, id, to);
+        let mut todo = Vec::new();
+        while todo.len() < parts.max(1)
+            && let Some(part) = self.shared.recheck.pop_first()
+        {
+            todo.push(part);
         }
-        if more {
-            self.shared.recheck.insert(part);
+        for &part in &todo {
+            let (sh, shard, codec) = self.owner(part);
+            let strays = shard.strays(sh, codec, part, n);
+            let more = strays.len() == n && n > 0;
+            for (id, to) in strays {
+                self.reassign(part, id, to);
+            }
+            if more {
+                self.shared.recheck.insert(part);
+            }
         }
-        true
+        !todo.is_empty()
     }
 
     /// Background work on up to `parts` partitions. Returns whether anything was done.
     pub fn maintain(&mut self, parts: usize) -> bool {
-        let mut done = self.recheck();
+        let mut done = self.recheck(parts);
         for _ in 0..parts.min(self.shared.dir.len()) {
             let after = self
                 .shared
@@ -1170,6 +1281,7 @@ impl<C: Codec> Index<C> {
             }
             State::Ready => {
                 let removed = self.remove_moved(part) + self.collect(part) > 0;
+                let removed = self.promote(part) > 0 || removed;
                 let meta = &self.shared.dir[&part];
                 let entries = meta.entries;
                 if entries == 0

@@ -88,6 +88,22 @@ impl Filter {
         }
     }
 
+    /// Conditions and connectives: the work units of evaluating it once.
+    pub fn nodes(&self) -> u64 {
+        let mut todo = vec![self];
+        let mut n = 0u64;
+        while let Some(f) = todo.pop() {
+            n = n.saturating_add(1);
+            match f {
+                Filter::And(all) | Filter::Or(all) => todo.extend(all),
+                Filter::Not(f) => todo.push(f),
+                Filter::ContainsAny(_, any) => n = n.saturating_add(any.len() as u64),
+                _ => {}
+            }
+        }
+        n
+    }
+
     /// The one value of the column that this filter allows.
     pub fn only(&self, column: usize) -> Option<&Value> {
         match self {
