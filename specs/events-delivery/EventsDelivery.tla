@@ -446,10 +446,11 @@ G06_PollLinearizable ==
     ~staleRead
 
 \* EVT-G08: retention removes events by publish time only, never before their
-\* retention period, and publish time is nondecreasing in offset order. The
-\* register names no clock tolerance, so the property is strict. Variant
-\* drift_bound_stated is the candidate fix: the plan states a clock bound and
-\* the guarantee allows early removal by at most that bound.
+\* retention period, and publish time is nondecreasing in offset order. Variant
+\* none is the strict reading with no clock tolerance, which a leader clock jump
+\* breaks (EVENTS-2). Every baseline uses Variant drift_bound_stated: the stamp
+\* clock is within MaxDrift of true time, which abstracts the guarded interval
+\* that specs/events-time checks, and early removal is allowed by at most that bound.
 G08_RetentionByPublishTime ==
     \A x \in sm.removed :
         x.pt + RetainAfter < now + (IF Variant = "drift_bound_stated" THEN MaxDrift ELSE 0)
