@@ -1,0 +1,36 @@
+# Bench client venv (/home/dev/bench-venv, Python 3.14). Every package, transitive ones included,
+# is pinned to its newest release uploaded before 2026-11-13, two weeks before the first run.
+#   python3 -m venv /home/dev/bench-venv && /home/dev/bench-venv/bin/pip install -r requirements.txt
+annotated-types==0.8.0
+anyio==4.16.0
+cachetools==8.0.0
+certifi==2026.10.23
+charset-normalizer==3.5.2
+grpcio==1.85.1
+h11==0.16.0
+h2==4.4.1
+h5py==3.16.0
+hpack==4.2.0
+httpcore==1.0.9
+httpx==0.28.1
+hyperframe==6.1.0
+idna==3.20
+numpy==2.5.4
+orjson==3.13.0
+pandas==3.1.1
+portalocker==4.4.2
+protobuf==7.36.2
+psycopg==3.3.9
+psycopg-binary==3.3.9
+pyarrow==26.0.1
+pydantic==2.14.3
+pydantic_core==2.50.4
+pymilvus==3.0.3
+python-dateutil==4.0.0
+python-dotenv==1.2.4
+qdrant-client==1.20.0
+requests==2.34.2
+typing-inspection==0.4.5
+typing_extensions==4.16.0
+tzdata==2026.6
+urllib3==2.8.0
