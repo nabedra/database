@@ -76,6 +76,7 @@ use crate::cache::{BlockCache, CacheKey};
 use crate::crc;
 use crate::error::{Damage, Error, FileId, Result};
 use crate::fs::{Fs, FsFile};
+use crate::mac::JournalKey;
 use crate::types::{Locator, MAX_SEQ, Seq};
 
 pub mod format;
@@ -123,6 +124,10 @@ pub struct JournalOptions {
     /// Write zeros over a new segment file once when it is created, so later overwrites
     /// change no file metadata. Default true.
     pub zero_fill: bool,
+    /// The key record headers are tagged with (LSM-1, [`crate::mac`]). [`crate::Store`]
+    /// always sets it from the store's `JOURNAL_KEY`; the default, an all-zero key, is
+    /// for journals opened on their own (tests), which nothing outside can write into.
+    pub key: JournalKey,
 }
 
 impl Default for JournalOptions {
@@ -131,6 +136,7 @@ impl Default for JournalOptions {
             segment_bytes: 64 << 20,
             max_group_bytes: 4 << 20,
             zero_fill: true,
+            key: JournalKey::from_bytes([0; 16]),
         }
     }
 }

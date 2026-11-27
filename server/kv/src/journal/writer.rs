@@ -195,6 +195,7 @@ impl Writer {
         let fs = &*shared.fs;
         let dir = &shared.dir;
         let options = &shared.options;
+        let key = &options.key;
 
         // Unused segment files (L4) hold nothing; delete them first.
         if !discard.is_empty() {
@@ -237,7 +238,7 @@ impl Writer {
             }
             End::Reepoch { idx } => {
                 sync_range(&live, idx)?;
-                segment::reepoch(&mut live[idx])?;
+                segment::reepoch(&mut live[idx], key)?;
                 RECORDS_START
             }
             End::Fence { idx, pad_at } => {
@@ -256,6 +257,7 @@ impl Writer {
                         },
                         &[],
                         Payload::Zeros(0),
+                        key,
                     );
                     seg.file.write_all_at(&pad, at).map_err(segment::io)?;
                 }
@@ -274,10 +276,11 @@ impl Writer {
                     options.segment_bytes,
                     options.zero_fill,
                     None,
+                    &options.key,
                 )?,
             };
             let number = shared.next_number.fetch_add(1, Ordering::Relaxed);
-            live.push(segment::activate(fs, dir, spare, number, next_seq)?);
+            live.push(segment::activate(fs, dir, spare, number, next_seq, key)?);
         } else {
             // The inventory saw the names of the process that stopped, which may not be
             // durable yet: a Kill between a roll's rename and its directory sync leaves the
@@ -477,6 +480,7 @@ impl Writer {
                 &fields,
                 batch.scope(),
                 Payload::Bytes(batch.data()),
+                &self.shared.options.key,
             );
             self.placements.push(Placement {
                 item: i,
@@ -512,6 +516,11 @@ impl Writer {
                 self.flush_buf()
             };
             ok = written.is_ok();
+        }
+        #[cfg(feature = "sim")]
+        if ok && !self.placements.is_empty() {
+            let last_seq = self.next_write_seq - 1;
+            crate::sim_trace::report(crate::sim_trace::JournalStep::Written { last_seq });
         }
         if !ok {
             self.fail_group(items);
@@ -628,6 +637,19 @@ impl Writer {
         if synced {
             self.shared.durable.store(self.durable, Ordering::Release);
         }
+        #[cfg(feature = "sim")]
+        if !self.placements.is_empty() {
+            let durable = self.shared.durable.load(Ordering::Acquire);
+            crate::sim_trace::report(if synced {
+                crate::sim_trace::JournalStep::Synced {
+                    synced: self.durable,
+                    visible,
+                    durable,
+                }
+            } else {
+                crate::sim_trace::JournalStep::Published { visible, durable }
+            });
+        }
 
         // Count the group before any waiter wakes: a caller that reads the stats right
         // after its commit returns must see that commit counted (ns08 saw 385 vs 384).
@@ -725,7 +747,13 @@ impl Writer {
             count,
             durable_seq: self.durable,
         };
-        format::encode_record(&mut self.buf, &fields, &[], Payload::Zeros(payload));
+        format::encode_record(
+            &mut self.buf,
+            &fields,
+            &[],
+            Payload::Zeros(payload),
+            &self.shared.options.key,
+        );
     }
 
     /// Makes room for `len` more bytes in the active segment, rolling to the next one
@@ -752,7 +780,14 @@ impl Writer {
         }
         let number = self.shared.next_number.fetch_add(1, Ordering::Relaxed);
         let fs = &*self.shared.fs;
-        let new = segment::activate(fs, &self.shared.dir, next, number, self.next_write_seq)?;
+        let new = segment::activate(
+            fs,
+            &self.shared.dir,
+            next,
+            number,
+            self.next_write_seq,
+            &self.shared.options.key,
+        )?;
         {
             let mut table = lock(&self.shared.table);
             if let Some(old) = table.live.get_mut(&self.active.number) {
@@ -797,6 +832,7 @@ impl Writer {
             options.segment_bytes,
             options.zero_fill,
             None,
+            &options.key,
         )
     }
 
@@ -919,6 +955,11 @@ impl Writer {
         }
         if let Some(visible) = visible {
             self.shared.visible.store(visible, Ordering::Release);
+            #[cfg(feature = "sim")]
+            crate::sim_trace::report(crate::sim_trace::JournalStep::Published {
+                visible,
+                durable: self.shared.durable.load(Ordering::Acquire),
+            });
         }
         // Count before any waiter wakes (ns08).
         let stats = &self.shared.stats;
@@ -1092,6 +1133,7 @@ fn prepare_spare(shared: &Shared) {
         options.segment_bytes,
         options.zero_fill,
         Some(&shared.prep_cancel),
+        &options.key,
     );
     let failed = made.is_err();
     if let Ok(free) = made {

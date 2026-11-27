@@ -16,11 +16,14 @@ pub mod fs;
 mod gc;
 pub mod iter;
 pub mod journal;
+pub mod mac;
 pub mod manifest;
 pub mod memtable;
 pub mod quarantine;
 mod recovery;
 pub mod run;
+#[cfg(feature = "sim")]
+pub mod sim_trace;
 pub mod source;
 pub mod store;
 pub mod types;

@@ -1,4 +1,6 @@
-# Design review rv-lsm (wave-rv), finding LSM-5. Open: a residual, written into the plan; the code is not changed.
+# Design review rv-lsm (wave-rv), finding LSM-5. Fixed in fx-lsm: the pool restores a quarantine kv lost from
+# its own synced record of accepted groups (Store::restore_quarantine). Residual, in the plan: a crash after
+# detection and before either record is durable.
 id = "RV-LSM-5"
 title = "A run-time quarantine whose manifest edit fails is kept only in memory; after a crash the damaged group's Raft node starts and votes again"
 class = "membership-replacement-trust"
@@ -7,12 +9,9 @@ guarantees = ["LSM-G03"]
 scenarios = ["NS07", "NS23"]
 found_by = "review"
 found_date = "2026-11-26"
-lowest_regression = "specs/lsm/quarantine/Quarantine.cfg"
+lowest_regression = "server/oltp-storage/src/oltp/pool/tests/kv/ns14.rs::ns23_lsm5_a_quarantine_kv_lost_is_restored_from_the_pool_record"
 seed = "unknown"
 why_not_caught = "No test fails the manifest sync right after a run-time damage report, and open checks run footers only, so block and journal-value damage is not found again before the group starts."
-invariant_added = "A group quarantined at run time never starts again under its old identity: G03_QuarantineSticky without its lostQ exception."
-fix_commits = []
-revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-24"
+invariant_added = "A group quarantined at run time never starts again under its old identity once either durable record of the quarantine (kv manifest or the pool's accepted record) exists: the open restores it from the pool record before any group starts."
+fix_commits = ["dd8b893018b358aa2e33073ef6fa0886fdbe3e53", "cabbf73d567c851876acb39f1420127573573650"]
+revert_patch_ok = true

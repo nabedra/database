@@ -88,6 +88,7 @@ pub fn store_wide(_: &[u8]) -> usize {
     0
 }
 
+#[derive(Clone)]
 pub struct Options {
     pub fs: Arc<dyn Fs>,
     /// Worker-shared block cache (`cache_bytes`).
@@ -248,8 +249,6 @@ struct VersionSet {
     manifest: Option<ManifestWriter>,
     state: ManifestState,
     current: Arc<Version>,
-    /// Next file number to hand out (at least `state.next_file`).
-    next_file: u64,
     /// Round-robin compaction position per level.
     cursor: Vec<Bytes>,
 }
@@ -308,6 +307,8 @@ pub(crate) struct Inner {
     active: Mutex<()>,
     replaying: AtomicBool,
     vs: Mutex<VersionSet>,
+    /// Next file number to hand out (at least the recorded `next_file`), see `alloc_file`.
+    next_file: AtomicU64,
     flush_lock: Mutex<()>,
     compaction_lock: Mutex<()>,
     snapshots: Snapshots,
@@ -409,10 +410,12 @@ enum Stall {
 
 impl Store {
     /// Opens or creates the store in `dir` and recovers it (plan section 3).
-    pub fn open(dir: &Path, options: Options) -> Result<Opened> {
+    pub fn open(dir: &Path, mut options: Options) -> Result<Opened> {
         let started = time::now_std();
         let fs = options.fs.clone();
-        let opened = recovery::prepare(&*fs, dir, options.scope_of)?;
+        let opened = recovery::prepare(&*fs, dir)?;
+        // The store's key, never the caller's (LSM-1).
+        options.journal.key = opened.key;
         let runs_dir = dir.join(RUNS_DIR);
         let ctx = RunReadContext::new(options.cache.clone());
         let run_stats = ctx.stats.clone();
@@ -518,9 +521,9 @@ impl Store {
                 manifest: None,
                 state: state.clone(),
                 current: Arc::new(Version::default()),
-                next_file: state.next_file,
                 cursor: vec![Bytes::new(); crate::version::NUM_LEVELS],
             }),
+            next_file: AtomicU64::new(state.next_file),
             flush_lock: Mutex::new(()),
             compaction_lock: Mutex::new(()),
             snapshots: Snapshots::default(),
@@ -627,11 +630,12 @@ impl Store {
                     ..VersionEdit::default()
                 })
                 .expect("consistent");
-            let number = snapshot.next_file;
-            snapshot.next_file += 1;
+            let number = inner.next_file.fetch_add(1, Ordering::AcqRel);
+            snapshot.next_file = snapshot
+                .next_file
+                .max(inner.next_file.load(Ordering::Acquire));
             let writer = ManifestWriter::create(&*fs, dir, number, &snapshot)?;
             manifest::set_current(&*fs, dir, number)?;
-            vs.next_file = snapshot.next_file;
             vs.state = snapshot;
             vs.manifest = Some(writer);
             orphans += recovery::cleanup(&*fs, dir, number, &vs.state)?;
@@ -745,6 +749,51 @@ impl Store {
             }
         }
         Ok(false)
+    }
+
+    /// Quarantines `scope` again from a record the caller keeps (LSM-5): a run-time
+    /// quarantine whose manifest edit failed is lost by a crash, but the pool also writes
+    /// its quarantined groups into a synced journal record, so the next open can restore
+    /// the quarantine before the group starts. Persists the quarantine with its own
+    /// manifest edit before it returns `true`. Returns `false` when the scope is already
+    /// quarantined or was released (its bytes are gone, and a released scope that the
+    /// caller still lists is a crash between the release and the caller's update).
+    /// `reason` is the caller's best knowledge: the original one was not recorded.
+    pub fn restore_quarantine(&self, scope: &[u8], reason: DamageReason) -> Result<bool> {
+        self.inner.check_usable()?;
+        if scope.is_empty() {
+            return Err(Error::InvalidArgument("a quarantine needs a scope"));
+        }
+        if self
+            .inner
+            .quarantine
+            .list()
+            .iter()
+            .any(|d| d.scope == scope)
+        {
+            return Ok(false);
+        }
+        let damage = Damage {
+            scope: Bytes::copy_from_slice(scope),
+            reason,
+            file: FileId::Other,
+            first_bad_seq: None,
+        };
+        {
+            let mut vs = lock(&self.inner.vs);
+            if vs.state.released.iter().any(|(s, _)| s == scope) {
+                return Ok(false);
+            }
+            self.inner.log_edit(
+                &mut vs,
+                VersionEdit {
+                    quarantined: vec![damage.clone()],
+                    ..VersionEdit::default()
+                },
+            )?;
+        }
+        self.inner.quarantine.add(damage);
+        Ok(true)
     }
 
     /// Deletes everything under `prefix`, makes that durable, flushes past it, records the
@@ -1406,11 +1455,13 @@ impl Inner {
         self.snapshots.sequences()
     }
 
+    /// A new file number. It takes no lock (LSM-9): a flush or compaction allocating
+    /// outputs never waits for another job's manifest sync under `vs`. Every edit records
+    /// a `next_file` read after the numbers its runs took, so the manifest never names a
+    /// run at or above its `next_file`; a number taken but never recorded belongs to an
+    /// orphan file that the next open deletes before it allocates again.
     fn alloc_file(&self) -> u64 {
-        let mut vs = lock(&self.vs);
-        let id = vs.next_file;
-        vs.next_file += 1;
-        id
+        self.next_file.fetch_add(1, Ordering::AcqRel)
     }
 
     fn spec<'a>(&'a self, snapshots: &'a [Seq], target: u64, bottommost: bool) -> OutputSpec<'a> {
@@ -1652,7 +1703,7 @@ impl Inner {
         if self.latched.load(Ordering::Acquire) {
             return Err(Error::RecoveryRequired);
         }
-        edit.next_file = Some(vs.next_file);
+        edit.next_file = Some(self.next_file.load(Ordering::Acquire));
         let mut next = vs.state.clone();
         next.apply(&edit).ok_or(Error::Corruption {
             file: FileId::Other,
@@ -1661,9 +1712,8 @@ impl Inner {
         })?;
         let roll = vs.manifest.as_ref().is_none_or(ManifestWriter::wants_roll);
         if roll {
-            let number = vs.next_file;
-            vs.next_file += 1;
-            next.next_file = vs.next_file;
+            let number = self.next_file.fetch_add(1, Ordering::AcqRel);
+            next.next_file = next.next_file.max(self.next_file.load(Ordering::Acquire));
             let writer = match ManifestWriter::create(&*self.fs, &self.dir, number, &next) {
                 Ok(w) => w,
                 Err(e) => return Err(self.latch_on(e)),

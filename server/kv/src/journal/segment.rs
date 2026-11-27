@@ -16,7 +16,8 @@ use crate::error::{Error, Result};
 use crate::fs::{Fs, FsFile, OpenMode};
 use crate::types::Seq;
 
-use super::format::{BLOCK, HeaderCopy, RECORDS_START, SegmentHeader};
+use super::format::{self, BLOCK, HeaderCopy, RECORDS_START, SegmentHeader};
+use crate::mac::JournalKey;
 
 pub(super) const LIVE_EXT: &str = "jnl";
 pub(super) const FREE_EXT: &str = "free";
@@ -84,7 +85,14 @@ pub(super) fn io(error: std::io::Error) -> Error {
 }
 
 /// Lists and classifies the segment files of `dir` (plan section 3: L4 and R3 for headers).
-pub(super) fn inventory(fs: &dyn Fs, dir: &Path, segment_bytes: u64) -> Result<Inventory> {
+/// A live segment whose header names another journal key than `key` is refused before
+/// anything changes.
+pub(super) fn inventory(
+    fs: &dyn Fs,
+    dir: &Path,
+    segment_bytes: u64,
+    key: &JournalKey,
+) -> Result<Inventory> {
     let mut live = Vec::new();
     let mut free = Vec::new();
     let mut headerless = Vec::new();
@@ -120,6 +128,13 @@ pub(super) fn inventory(fs: &dyn Fs, dir: &Path, segment_bytes: u64) -> Result<I
             .filter(|h| is_live_name && h.segment == number)
             .max_by_key(|h| h.epoch);
         if let Some(header) = named {
+            if header.key_check != format::key_check(key, header.segment, header.epoch) {
+                return Err(Error::Corruption {
+                    file: crate::error::FileId::Journal { segment: number },
+                    offset: 0,
+                    what: "journal segment written under another journal key",
+                });
+            }
             live.push(LiveSeg {
                 number,
                 epoch: header.epoch,
@@ -176,6 +191,7 @@ pub(super) fn create_free(
     segment_bytes: u64,
     zero_fill: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    key: &JournalKey,
 ) -> Result<FreeSeg> {
     let path = path_of(dir, number, FREE_EXT);
     let file = fs.open(&path, OpenMode::CreateNew).map_err(io)?;
@@ -205,11 +221,7 @@ pub(super) fn create_free(
                 }
             }
         }
-        let header = SegmentHeader {
-            segment: number,
-            epoch: 0,
-            first_seq: 0,
-        };
+        let header = SegmentHeader::new(number, 0, 0, key);
         // A new file: nothing is synced yet, so both copies go in one write.
         file.write_all_at(&header.encode_blocks(), 0)?;
         file.sync_all()?;
@@ -230,23 +242,21 @@ pub(super) fn create_free(
     })
 }
 
-/// Turns a free file into live segment `number` whose first record takes `first_seq`.
-/// When this returns, the header is durable and records may be written.
+/// Turns a free file into live segment `number` whose first record takes `first_seq`,
+/// for records tagged under `key`. When this returns, the header is durable and records
+/// may be written.
 pub(super) fn activate(
     fs: &dyn Fs,
     dir: &Path,
     free: FreeSeg,
     number: u64,
     first_seq: Seq,
+    key: &JournalKey,
 ) -> Result<LiveSeg> {
     let path = path_of(dir, number, LIVE_EXT);
     let epoch = free.epoch + 1;
     fs.rename(&free.path, &path).map_err(io)?;
-    let header = SegmentHeader {
-        segment: number,
-        epoch,
-        first_seq,
-    };
+    let header = SegmentHeader::new(number, epoch, first_seq, key);
     write_header(&*free.file, &header)?;
     fs.sync_dir(dir).map_err(io)?;
     let len = free.file.len().map_err(io)? / BLOCK * BLOCK;
@@ -262,12 +272,8 @@ pub(super) fn activate(
 
 /// Gives a live segment that holds no valid record a new epoch, so anything a lost
 /// write left in it reads as leftover data.
-pub(super) fn reepoch(seg: &mut LiveSeg) -> Result<()> {
-    let header = SegmentHeader {
-        segment: seg.number,
-        epoch: seg.epoch + 1,
-        first_seq: seg.first_seq,
-    };
+pub(super) fn reepoch(seg: &mut LiveSeg, key: &JournalKey) -> Result<()> {
+    let header = SegmentHeader::new(seg.number, seg.epoch + 1, seg.first_seq, key);
     write_header(&*seg.file, &header)?;
     seg.epoch += 1;
     Ok(())

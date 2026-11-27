@@ -1,5 +1,5 @@
-# Design review rv-lsm (wave-rv), finding LSM-1. Open: the fix (keyed CRCs) changes the on-disk format and waits for
-# the user; the reproduction is rv-lsm-lsm1-test.patch in wave-rv/reports/rv-lsm-patches.
+# Design review rv-lsm (wave-rv), finding LSM-1. Fixed in fx-lsm: journal record headers are tagged with
+# SipHash-2-4 under a per-store key (FORMAT 2 is the only format; user decision 2026-11-27, breaking change).
 id = "RV-LSM-1"
 title = "Client bytes inside a journal value pass as recovery evidence after a torn header: the pool is refused, or a forged batch is replayed"
 class = "other"
@@ -8,12 +8,9 @@ guarantees = ["LSM-G02", "LSM-G03"]
 scenarios = ["NS05", "NS25", "LSM01"]
 found_by = "review"
 found_date = "2026-11-26"
-lowest_regression = "NS05"
+lowest_regression = "server/kv/src/journal/crash_tests.rs::lsm1_forged_pad_in_a_value_is_not_evidence"
 seed = "unknown"
 why_not_caught = "The campaign generates values from a seeded generator and never writes a value that embeds a valid record header at a 4 KiB boundary, and the specs model records, not bytes."
-invariant_added = "Recovery accepts as evidence or as a resync point only a record that bytes a client wrote cannot produce: a header keyed by a per-store salt, and never a record with durable_seq >= first_seq."
-fix_commits = []
+invariant_added = "Recovery accepts as evidence or as a resync point only a record whose header tag checks under the store's journal key (and with durable_seq < first_seq); Lsm.tla mutant unauthenticated_frames breaks G03_NoFalseDamage."
+fix_commits = ["dd8b893018b358aa2e33073ef6fa0886fdbe3e53", "433342db06b251a747fe5a216dd27e963bddee1a"]
 revert_patch_ok = false
-status = "open"
-owner = "zPy52"
-expires = "2026-12-24"

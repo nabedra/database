@@ -2,8 +2,12 @@
 //!
 //! # Files
 //!
-//! - `FORMAT` holds `nabedra-kv 1\n`, written once (temp file, rename, directory sync).
-//!   Anything else, or a non-empty directory without it, is [`Error::UnsupportedFormat`].
+//! - `FORMAT` holds `nabedra-kv 2\n`, written once at creation (temp file, rename,
+//!   directory sync). Anything else, including the format 1 of stores written before
+//!   LSM-1, or a non-empty directory without it, is [`Error::UnsupportedFormat`], before
+//!   any file changes.
+//! - `JOURNAL_KEY` holds the 128-bit key that journal record headers are tagged with, with
+//!   a CRC ([`crate::mac`]). It is durable before `FORMAT` exists and never rewritten.
 //! - `CURRENT` names the live manifest: `MANIFEST-<n> <crc>\n`, where `<crc>` is the masked
 //!   CRC32C of `MANIFEST-<n>` in hex. It is replaced by writing `CURRENT.tmp`, syncing it,
 //!   renaming it over `CURRENT` and syncing the directory. Any other content is R3.
@@ -33,10 +37,14 @@ use crate::coding::{get_length_prefixed, get_varint32, put_length_prefixed, put_
 use crate::crc;
 use crate::error::{Damage, DamageReason, Error, FileId, Result};
 use crate::fs::{Fs, FsFile, OpenMode};
+use crate::mac::JournalKey;
 use crate::types::Seq;
 
 pub const FORMAT_FILE: &str = "FORMAT";
-pub const FORMAT_CONTENT: &[u8] = b"nabedra-kv 1\n";
+/// Format 2: journal records in the authenticated frame (LSM-1). Format 1 is refused.
+pub const FORMAT_CONTENT: &[u8] = b"nabedra-kv 2\n";
+pub const JOURNAL_KEY_FILE: &str = "JOURNAL_KEY";
+pub(crate) const JOURNAL_KEY_TMP: &str = "JOURNAL_KEY.tmp";
 pub const CURRENT_FILE: &str = "CURRENT";
 pub const LOCK_FILE: &str = "LOCK";
 pub const JOURNAL_DIR: &str = "journal";
@@ -576,15 +584,31 @@ pub fn switch_current(
 
 /// Writes `FORMAT` once: temp file, sync, rename, directory sync.
 pub fn write_format(fs: &dyn Fs, dir: &Path) -> Result<()> {
-    let tmp = dir.join(FORMAT_TMP);
+    replace_file(fs, dir, FORMAT_TMP, FORMAT_FILE, FORMAT_CONTENT)
+}
+
+/// Writes `JOURNAL_KEY` the same way, at creation, before `FORMAT`: a key file without
+/// `FORMAT` is a leftover of an interrupted creation that nothing depends on.
+pub(crate) fn write_journal_key(fs: &dyn Fs, dir: &Path, key: &JournalKey) -> Result<()> {
+    replace_file(
+        fs,
+        dir,
+        JOURNAL_KEY_TMP,
+        JOURNAL_KEY_FILE,
+        &key.encode_file(),
+    )
+}
+
+fn replace_file(fs: &dyn Fs, dir: &Path, tmp: &str, name: &str, content: &[u8]) -> Result<()> {
+    let tmp = dir.join(tmp);
     if fs.exists(&tmp).map_err(io)? {
         fs.remove(&tmp).map_err(io)?;
     }
     let file = fs.open(&tmp, OpenMode::CreateNew).map_err(io)?;
-    file.write_all_at(FORMAT_CONTENT, 0).map_err(io)?;
+    file.write_all_at(content, 0).map_err(io)?;
     file.sync_all().map_err(io)?;
     drop(file);
-    fs.rename(&tmp, &dir.join(FORMAT_FILE)).map_err(io)?;
+    fs.rename(&tmp, &dir.join(name)).map_err(io)?;
     fs.sync_dir(dir).map_err(io)
 }
 

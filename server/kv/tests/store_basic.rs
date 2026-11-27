@@ -143,7 +143,9 @@ fn ns22_foreign_directories_are_refused_untouched() {
     }
     let unknown = tmp.path().join("unknown");
     std::fs::create_dir_all(&unknown).unwrap();
-    std::fs::write(unknown.join("FORMAT"), b"nabedra-kv 2\n").unwrap();
+    // Format 1, the store format before LSM-1 (journal records in a CRC frame): refused,
+    // not migrated.
+    std::fs::write(unknown.join("FORMAT"), b"nabedra-kv 1\n").unwrap();
     let legacy = tmp.path().join("legacy");
     std::fs::create_dir_all(legacy.join("rocksdb")).unwrap();
     std::fs::write(

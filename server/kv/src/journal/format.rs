@@ -3,16 +3,24 @@
 //! ```text
 //! segment = header block A (4 KiB) ‖ header block B (4 KiB) ‖ record*   (records at 8192)
 //! header block: one header copy at its start, zeros elsewhere
-//! header copy = magic "NBKVJNL1" | version u32 | 0 u32 | segment u64 | epoch u64
+//! header copy = magic "NBKVJNL1" | version u32 | key_check u32 | segment u64 | epoch u64
 //!             | first_seq u64 | crc u32 (masked CRC32C of the 40 bytes before it)
 //!
 //! record = header(48) ‖ scope(scope_len) ‖ payload(payload_len)
-//! header = header_crc u32 | payload_crc u32 | payload_len u32 | kind u8 | flags u8
-//!        | scope_len u8 | 0 u8 | epoch u64 | first_seq u64 | count u32 | 0 u32 | durable_seq u64
+//! header = tag u64 | payload_crc u32 | payload_len u32 | kind u8 | flags u8 | scope_len u8
+//!        | 0 u8 | count u32 | epoch u64 | first_seq u64 | durable_seq u64
 //! ```
 //!
-//! All integers are little-endian and both CRCs are masked ([`crate::crc::mask`]).
-//! `header_crc` covers header bytes 4..48 and the scope; `payload_crc` covers the payload.
+//! All integers are little-endian. `tag` is a SipHash-2-4 tag of header bytes 8..48 and
+//! the scope under the store's journal key ([`crate::mac`], LSM-1): bytes a client wrote
+//! into a payload cannot carry a valid tag, so recovery never takes them for a record,
+//! whether as evidence of a completed sync or as a resync point after a damaged header.
+//! `payload_crc` is the masked CRC32C ([`crate::crc::mask`]) of the payload; the tag
+//! covers it, so a payload is bound to an authenticated header. The segment header's
+//! `key_check` identifies the key its records are tagged with ([`key_check`]): a store
+//! whose `JOURNAL_KEY` is not that key refuses to open instead of reading every record
+//! as damage. Version 2 is the only version; a segment of another version is refused
+//! (`UnsupportedFormat`).
 //!
 //! The header is kept twice, each copy in its own 4 KiB block, and a header rewrite (a
 //! reused free file, a re-epoch) writes and syncs copy A before it writes copy B. A power
@@ -24,6 +32,7 @@
 
 use crate::coding::{read_u32_le, read_u64_le};
 use crate::crc;
+use crate::mac::JournalKey;
 use crate::types::Seq;
 
 /// Alignment unit: the header block size, and the boundary every group commit that
@@ -32,11 +41,15 @@ pub const BLOCK: u64 = 4096;
 /// Offset of the first record: after the two header blocks.
 pub const RECORDS_START: u64 = 2 * BLOCK;
 pub const SEGMENT_MAGIC: [u8; 8] = *b"NBKVJNL1";
-pub const FORMAT_VERSION: u32 = 1;
+/// The segment version: records in the authenticated frame (LSM-1). Version 1 (CRC
+/// frames) is refused.
+pub const FORMAT_VERSION: u32 = 2;
 const SEGMENT_HEADER_LEN: usize = 44;
 const SEGMENT_HEADER_COPY_B: usize = BLOCK as usize;
 
 pub const RECORD_HEADER_LEN: usize = 48;
+/// Header bytes the tag covers (with the scope): everything after the tag.
+const TAGGED: std::ops::Range<usize> = 8..RECORD_HEADER_LEN;
 
 /// `kind` byte of a record. Zero is reserved, so an all-zero header never parses.
 #[repr(u8)]
@@ -73,6 +86,30 @@ pub struct SegmentHeader {
     pub segment: u64,
     pub epoch: u64,
     pub first_seq: Seq,
+    /// [`key_check`] of the key the segment's records are tagged with.
+    pub key_check: u32,
+}
+
+/// A 32-bit check value of `key` for segment `segment` at `epoch`. It identifies the key;
+/// it is not what keeps forged records out (the record tags are).
+pub fn key_check(key: &JournalKey, segment: u64, epoch: u64) -> u32 {
+    key.tag(&[
+        b"NBKVJNL2 key check",
+        &segment.to_le_bytes(),
+        &epoch.to_le_bytes(),
+    ]) as u32
+}
+
+impl SegmentHeader {
+    /// The header of segment `segment` at `epoch`, for records tagged under `key`.
+    pub fn new(segment: u64, epoch: u64, first_seq: Seq, key: &JournalKey) -> SegmentHeader {
+        SegmentHeader {
+            segment,
+            epoch,
+            first_seq,
+            key_check: key_check(key, segment, epoch),
+        }
+    }
 }
 
 /// What one copy of a segment header holds.
@@ -104,6 +141,7 @@ impl SegmentHeader {
         let mut out = [0u8; SEGMENT_HEADER_LEN];
         out[0..8].copy_from_slice(&SEGMENT_MAGIC);
         out[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        out[12..16].copy_from_slice(&self.key_check.to_le_bytes());
         out[16..24].copy_from_slice(&self.segment.to_le_bytes());
         out[24..32].copy_from_slice(&self.epoch.to_le_bytes());
         out[32..40].copy_from_slice(&self.first_seq.to_le_bytes());
@@ -142,6 +180,7 @@ fn decode_copy(bytes: Option<&[u8]>) -> HeaderCopy {
         segment: read_u64_le(bytes, 16).unwrap_or(0),
         epoch: read_u64_le(bytes, 24).unwrap_or(0),
         first_seq: read_u64_le(bytes, 32).unwrap_or(0),
+        key_check: read_u32_le(bytes, 12).unwrap_or(0),
     })
 }
 
@@ -185,14 +224,14 @@ impl RecordHeader {
 
     fn decode_unchecked(h: &[u8]) -> RecordHeader {
         RecordHeader {
-            payload_crc: read_u32_le(h, 4).unwrap_or(0),
-            payload_len: read_u32_le(h, 8).unwrap_or(0),
-            kind: h[12],
-            flags: h[13],
-            scope_len: h[14],
-            epoch: read_u64_le(h, 16).unwrap_or(0),
-            first_seq: read_u64_le(h, 24).unwrap_or(0),
-            count: read_u32_le(h, 32).unwrap_or(0),
+            payload_crc: read_u32_le(h, 8).unwrap_or(0),
+            payload_len: read_u32_le(h, 12).unwrap_or(0),
+            kind: h[16],
+            flags: h[17],
+            scope_len: h[18],
+            count: read_u32_le(h, 20).unwrap_or(0),
+            epoch: read_u64_le(h, 24).unwrap_or(0),
+            first_seq: read_u64_le(h, 32).unwrap_or(0),
             durable_seq: read_u64_le(h, 40).unwrap_or(0),
         }
     }
@@ -215,9 +254,24 @@ pub enum Payload<'a> {
     Zeros(usize),
 }
 
-/// Appends one record to `out`. The caller checks that `scope` fits in a `u8` and the
-/// payload in a `u32`.
-pub fn encode_record(out: &mut Vec<u8>, fields: &RecordFields, scope: &[u8], payload: Payload<'_>) {
+/// The tag of a record header: SipHash-2-4 of header bytes 8..48 and the scope.
+pub fn record_tag(key: &JournalKey, header: &[u8], scope: &[u8]) -> u64 {
+    key.tag(&[&header[TAGGED], scope])
+}
+
+/// Appends one record to `out`, tagged under `key`. The caller checks that `scope` fits
+/// in a `u8` and the payload in a `u32`.
+///
+/// Every record the journal writes has `durable_seq < first_seq` (the last completed
+/// sync covers only earlier records); recovery checks it too.
+pub fn encode_record(
+    out: &mut Vec<u8>,
+    fields: &RecordFields,
+    scope: &[u8],
+    payload: Payload<'_>,
+    key: &JournalKey,
+) {
+    debug_assert!(fields.durable_seq < fields.first_seq, "{fields:?}");
     let start = out.len();
     let payload_len = match payload {
         Payload::Bytes(bytes) => bytes.len(),
@@ -233,19 +287,17 @@ pub fn encode_record(out: &mut Vec<u8>, fields: &RecordFields, scope: &[u8], pay
     }
     let payload_crc = crc::mask(crc::crc32c(&out[payload_start..]));
     let h = &mut out[start..start + RECORD_HEADER_LEN];
-    h[4..8].copy_from_slice(&payload_crc.to_le_bytes());
-    h[8..12].copy_from_slice(&(payload_len as u32).to_le_bytes());
-    h[12] = fields.kind as u8;
-    h[13] = fields.flags;
-    h[14] = scope.len() as u8;
-    h[16..24].copy_from_slice(&fields.epoch.to_le_bytes());
-    h[24..32].copy_from_slice(&fields.first_seq.to_le_bytes());
-    h[32..36].copy_from_slice(&fields.count.to_le_bytes());
+    h[8..12].copy_from_slice(&payload_crc.to_le_bytes());
+    h[12..16].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    h[16] = fields.kind as u8;
+    h[17] = fields.flags;
+    h[18] = scope.len() as u8;
+    h[20..24].copy_from_slice(&fields.count.to_le_bytes());
+    h[24..32].copy_from_slice(&fields.epoch.to_le_bytes());
+    h[32..40].copy_from_slice(&fields.first_seq.to_le_bytes());
     h[40..48].copy_from_slice(&fields.durable_seq.to_le_bytes());
-    let header_crc = crc::mask(crc::crc32c(
-        &out[start + 4..start + RECORD_HEADER_LEN + scope.len()],
-    ));
-    out[start..start + 4].copy_from_slice(&header_crc.to_le_bytes());
+    let tag = record_tag(key, &out[start..start + RECORD_HEADER_LEN], scope);
+    out[start..start + 8].copy_from_slice(&tag.to_le_bytes());
 }
 
 /// Smallest record a pad can be.
@@ -272,7 +324,7 @@ pub fn align_up(pos: u64) -> u64 {
 pub enum HeaderCheck {
     /// All 48 bytes are zero.
     Zero,
-    /// Non-zero and the header CRC fails.
+    /// Non-zero and the tag does not check.
     Bad,
     Valid(RecordHeader),
 }
@@ -281,7 +333,7 @@ pub enum HeaderCheck {
 /// bytes: at least [`RECORD_HEADER_LEN`], and the scope too unless it lies beyond the
 /// readable segment (then a non-zero header counts as `Bad`). On `Valid`, the scope is
 /// `buf[RECORD_HEADER_LEN..][..scope_len]`.
-pub fn check_header(buf: &[u8]) -> HeaderCheck {
+pub fn check_header(buf: &[u8], key: &JournalKey) -> HeaderCheck {
     let h = &buf[..RECORD_HEADER_LEN];
     if h.iter().all(|&b| b == 0) {
         return HeaderCheck::Zero;
@@ -291,9 +343,7 @@ pub fn check_header(buf: &[u8]) -> HeaderCheck {
     else {
         return HeaderCheck::Bad;
     };
-    let stored = read_u32_le(h, 0).unwrap_or(0);
-    let crc = crc::extend(crc::crc32c(&h[4..]), scope);
-    if crc::mask(crc) != stored {
+    if record_tag(key, h, scope) != read_u64_le(h, 0).unwrap_or(0) {
         return HeaderCheck::Bad;
     }
     HeaderCheck::Valid(header)
@@ -307,6 +357,10 @@ pub fn payload_crc_ok(header: &RecordHeader, payload: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    fn key() -> JournalKey {
+        JournalKey::from_bytes(*b"fedcba9876543210")
+    }
+
     #[test]
     fn ns_unit_record_round_trips_and_detects_damage() {
         let mut out = Vec::new();
@@ -318,9 +372,15 @@ mod tests {
             count: 2,
             durable_seq: 9,
         };
-        encode_record(&mut out, &fields, b"g1/", Payload::Bytes(b"payload"));
+        encode_record(
+            &mut out,
+            &fields,
+            b"g1/",
+            Payload::Bytes(b"payload"),
+            &key(),
+        );
         assert_eq!(out.len(), RECORD_HEADER_LEN + 3 + 7);
-        let check = check_header(&out);
+        let check = check_header(&out, &key());
         let HeaderCheck::Valid(h) = check else {
             panic!("expected a valid header, got {check:?}")
         };
@@ -329,33 +389,65 @@ mod tests {
             b"g1/"
         );
         assert_eq!(
-            (h.epoch, h.first_seq, h.count, h.durable_seq),
-            (3, 10, 2, 9)
+            (
+                h.kind,
+                h.flags,
+                h.epoch,
+                h.first_seq,
+                h.count,
+                h.durable_seq
+            ),
+            (RecordType::Batch as u8, FLAG_SYNC, 3, 10, 2, 9)
         );
         assert_eq!(h.record_len() as usize, out.len());
         assert!(payload_crc_ok(&h, &out[h.payload_offset() as usize..]));
 
-        // A flipped scope byte breaks the header CRC; a flipped payload byte only the payload's.
-        let mut bad = out.clone();
-        bad[RECORD_HEADER_LEN] ^= 1;
-        assert_eq!(check_header(&bad), HeaderCheck::Bad);
+        // Every header or scope byte is covered by the tag; a flipped payload byte breaks
+        // only the payload CRC.
+        for i in 0..RECORD_HEADER_LEN + 3 {
+            let mut bad = out.clone();
+            bad[i] ^= 0x01;
+            assert_eq!(check_header(&bad, &key()), HeaderCheck::Bad, "byte {i}");
+        }
         assert_eq!(
-            check_header(&out[..RECORD_HEADER_LEN + 1]),
+            check_header(&out[..RECORD_HEADER_LEN + 1], &key()),
             HeaderCheck::Bad
         );
         let mut bad = out.clone();
         *bad.last_mut().unwrap() ^= 1;
         assert!(!payload_crc_ok(&h, &bad[h.payload_offset() as usize..]));
-        assert_eq!(check_header(&[0u8; RECORD_HEADER_LEN]), HeaderCheck::Zero);
+        assert_eq!(
+            check_header(&[0u8; RECORD_HEADER_LEN], &key()),
+            HeaderCheck::Zero
+        );
+    }
+
+    /// LSM-1: a header checks only under its own key. What a client can write without the
+    /// key (any bytes, including a header tagged under a guessed key) never checks.
+    #[test]
+    fn ns_unit_record_header_needs_the_key() {
+        let other = JournalKey::from_bytes(*b"fedcba9876543211");
+        let fields = RecordFields {
+            kind: RecordType::Pad,
+            flags: 0,
+            epoch: 1,
+            first_seq: 1000,
+            count: 0,
+            durable_seq: 999,
+        };
+        let mut forged = Vec::new();
+        encode_record(&mut forged, &fields, &[], Payload::Zeros(0), &other);
+        assert_eq!(check_header(&forged, &key()), HeaderCheck::Bad);
+        assert!(matches!(
+            check_header(&forged, &other),
+            HeaderCheck::Valid(_)
+        ));
     }
 
     #[test]
     fn ns_unit_segment_header_copies() {
-        let header = SegmentHeader {
-            segment: 7,
-            epoch: 2,
-            first_seq: 100,
-        };
+        let header = SegmentHeader::new(7, 2, 100, &key());
+        assert_eq!(header.key_check, key_check(&key(), 7, 2));
         let blocks = header.encode_blocks();
         assert_eq!(blocks.len() as u64, RECORDS_START);
         assert_eq!(
@@ -389,6 +481,12 @@ mod tests {
             SegmentHeader::decode_blocks(&vec![0u8; RECORDS_START as usize]),
             [HeaderCopy::Zero; 2]
         );
+        // A version 1 segment (CRC frames, before LSM-1) is refused, not misread.
+        let mut v1 = blocks[..SEGMENT_HEADER_LEN].to_vec();
+        v1[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let crc = crc::mask(crc::crc32c(&v1[..40]));
+        v1[40..44].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(decode_copy(Some(&v1)), HeaderCopy::Unsupported(1));
         assert_eq!(align_pad_len(4096), None);
         assert_eq!(align_pad_len(4096 + 10), Some(4086));
         assert_eq!(align_pad_len(8192 - 20), Some(20 + 4096));

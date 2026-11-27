@@ -1,0 +1,15 @@
+# fx-lsm (wave-rv phase 2), finding LSM-10: found by the creation crash test of LSM-1.
+id = "RV-LSM-10"
+title = "A kill right after a store's directory is created leaves its entry unsynced, and no later open syncs it: synced writes are lost with the directory at the next power loss"
+class = "other"
+module = "lsm"
+guarantees = ["LSM-G01"]
+scenarios = ["NS04", "NS05"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/kv/tests/store_integrity.rs::lsm10_creation_survives_a_crash_at_every_step"
+seed = "unknown"
+why_not_caught = "NS04 enumerates crash points of a running store, not of its first open, and a test never reopened after a cut inside creation and then cut power again."
+invariant_added = "Every open makes the store directory's entry in its parent, and its journal/ and runs/ entries, durable before the open writes anything that depends on them."
+fix_commits = ["433342db06b251a747fe5a216dd27e963bddee1a"]
+revert_patch_ok = true

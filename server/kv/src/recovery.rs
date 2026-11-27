@@ -7,9 +7,10 @@ use std::path::Path;
 
 use crate::error::{Error, FileId, Result};
 use crate::fs::{Fs, FsLock};
+use crate::mac::JournalKey;
 use crate::manifest::{
     self, CURRENT_FILE, CURRENT_TMP, FORMAT_CONTENT, FORMAT_FILE, FORMAT_TMP, JOURNAL_DIR,
-    LOCK_FILE, ManifestState, RUNS_DIR,
+    JOURNAL_KEY_FILE, JOURNAL_KEY_TMP, LOCK_FILE, ManifestState, RUNS_DIR,
 };
 use crate::run::parse_run_file_name;
 
@@ -17,6 +18,22 @@ pub(crate) struct Prepared {
     pub lock: FsLock,
     pub state: ManifestState,
     pub manifest_torn_tail: bool,
+    /// The key journal record headers are tagged with.
+    pub key: JournalKey,
+}
+
+/// The store's journal key. Without it no record can be read, so a missing or damaged
+/// key refuses the store (R3) before anything changes.
+fn read_journal_key(fs: &dyn Fs, dir: &Path) -> Result<JournalKey> {
+    let path = dir.join(JOURNAL_KEY_FILE);
+    if !fs.exists(&path)? {
+        return Err(Error::Corruption {
+            file: FileId::Other,
+            offset: 0,
+            what: "JOURNAL_KEY is missing",
+        });
+    }
+    JournalKey::decode_file(&manifest::read_file(fs, &path)?)
 }
 
 fn names(fs: &dyn Fs, dir: &Path) -> Result<Vec<String>> {
@@ -37,17 +54,14 @@ fn unsupported(dir: &Path, what: String) -> Error {
 ///
 /// A directory without `FORMAT` must be empty apart from the leftovers of an interrupted
 /// creation (`LOCK`, `FORMAT.tmp`); anything else (another engine's store, for instance) is
-/// refused before anything in it is touched.
-pub(crate) fn prepare(fs: &dyn Fs, dir: &Path, _scope_of: fn(&[u8]) -> usize) -> Result<Prepared> {
+/// refused before anything in it is touched. A new store's key is durable before its
+/// `FORMAT` is written.
+pub(crate) fn prepare(fs: &dyn Fs, dir: &Path) -> Result<Prepared> {
     if !fs.exists(dir)? {
         fs.create_dir_all(dir)?;
-        if let Some(parent) = dir.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs.sync_dir(parent)?;
-        }
     }
     let entries = names(fs, dir)?;
+    let mut key = None;
     let has_format = entries.iter().any(|n| n == FORMAT_FILE);
     if has_format {
         let content = manifest::read_file(fs, &dir.join(FORMAT_FILE))?;
@@ -55,10 +69,18 @@ pub(crate) fn prepare(fs: &dyn Fs, dir: &Path, _scope_of: fn(&[u8]) -> usize) ->
             let shown = String::from_utf8_lossy(&content[..content.len().min(64)]).into_owned();
             return Err(unsupported(dir, format!("FORMAT holds {shown:?}")));
         }
+        key = Some(read_journal_key(fs, dir)?);
     } else {
+        // Leftovers of an interrupted creation: the lock, temp files, and a key that no
+        // FORMAT names yet.
         let mut foreign: Vec<&String> = entries
             .iter()
-            .filter(|n| *n != LOCK_FILE && *n != FORMAT_TMP)
+            .filter(|n| {
+                *n != LOCK_FILE
+                    && *n != FORMAT_TMP
+                    && *n != JOURNAL_KEY_FILE
+                    && *n != JOURNAL_KEY_TMP
+            })
             .collect();
         if !foreign.is_empty() {
             foreign.sort();
@@ -70,20 +92,32 @@ pub(crate) fn prepare(fs: &dyn Fs, dir: &Path, _scope_of: fn(&[u8]) -> usize) ->
         }
     }
     let lock = fs.lock(&dir.join(LOCK_FILE))?;
-    if !has_format {
-        manifest::write_format(fs, dir)?;
+    // LSM-10: make the store directory's entry durable on every open, not only on the
+    // one that created it. A kill between the creation of `dir` (or of `journal/` or
+    // `runs/` below) and its directory sync leaves a name the OS shows; the next open
+    // saw it, skipped the sync, wrote synced records, and a power loss then took the
+    // whole store with them. One directory sync per open, twice.
+    if let Some(parent) = dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs.sync_dir(parent)?;
     }
-    let mut created = false;
+    let key = match key {
+        Some(key) => key,
+        None => {
+            let key = JournalKey::generate()?;
+            manifest::write_journal_key(fs, dir, &key)?;
+            manifest::write_format(fs, dir)?;
+            key
+        }
+    };
     for sub in [JOURNAL_DIR, RUNS_DIR] {
         let path = dir.join(sub);
         if !fs.exists(&path)? {
             fs.create_dir_all(&path)?;
-            created = true;
         }
     }
-    if created {
-        fs.sync_dir(dir)?;
-    }
+    fs.sync_dir(dir)?;
     let (state, manifest_torn_tail) = if fs.exists(&dir.join(CURRENT_FILE))? {
         let number = manifest::read_current(fs, dir)?;
         let (state, report) = manifest::read_manifest(fs, dir, number)?;
@@ -118,6 +152,7 @@ pub(crate) fn prepare(fs: &dyn Fs, dir: &Path, _scope_of: fn(&[u8]) -> usize) ->
         lock,
         state,
         manifest_torn_tail,
+        key,
     })
 }
 
@@ -137,7 +172,7 @@ pub(crate) fn cleanup(fs: &dyn Fs, dir: &Path, current: u64, state: &ManifestSta
     };
     for name in names(fs, dir)? {
         let stale_manifest = manifest::parse_manifest_name(&name).is_some_and(|n| n != current);
-        if stale_manifest || name == CURRENT_TMP || name == FORMAT_TMP {
+        if stale_manifest || name == CURRENT_TMP || name == FORMAT_TMP || name == JOURNAL_KEY_TMP {
             remove(&dir.join(&name))?;
         }
     }
