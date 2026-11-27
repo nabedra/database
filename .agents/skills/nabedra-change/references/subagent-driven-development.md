@@ -62,14 +62,29 @@ runners, and integration changes as tasks where the plan calls for them.
   exclusive paths, leave edits unstaged, and have the lead stage only the
   approved paths for each task. Isolate resource-heavy test runs or schedule them around shared
   CPU, memory, services, and fixtures.
-- Use the requested model and settings. Nabedra's default is the latest GPT
-  Sol on high for Codex or the latest Claude Opus on high for Claude Code,
-  subject to harness availability and dispatch rules. The lead dispatches
-  implementations and reviews. Children work directly on their assignment.
-  For research and reading tasks, default to GPT Luna for Codex or Claude Haiku
-  for Claude Code.
 - Local simulation and property runs use one thread per agent
   (`--test-threads=1`, and `-j 2` for builds). Larger seed counts go to Actions.
+
+## Choose a model and effort
+
+Handle isolated work directly. The lead delegates for independent evidence or
+safe parallel work. Children work directly on their assignment. Use the latest
+supported model in each family and honor explicit requests and harness rules.
+
+| Assignment | Claude Code | Codex |
+| --- | --- | --- |
+| Bounded scoping, reading, or tiny edits with a deterministic check | Haiku High | Luna High or Extra High |
+| Scoped implementation or local review with clear acceptance checks | Sonnet Medium | Sol Medium |
+| Cross-module diagnosis or verification against known guarantees | Opus Medium or High | Sol High, or Astra Medium for deeper independent judgment |
+| Challenge a design or resolve a material risk after escalation | Fable Medium or High | Astra Medium or High |
+
+Start with two or three Haiku or Luna agents when the work has distinct slices.
+Ask for file and line evidence and have the lead reconcile the results. Exclude
+Terra. Clarify the brief before retrying. Raise effort for a deeper pass on a
+clear task. Use Fable or Astra when the decision needs a different approach, and
+ask for a check that distinguishes the options. Respect included usage limits
+and require opt-in for paid overage. Judge usage per accepted task, including
+retries and re-review.
 
 ## Three roles per task
 

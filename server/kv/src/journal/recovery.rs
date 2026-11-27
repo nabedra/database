@@ -17,7 +17,10 @@
 //! the scan reads the rest of the journal for **evidence**: a later valid record of its
 //! segment's current epoch with `durable_seq >= seq(P)`. After a damaged header it
 //! resumes at the next 4 KiB boundary, where every group commit that follows a sync
-//! starts. Then:
+//! starts. The manifest certifies sequences through `replay_after`, so a fully covered
+//! damaged record can be skipped and an unknown boundary may be crossed without overwriting
+//! the covered prefix. Evidence beyond that prefix classifies the remaining unflushed gap.
+//! Then:
 //!
 //! - end marker, nothing valid after it, no evidence: **L1**, clean end;
 //! - otherwise without evidence: **L2**, torn tail, the journal ends exactly before P;
@@ -54,7 +57,7 @@ use crate::crc;
 use crate::error::{Damage, DamageReason, Error, FileId, Result};
 use crate::fs::FsFile;
 use crate::types::{Locator, Seq};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::format::{
@@ -101,8 +104,36 @@ pub(super) struct Recovered {
     pub next_seq: Seq,
     /// Highest `durable_seq` seen in a valid record.
     pub max_durable: Seq,
-    /// Unused header-less segments (L4) to delete before anything is written.
-    pub discard: Vec<Headerless>,
+    /// Unused segment files (L4) to delete after validating the recovered identities.
+    pub discard: Vec<PathBuf>,
+}
+
+impl Recovered {
+    /// Validate the scanned on-disk identities and the plan's preserved prefix together.
+    /// A fresh segment cannot satisfy the manifest, and a re-epoched one loses its old identity.
+    pub(super) fn validate_segments(&self, required: &[(u64, u64)]) -> Result<()> {
+        let preserved = match self.end {
+            End::Reepoch { idx } => idx,
+            _ => self.end.index().map_or(0, |idx| idx + 1),
+        };
+        for &(segment, epoch) in required {
+            if !self.live[..preserved]
+                .iter()
+                .any(|s| s.number == segment && s.epoch == epoch)
+            {
+                return Err(missing_segment(segment));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn missing_segment(segment: u64) -> Error {
+    corrupt(
+        segment,
+        0,
+        "a journal segment the manifest records is missing",
+    )
 }
 
 fn corrupt(segment: u64, offset: u64, what: &'static str) -> Error {
@@ -258,6 +289,7 @@ pub(super) fn recover(
         return Err(corrupt(h.number, 0, "journal segment header damaged"));
     }
     let candidate = headerless.pop();
+    let mut discard = inventory.discard;
     let mut report = RecoveryReport {
         tail: TailOutcome::Clean,
         damage: Vec::new(),
@@ -274,7 +306,7 @@ pub(super) fn recover(
     let live = inventory.live;
     if live.is_empty() {
         let next_seq = replay_after + 1;
-        let discard = check_headerless(candidate, next_seq)?;
+        discard.extend(check_headerless(candidate, next_seq)?);
         return Ok(Recovered {
             report,
             live,
@@ -429,12 +461,13 @@ pub(super) fn recover(
         };
 
         // P = (idx, pos) is not a valid record.
-        if matches!(non_valid, NonValid::EndMarker) && last_close {
+        let seq_p = next_seq;
+        let covered = seq_p <= replay_after;
+        if matches!(non_valid, NonValid::EndMarker) && last_close && !covered {
             // Clean close, and the next open never wrote its open pad: nothing was
             // written after the close pad.
             break End::Append { idx, pos };
         }
-        let seq_p = next_seq;
         if !matches!(non_valid, NonValid::Damaged(_))
             && live
                 .get(idx + 1)
@@ -449,12 +482,37 @@ pub(super) fn recover(
             last_close = false;
             continue;
         }
+        let first_unflushed = replay_after + 1;
+        if let NonValid::Damaged(h) = &non_valid
+            && !h.is_pad()
+            && h.end_seq() <= first_unflushed
+        {
+            // The flush certifies every sequence in this record. Preserve the bytes
+            // so any locator whose own checksum still holds remains usable.
+            report.flushed_damage += 1;
+            next_seq = h.end_seq();
+            pos += h.record_len();
+            last_close = false;
+            continue;
+        }
         let resume = match &non_valid {
             NonValid::Damaged(h) => pos + h.record_len(),
             _ => format::align_up(pos + 1),
         };
         let scan = evidence_scan(&live, idx, resume)?;
-        let fence = if pos == RECORDS_START {
+        // A validated boundary inside the flushed prefix or at its end is safe to use
+        // even when no later record carries a journal sync certificate.
+        let flush_covers_gap = covered
+            && !matches!(non_valid, NonValid::Damaged(_))
+            && scan
+                .first_valid
+                .is_some_and(|(_, _, first_seq)| first_seq <= first_unflushed);
+        let unflushed = seq_p.max(first_unflushed);
+        let fence = if covered {
+            // A locator into the skipped block may still be live. Preserve the segment
+            // byte for byte. The next segment records the gap as a void pad before writes.
+            End::Fence { idx, pad_at: None }
+        } else if pos == RECORDS_START {
             End::Reepoch { idx }
         } else {
             End::Fence {
@@ -462,7 +520,10 @@ pub(super) fn recover(
                 pad_at: Some(pos),
             }
         };
-        if scan.max_durable.is_none_or(|d| d < seq_p) {
+        if !flush_covers_gap && scan.max_durable.is_none_or(|d| d < unflushed) {
+            if covered {
+                report.flushed_damage += 1;
+            }
             if matches!(non_valid, NonValid::EndMarker) && scan.first_valid.is_none() {
                 // L1.
                 break fence;
@@ -477,7 +538,7 @@ pub(super) fn recover(
             };
             let bytes_discarded = damaged + scan.valid_bytes;
             report.tail = TailOutcome::TornTail {
-                truncated_at_seq: seq_p,
+                truncated_at_seq: unflushed,
                 segment: seg.number,
                 offset: pos,
                 bytes_discarded,
@@ -487,7 +548,7 @@ pub(super) fn recover(
             break fence;
         }
 
-        // A completed sync covered P.
+        // A completed sync or the durable flush covered P.
         last_close = false;
         match non_valid {
             NonValid::Damaged(h) => {
@@ -540,7 +601,7 @@ pub(super) fn recover(
         }
     };
 
-    let discard = check_headerless(candidate, next_seq)?;
+    discard.extend(check_headerless(candidate, next_seq)?);
     Ok(Recovered {
         report,
         live,
@@ -557,7 +618,7 @@ pub(super) fn recover(
 /// a valid header and a sequence at or after `next_seq`, the sequence the log continues
 /// with: nothing then chains into it, and older records in it are leftovers of an earlier
 /// use. Otherwise it may hold records the log needs: R3.
-fn check_headerless(candidate: Option<Headerless>, next_seq: Seq) -> Result<Vec<Headerless>> {
+fn check_headerless(candidate: Option<Headerless>, next_seq: Seq) -> Result<Vec<PathBuf>> {
     let Some(h) = candidate else {
         return Ok(Vec::new());
     };
@@ -577,5 +638,5 @@ fn check_headerless(candidate: Option<Headerless>, next_seq: Seq) -> Result<Vec<
         }
         pos = format::align_up(pos + 1);
     }
-    Ok(vec![h])
+    Ok(vec![h.path])
 }

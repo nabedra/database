@@ -133,7 +133,9 @@ def main():
     workloads = ("get-hit", "set-px")
     with tempfile.TemporaryDirectory(prefix="nabedra-local-pair-") as temporary, ExitStack() as scope:
         root = Path(temporary)
-        fleet = fixture.Fleet(args.nabedra.resolve(), root, args.output, scope)
+        # The fixture records its client and nemesis operations; keep them with the evidence.
+        recorder = scope.enter_context(fixture.HistoryWriter(args.output / "fleet-history.jsonl"))
+        fleet = fixture.Fleet(args.nabedra.resolve(), root, args.output, scope, recorder)
         placements = {
             "nabedra": start_nabedra(fixture, fleet),
             "valkey": start_valkey(args, fixture, fleet),

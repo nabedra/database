@@ -882,7 +882,7 @@ pub struct ControlClient {
     group: GroupIdentity,
     routes: Arc<dyn ControlRoutes>,
     last_read_route: Mutex<Option<(Option<Uuid>, Uuid)>>,
-    replica_routes: Option<Box<Mutex<ReplicaRouteCache>>>,
+    replica_routes: Option<Arc<Mutex<ReplicaRouteCache>>>,
     service_grants: crate::oltp_replication::service_rpc::GrantCache,
 }
 impl ControlClient {
@@ -2136,15 +2136,41 @@ struct ReplicaRouteCache {
     _metadata: ScratchLease,
 }
 impl ReplicaRouteCache {
-    fn new(shared: &WorkerSharedResources) -> Option<Box<Mutex<Self>>> {
+    fn new(shared: &WorkerSharedResources) -> Option<Arc<Mutex<Self>>> {
         let metadata = shared
             .reserve_scratch(ByteClass::Data, size_of::<Mutex<Self>>() + 64)
             .ok()?;
-        Some(Box::new(Mutex::new(Self {
+        let cache = Arc::new(Mutex::new(Self {
             entries: [const { None }; ROUTE_CACHE_ENTRIES],
             next: 0,
             _metadata: metadata,
-        })))
+        }));
+        #[cfg(feature = "sim")]
+        nabedra_oltp_types::sim_probe::track_ledgers(&cache, Self::probe_ledgers);
+        Some(cache)
+    }
+
+    /// Reports the routes the cache holds and their charged bytes, so the simulator can
+    /// judge them against the cache's bounds instead of as transient work.
+    #[cfg(feature = "sim")]
+    fn probe_ledgers(cache: &Mutex<Self>) {
+        use nabedra_oltp_types::sim_probe::{Ledger, Probe, emit};
+        let Ok(cache) = cache.lock() else {
+            return;
+        };
+        let routes = cache.entries.iter().flatten();
+        let bytes = routes.clone().map(|route| route._owner.bytes() as u64).sum();
+        for (ledger, outstanding) in [
+            (Ledger::RouteCaches, 1),
+            (Ledger::RouteCacheEntries, routes.count() as u64),
+            (Ledger::RouteCacheBytes, bytes),
+        ] {
+            emit(|| Probe::LedgerSnapshot {
+                ledger,
+                group: None,
+                outstanding,
+            });
+        }
     }
 
     fn slot(&mut self, group: &GroupIdentity) -> Option<&mut Option<ReplicaRoutes>> {

@@ -297,8 +297,10 @@ impl State {
         }
         let mut action = NetAction::Pass;
         for (id, rule) in &mut self.open {
-            let delay = match rule {
-                Rule::FrameDrop { per_mille } if self.rng.chance(*per_mille) => None,
+            // Beyond-TCP rules may let other streams of the session pass a frame; the others
+            // keep the session in order (`NetAction::Overtake`).
+            let (delay, beyond_tcp) = match rule {
+                Rule::FrameDrop { per_mille } if self.rng.chance(*per_mille) => (None, true),
                 Rule::BlackHole { worker, stream }
                     if frame.from == Some(*worker)
                         && matches!(frame.kind, FrameKind::Request | FrameKind::Reply) =>
@@ -306,18 +308,21 @@ impl State {
                     if *stream.get_or_insert(frame.stream) != frame.stream {
                         continue;
                     }
-                    None
+                    (None, true)
                 }
-                Rule::Reorder { max_ms } => Some(Duration::from_millis(self.rng.range(0, *max_ms))),
+                Rule::Reorder { max_ms } => (
+                    Some(Duration::from_millis(self.rng.range(0, *max_ms))),
+                    true,
+                ),
                 Rule::Delay { worker, by }
                     if frame.from == Some(*worker) || frame.to == Some(*worker) =>
                 {
-                    Some(*by)
+                    (Some(*by), false)
                 }
                 Rule::Slow { workers, by }
                     if frame.from.is_some_and(|node| workers.contains(&node)) =>
                 {
-                    Some(*by)
+                    (Some(*by), false)
                 }
                 _ => continue,
             };
@@ -326,7 +331,12 @@ impl State {
             effect.first.get_or_insert(at);
             action = match (action, delay) {
                 (NetAction::Cut, _) | (_, None) => NetAction::Cut,
+                (NetAction::Overtake(longest), Some(by)) => NetAction::Overtake(longest.max(by)),
+                (NetAction::Delay(longest), Some(by)) if beyond_tcp => {
+                    NetAction::Overtake(longest.max(by))
+                }
                 (NetAction::Delay(longest), Some(by)) => NetAction::Delay(longest.max(by)),
+                (_, Some(by)) if beyond_tcp => NetAction::Overtake(by),
                 (_, Some(by)) => NetAction::Delay(by),
             };
         }

@@ -80,4 +80,4 @@ The highest sampled Docker VM use across the pair and zone run was
 readiness watchdog. The paired workload itself exited zero.
 [Raw samples and configs](paired-raw.tar.gz) · [Paired output](pair-output.txt) ·
 [Docker session](docker-trace.jsonl) ·
-[Linux build](https://github.com/zPy52/nabedra-database/actions/runs/44929728236)
+[Linux build](https://github.com/nabedra/database/actions/runs/44929728236)

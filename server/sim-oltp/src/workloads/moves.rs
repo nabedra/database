@@ -204,7 +204,7 @@ impl Move {
         matches!(self.inner().phase, Phase::Moving { .. })
     }
 
-    fn retired(&self) -> bool {
+    pub(crate) fn retired(&self) -> bool {
         matches!(self.inner().phase, Phase::Retired)
     }
 

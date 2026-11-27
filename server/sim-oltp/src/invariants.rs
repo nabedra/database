@@ -27,6 +27,8 @@ use nabedra_rt::{
 use nabedra_sim::raft::MAX_VIOLATIONS;
 use serde_json::Value;
 
+use nabedra_oltp_types::sim_probe::Ledger;
+
 use crate::{
     history::Bodies,
     probes::{ProbeEvent, Probes, describe},
@@ -66,6 +68,12 @@ pub(crate) struct Checks {
     resources: BTreeMap<u64, ResourceUsage>,
     /// Per worker: every ledger at the resource baseline, from probes.
     ledger_baseline: BTreeMap<u64, Ledgers>,
+    /// Per worker: its process's incarnation when the baseline was taken.
+    baseline_incarnation: BTreeMap<u64, u64>,
+    /// Per worker: pools that a replica move mounted after the baseline.
+    added_pools: BTreeMap<u64, u64>,
+    /// Workers that led a range whose replica a move removed.
+    removed_learner_leaders: BTreeSet<u64>,
     /// Per worker: what [`Invariants::resources_at_baseline`] last observed.
     settling: BTreeMap<u64, Settling>,
     /// Per worker: what [`Invariants::resources_steady`] last observed.
@@ -289,6 +297,10 @@ impl Invariants {
         if let Some(ledgers) = ledgers {
             checks.ledger_baseline.insert(worker, ledgers);
         }
+        let incarnation = checks.probes.as_ref().map(|probes| probes.incarnation(worker));
+        if let Some(incarnation) = incarnation {
+            checks.baseline_incarnation.insert(worker, incarnation);
+        }
         match ResourceUsage::from_stats(stats) {
             Some(usage) => {
                 checks.check_storage_devices(world, worker, &usage);
@@ -356,6 +368,32 @@ impl Invariants {
                 "n{worker} was judged without the observation that settled it"
             )),
         };
+        // Lead decision 20: a process that restarted after the baseline has no judged
+        // baseline. It stays red, and its line says so, so that it is never mistaken for a
+        // leak of the process that took the baseline.
+        let restarted = match (&checks.probes, checks.baseline_incarnation.get(&worker)) {
+            (Some(probes), Some(&before)) => {
+                let now = probes.incarnation(worker);
+                (now != before).then(|| format!("{before} to {now}"))
+            }
+            _ => None,
+        };
+        let problem = match (problem, restarted) {
+            (Some(problem), Some(restarts)) => Some(format!(
+                "{problem} (restarted after its baseline, incarnation {restarts}: no judged baseline, lead decision 20)"
+            )),
+            (problem, _) => problem,
+        };
+        let problem = problem.map(|problem| {
+            if checks.removed_learner_leaders.contains(&worker) && problem.contains("ScratchBytes")
+            {
+                format!(
+                    "{problem} (the signature of open record {REMOVED_LEARNER_CHARGE}: n{worker} led a range whose replica a move removed)"
+                )
+            } else {
+                problem
+            }
+        });
         if let Some(problem) = problem {
             checks.violate(world, "ResourceBaseline", problem);
         }
@@ -380,11 +418,16 @@ impl Invariants {
             Some(now) => checks.ledgers_moved(worker, now),
             None => Vec::new(),
         };
+        // The public decode gauge counts cached routes too: compare it without them.
+        let routes = (
+            ledgers.as_ref().map_or(0, route_cache_bytes),
+            checks.ledger_baseline.get(&worker).map_or(0, route_cache_bytes),
+        );
         match (
             checks.resources.get(&worker),
             ResourceUsage::from_stats(stats),
         ) {
-            (Some(baseline), Some(now)) if now.within(baseline) => {}
+            (Some(baseline), Some(now)) if now.within(baseline, routes) => {}
             (Some(baseline), Some(now)) => off.push(format!("{now:?} (baseline {baseline:?})")),
             (None, _) => off.push("no baseline".into()),
             (_, None) => off.push("no resource gauges in the stats".into()),
@@ -408,6 +451,23 @@ impl Invariants {
         };
         checks.settling.insert(worker, observed);
         passes >= SETTLED_PASSES
+    }
+
+    /// Declares that a replica move mounted `pools` pools on `worker` after its baseline. Each
+    /// is charged [`POOL_OVERHEAD_BYTES`] to the scheduler, which ResourceBaseline then
+    /// expects on top of the baseline, exactly.
+    pub(crate) fn pools_added(&self, worker: u64, pools: u64) {
+        self.checks.lock().unwrap().added_pools.insert(worker, pools);
+    }
+
+    /// Declares that `worker` led a range whose replica a move removed, so that a scratch
+    /// charge left on it names the open record of that signature.
+    pub(crate) fn led_removed_learner(&self, worker: u64) {
+        self.checks
+            .lock()
+            .unwrap()
+            .removed_learner_leaders
+            .insert(worker);
     }
 
     /// Verify the workload reached the direct path using public worker stats.
@@ -531,9 +591,95 @@ fn deadline_message(label: &str, deadline: Duration) -> String {
     )
 }
 
+/// The Control replica route cache's bounds, as `ROUTE_CACHE_ENTRIES` and
+/// `ROUTE_CACHE_ENTRY_BYTES` in oltp-replication's `authority/control/endpoint.rs` state
+/// them. Restated, not imported, so that a product change to them shows here.
+pub(crate) const ROUTE_CACHE_ENTRIES: u64 = 64;
+pub(crate) const ROUTE_CACHE_ENTRY_BYTES: u64 = 4 << 10;
+
+/// What a mounted pool charges the scheduler, as `POOL_OVERHEAD_BYTES` in
+/// `nabedra-resources`' `memory/worker.rs` states it. Restated, not imported.
+pub(crate) const POOL_OVERHEAD_BYTES: u64 = 64 << 20;
+
+/// The open record whose signature is a scratch charge left on the leader of a range whose
+/// replica a move removed.
+const REMOVED_LEARNER_CHARGE: &str = "OLTP-sim-removed-learner-charge";
+
+/// The ledgers that count a cached route's working-memory charge with every other one.
+const HOLD_ROUTES: [Ledger; 2] = [Ledger::ScratchBytes, Ledger::SchedulerBytes];
+
+/// The route cache is a bounded cache, not transient work: how full it is depends on which
+/// groups a process resolved since it started, so a restart or a move changes it. It is
+/// judged against its own bounds ([`route_cache_over`]), and everything else stays judged
+/// strictly: this returns `ledgers` with the cache's bytes taken out of [`HOLD_ROUTES`], by
+/// what the cache itself reports, and its own ledgers gone. Nothing is taken out of a
+/// worker whose cache reported nothing, and no fixed allowance ever. Err when the cache
+/// reports more bytes than a ledger that includes them holds.
+pub(crate) fn without_route_cache(ledgers: &Ledgers) -> Result<Ledgers, String> {
+    let routes = route_cache_bytes(ledgers);
+    let mut rest = ledgers.clone();
+    for ledger in [
+        Ledger::RouteCaches,
+        Ledger::RouteCacheEntries,
+        Ledger::RouteCacheBytes,
+    ] {
+        rest.remove(&(ledger, None));
+    }
+    if routes == 0 {
+        return Ok(rest);
+    }
+    for ledger in HOLD_ROUTES {
+        let Some(held) = rest.get_mut(&(ledger, None)) else {
+            return Err(format!("the route cache holds {routes} B and no {ledger:?} is reported"));
+        };
+        *held = held.checked_sub(routes).ok_or_else(|| {
+            format!("the route cache holds {routes} B, more than all of {ledger:?} {held}")
+        })?;
+    }
+    Ok(rest)
+}
+
+/// What the route cache reports holding.
+pub(crate) fn route_cache_bytes(ledgers: &Ledgers) -> u64 {
+    ledgers
+        .get(&(Ledger::RouteCacheBytes, None))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The route cache's bounds that `ledgers` break, independent of any baseline: at most
+/// [`ROUTE_CACHE_ENTRIES`] routes per cache, each at most [`ROUTE_CACHE_ENTRY_BYTES`]. A
+/// worker may run more than one Control client, so the bound is per cache that reported.
+pub(crate) fn route_cache_over(ledgers: &Ledgers) -> Option<String> {
+    let at = |ledger| ledgers.get(&(ledger, None)).copied().unwrap_or(0);
+    let (caches, entries) = (at(Ledger::RouteCaches), at(Ledger::RouteCacheEntries));
+    let bytes = route_cache_bytes(ledgers);
+    let cap = caches * ROUTE_CACHE_ENTRIES;
+    (entries > cap || bytes > entries * ROUTE_CACHE_ENTRY_BYTES).then(|| {
+        format!(
+            "the route cache holds {entries} routes in {bytes} B, over its bound of {cap} routes of at most {ROUTE_CACHE_ENTRY_BYTES} B"
+        )
+    })
+}
+
+/// `before` and `now` without the route cache, to compare strictly, or why the cache is off
+/// by itself: over its bounds now, or reporting more than the ledgers that include it.
+pub(crate) fn split_route_cache(
+    before: &Ledgers,
+    now: &Ledgers,
+) -> Result<(Ledgers, Ledgers), String> {
+    let before = without_route_cache(before).map_err(|error| format!("before, {error}"))?;
+    let rest = without_route_cache(now)?;
+    match route_cache_over(now) {
+        Some(over) => Err(over),
+        None => Ok((before, rest)),
+    }
+}
+
 impl Checks {
     /// ResourceBaseline from probes: the ledgers of `worker` that differ from its baseline.
-    /// A ledger its baseline did not have starts at zero.
+    /// A ledger its baseline did not have starts at zero. The route cache is split off on
+    /// both sides ([`without_route_cache`]) and judged by its bounds alone.
     fn ledgers_moved(&self, worker: u64, now: &Ledgers) -> Vec<String> {
         let Some(baseline) = self.ledger_baseline.get(&worker) else {
             return vec!["no baseline snapshot".into()];
@@ -541,6 +687,26 @@ impl Checks {
         if now.is_empty() {
             return vec!["no ledger reported".into()];
         }
+        let (baseline, mut now) = match split_route_cache(baseline, now) {
+            Ok(split) => split,
+            Err(off) => return vec![off],
+        };
+        // A pool a move mounted is charged to the scheduler: expect exactly that on top of the
+        // baseline, from the number of pools, never an allowance off the total.
+        let pools = self.added_pools.get(&worker).copied().unwrap_or(0);
+        if pools > 0 {
+            let charge = pools * POOL_OVERHEAD_BYTES;
+            let Some(held) = now.get_mut(&(Ledger::SchedulerBytes, None)) else {
+                return vec![format!("{pools} added pools and no SchedulerBytes reported")];
+            };
+            let Some(rest) = held.checked_sub(charge) else {
+                return vec![format!(
+                    "{pools} added pools charge {charge} B, more than all of SchedulerBytes {held}"
+                )];
+            };
+            *held = rest;
+        }
+        let (baseline, now) = (&baseline, &now);
         let keys: BTreeSet<_> = baseline.keys().chain(now.keys()).collect();
         keys.into_iter()
             .filter_map(|key| {
@@ -674,8 +840,11 @@ impl ResourceUsage {
         Some(usage)
     }
 
-    fn within(&self, baseline: &Self) -> bool {
-        self.working_decode_bytes <= baseline.working_decode_bytes
+    /// At or below `baseline`, where `routes` are the bytes the route cache held now and at
+    /// the baseline, which the decode gauge includes ([`without_route_cache`]).
+    fn within(&self, baseline: &Self, (routes, baseline_routes): (u64, u64)) -> bool {
+        self.working_decode_bytes.saturating_add(baseline_routes)
+            <= baseline.working_decode_bytes.saturating_add(routes)
             && self.native_threads <= baseline.native_threads
             && self.direct_in_flight <= baseline.direct_in_flight
             && self.disk.keys().eq(baseline.disk.keys())
@@ -838,6 +1007,237 @@ mod tests {
         // A message in the first observation, and one in the second.
         assert_eq!(steady(|ms| ms < 5), 30);
         assert_eq!(steady(|ms| (10..12).contains(&ms)), 40);
+    }
+
+    /// What a worker holds `ms` after its baseline: routes in its cache, the bytes of each,
+    /// and other working memory beyond the baseline's.
+    #[derive(Clone, Copy)]
+    struct Held {
+        routes: u64,
+        route_bytes: u64,
+        other: u64,
+    }
+
+    /// The bytes of one cached route of a group with three replicas, as `sim_triage.py`
+    /// measured them.
+    const ROUTE: u64 = 692;
+
+    /// Like [`judge`], for a worker with a Control route cache: four routes at the baseline,
+    /// then what `held(ms)` says. A cached route is charged to the scratch and scheduler
+    /// ledgers and to the public decode gauge, as `reserve_scratch(ByteClass::Data, ..)` does.
+    fn judge_routes(held: impl Fn(u64) -> Held + Send + Sync + 'static) -> Vec<String> {
+        #[derive(Default)]
+        struct Worker {
+            routes: AtomicU64,
+            route_bytes: AtomicU64,
+            other: AtomicU64,
+        }
+        impl Worker {
+            fn scratch(&self) -> u64 {
+                BASE + self.routes.load(SeqCst) * self.route_bytes.load(SeqCst)
+                    + self.other.load(SeqCst)
+            }
+            fn set(&self, held: Held) {
+                self.routes.store(held.routes, SeqCst);
+                self.route_bytes.store(held.route_bytes, SeqCst);
+                self.other.store(held.other, SeqCst);
+            }
+        }
+        sim::run(1, |world| async move {
+            world.add_node(1, NodeClock::default());
+            let checks = Invariants::new();
+            checks.install_probes(&world, "unit");
+            let worker = Arc::new(Worker::default());
+            worker.set(Held {
+                routes: 4,
+                route_bytes: ROUTE,
+                other: 0,
+            });
+            fn ledger(ledger: Ledger, outstanding: u64) {
+                emit(|| Probe::LedgerSnapshot {
+                    ledger,
+                    group: None,
+                    outstanding,
+                });
+            }
+            // The cache reports itself as the product's does: a ledger owner of its own.
+            struct Cache(Arc<Worker>);
+            let cache = Arc::new(Cache(worker.clone()));
+            in_node(1, async {
+                track_ledgers(&worker, |worker: &Worker| {
+                    ledger(Ledger::ScratchBytes, worker.scratch());
+                    ledger(Ledger::SchedulerBytes, worker.scratch());
+                });
+                track_ledgers(&cache, |Cache(worker): &Cache| {
+                    let routes = worker.routes.load(SeqCst);
+                    ledger(Ledger::RouteCaches, 1);
+                    ledger(Ledger::RouteCacheEntries, routes);
+                    ledger(
+                        Ledger::RouteCacheBytes,
+                        routes * worker.route_bytes.load(SeqCst),
+                    );
+                });
+            })
+            .await;
+            let stats = || {
+                let mut stats = stats();
+                stats["working_decode_bytes"] = json!(worker.scratch());
+                stats
+            };
+            checks.capture_resources(&world, 1, &stats());
+            let start = world.elapsed();
+            let charge = async {
+                loop {
+                    let ms = (world.elapsed() - start).as_millis() as u64;
+                    worker.set(held(ms));
+                    time::sleep(Duration::from_millis(1)).await;
+                }
+            };
+            let settle = async {
+                let deadline = start + Duration::from_secs(2);
+                loop {
+                    time::sleep(Duration::from_millis(3)).await;
+                    let stats = stats();
+                    if checks.resources_at_baseline(1, &stats) || world.elapsed() >= deadline {
+                        checks.check_resources(&world, 1, &stats);
+                        return;
+                    }
+                    time::sleep(STEP).await;
+                }
+            };
+            let steps = async {
+                loop {
+                    time::sleep(STEP).await;
+                    checks.step(&world);
+                }
+            };
+            tokio::select! {
+                biased;
+                () = charge => unreachable!("the charge never ends"),
+                () = steps => unreachable!("the steps never end"),
+                () = settle => {}
+            }
+            checks.violations()
+        })
+    }
+
+    #[test]
+    fn a_warm_route_cache_is_judged_by_its_bounds() {
+        let routes = |routes, route_bytes, other| {
+            move |_| Held {
+                routes,
+                route_bytes,
+                other,
+            }
+        };
+        // The clean twins: the same cache, one that a restart or a move filled further or
+        // emptied, and one at its cap of 64 routes of at most 4 KiB.
+        for clean in [
+            routes(4, ROUTE, 0),
+            routes(5, ROUTE, 0),
+            routes(1, ROUTE, 0),
+            routes(64, ROUTE_CACHE_ENTRY_BYTES, 0),
+        ] {
+            let found = judge_routes(clean);
+            assert!(found.is_empty(), "{found:?}");
+        }
+        // A route filled while the baseline settles, then work that ends.
+        let found = judge_routes(|ms| Held {
+            routes: 5,
+            route_bytes: ROUTE,
+            other: if ms < 700 { CHARGE } else { 0 },
+        });
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_route_cache_does_not_excuse_a_held_lease() {
+        let routes = |routes, route_bytes, other| {
+            move |_| Held {
+                routes,
+                route_bytes,
+                other,
+            }
+        };
+        // The failing twins: a warm cache beside a transient lease that is never released,
+        // one the size of a route, and one that comes back every 51 ms; a cache over its
+        // count and one whose routes are over their size.
+        for (leak, says) in [
+            (judge_routes(routes(5, ROUTE, ROUTE)), "ScratchBytes"),
+            (judge_routes(routes(5, ROUTE, CHARGE)), "SchedulerBytes"),
+            (judge_routes(routes(1, ROUTE, 3 * ROUTE)), "ScratchBytes"),
+            (judge_routes(routes(65, ROUTE, 0)), "over its bound"),
+            (judge_routes(routes(5, ROUTE_CACHE_ENTRY_BYTES + 1, 0)), "over its bound"),
+            (
+                judge_routes(|ms| Held {
+                    routes: 5,
+                    route_bytes: ROUTE,
+                    other: if ms % 51 < 50 { CHARGE } else { 0 },
+                }),
+                "ScratchBytes",
+            ),
+        ] {
+            assert!(
+                shrink::kinds(&leak).contains(protocol::RESOURCE_BASELINE),
+                "{leak:?}"
+            );
+            assert!(leak.iter().any(|line| line.contains(says)), "{says}: {leak:?}");
+        }
+    }
+
+    /// A pool that a move mounted is expected on top of the baseline, exactly: one pool more
+    /// or less, or a lease beside it, is red.
+    #[test]
+    fn added_pools_are_expected_exactly() {
+        let sched = |bytes| Ledgers::from([((Ledger::SchedulerBytes, None), bytes)]);
+        let moved = |pools, now| {
+            let mut checks = Checks::default();
+            checks.ledger_baseline.insert(1, sched(1_000));
+            checks.added_pools.insert(1, pools);
+            checks.ledgers_moved(1, &sched(now))
+        };
+        assert!(moved(2, 1_000 + 2 * POOL_OVERHEAD_BYTES).is_empty());
+        assert!(moved(0, 1_000).is_empty());
+        for (pools, now) in [
+            (1, 1_000 + 2 * POOL_OVERHEAD_BYTES),
+            (2, 1_000 + POOL_OVERHEAD_BYTES),
+            (2, 1_692 + 2 * POOL_OVERHEAD_BYTES),
+            (0, 1_000 + POOL_OVERHEAD_BYTES),
+        ] {
+            assert_eq!(moved(pools, now).len(), 1, "{pools} pools, {now} B");
+        }
+    }
+
+    #[test]
+    fn a_route_cache_split_is_exact() {
+        let ledgers = |scratch, scheduler, routes: Option<(u64, u64)>| {
+            let mut ledgers = Ledgers::from([
+                ((Ledger::ScratchBytes, None), scratch),
+                ((Ledger::SchedulerBytes, None), scheduler),
+            ]);
+            if let Some((entries, bytes)) = routes {
+                ledgers.insert((Ledger::RouteCaches, None), 1);
+                ledgers.insert((Ledger::RouteCacheEntries, None), entries);
+                ledgers.insert((Ledger::RouteCacheBytes, None), bytes);
+            }
+            ledgers
+        };
+        let rest = without_route_cache(&ledgers(5_000, 6_000, Some((2, 1_384)))).unwrap();
+        assert_eq!(rest, ledgers(3_616, 4_616, None));
+        // Nothing is taken out without a report, and a report larger than its ledgers is
+        // an error, not zero.
+        assert_eq!(
+            without_route_cache(&ledgers(5_000, 6_000, None)).unwrap(),
+            ledgers(5_000, 6_000, None)
+        );
+        assert!(without_route_cache(&ledgers(1_000, 6_000, Some((2, 1_384)))).is_err());
+        let mut alone = ledgers(0, 0, Some((2, 1_384)));
+        alone.remove(&(Ledger::ScratchBytes, None));
+        assert!(without_route_cache(&alone).is_err());
+        // Routes without a cache that reported itself are over any bound.
+        let mut stray = ledgers(5_000, 6_000, Some((2, 1_384)));
+        stray.remove(&(Ledger::RouteCaches, None));
+        assert!(route_cache_over(&stray).is_some());
     }
 
     #[test]

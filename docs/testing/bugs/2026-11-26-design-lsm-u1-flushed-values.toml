@@ -1,0 +1,15 @@
+# Design review rv-lsm (wave-rv), finding LSM-2.
+id = "RV-LSM-2"
+title = "Media damage of a record at or below flushed_seq re-epochs or frees a recorded journal segment, so flushed journal values are lost and the open refuses"
+class = "other"
+module = "lsm"
+guarantees = ["LSM-G01", "LSM-G03"]
+scenarios = ["NS07", "NS25", "LSM01"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/kv/tests/store_damage.rs::ns07_flushed_header_damage_preserves_live_journal_value"
+seed = "unknown"
+why_not_caught = "Clean-close damage cases had a later sync marker and never exercised a flushed locator sharing the damaged header block."
+invariant_added = "Recovery preserves live journal locators in the durable flush prefix, classifies certified gaps beyond that prefix independently, and validates recorded segment identities before any journal file mutation."
+fix_commits = ["a01ad16e6e347ca522ce30ff351e91ae0d9d7c53"]
+revert_patch_ok = true

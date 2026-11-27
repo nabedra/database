@@ -6,7 +6,7 @@ builds queries for a separately running Nabedra Database v0 server. It requires 
 does not start the server or need AWS credentials; the server owns S3 access.
 
 For shared compute, point this client at your application's endpoint. The
-[framework-independent gateway](https://github.com/zPy52/nabedra-database/blob/main/server/docs/cli-and-serverless.md#host-an-application-endpoint)
+[framework-independent gateway](https://github.com/nabedra/database/blob/main/server/docs/cli-and-serverless.md#host-an-application-endpoint)
 lets that endpoint authorize and forward the existing operation with storage
 credentials supplied by server middleware.
 
@@ -356,7 +356,7 @@ The API provides no general transactions across calls, joins, import/export,
 schema migrations, model decorators, relationships, indexes, or
 data-frame adapters. The atomic batch remains a single operation.
 
-See the [server guide](https://github.com/zPy52/nabedra-database/blob/main/server/docs/reference.md#configuration)
+See the [server guide](https://github.com/nabedra/database/blob/main/server/docs/reference.md#configuration)
 for size syntax and worker configuration, and the
-[execution and recovery plan](https://github.com/zPy52/nabedra-database/blob/main/plans/resource-aware-scheduling.md)
+[execution and recovery plan](https://github.com/nabedra/database/blob/main/plans/resource-aware-scheduling.md)
 for storage and worker requirements.

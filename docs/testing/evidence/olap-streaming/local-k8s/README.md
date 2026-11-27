@@ -31,4 +31,4 @@ The container exited zero after 49.82 seconds. Peak observed Docker VM use was
 1,038,258,176 bytes. Cleanup confirmed the container was absent before the
 Docker lane was released.
 [Raw assertions](olap-output.txt) · [Session trace](trace.jsonl) ·
-[Linux build](https://github.com/zPy52/nabedra-database/actions/runs/44929728236)
+[Linux build](https://github.com/nabedra/database/actions/runs/44929728236)

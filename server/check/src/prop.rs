@@ -62,7 +62,11 @@ pub fn parse_u64(raw: &str) -> Option<u64> {
 /// The seed of case `case` under base seed `base`. Case 0 uses `base` itself, which is what makes
 /// the printed replay line work.
 pub fn case_seed(base: u64, case: u64) -> u64 {
-    if case == 0 { base } else { mix(base.wrapping_add(case.wrapping_mul(GAMMA))) }
+    if case == 0 {
+        base
+    } else {
+        mix(base.wrapping_add(case.wrapping_mul(GAMMA)))
+    }
 }
 
 fn name_seed(name: &str) -> u64 {
@@ -83,7 +87,9 @@ pub fn check_with(cfg: Config, name: &str, f: impl Fn(&mut Gen) -> Result<(), St
     for case in 0..cfg.cases {
         let seed = case_seed(base, case);
         let mut g = Gen::from_seed(seed);
-        let Err(message) = run(&f, &mut g) else { continue };
+        let Err(message) = run(&f, &mut g) else {
+            continue;
+        };
         let original = g.into_tape();
         let original_len = original.len();
         let s = shrink_with_seed(seed, original, message, cfg.max_shrink_steps, &f);
@@ -143,13 +149,15 @@ pub fn run(f: &impl Fn(&mut Gen) -> Result<(), String>, g: &mut Gen) -> Result<(
     match out {
         Ok(r) => r,
         Err(payload) => {
-            let text = LAST_PANIC.with(|p| p.borrow_mut().take()).unwrap_or_else(|| {
-                payload
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "non-string panic payload".into())
-            });
+            let text = LAST_PANIC
+                .with(|p| p.borrow_mut().take())
+                .unwrap_or_else(|| {
+                    payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".into())
+                });
             Err(format!("panic: {text}"))
         }
     }
@@ -253,16 +261,27 @@ impl<F: Fn(&mut Gen) -> Result<(), String>> Shrinker<'_, F> {
                 i += 1;
                 continue;
             }
-            while i < self.best.len() && self.best[i] > 1 && self.attempt(self.with(i, self.best[i] / 2)) {}
+            while i < self.best.len()
+                && self.best[i] > 1
+                && self.attempt(self.with(i, self.best[i] / 2))
+            {}
             if i < self.best.len() && self.best[i] > 1 {
                 // best[i] fails and best[i] / 2 did not: search (lo, hi] for the smallest failure.
                 let (mut lo, mut hi) = (self.best[i] / 2, self.best[i]);
-                while hi - lo > 1 && i < self.best.len() && self.best[i] == hi && !self.exhausted() {
+                while hi - lo > 1 && i < self.best.len() && self.best[i] == hi && !self.exhausted()
+                {
                     let mid = lo + (hi - lo) / 2;
-                    if self.attempt(self.with(i, mid)) { hi = mid } else { lo = mid }
+                    if self.attempt(self.with(i, mid)) {
+                        hi = mid
+                    } else {
+                        lo = mid
+                    }
                 }
             }
-            while i < self.best.len() && self.best[i] > 0 && self.attempt(self.with(i, self.best[i] - 1)) {}
+            while i < self.best.len()
+                && self.best[i] > 0
+                && self.attempt(self.with(i, self.best[i] - 1))
+            {}
             i += 1;
         }
     }
@@ -325,7 +344,14 @@ fn shrink_with_seed(
     max_steps: u64,
     f: &impl Fn(&mut Gen) -> Result<(), String>,
 ) -> Shrunk {
-    let mut s = Shrinker { f, seed, best: tape, message, steps: 0, max_steps };
+    let mut s = Shrinker {
+        f,
+        seed,
+        best: tape,
+        message,
+        steps: 0,
+        max_steps,
+    };
     loop {
         let before = s.best.clone();
         s.delete_chunks();
@@ -336,5 +362,9 @@ fn shrink_with_seed(
             break;
         }
     }
-    Shrunk { tape: s.best, message: s.message, steps: s.steps }
+    Shrunk {
+        tape: s.best,
+        message: s.message,
+        steps: s.steps,
+    }
 }

@@ -310,8 +310,14 @@ impl Stage {
     }
 }
 
-/// The ledgers that differ. One that only one side has is zero on the other.
+/// The ledgers that differ. One that only one side has is zero on the other. The route cache
+/// is judged by its bounds alone ([`super::split_route_cache`]).
 fn differences(before: &Ledgers, after: &Ledgers) -> Vec<String> {
+    let (before, after) = match super::split_route_cache(before, after) {
+        Ok(split) => split,
+        Err(off) => return vec![off],
+    };
+    let (before, after) = (&before, &after);
     let keys: BTreeSet<_> = before.keys().chain(after.keys()).collect();
     keys.into_iter()
         .filter_map(|key| {
