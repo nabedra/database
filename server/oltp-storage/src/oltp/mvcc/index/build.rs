@@ -15,7 +15,9 @@ use crate::oltp::{
     },
     pool::ScratchLease,
 };
-use crate::protocol::Outcome;
+use crate::{
+    protocol::Outcome,
+};
 use nabedra_oltp_types::{
     owned::serialized_digest,
     types::{Authority, Digest, MaintenanceOwnerRef, ReadTs, RequestBinding, TxnId},
@@ -168,21 +170,11 @@ impl IndexService {
             }
             nabedra_rt::time::sleep(std::time::Duration::from_millis(2)).await;
         };
-        if let Err(cause) = self
-            .backend
-            .planner()
-            .validate_index_declaration(&metadata.pin, &definition)
-            .await
-        {
-            return self
-                .failed(
-                    metadata,
-                    PlanError::Guarded {
-                        cause: Box::new(cause),
-                        guards: vec![guard],
-                    },
-                )
-                .await;
+        if let Err(cause) = self.backend.planner().validate_index_declaration(&metadata.pin, &definition).await {
+            return self.failed(metadata, PlanError::Guarded {
+                cause: Box::new(cause),
+                guards: vec![guard],
+            }).await;
         }
         // Plan section 7: direct writers stop at the Data log before the
         // source pin, so every direct commit that omitted the new index is
@@ -190,22 +182,13 @@ impl IndexService {
         if let Err(cause) = self
             .backend
             .planner()
-            .fence_direct_writers(
-                &metadata.pin,
-                definition.table_id,
-                Some(metadata.txn.request_id),
-            )
+            .fence_direct_writers(&metadata.pin, definition.table_id, Some(metadata.txn.request_id))
             .await
         {
-            return self
-                .failed(
-                    metadata,
-                    PlanError::Guarded {
-                        cause: Box::new(cause),
-                        guards: vec![guard],
-                    },
-                )
-                .await;
+            return self.failed(metadata, PlanError::Guarded {
+                cause: Box::new(cause),
+                guards: vec![guard],
+            }).await;
         }
         let (pin, source) = match self
             .backend
@@ -346,15 +329,10 @@ impl IndexService {
             .fence_direct_writers(&metadata.pin, next.table_id, Some(metadata.txn.request_id))
             .await
         {
-            return self
-                .failed(
-                    metadata,
-                    PlanError::Guarded {
-                        cause: Box::new(cause),
-                        guards: vec![guard],
-                    },
-                )
-                .await;
+            return self.failed(metadata, PlanError::Guarded {
+                cause: Box::new(cause),
+                guards: vec![guard],
+            }).await;
         }
         let (pin, source) = match self.backend.source_pin(metadata.pin.authority, next).await {
             Ok(source) => source,
@@ -514,18 +492,13 @@ impl IndexService {
                         .map_err(|_| blocked_index())?,
                     source.authority,
                 )?;
-                let completed = self
-                    .backend
-                    .planner()
-                    .catalog()
-                    .read::<IndexProgress>(
-                        &current,
-                        MvccKey::CatalogIndexProgress {
-                            table_id: maintenance.table_id,
-                            progress_id: progress_id(maintenance.index_id, route.group.group_id),
-                        },
-                    )
-                    .await?;
+                let completed = self.backend.planner().catalog().read::<IndexProgress>(
+                    &current,
+                    MvccKey::CatalogIndexProgress {
+                        table_id: maintenance.table_id,
+                        progress_id: progress_id(maintenance.index_id, route.group.group_id),
+                    },
+                ).await?;
                 if matches!(completed, CatalogRead::Value { record: Some(progress), .. }
                     if progress.done && progress.build_id == maintenance.build_id
                     && progress.attempt == maintenance.attempt && progress.group_id == route.group.group_id
@@ -587,27 +560,15 @@ impl IndexService {
                             if crate::oltp::test_hooks::index_holds::checkpoint(
                                 maintenance.index_id,
                                 crate::oltp::test_hooks::index_holds::Checkpoint::Backfill,
-                                || {
-                                    Some(crate::oltp::test_hooks::index_holds::PageBuffers {
-                                        rows: records.len(),
-                                        source_rows: records
-                                            .iter()
-                                            .filter(|record| record.value.is_some())
-                                            .count(),
-                                        page_bytes: response.decode_owner().unwrap().bytes(),
-                                        cursor_bytes: after_owner
-                                            .as_ref()
-                                            .map_or(0, |owner| owner.bytes()),
-                                        exhausted: *exhausted,
-                                    })
-                                },
-                            )
-                            .await
-                            {
-                                return Err(failure(
-                                    ErrorCode::StorageUnavailable,
-                                    "index fixture interrupted backfill",
-                                ));
+                                || Some(crate::oltp::test_hooks::index_holds::PageBuffers {
+                                    rows: records.len(),
+                                    source_rows: records.iter().filter(|record| record.value.is_some()).count(),
+                                    page_bytes: response.decode_owner().unwrap().bytes(),
+                                    cursor_bytes: after_owner.as_ref().map_or(0, |owner| owner.bytes()),
+                                    exhausted: *exhausted,
+                                }),
+                            ).await {
+                                return Err(failure(ErrorCode::StorageUnavailable, "index fixture interrupted backfill"));
                             }
                             blocked = 0;
                             for record in records.iter() {
@@ -638,13 +599,8 @@ impl IndexService {
                                         maintenance.index_id,
                                         crate::oltp::test_hooks::index_holds::Checkpoint::Refresh,
                                         || None,
-                                    )
-                                    .await
-                                    {
-                                        return Err(failure(
-                                            ErrorCode::StorageUnavailable,
-                                            "index fixture interrupted refresh",
-                                        ));
+                                    ).await {
+                                        return Err(failure(ErrorCode::StorageUnavailable, "index fixture interrupted refresh"));
                                     }
                                 }
                             }
@@ -802,9 +758,7 @@ impl IndexService {
                     error = *cause;
                 }
                 PlanError::Protocol(error) => {
-                    self.backend
-                        .fail(attempt, guards, None, error.clone())
-                        .await?;
+                    self.backend.fail(attempt, guards, None, error.clone()).await?;
                     return Err(error);
                 }
                 error => {
@@ -813,9 +767,7 @@ impl IndexService {
                         _ => None,
                     };
                     let error = blocked_index();
-                    self.backend
-                        .fail(attempt, guards, pending, error.clone())
-                        .await?;
+                    self.backend.fail(attempt, guards, pending, error.clone()).await?;
                     return Err(error);
                 }
             }
@@ -824,27 +776,15 @@ impl IndexService {
 }
 
 fn blocked_index() -> ProtocolError {
-    failure(
-        ErrorCode::StorageUnavailable,
-        "index dependency is still active",
-    )
+    failure(ErrorCode::StorageUnavailable, "index dependency is still active")
 }
 
 pub fn ready_job(owner: MaintenanceOwnerRef) -> Result<(Uuid, Digest), ProtocolError> {
-    Ok((
-        job_id(owner, b"ready", None)?,
-        serialized_digest(&(b"index-ready/v1", owner))?,
-    ))
+    Ok((job_id(owner, b"ready", None)?, serialized_digest(&(b"index-ready/v1", owner))?))
 }
 
-pub fn declaration_job(
-    owner: MaintenanceOwnerRef,
-    definition: &IndexDefinition,
-) -> Result<(Uuid, Digest), ProtocolError> {
-    Ok((
-        job_id(owner, b"declare", None)?,
-        serialized_digest(&(b"index-declare/v1", definition, owner))?,
-    ))
+pub fn declaration_job(owner: MaintenanceOwnerRef, definition: &IndexDefinition) -> Result<(Uuid, Digest), ProtocolError> {
+    Ok((job_id(owner, b"declare", None)?, serialized_digest(&(b"index-declare/v1", definition, owner))?))
 }
 pub fn refresh_job(
     owner: MaintenanceOwnerRef,

@@ -1,9 +1,9 @@
 //! NS6: the pool on `nabedra-kv`. Fault and crash scenarios run the store on
 //! `FaultFs`; their power-loss evidence is a fault model, not a physical cut.
 use super::*;
+use nabedra_kv::fs::{FaultFs, Fs};
 #[cfg(test)]
 use nabedra_kv::fs::{Fault, FaultError, FsFile, FsLock, FsOp, OpenMode};
-use nabedra_kv::fs::{FaultFs, Fs};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 

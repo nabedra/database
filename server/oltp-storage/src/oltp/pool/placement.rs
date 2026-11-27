@@ -7,7 +7,10 @@ pub(super) fn learner_key(group: Uuid) -> Vec<u8> {
 }
 
 impl OltpPool {
-    pub async fn unused_placement_target(&self, group: GroupIdentity) -> Result<(), ProtocolError> {
+    pub async fn unused_placement_target(
+        &self,
+        group: GroupIdentity,
+    ) -> Result<(), ProtocolError> {
         let pool = self.clone();
         self.resources()
             .execute(ExecutionClass::Control, 0, 0, move || {

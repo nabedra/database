@@ -163,12 +163,10 @@ impl RangeClock {
         }
         #[cfg(feature = "sim")]
         nabedra_oltp_types::sim_probe::track_ledgers(&clock, |clock: &Self| {
-            nabedra_oltp_types::sim_probe::emit(|| {
-                nabedra_oltp_types::sim_probe::Probe::LedgerSnapshot {
-                    ledger: nabedra_oltp_types::sim_probe::Ledger::RangeClockPending,
-                    group: Some(clock._store.identity().group_id),
-                    outstanding: clock.lock().pending.len() as u64,
-                }
+            nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::LedgerSnapshot {
+                ledger: nabedra_oltp_types::sim_probe::Ledger::RangeClockPending,
+                group: Some(clock._store.identity().group_id),
+                outstanding: clock.lock().pending.len() as u64,
             });
         });
         registry.insert(key, Arc::downgrade(&clock));
@@ -261,12 +259,10 @@ impl RangeClock {
         }
         state.pending.insert(commit_ts, keys);
         #[cfg(feature = "sim")]
-        nabedra_oltp_types::sim_probe::emit(|| {
-            nabedra_oltp_types::sim_probe::Probe::DirectProposed {
-                group: self._store.identity().group_id,
-                commit_ts: commit_ts.get(),
-                term: token.term,
-            }
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::DirectProposed {
+            group: self._store.identity().group_id,
+            commit_ts: commit_ts.get(),
+            term: token.term,
         });
         Ok(())
     }
@@ -388,10 +384,7 @@ impl RangeClock {
                     return Ok(());
                 }
             }
-            if nabedra_rt::time::timeout_at(deadline, notified)
-                .await
-                .is_err()
-            {
+            if nabedra_rt::time::timeout_at(deadline, notified).await.is_err() {
                 return Err(failure(
                     ErrorCode::StorageUnavailable,
                     "range read waited too long for an in-flight direct commit",

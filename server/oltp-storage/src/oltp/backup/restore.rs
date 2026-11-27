@@ -152,7 +152,10 @@ pub struct RestoredGenesis {
     target: Arc<Target>,
 }
 impl OfflineRestoreTarget {
-    pub fn claim(destination: &Path, plan: &VerifiedRestorePlan) -> Result<Self, ProtocolError> {
+    pub fn claim(
+        destination: &Path,
+        plan: &VerifiedRestorePlan,
+    ) -> Result<Self, ProtocolError> {
         if !plan.base.status_partitions.is_empty() {
             return Err(failure(
                 ErrorCode::UnsupportedOperation,

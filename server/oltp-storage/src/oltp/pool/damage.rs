@@ -136,10 +136,8 @@ impl DamageState {
         let Some(pool) = self.pool.get().cloned() else {
             return;
         };
-        let spawned = nabedra_rt::task::spawn_oneshot(
-            "oltp-damage",
-            nabedra_kv::THREAD_STACK_BYTES,
-            move || {
+        let spawned =
+            nabedra_rt::task::spawn_oneshot("oltp-damage", nabedra_kv::THREAD_STACK_BYTES, move || {
                 let Some(inner) = pool.upgrade() else {
                     return;
                 };
@@ -149,8 +147,7 @@ impl DamageState {
                     // only make R6 stricter.
                     tracing::warn!(%group, %error, "could not record run-time quarantine");
                 }
-            },
-        );
+            });
         if spawned.is_err() {
             tracing::warn!(%group, "could not record run-time quarantine: no thread");
         }

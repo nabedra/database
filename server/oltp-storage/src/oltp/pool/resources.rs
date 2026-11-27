@@ -1,17 +1,19 @@
 //! Worker-owned physical execution and native-memory resources.
 use crate::{oltp::read_attempt::ReadAttempts, protocol::ProtocolError};
-#[cfg(any(test, feature = "test-hooks"))]
-pub use nabedra_resources::memory::RAFT_REPLICA_BYTES;
+use nabedra_resources::{
+    config::{ExecutionConfig, WorkerResources},
+    scheduling::{MemoryCharge, ResourceScheduler},
+};
 use nabedra_resources::memory::WorkerMemory;
 pub use nabedra_resources::memory::{
     ByteClass, ChargedBuffer, ChargedBytes, ExecutionClass, ScratchLease, SharedResourceConfig,
 };
 pub(super) use nabedra_resources::memory::{ByteReservation, ScratchBuffer, capacity};
-pub(crate) use nabedra_resources::memory::{DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease};
-use nabedra_resources::{
-    config::{ExecutionConfig, WorkerResources},
-    scheduling::{MemoryCharge, ResourceScheduler},
+pub(crate) use nabedra_resources::memory::{
+    DEFAULT_REPLY_DECODE_BYTES, GroupCapacityLease,
 };
+#[cfg(any(test, feature = "test-hooks"))]
+pub use nabedra_resources::memory::RAFT_REPLICA_BYTES;
 use serde::Serialize;
 use std::{
     any::Any,
@@ -418,7 +420,9 @@ impl WorkerSharedResources {
     }
 
     #[doc(hidden)]
-    pub fn read_replica<T: Send + Sync + 'static>(&self) -> Result<Arc<T>, ProtocolError> {
+    pub fn read_replica<T: Send + Sync + 'static>(
+        &self,
+    ) -> Result<Arc<T>, ProtocolError> {
         self.read_replica
             .get()
             .and_then(|slot| slot.downcast_ref::<Weak<T>>())
@@ -437,7 +441,9 @@ impl WorkerSharedResources {
     }
 
     #[doc(hidden)]
-    pub fn read_queue<T: Send + Sync + 'static>(&self) -> Result<Arc<T>, ProtocolError> {
+    pub fn read_queue<T: Send + Sync + 'static>(
+        &self,
+    ) -> Result<Arc<T>, ProtocolError> {
         self.read_queue
             .get()
             .and_then(|slot| slot.downcast_ref::<Weak<T>>())
@@ -633,8 +639,8 @@ impl Drop for NativeSettlement {
     fn drop(&mut self) {
         self.0.state.lock().expect("native lease state").count -= 1;
         #[cfg(feature = "sim")]
-        nabedra_oltp_types::sim_probe::emit(|| {
-            nabedra_oltp_types::sim_probe::Probe::GuardReleased { guard: self.1 }
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::GuardReleased {
+            guard: self.1,
         });
         self.0.settled.notify_waiters();
     }
@@ -762,11 +768,7 @@ impl WorkerSharedResources {
     fn probe_ledgers(&self) {
         use nabedra_oltp_types::sim_probe::{Ledger, Probe, emit};
         let snapshot = |ledger, outstanding: u64| {
-            emit(|| Probe::LedgerSnapshot {
-                ledger,
-                group: None,
-                outstanding,
-            })
+            emit(|| Probe::LedgerSnapshot { ledger, group: None, outstanding })
         };
         let (progress, data) = (
             self.buffer_bytes_used(ByteClass::Progress) as u64,
@@ -791,12 +793,7 @@ impl WorkerSharedResources {
             snapshot(Ledger::ChargedBytes(class), bytes);
         }
         let node = self.scheduler_node_id();
-        for (_, threads, bytes) in self
-            .scheduler()
-            .usage()
-            .into_iter()
-            .filter(|row| row.0 == node)
-        {
+        for (_, threads, bytes) in self.scheduler().usage().into_iter().filter(|row| row.0 == node) {
             snapshot(Ledger::ComputeGuards, threads);
             snapshot(Ledger::SchedulerBytes, bytes);
         }

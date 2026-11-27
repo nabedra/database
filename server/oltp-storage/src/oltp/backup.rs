@@ -6,9 +6,9 @@ pub mod history;
 pub mod lifecycle;
 #[doc(hidden)]
 pub mod restore;
-use crate::protocol::{ErrorCode, Outcome, ProtocolError};
-#[doc(hidden)]
-pub use nabedra_oltp_types::authority::BackupOwnerRef;
+use crate::{
+    protocol::{ErrorCode, Outcome, ProtocolError},
+};
 use nabedra_oltp_types::{
     owned::serialized_digest,
     types::{Digest, StoragePin},
@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use uuid::Uuid;
+#[doc(hidden)]
+pub use nabedra_oltp_types::authority::BackupOwnerRef;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupPublishedStatement {

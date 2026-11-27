@@ -18,8 +18,7 @@ fn acceptance_o20() {
         std::env::var_os("NABEDRA_ACCEPTANCE_PYTHON").unwrap_or_else(|| "python3.11".into()),
     )
     .arg(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/oltp_migration_acceptance.py"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/oltp_migration_acceptance.py"),
     )
     .arg("--olap-binary")
     .arg(olap)
@@ -47,10 +46,7 @@ fn acceptance_o24() {
     let status = std::process::Command::new(
         std::env::var_os("NABEDRA_ACCEPTANCE_PYTHON").unwrap_or_else(|| "python3.11".into()),
     )
-    .arg(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/oltp_postgres_benchmark.py"),
-    )
+    .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/oltp_postgres_benchmark.py"))
     .arg("--config")
     .arg(config)
     .arg("--output")

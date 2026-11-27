@@ -30,7 +30,9 @@ impl<R> Applied<R> {
             decode_owner: Some(owner),
         }
     }
-    pub fn into_parts(self) -> Result<(AppliedPosition, R, Arc<ScratchLease>), ProtocolError> {
+    pub fn into_parts(
+        self,
+    ) -> Result<(AppliedPosition, R, Arc<ScratchLease>), ProtocolError> {
         let owner = self.decode_owner.ok_or_else(|| {
             crate::protocol::ProtocolError::new(
                 crate::protocol::ErrorCode::StorageUnavailable,

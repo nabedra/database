@@ -1,6 +1,6 @@
 //! Native Data settlement and exact evidence for a Timestamp decision home.
-use super::consensus::Applied;
 use super::*;
+use super::consensus::Applied;
 use crate::oltp::pool::{ByteClass, GroupRead};
 use nabedra_oltp_types::{
     authority::{PointDecision, ScopedCatalogRead},

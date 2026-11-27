@@ -94,7 +94,11 @@ pub async fn pause(stage: &str, request: Uuid) {
 
 /// Each selected checkpoint belongs to the first actor that reaches it.
 /// A reader helping the same transaction must be able to pass a paused actor.
-pub async fn transaction_checkpoint(stage: &str, request: Uuid, observed: &impl serde::Serialize) {
+pub async fn transaction_checkpoint(
+    stage: &str,
+    request: Uuid,
+    observed: &impl serde::Serialize,
+) {
     if stage == "participants" || stage.starts_with("retry-participants-") {
         index_holds::checkpoint(request, index_holds::Checkpoint::RefreshPrepare, || None).await;
     }

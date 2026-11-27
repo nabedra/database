@@ -1,7 +1,10 @@
 use super::*;
 use nabedra_oltp_types::types::{GroupKind, Text};
 use nabedra_resources::config::WorkerResources;
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::Duration,
+};
 
 #[cfg(test)]
 use std::sync::{Condvar, Mutex};

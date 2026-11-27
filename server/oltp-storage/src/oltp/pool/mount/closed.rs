@@ -50,8 +50,7 @@ pub(super) fn read_marker(
                 && metadata.nlink() == 1 =>
         {
             let mut bytes = Vec::new();
-            fs::OpenOptions::new()
-                .read(true)
+            fs::OpenOptions::new().read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(path)
                 .map_err(|_| invalid())?
@@ -94,10 +93,7 @@ impl VerifiedPoolMount {
             if load_marker(&self.directory, &marker.expected, close_id)? {
                 return self.directory.sync_all().map_err(|_| invalid());
             }
-            let temporary = root.join(format!(
-                ".nabedra-closing-{}.tmp",
-                nabedra_rt::ids::uuid_v4()
-            ));
+            let temporary = root.join(format!(".nabedra-closing-{}.tmp", nabedra_rt::ids::uuid_v4()));
             let result = (|| {
                 let file = OpenOptions::new()
                     .write(true)

@@ -7,7 +7,13 @@ pub fn marker(scope: ReadScope, group: Uuid, stage: &str) -> Option<PathBuf> {
     Some(directory.join(format!("read-{}-{group}-{stage}", scope.request.request_id)))
 }
 
-pub fn record(scope: ReadScope, group: Uuid, stage: &str, ticket: Uuid, worker: WorkerIdentity) {
+pub fn record(
+    scope: ReadScope,
+    group: Uuid,
+    stage: &str,
+    ticket: Uuid,
+    worker: WorkerIdentity,
+) {
     let Some(path) = marker(scope, group, stage) else {
         return;
     };

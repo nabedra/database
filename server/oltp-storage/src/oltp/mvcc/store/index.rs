@@ -314,7 +314,10 @@ pub fn index_closure_row(
     Ok(Some(row))
 }
 
-pub fn phase_certifies_closure(phase: &IndexPhase, closure: &IndexAttemptClosedRecord) -> bool {
+pub fn phase_certifies_closure(
+    phase: &IndexPhase,
+    closure: &IndexAttemptClosedRecord,
+) -> bool {
     let (build_id, attempt, pin) = phase.attempt_binding();
     if build_id != closure.owner.build_id {
         return false;

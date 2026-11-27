@@ -247,15 +247,7 @@ impl NativePlanner {
     ) -> Result<LifecycleBinding, PlanError> {
         let (version, table) = value(self.catalog.describe(pin, table_id).await?)?;
         let table = table.ok_or_else(not_found)?;
-        Ok(self.lifecycle_binding(
-            pin,
-            txn,
-            request,
-            table_id,
-            version,
-            table.schema_epoch,
-            pin.authority,
-        ))
+        Ok(self.lifecycle_binding(pin, txn, request, table_id, version, table.schema_epoch, pin.authority))
     }
 
     pub(crate) async fn validate_index_declaration(
@@ -265,33 +257,16 @@ impl NativePlanner {
     ) -> Result<(), PlanError> {
         let (_, table) = value(self.catalog.describe(pin, definition.table_id).await?)?;
         definition.validate(&table.ok_or_else(not_found)?.descriptor)?;
-        let (_, name) = value(
-            self.catalog
-                .read::<IndexNameRecord>(
-                    pin,
-                    MvccKey::CatalogIndexName {
-                        table_id: definition.table_id,
-                        name: nabedra_oltp_types::types::Text::try_from(definition.name.as_str())
-                            .map_err(|_| not_found())?,
-                    },
-                )
-                .await?,
-        )?;
-        let (_, record) = value(
-            self.catalog
-                .read::<IndexRecord>(
-                    pin,
-                    MvccKey::CatalogIndex {
-                        table_id: definition.table_id,
-                        index_id: definition.index_id,
-                    },
-                )
-                .await?,
-        )?;
+        let (_, name) = value(self.catalog.read::<IndexNameRecord>(pin, MvccKey::CatalogIndexName {
+            table_id: definition.table_id,
+            name: nabedra_oltp_types::types::Text::try_from(definition.name.as_str()).map_err(|_| not_found())?,
+        }).await?)?;
+        let (_, record) = value(self.catalog.read::<IndexRecord>(pin, MvccKey::CatalogIndex {
+            table_id: definition.table_id,
+            index_id: definition.index_id,
+        }).await?)?;
         if name.is_some() || record.is_some() {
-            return Err(
-                failure(ErrorCode::Conflict, "index name or identity already exists").into(),
-            );
+            return Err(failure(ErrorCode::Conflict, "index name or identity already exists").into());
         }
         Ok(())
     }
@@ -425,8 +400,10 @@ impl NativePlanner {
                 PreparedWrite {
                     key: MvccKey::CatalogIndexName {
                         table_id,
-                        name: nabedra_oltp_types::types::Text::try_from(definition.name.as_str())
-                            .map_err(|_| not_found())?,
+                        name: nabedra_oltp_types::types::Text::try_from(
+                            definition.name.as_str(),
+                        )
+                        .map_err(|_| not_found())?,
                     },
                     expected_version: name_version,
                     change: self.index_put(&IndexNameRecord { index_id })?,

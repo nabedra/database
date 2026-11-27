@@ -170,25 +170,17 @@ impl OltpPool {
         let mut after = None;
         loop {
             let bytes = self.list_groups(after, 32, budget).await?;
-            let page: LocalGroupPage =
-                serde_json::from_slice(bytes.as_ref()).map_err(|_| storage_error_message())?;
+            let page: LocalGroupPage = serde_json::from_slice(bytes.as_ref())
+                .map_err(|_| storage_error_message())?;
             for group in page.items {
                 let proof = self.drain_group_retirement(group).await?;
                 if !check(proof).await? {
-                    return Err(failure(
-                        ErrorCode::Conflict,
-                        "Control has not acknowledged exact replica retirement",
-                    ));
+                    return Err(failure(ErrorCode::Conflict, "Control has not acknowledged exact replica retirement"));
                 }
             }
-            if page.exhausted {
-                return Ok(());
-            }
-            after = Some(
-                page.after
-                    .filter(|next| after.is_none_or(|old| *next > old))
-                    .ok_or_else(storage_error_message)?,
-            );
+            if page.exhausted { return Ok(()); }
+            after = Some(page.after.filter(|next| after.is_none_or(|old| *next > old))
+                .ok_or_else(storage_error_message)?);
         }
     }
 
@@ -204,7 +196,8 @@ impl OltpPool {
     pub async fn drain_group_retirement(
         &self,
         group: GroupIdentity,
-    ) -> Result<nabedra_oltp_types::authority::ReplicaRetiredStamp, ProtocolError> {
+    ) -> Result<nabedra_oltp_types::authority::ReplicaRetiredStamp, ProtocolError>
+    {
         use nabedra_oltp_types::{authority::ReplicaRetiredStamp, types::GroupKind};
         let pool = self.clone();
         self.resources()

@@ -16,8 +16,8 @@ use nabedra_oltp_types::{
     authority::{SealedStatusDecision, TimestampDecisionLocator},
     owned::{OwnedCommand, OwnedPayload},
     types::{
-        AppliedPosition, Authority, CommitTs, Digest, GroupIdentity, GroupKind, ManifestRef, Page,
-        ParticipantPlan, PreparedParticipant, ReadTs, RequestBinding, TxnDecision, TxnId,
+        AppliedPosition, Authority, CommitTs, Digest, GroupIdentity, GroupKind, ManifestRef,
+        Page, ParticipantPlan, PreparedParticipant, ReadTs, RequestBinding, TxnDecision, TxnId,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -58,13 +58,13 @@ pub mod split_usage;
 #[doc(hidden)]
 pub mod timestamp_resolution;
 #[doc(hidden)]
+pub use nabedra_oltp_types::authority::ResolutionEvidence;
+#[doc(hidden)]
 pub use handle::{
-    LatestRead, ParticipantEpochs, ParticipantFuture, ParticipantHandle, ParticipantReplyProof,
-    PointEvidenceRead, RemoteParticipant, ScheduledReadFuture, VerifiedParticipantResolution,
+    LatestRead, ParticipantEpochs, ParticipantFuture, ParticipantHandle, PointEvidenceRead,
+    ParticipantReplyProof, RemoteParticipant, ScheduledReadFuture, VerifiedParticipantResolution,
     VerifiedParticipantSeal,
 };
-#[doc(hidden)]
-pub use nabedra_oltp_types::authority::ResolutionEvidence;
 const CONFIG: &[u8] = b"mvcc/config/v1";
 const HEAD: u8 = b'h';
 const VALUE: u8 = b'v';
@@ -551,7 +551,8 @@ fn apply(
         let mut fence_key = [0; 17];
         fence_key[0] = b'F';
         fence_key[1..].copy_from_slice(transition_id.as_bytes());
-        if let Some(receipt) = load::<nabedra_oltp_types::types::GroupFenceReceipt>(tx, &fence_key)?
+        if let Some(receipt) =
+            load::<nabedra_oltp_types::types::GroupFenceReceipt>(tx, &fence_key)?
         {
             return if receipt.command_digest == command_digest {
                 commit(tx, &ParticipantReply::Fenced(receipt))
@@ -629,15 +630,10 @@ fn apply(
         return commit(tx, &ParticipantReply::Fenced(receipt));
     }
     #[cfg(feature = "sim")]
-    if matches!(
-        command,
-        ParticipantCommand::Direct(_) | ParticipantCommand::DirectBatch(_)
-    ) {
-        nabedra_oltp_types::sim_probe::emit(|| {
-            nabedra_oltp_types::sim_probe::Probe::DirectApplying {
-                group: group.group_id,
-                index: position.index,
-            }
+    if matches!(command, ParticipantCommand::Direct(_) | ParticipantCommand::DirectBatch(_)) {
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::DirectApplying {
+            group: group.group_id,
+            index: position.index,
         });
     }
     match command {
@@ -959,21 +955,9 @@ fn apply(
                 },
             )
         }
-        ParticipantCommand::Seal {
-            txn,
-            manifest,
-            result_digest,
-            ..
-        } => seal(
-            tx,
-            *txn,
-            *manifest,
-            *result_digest,
-            authority,
-            position,
-            scope,
-            None,
-        ),
+        ParticipantCommand::Seal { txn, manifest, result_digest, .. } => {
+            seal(tx, *txn, *manifest, *result_digest, authority, position, scope, None)
+        }
         ParticipantCommand::SealTimestampPoint { locator, .. } => {
             let Some(scope) = scope else {
                 return reject(tx, Fault::InvalidBinding);
@@ -985,14 +969,8 @@ fn apply(
                 return reject(tx, Fault::InvalidBinding);
             }
             seal(
-                tx,
-                locator.binding.txn,
-                locator.manifest,
-                locator.binding.result_digest,
-                authority,
-                position,
-                Some(scope),
-                Some(locator.digest()?),
+                tx, locator.binding.txn, locator.manifest, locator.binding.result_digest,
+                authority, position, Some(scope), Some(locator.digest()?),
             )
         }
         ParticipantCommand::ResolveTimestampPoint { proof, .. } => {
@@ -1074,9 +1052,7 @@ fn apply(
             }
             proof.validate_for(txn, &state.manifest, &state.request)?;
             if known_digest.is_some()
-                && (state.decision.is_none()
-                    || state.resolved == 0
-                    || state.resolved > state.writes)
+                && (state.decision.is_none() || state.resolved == 0 || state.resolved > state.writes)
             {
                 return Err(recovery_unknown());
             }
@@ -1160,7 +1136,8 @@ fn seal(
     scope: Option<nabedra_oltp_types::authority::ScopedCatalogRead>,
     point_home: Option<Digest>,
 ) -> Result<Transition, ProtocolError> {
-    if tx.pinned(&txn_key(b'b', txn))?.is_some() || timestamp_resolution::rejection_exists(tx, txn)?
+    if tx.pinned(&txn_key(b'b', txn))?.is_some()
+        || timestamp_resolution::rejection_exists(tx, txn)?
     {
         return reject(tx, Fault::RolledBack);
     }
@@ -1246,7 +1223,9 @@ fn resolve_writes(
                         value: Option<&'a RawValue>,
                     }
                     let value = match intent.change {
-                        IntentChange::Put => Some(intent.value.ok_or_else(recovery_unknown)?),
+                        IntentChange::Put => {
+                            Some(intent.value.ok_or_else(recovery_unknown)?)
+                        }
                         IntentChange::Delete => None,
                         _ => unreachable!(),
                     };
@@ -1278,9 +1257,7 @@ fn resolve_writes(
         && until == state.writes
     {
         nabedra_oltp_types::sim_probe::emit(|| {
-            nabedra_oltp_types::sim_probe::Probe::WritesResolved {
-                commit_ts: commit_ts.get(),
-            }
+            nabedra_oltp_types::sim_probe::Probe::WritesResolved { commit_ts: commit_ts.get() }
         });
     }
     Ok(())
@@ -1291,11 +1268,9 @@ fn resolve_writes(
 #[cfg(feature = "sim")]
 fn snapshot_probe(group: &GroupIdentity, read_ts: ReadTs) {
     if matches!(group.kind, GroupKind::Data { .. }) && read_ts.get() != u64::MAX {
-        nabedra_oltp_types::sim_probe::emit(|| {
-            nabedra_oltp_types::sim_probe::Probe::SnapshotServed {
-                group: group.group_id,
-                read_ts: read_ts.get(),
-            }
+        nabedra_oltp_types::sim_probe::emit(|| nabedra_oltp_types::sim_probe::Probe::SnapshotServed {
+            group: group.group_id,
+            read_ts: read_ts.get(),
         });
     }
 }
@@ -1312,38 +1287,21 @@ fn route_probe(logical: &[u8], value: Option<&RawValue>, commit_ts: CommitTs) {
         Uuid::from_slice(&logical[range]).expect("encoded key holds UUIDs")
     };
     let record = match (tag, value) {
-        (6, Some(raw)) => {
-            serde_json::from_str::<RoutingRoot>(raw.get()).map(|root| RouteRecord::Root {
-                first_page: root.first_page,
-                routing_epoch: root.routing_epoch,
-            })
-        }
+        (6, Some(raw)) => serde_json::from_str::<RoutingRoot>(raw.get()).map(|root| {
+            RouteRecord::Root { first_page: root.first_page, routing_epoch: root.routing_epoch }
+        }),
         (6, None) => Ok(RouteRecord::RootDeleted),
-        (_, Some(raw)) => {
-            serde_json::from_str::<RoutingPage>(raw.get()).map(|page| RouteRecord::Page {
+        (_, Some(raw)) => serde_json::from_str::<RoutingPage>(raw.get()).map(|page| {
+            RouteRecord::Page {
                 page_id: id(17..33),
                 next_page: page.next_page,
-                spans: page
-                    .shards
-                    .iter()
-                    .map(|route| Span {
-                        group: route.group.group_id,
-                        start: route.span.start.clone(),
-                        end: route.span.end.clone(),
-                    })
-                    .collect(),
-            })
-        }
-        (_, None) => Ok(RouteRecord::PageDeleted {
-            page_id: id(17..33),
+                spans: page.shards.iter().map(|route| Span { group: route.group.group_id, start: route.span.start.clone(), end: route.span.end.clone() }).collect(),
+            }
         }),
+        (_, None) => Ok(RouteRecord::PageDeleted { page_id: id(17..33) }),
     };
     if let Ok(record) = record {
-        emit(|| Probe::RouteEpochPublished {
-            table: id(1..17),
-            commit_ts: commit_ts.get(),
-            record,
-        });
+        emit(|| Probe::RouteEpochPublished { table: id(1..17), commit_ts: commit_ts.get(), record });
     }
 }
 
@@ -1688,13 +1646,7 @@ fn components(key: &MvccKey) -> (u8, Uuid, Uuid, Option<&str>, Option<&Key>) {
         }
         MvccKey::DirectDedup {
             table_id, anchor, ..
-        } => (
-            direct::DEDUP_TAG,
-            *table_id,
-            Uuid::nil(),
-            None,
-            Some(anchor),
-        ),
+        } => (direct::DEDUP_TAG, *table_id, Uuid::nil(), None, Some(anchor)),
     }
 }
 pub fn compare_keys(a: &MvccKey, b: &MvccKey) -> Ordering {

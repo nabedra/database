@@ -12,7 +12,9 @@ use super::{
     failure,
     pool::{ByteClass, ChargedBytes, ScratchLease, WorkerSharedResources},
 };
-use crate::protocol::{ErrorCode, Key, ProtocolError};
+use crate::{
+    protocol::{ErrorCode, Key, ProtocolError},
+};
 use nabedra_oltp_types::types::{CommitTs, Text};
 /// Fixed commands may duplicate bounded frontend keys/rows. This is an
 /// internal message ceiling, independent of the unchanged8MiB application body.

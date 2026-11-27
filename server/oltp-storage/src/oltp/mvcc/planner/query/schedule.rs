@@ -3,8 +3,8 @@ use crate::{
     oltp::{pool::WorkerSharedResources, read_attempt::UnsettledRead},
     scheduling::Reservation,
 };
-use futures_util::{StreamExt, stream::FuturesUnordered};
 use nabedra_oltp_types::authority::MAX_READ_GRANTS;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{
     future::Future,
     sync::{
