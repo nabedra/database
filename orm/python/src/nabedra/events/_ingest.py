@@ -43,6 +43,16 @@ class _Pending:
     row_count: int
 
 
+def _same_event(existing: Row, row: Row) -> bool:
+    """The same event identity and deterministic payload.
+
+    A producer retry after retention removed the original event publishes it again at a
+    new offset and publish time (EVENTS-9). The original row stays: the repeat is already
+    ingested. Different data under one identity still pauses the sink.
+    """
+    return all(existing.get(name) == row[name] for name in (ROW_KEY, "partition", "data"))
+
+
 def _row(event: Event) -> Row:
     try:
         data = canonical_json(event.data).decode("utf-8")
@@ -135,7 +145,7 @@ class Writer:
                 raise SinkPaused("Destination table disappeared during reconciliation") from None
             if existing is None:
                 missing.append(row)
-            elif existing != row:
+            elif existing != row and not _same_event(existing, row):
                 raise SinkPaused("Destination already has different data for this event identity")
         return missing
 
