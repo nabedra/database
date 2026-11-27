@@ -21,7 +21,6 @@ async fn shutdown_closes_listener_and_waits_for_detached_engine_work() {
     for signal_error in [false, true] {
         tokio::time::timeout(Duration::from_secs(10), async {
             let storage = Storage::new(Fake::default(), Namespace::new("runtime/").unwrap());
-            storage.initialize_catalog().await.unwrap();
             let (pool, workers) = WorkerPool::start(
                 NonZeroUsize::new(2).unwrap(),
                 tokio::runtime::Handle::current(),
@@ -51,7 +50,7 @@ async fn shutdown_closes_listener_and_waits_for_detached_engine_work() {
                     },
                     Default::default(),
                     false,
-                    true,
+                    false,
                 )
                 .await;
                 workers.shutdown().await.unwrap();
@@ -212,7 +211,7 @@ async fn u01_startup_initializes_the_same_local_run_before_readiness() {
                     scheduler_term: 1,
                 };
                 storage
-                    .initialize_fenced_cluster_catalog(fence, false, false)
+                    .initialize_fenced_cluster_catalog(fence, false)
                     .await
                     .unwrap();
                 Some(fence)
@@ -257,7 +256,7 @@ async fn u01_startup_initializes_the_same_local_run_before_readiness() {
             client.read_to_string(&mut response).await.unwrap();
             assert!(response.starts_with("HTTP/1.1 200"));
             let catalog = engine.storage().load_cluster_catalog().await.unwrap();
-            assert_eq!(catalog.catalog().format_version, 4);
+            assert_eq!(catalog.catalog().format_version, 6);
             assert!(catalog.catalog().fence.is_some());
             if let Some(previous) = previous {
                 assert_ne!(catalog.catalog().fence.unwrap().run_id, previous.run_id);
@@ -286,7 +285,6 @@ async fn r04_startup_rejects_missing_migration_and_cold_confirmation_before_ingr
                             run_id: uuid::Uuid::new_v4(),
                             scheduler_term: 1,
                         },
-                        false,
                         false,
                     )
                     .await
@@ -321,11 +319,11 @@ async fn r04_startup_rejects_missing_migration_and_cold_confirmation_before_ingr
             )
             .await
             .unwrap_err();
-            assert!(error.to_string().contains(if legacy {
-                "migrate-catalog"
-            } else {
-                "cold-start"
-            }));
+            assert!(
+                error
+                    .to_string()
+                    .contains(if legacy { "format 6" } else { "cold-start" })
+            );
             assert!(TcpStream::connect(address).await.is_err());
             assert_eq!(
                 engine

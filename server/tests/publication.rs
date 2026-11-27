@@ -120,7 +120,10 @@ fn budget() -> HistoryBudget {
 }
 async fn store() -> (Storage<Backend>, LoadedClusterCatalog) {
     let s = Storage::new(Backend::default(), Namespace::new("test").unwrap());
-    let base = s.initialize_cluster_catalog().await.unwrap();
+    let base = s
+        .initialize_fenced_cluster_catalog(test_fence(), false)
+        .await
+        .unwrap();
     s.backend().0.lock().unwrap().puts.clear();
     (s, base)
 }
@@ -145,7 +148,7 @@ fn entry(n: u128) -> CatalogEntry {
     serde_json::from_value(serde_json::json!({"id":Uuid::from_u128(n),"schema":{"id":"int64"},"key":"id","format":"parquet","data":{"layout":"partitioned","files":[]},"row_count":0})).unwrap()
 }
 fn prepare(base: &LoadedClusterCatalog, d: Decision) -> PreparedPublication {
-    PreparedPublication::prepare(base.clone(), base.catalog().tables.clone(), d).unwrap()
+    prepare_test(base.clone(), base.catalog().tables.clone(), d).unwrap()
 }
 fn seed(s: &Storage<Backend>, key: ObjectKey, bytes: Vec<u8>) {
     s.backend().0.lock().unwrap().objects.insert(
@@ -170,7 +173,7 @@ async fn atomic_tables_and_exact_replay_including_noop_and_error() {
     let d = decision(&base, 1);
     let mut tables = base.catalog().tables.clone();
     tables.insert("users".into(), entry(50));
-    let p = PreparedPublication::prepare(base, tables.clone(), d.clone()).unwrap();
+    let p = prepare_test(base, tables.clone(), d.clone()).unwrap();
     assert!(!format!("{p:?}").contains("private-token"));
     assert!(!format!("{p:?}").contains("users"));
     assert!(!format!("{p:?}").contains("request_id"));
@@ -220,19 +223,19 @@ async fn preparation_rejects_relationships_tables_and_bounds_without_puts() {
     let d = decision(&base, 1);
     let mut bad = d.clone();
     bad.id = base.catalog().commit_id;
-    assert!(PreparedPublication::prepare(base.clone(), BTreeMap::new(), bad).is_err());
+    assert!(prepare_test(base.clone(), BTreeMap::new(), bad).is_err());
     let mut bad = d.clone();
     bad.parent = Some(Uuid::from_u128(88));
-    assert!(PreparedPublication::prepare(base.clone(), BTreeMap::new(), bad).is_err());
+    assert!(prepare_test(base.clone(), BTreeMap::new(), bad).is_err());
     let mut bad = d.clone();
     bad.base_revision += 1;
     bad.revision += 1;
-    assert!(PreparedPublication::prepare(base.clone(), BTreeMap::new(), bad).is_err());
+    assert!(prepare_test(base.clone(), BTreeMap::new(), bad).is_err());
     let mut bad = d.clone();
     bad.revision = 0;
-    assert!(PreparedPublication::prepare(base.clone(), BTreeMap::new(), bad).is_err());
+    assert!(prepare_test(base.clone(), BTreeMap::new(), bad).is_err());
     let mut tables = BTreeMap::from([("a".into(), entry(51)), ("b".into(), entry(52))]);
-    assert!(PreparedPublication::prepare(base.clone(), tables.clone(), d.clone()).is_err());
+    assert!(prepare_test(base.clone(), tables.clone(), d.clone()).is_err());
     tables.remove("b");
     let mut bad = d.clone();
     bad.response_status = 409;
@@ -240,14 +243,14 @@ async fn preparation_rejects_relationships_tables_and_bounds_without_puts() {
         "{{\"request_id\":\"{}\",\"error\":{{\"code\":\"conflict\",\"message\":\"duplicate\",\"outcome\":\"not_applied\"}}}}",
         d.request_id
     );
-    assert!(PreparedPublication::prepare(base.clone(), tables.clone(), bad).is_err());
+    assert!(prepare_test(base.clone(), tables.clone(), bad).is_err());
     tables.get_mut("a").unwrap().key = "missing".into();
-    assert!(PreparedPublication::prepare(base.clone(), tables, d.clone()).is_err());
+    assert!(prepare_test(base.clone(), tables, d.clone()).is_err());
     let mut bad = d;
     bad.request_body
         .push_str(&" ".repeat(nabedra_database_server::protocol::MAX_BODY_BYTES));
     assert!(matches!(
-        PreparedPublication::prepare(base.clone(), BTreeMap::new(), bad),
+        prepare_test(base.clone(), BTreeMap::new(), bad),
         Err(StorageError::LimitExceeded)
     ));
     let mut c = base.catalog().clone();
@@ -256,7 +259,7 @@ async fn preparation_rejects_relationships_tables_and_bounds_without_puts() {
     let base = s.load_cluster_catalog().await.unwrap();
     let mut bad = decision_overflow(&base);
     bad.revision = 0;
-    assert!(PreparedPublication::prepare(base, BTreeMap::new(), bad).is_err());
+    assert!(prepare_test(base, BTreeMap::new(), bad).is_err());
     assert!(s.backend().0.lock().unwrap().puts.is_empty());
 }
 fn decision_overflow(base: &LoadedClusterCatalog) -> Decision {
@@ -299,7 +302,15 @@ async fn immutable_collision_rejected_and_applied_lost_upload_confirmed_once() {
             .unwrap(),
         PublicationOutcome::Terminal(d)
     );
-    assert_eq!(s.backend().0.lock().unwrap().puts.len(), 2);
+    // One decision and one root PUT, plus the new index page (OLAP-1).
+    let puts = s.backend().0.lock().unwrap().puts.clone();
+    assert_eq!(
+        puts.iter()
+            .filter(|k| !k.starts_with("test/decision-index/"))
+            .count(),
+        2
+    );
+    assert_eq!(puts.len(), 3);
 }
 
 #[tokio::test]
@@ -400,18 +411,22 @@ async fn orphan_and_incomplete_history_and_ambiguous_absence_are_safe() {
     );
     let base = s.load_cluster_catalog().await.unwrap();
     let d = decision(&base, 2);
-    s.backend().0.lock().unwrap().fail_reads = true;
+    // A cold Storage (no cached index pages) whose reads fail, or whose budget
+    // cannot read one page, never proves absence and never publishes.
+    let cold = Storage::new(Backend::default(), Namespace::new("test").unwrap());
+    cold.backend().0.lock().unwrap().objects = s.backend().0.lock().unwrap().objects.clone();
+    cold.backend().0.lock().unwrap().fail_reads = true;
     assert!(
         prepare(&base, d.clone())
-            .publish(&s, budget())
+            .publish(&cold, budget())
             .await
             .is_err()
     );
-    assert_eq!(roots(&s), 1);
-    s.backend().0.lock().unwrap().fail_reads = false;
+    assert_eq!(roots(&cold), 0);
+    cold.backend().0.lock().unwrap().fail_reads = false;
     let small = HistoryBudget::new(1, 1, Instant::now() + Duration::from_secs(1)).unwrap();
-    assert!(prepare(&base, d).publish(&s, small).await.is_err());
-    assert_eq!(roots(&s), 1);
+    assert!(prepare(&base, d).publish(&cold, small).await.is_err());
+    assert_eq!(roots(&cold), 0);
     let (s, base) = store().await;
     let d = decision(&base, 3);
     s.backend().0.lock().unwrap().root_absent_reply = true;
@@ -487,7 +502,7 @@ async fn encoded_root_bound_is_checked_before_upload() {
     view.tables.insert("users".into(), table);
     view.validate().unwrap(); // Valid manifest, specifically the encoded cap fails.
     assert!(matches!(
-        PreparedPublication::prepare(base, view.tables, d),
+        prepare_test(base, view.tables, d),
         Err(StorageError::LimitExceeded)
     ));
     assert!(s.backend().0.lock().unwrap().puts.is_empty());
@@ -563,12 +578,57 @@ async fn failed_reconciliation_after_applied_root_remains_unknown() {
         .unwrap()
         .objects
         .remove(&format!("test/{}", ObjectKey::decision(d.id).as_str()));
+    // The index, not the decision objects, proves absence (OLAP-1): a lost
+    // decision object surfaces as damage only on that request's replay.
+    assert!(matches!(
+        prepare(&base, next).publish(&s, budget()).await.unwrap(),
+        PublicationOutcome::Terminal(_)
+    ));
+    let current = s.load_cluster_catalog().await.unwrap();
     assert_eq!(
-        prepare(&base, next)
-            .publish(&s, budget())
-            .await
-            .unwrap_err(),
-        StorageError::InvalidCatalog
+        s.lookup_decision_by_id(&current, d.request_id, budget())
+            .await,
+        Err(StorageError::InvalidCatalog)
     );
-    assert_eq!(roots(&s), 1);
+    assert_eq!(roots(&s), 2);
+}
+
+#[allow(dead_code)]
+fn test_fence() -> nabedra_database_server::storage::CatalogFence {
+    nabedra_database_server::storage::CatalogFence {
+        run_id: uuid::Uuid::from_u128(0xf3),
+        scheduler_term: 1,
+    }
+}
+/// A format 6 root holding a legacy-shaped table set, fenced by `test_fence`.
+#[allow(dead_code)]
+fn test_root(
+    catalog: &nabedra_database_server::storage::Catalog,
+) -> Result<
+    nabedra_database_server::storage::ClusterCatalog,
+    nabedra_database_server::storage::StorageError,
+> {
+    let mut root = nabedra_database_server::storage::ClusterCatalog::empty(test_fence(), None)?;
+    root.revision = catalog.revision;
+    root.commit_id = catalog.commit_id;
+    root.tables = catalog.tables.clone();
+    Ok(root)
+}
+/// Prepare under the base's own fence (every root is fenced).
+#[allow(dead_code)]
+fn prepare_test(
+    base: nabedra_database_server::storage::LoadedClusterCatalog,
+    tables: std::collections::BTreeMap<String, nabedra_database_server::storage::CatalogEntry>,
+    decision: nabedra_database_server::storage::Decision,
+) -> Result<
+    nabedra_database_server::storage::PreparedPublication,
+    nabedra_database_server::storage::StorageError,
+> {
+    let fence = base
+        .catalog()
+        .fence
+        .ok_or(nabedra_database_server::storage::StorageError::InvalidCatalog)?;
+    nabedra_database_server::storage::PreparedPublication::prepare_fenced(
+        base, tables, decision, fence,
+    )
 }

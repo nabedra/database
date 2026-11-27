@@ -178,7 +178,6 @@ async fn q02_q04_f03_task_admission_precedes_acceptance_and_actor_memory_survive
 #[tokio::test]
 async fn q04_q05_u01_accepted_work_outlives_its_transport_and_deduplicates() {
     let storage = Storage::new(Fake::default(), Namespace::new("queued-api/").unwrap());
-    storage.initialize_catalog().await.unwrap();
     let (pool, threads) = WorkerPool::start(
         NonZeroUsize::new(1).unwrap(),
         tokio::runtime::Handle::current(),
@@ -202,7 +201,7 @@ async fn q04_q05_u01_accepted_work_outlives_its_transport_and_deduplicates() {
         "test-token".into(),
         ExecutionConfig::default(),
         false,
-        true,
+        false,
     )
     .unwrap();
     let id = Uuid::new_v4();
@@ -255,7 +254,6 @@ async fn q04_q05_u01_accepted_work_outlives_its_transport_and_deduplicates() {
 #[tokio::test]
 async fn q06_r04_receipts_reconcile_commits_and_expired_reads_are_explicit() {
     let storage = Storage::new(Fake::default(), Namespace::new("cold-queue/").unwrap());
-    storage.initialize_catalog().await.unwrap();
     let (pool, threads) = WorkerPool::start(
         NonZeroUsize::new(1).unwrap(),
         tokio::runtime::Handle::current(),
@@ -270,7 +268,7 @@ async fn q06_r04_receipts_reconcile_commits_and_expired_reads_are_explicit() {
         "test-token".into(),
         execution.clone(),
         false,
-        true,
+        false,
     )
     .unwrap();
     let mutation = Uuid::new_v4();
@@ -434,7 +432,6 @@ async fn a01_local_fixed_worker_explicitly_rejects_provisioning_without_changing
         Fake::default(),
         Namespace::new("manual-capability/").unwrap(),
     );
-    storage.initialize_catalog().await.unwrap();
     let (pool, threads) = WorkerPool::start(
         NonZeroUsize::new(1).unwrap(),
         tokio::runtime::Handle::current(),
@@ -447,7 +444,7 @@ async fn a01_local_fixed_worker_explicitly_rejects_provisioning_without_changing
         "test-token".into(),
         ExecutionConfig::default(),
         false,
-        true,
+        false,
     )
     .unwrap();
     let body = json!({"request_id":Uuid::new_v4(),"operation":"cluster.autoscale","payload":{"min_nodes":1,"max_nodes":2}});

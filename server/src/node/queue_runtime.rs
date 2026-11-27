@@ -616,6 +616,15 @@ impl QueueRuntime {
         })
     }
 }
+/// OLAP-5: a denial is `unauthorized`; a slow or failed probe is retryable.
+fn access_failure(error: crate::storage::ObjectAccessError) -> crate::protocol::ProtocolError {
+    match error {
+        crate::storage::ObjectAccessError::Denied => {
+            http::failure(crate::protocol::ErrorCode::Unauthorized)
+        }
+        crate::storage::ObjectAccessError::Storage(_) => unavailable(),
+    }
+}
 fn encode_pin(loaded: &LoadedClusterCatalog) -> Result<Vec<u8>> {
     let catalog = loaded.catalog().encode().map_err(|_| invalid())?;
     let etag = loaded.etag().as_bytes();
@@ -1065,7 +1074,7 @@ impl Worker {
             Err(_) => return Err(unavailable()),
         };
         storage
-            .initialize_owned_cluster_catalog(root.cluster_id, fence, false, cold)
+            .initialize_owned_cluster_catalog(root.cluster_id, fence, cold)
             .await
             .map_err(|_| unavailable())
     }
@@ -1924,12 +1933,12 @@ impl Worker {
                     let loaded = self.owned_catalog(root, &grant).await?;
                     grant
                         .storage()
-                        .authorize_catalog_objects(
+                        .authorize_catalog_access(
                             &loaded,
                             nabedra_rt::time::now() + Duration::from_secs(30),
                         )
                         .await
-                        .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
+                        .map_err(access_failure)?;
                     Some(grant)
                 } else {
                     None
@@ -2031,14 +2040,14 @@ impl Worker {
                     }
                     let deadline = nabedra_rt::time::now() + Duration::from_secs(30);
                     storage
-                        .authorize_catalog_objects(&loaded, deadline)
+                        .authorize_catalog_access(&loaded, deadline)
                         .await
-                        .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
+                        .map_err(access_failure)?;
                     if let Some(pinned) = self.queue.pinned(key.clone()) {
                         storage
-                            .authorize_catalog_objects(&pinned, deadline)
+                            .authorize_catalog_access(&pinned, deadline)
                             .await
-                            .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
+                            .map_err(access_failure)?;
                     }
                 }
                 let result = {
@@ -2104,6 +2113,28 @@ impl Worker {
                                 | crate::request_queue::QueueError::NotFound
                         ) =>
                     {
+                        // OLAP-2: `abandoned` needs a root fenced by the current
+                        // run, so that no PUT of the request's run can still
+                        // apply. Fence it first, as dispatch does; without that
+                        // proof the receipt stays retryable.
+                        let loaded = if error == crate::request_queue::QueueError::Abandoned {
+                            let run = self.queue.fence()?.run_id;
+                            if loaded.catalog().fence.is_some_and(|f| f.run_id == run) {
+                                loaded
+                            } else {
+                                let grant = fresh_grant
+                                    .as_ref()
+                                    .filter(|_| !root.template.mode.is_fixed())
+                                    .ok_or_else(unavailable)?;
+                                let fenced = self.owned_catalog(root, grant).await?;
+                                if fenced.catalog().fence.is_none_or(|f| f.run_id != run) {
+                                    return Err(unavailable());
+                                }
+                                fenced
+                            }
+                        } else {
+                            loaded
+                        };
                         let budget = crate::storage::HistoryBudget::new(
                             4096,
                             64 << 20,

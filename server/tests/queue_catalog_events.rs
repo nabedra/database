@@ -630,7 +630,9 @@ impl History {
                 .keys()
                 .all(|key| key.ends_with("/catalog.json")
                     || key.contains("/tables/")
-                    || key.contains("/decisions/"))
+                    || key.contains("/decisions/")
+                    // OLAP-1: immutable decision index pages.
+                    || key.contains("/decision-index/"))
         );
     }
     async fn run(&mut self) {
@@ -704,7 +706,7 @@ async fn u03_seeded_queue_resources_membership_and_fenced_catalog_match_serial_o
             scheduler_term: 1,
         };
         storage
-            .initialize_fenced_cluster_catalog(fence, false, false)
+            .initialize_fenced_cluster_catalog(fence, false)
             .await
             .unwrap();
         let (pool, threads) = WorkerPool::start(
