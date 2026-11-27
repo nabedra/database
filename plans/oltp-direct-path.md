@@ -294,7 +294,10 @@ Found in review of T4 (`RV-T4`). These refine section 4 and 6 without changing t
   export scans images for changes since the previous backup.
 - **Splits under write load.** The split coordinator stops direct commits with a replicated barrier entry in the source
   range before allocating the cut, so a leader change cannot lose the pause. A frozen range answers a dedicated
-  `SplitInProgress`, which the gateway treats as `Fallback`, not as a stale route.
+  `SplitInProgress`, which the gateway treats as `Fallback`, not as a stale route. Every decided attempt releases the
+  barrier, including one aborted before its children were bound, and the source refuses a `DirectPause` of an attempt
+  it already settled, so a late or repeated pause cannot hold the range (design review of `specs/oltp/split`,
+  `plans/oltp-engine.md`).
 - **Range clock.** A pending commit is bound to the leadership generation in which its timestamp was fetched, and a
   leadership change fails reads that were waiting on pending commits instead of releasing them.
 - **Activation boundary (T7c, 2026-11-20).** The queue owner applies the forward rule where it reserves the request

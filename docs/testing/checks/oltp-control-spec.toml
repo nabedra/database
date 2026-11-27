@@ -1,0 +1,14 @@
+# The design spec of Control's run owner and the topology steps only the owner may advance (a replica
+# move, a pending ready-set removal) when the owner's worker is lost. Safety and liveness baselines,
+# coverage and every mutant. See plans/oltp-shard-refactor.md, "Design review".
+id = "oltp-control-spec"
+module = "oltp"
+kinds = ["T"]
+guarantees = ["OLTP-G07", "OLTP-G08"]
+scenarios = ["R05", "O17", "O26"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/oltp/control", "OltpControl", "--module", "oltp"]
+cwd = "."
+timeout_s = 7200
+needs = ["tlc"]
+result_parser = "tlc"

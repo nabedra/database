@@ -1,0 +1,17 @@
+id = "OLTP-design-stale-pool-copy-rejoins"
+title = "A pool restored from an older copy of itself rejoins under its identity, votes again in a term and can lose an acknowledged write"
+class = "membership-replacement-trust"
+module = "oltp"
+guarantees = ["OLTP-G01", "OLTP-G08"]
+scenarios = ["O06", "O17", "O26"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/oltp/ranges/mutants/prefix_stale_rejoins_lost.cfg"
+seed = "unknown"
+why_not_caught = "No fault restores a pool from a copy taken in the same incarnation; the identity file, the mount manifest and the restart proof all accept it."
+invariant_added = "OltpRanges G01_CommittedNeverLost and G08_NoRevote with StaleRestore: a restored or cloned pool is a new pool identity and its replicas rejoin as learners (11-state counterexample on the shipped rule)."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-26"

@@ -1,0 +1,15 @@
+# The design spec of one OLTP Raft group (a Data range or a system group): elections and commits,
+# replica identity after pool loss and after an older copy of the pool, leader leases under bounded
+# clock drift, and a voter replacement. Four baselines (identity, replacement, lease, liveness) at
+# L3 bounds, coverage and every mutant. See plans/oltp-engine.md, "Design review".
+id = "oltp-ranges-spec"
+module = "oltp"
+kinds = ["T"]
+guarantees = ["OLTP-G01", "OLTP-G02", "OLTP-G08", "OLTP-G10"]
+scenarios = ["O06", "O17", "O18", "O26", "D04", "D05", "D06"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/oltp/ranges", "OltpRanges", "--module", "oltp"]
+cwd = "."
+timeout_s = 19800
+needs = ["tlc"]
+result_parser = "tlc"
