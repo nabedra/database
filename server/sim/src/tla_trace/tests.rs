@@ -933,7 +933,7 @@ fn a_mapped_fault_must_meet_its_declaration() {
     };
     assert_eq!(
         crash(|mut line| {
-            assert_eq!(line.fault, Fault::Crash { node: 2 });
+            assert_eq!(line.fault, Fault::Crash { node: 2, power_off: false });
             line.action = "Stop".into();
             line.vars = json!({"up": false});
             line.msg = None;
