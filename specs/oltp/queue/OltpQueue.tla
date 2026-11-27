@@ -41,6 +41,10 @@
 \*    are dropped.
 \* A6 All modelled requests are valid mutations. A failed terminal record
 \*    can only come from a transient fault, which the design forbids.
+\* A7 The Timestamp group's ready fence is not a variable: it holds the
+\*    pending join's next view exactly while that join is past Building
+\*    (jcopied, Control's SealReady and TimestampFenced precede the owner's
+\*    copy), and the published view otherwise.
 \* Out of scope: queries and pinned read grants, the scoped RF3 protocol
 \* (O30, O31), byte and count limits (SCHED-G01), scheduling fairness.
 
@@ -69,7 +73,8 @@ VARIABLES
     owner,      \* fenced queue owner, or NoW
     joining,    \* worker holding a join ticket, or NoW
     sealed,     \* the owner sealed its join export: no queue mutation
-    jcopied,    \* Control's pending join is past Building: the owner copies
+    jcopied,    \* Control's pending join is past Building (sealed in Control,
+                \* the Timestamp group fenced to its next view): the owner copies
     \* Status (durable): identity reservation and decision, cold fence.
     ident,      \* [st |-> "none" | "reserved" | "committed", run |-> n]
     fenceRun,   \* run whose attempts Status still admits
@@ -122,6 +127,12 @@ Has(w, r)   == q[w][r] # "none"
 Live(w)     == up[w] /\ conn[w]
 \* A worker whose queue installed the published view.
 Current(w)  == w \in Workers /\ Live(w) /\ w \in ready /\ view[w] = "cur"
+\* OQ-2, route 1: a removal that supersedes a join past Building sends its
+\* Timestamp FenceReady from the join's fenced next view, which the
+\* Timestamp group holds (A7). Mutant abort_expects_old_view: it expects the
+\* published view, the Timestamp group refuses it as stale, and the removal
+\* never completes.
+SupersedeOK == ~(Mutant = "abort_expects_old_view" /\ joining # NoW /\ jcopied)
 \* The owner may mutate its queue (replica.rs mutating_owner).
 OwnerOK     == owner # NoW /\ Current(owner) /\ ~sealed
 Copied(r)   == acks[r] = ready
@@ -513,6 +524,7 @@ RemoveMember(x, o) ==
     /\ o \in ready \ {x}
     /\ owner \in ready \ {x} => o = owner
     /\ Mutant = "prefix_join_never_aborted" => joining = NoW
+    /\ SupersedeOK
     /\ \A s \in ready \ {x} : Current(s)
     /\ \E lag \in BOOLEAN :
        LET S == ready \ {x} IN
@@ -534,15 +546,25 @@ RemoveMember(x, o) ==
 \* (the heartbeat timeout that drives removals), and the owner drops its
 \* export and seal. Shipped Control has no such step: Pending::Ready is
 \* cleared only by PublishReady or a cold fence (machine.rs publish_ready,
-\* PublishFence).
-AbortJoin ==
-    /\ Mutant # "prefix_join_never_aborted"
-    /\ joining # NoW /\ ~Live(joining)
+\* PublishFence). Two cases: before Control sealed the join (Building:
+\* nothing outside Control saw its next view) and after (the Timestamp group
+\* is fenced to the join's next view and the owner may hold its seal).
+AbortEffect ==
     /\ joining' = NoW /\ jcopied' = FALSE /\ sealed' = FALSE
     /\ q' = [q EXCEPT ![joining] = [r \in Reqs |-> "none"]]
     /\ view' = [view EXCEPT ![joining] = "none"]
     /\ UNCHANGED <<run, ready, owner, durable, up, conn, acks, held, atts,
                    faults, ghost>>
+AbortJoinBuilding ==
+    /\ Mutant # "prefix_join_never_aborted"
+    /\ joining # NoW /\ ~jcopied /\ ~Live(joining)
+    /\ AbortEffect
+AbortJoinSealed ==
+    /\ Mutant # "prefix_join_never_aborted"
+    /\ joining # NoW /\ jcopied /\ ~Live(joining)
+    /\ SupersedeOK
+    /\ AbortEffect
+AbortJoin == AbortJoinBuilding \/ AbortJoinSealed
 
 \* A worker outside the ready set starts a join (Control BeginJoin): a live
 \* one after a partition (LIVE1), or a stopped one that restarts. Its stale
