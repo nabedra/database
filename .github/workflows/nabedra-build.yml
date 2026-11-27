@@ -18,7 +18,8 @@
 #   migrate     MIG1/MIG2 RocksDB-era RF3 archive export and restore
 #   live3, live3-fixture  LIVE3 Linux release binaries per engine; the library test executable
 #   campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1  long, image and measurement jobs
-#   ab, insn    paired docs/testing/perf specs and Callgrind counts of ab_base (default: sha, an A/A run) against sha
+#   ab, insn    paired docs/testing/perf specs (ab_specs, default all) and Callgrind counts of ab_base
+#               (default: sha, an A/A run) against sha
 #   engine-tests, check-tests  Cache, OLAP and nabedra-check tests, also in the base jobs
 #   clippy      the phase 7 runtime seam bans (server/clippy.toml) for every product feature set, also a base job
 #   features    engine feature checks and the OLTP S3 loopback fixture, also a base job
@@ -62,6 +63,10 @@ on:
         default: ""
       ab_base:
         description: "Full base commit for jobs=ab and insn; empty compares sha with itself (A/A)"
+        type: string
+        default: ""
+      ab_specs:
+        description: "Comma-separated docs/testing/perf specs for jobs=ab, e.g. kv/store (default: all)"
         type: string
         default: ""
       checks:
@@ -136,6 +141,7 @@ jobs:
       checks: ${{ steps.checks.outputs.matrix }}
       fuzz: ${{ steps.fuzz.outputs.matrix }}
       ab_base: ${{ steps.ab.outputs.base }}
+      ab_matrix: ${{ steps.ab.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -263,16 +269,27 @@ jobs:
             echo
             python3 scripts/ci_quarantine.py report
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Resolve the A/B base
+      - name: Resolve the A/B base and specs
         id: ab
         if: contains(steps.plan.outputs.jobs, ',ab,') || contains(steps.plan.outputs.jobs, ',insn,')
         env:
           AB_BASE: ${{ inputs.ab_base }}
+          AB_SPECS: ${{ inputs.ab_specs }}
         run: |
           base=${AB_BASE:-$TESTED_SHA}
           [[ "$base" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::ab_base must be a full 40-character commit, got '$base'"; exit 1; }
-          echo "base=$base" >> "$GITHUB_OUTPUT"
-          printf '\nA/B base: `%s`, head: `%s`, harness: `%s`\n' "$base" "$TESTED_SHA" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          # spec:target, one leg each; ab_specs selects a subset (default all).
+          all="cache/get-hit:cache events/publish:events olap/streaming:olap olap/streaming-sparse:olap"
+          all+=" oltp/point-update:oltp oltp/queued-update:oltp kv/store:kv sim/oltp-seeds:sim"
+          for spec in ${AB_SPECS//,/ }; do [[ " $all " == *" $spec:"* ]] || { echo "::error::unknown ab spec '$spec'"; exit 1; }; done
+          legs=()
+          for entry in $all; do
+            spec=${entry%%:*}
+            [ -z "$AB_SPECS" ] || [[ ",$AB_SPECS," == *",$spec,"* ]] || continue
+            legs+=("{\"spec\":\"$spec\",\"name\":\"${spec//\//-}\",\"target\":\"${entry##*:}\"}")
+          done
+          { echo "base=$base"; echo "matrix={\"include\":[$(IFS=,; echo "${legs[*]}")]}"; } >> "$GITHUB_OUTPUT"
+          printf '\nA/B base: `%s`, head: `%s`, harness: `%s`, specs: %s\n' "$base" "$TESTED_SHA" "$GITHUB_SHA" "${AB_SPECS:-all}" >> "$GITHUB_STEP_SUMMARY"
       - name: Validate registered checks and plan their jobs
         id: checks
         if: github.event_name == 'workflow_dispatch' && inputs.checks != ''
@@ -2413,16 +2430,8 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { spec: cache/get-hit, name: cache-get-hit, target: cache }
-          - { spec: events/publish, name: events-publish, target: events }
-          - { spec: olap/streaming, name: olap-streaming, target: olap }
-          - { spec: olap/streaming-sparse, name: olap-streaming-sparse, target: olap }
-          - { spec: oltp/point-update, name: oltp-point-update, target: oltp }
-          - { spec: oltp/queued-update, name: oltp-queued-update, target: oltp }
-          - { spec: kv/store, name: kv-store, target: kv }
-          - { spec: sim/oltp-seeds, name: sim-oltp-seeds, target: sim }
+      # One leg per selected spec (revision job, "Resolve the A/B base and specs").
+      matrix: ${{ fromJSON(needs.revision.outputs.ab_matrix) }}
     env:
       SPEC: ${{ matrix.spec }}
       NAME: ${{ matrix.name }}

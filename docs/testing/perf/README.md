@@ -15,7 +15,7 @@ python3.11 scripts/testing/ab.py docs/testing/perf/oltp/point-update.toml \
 | `events/publish` | Two locally built Events images and Docker. | Median of the publish p99 values from the measured load stages; poll p99 is reported. |
 | `kv/store` | The release `store_bench` test executable of `nabedra-kv`. | NS18 16-writer synced put, get, scan and install costs, NS5 flush and compaction throughput; the 1-writer put and append costs are reported. |
 | `olap/streaming` | Matching OLAP binaries and the streaming fixture. Set `NABEDRA_PERF_BASE_SHA`, `NABEDRA_PERF_HEAD_SHA` and `NABEDRA_PERF_FIXTURE_SHA` to the source revisions. | Medians of the steady-state next-batch p99 and the first-batch p99 across prefetch depths, dense profile. |
-| `olap/streaming-sparse` | As `olap/streaming`. | The same metrics for the sparse/wide profile, with ordinary requests during the stream. |
+| `olap/streaming-sparse` | As `olap/streaming`. | The sparse/wide profile, with ordinary requests during the stream: steady-state p50 and first-batch p99; steady-state p99 is reported. |
 | `oltp/point-update` | Linux OLTP binaries and Docker. Set `NABEDRA_PERF_OLTP_IMAGE` to a locally available image with the benchmark's runtime dependencies. | Medians of the phase p99 and p50 latencies for direct updates at 20 offered requests/s. |
 | `oltp/queued-update` | As `oltp/point-update`. | The same workload with direct OLTP off, so updates take the queued path. |
 | `sim/oltp-seeds` | The release `nabedra-sim` binary, built with `RUSTFLAGS='--cfg tokio_unstable'`. | Wall time of a smoke sweep of seeds 1 to 8, each run twice for replay. |
@@ -68,7 +68,8 @@ above, both sides on one runner per spec. `jobs=insn` runs the instruction
 counts below for the same pair. With `ab_base` empty both sides are `sha`,
 which measures the runner's noise (an A/A run). The specs, `ab.py` and the
 benchmark drivers come from the workflow ref, so both sides use the same
-driver. Results are in the `ab-<spec>` and `insn-counts` artifacts and the job
+driver. `ab_specs` selects specs by path, such as `kv/store,sim/oltp-seeds`.
+Results are in the `ab-<spec>` and `insn-counts` artifacts and the job
 summaries.
 
 ```sh
