@@ -954,7 +954,66 @@ def queue_survival(binary, test_executable):
         prepare_rolling_restart(cluster, owner, survivor)
         launch_retained(cluster, owner)
         same_run_ready(cluster, run, WORKERS, 3)
+        # OQ-2 (route 1'): a join interrupted after its seal, by losing the
+        # joiner and then the owner, no longer stops queued admission.
+        owner = interrupted_join(cluster, run, table, survivor, 'joiner')
+        interrupted_join(cluster, run, table, owner, 'owner')
         assertion('O14', 'same-run-request-and-context', 'Successive API and worker losses preserved exact bytes, identity, read timestamp, schema, authorization and outcomes. The restored gateway attached an identical retry, refused a changed body, and returned the historical row and one mutation result. All three workers became ready on the original run.')
+
+
+def interrupted_join(cluster, run, table, owner, lost):
+    """OQ-2 (`specs/oltp/queue` route 1'). A worker removed while paused
+    rejoins; its endpoint holds the owner's JoinStatement at
+    `rolling_copy_complete`, after Control sealed the join, the Timestamp
+    group was fenced to the join's view and the owner sealed its export.
+    Then the joiner (`lost='joiner'`) or the owner (`lost='owner'`) is
+    killed. The surviving owner, or the worker that fences a new owner term,
+    abandons the join without publishing it, and a queued mutation is
+    admitted and commits. Before the fix every admission waited until a cold
+    start. Returns the owner afterwards; every worker is ready again."""
+    joiner, third = [name for name in WORKERS if name != owner]
+    joiner_dir = cluster.barrier_dir(joiner)
+    join = {'request_id': str(uuid.uuid4())}
+    cluster.workers[joiner].pause()
+    try:
+        same_run_ready(cluster, run, (owner, third), 2)
+        (joiner_dir / 'rolling-test-id').write_text(join['request_id'])
+        write_json(joiner_dir / 'gates.json', {join['request_id']: 'rolling_copy_complete'})
+    finally:
+        cluster.workers[joiner].resume()
+    wait_reached([joiner_dir], join, 'rolling_copy_complete')
+    victim = joiner if lost == 'joiner' else owner
+    cluster.workers[victim].kill()
+    # The killed joiner never answers again; a live joiner's held reply
+    # goes to a dead owner. Either way the gate must not hold a later join.
+    release(joiner_dir, join)
+    survivors = (owner, third) if lost == 'joiner' else (third, joiner)
+    mutation = operation('table.insert', dict(table_id=table.id, row=dict(id=f'oq2-{lost}', value=5)))
+    gateway_url = cluster.api_urls['api2']
+
+    def admitted():
+        with closing(Http(gateway_url, cluster.auth['data_token'], 10, cluster.ca)) as client:
+            try:
+                status, body = client.exchange('/v1/requests', mutation)
+            except TRANSPORT_ERRORS:
+                return None
+        if status == 202:
+            assert_accepted((status, body), run, mutation)
+            return True
+        assert status in (429, 503), (status, body)
+        return None
+
+    wait_until(admitted, f'no queued admission after the sealed join lost its {lost}', timeout=110)
+    with closing(gateway(cluster, 'api2')) as client:
+        exact_receipt(client.exchange, run, mutation, None, timeout=110)
+    same_run_ready(cluster, run, survivors, 2)
+    assert Database(gateway_url, cluster.auth['data_token'], database='test', ca_file=str(cluster.ca),
+                    timeout=30).table("same_run").get(f'oq2-{lost}') == dict(id=f'oq2-{lost}', value=5)
+    evidence('O14', f'sealed-join-lost-{lost}', scenarios=['R05', 'O14'], survivors=list(survivors))
+    prepare_rolling_restart(cluster, victim, survivors[0])
+    launch_retained(cluster, victim)
+    same_run_ready(cluster, run, WORKERS, 3)
+    return owner if lost == 'joiner' else third
 
 
 def count_pressure(test_executable):
