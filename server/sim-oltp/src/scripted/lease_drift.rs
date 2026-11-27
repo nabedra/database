@@ -74,7 +74,12 @@ fn true_time(local: Duration, ppm: i64) -> Duration {
     Duration::from_nanos(nanos as u64)
 }
 
-async fn lease(driver: Arc<Driver>, leader_ppm: i64, voter_ppm: i64) -> Result<(), String> {
+async fn lease(
+    driver: Arc<Driver>,
+    leader_ppm: i64,
+    voter_ppm: i64,
+    window: Duration,
+) -> Result<(), String> {
     let world = driver.cluster.world.clone();
     let leader = driver.leader;
     let voters: Vec<u64> = WORKERS.into_iter().filter(|w| *w != leader).collect();
@@ -108,7 +113,7 @@ async fn lease(driver: Arc<Driver>, leader_ppm: i64, voter_ppm: i64) -> Result<(
     if !matches!(answer, Answer::Ok(_)) {
         return Err(format!("pinning write: {answer:?}"));
     }
-    let lease = true_time(lease_window(), leader_ppm);
+    let lease = true_time(window, leader_ppm);
     let (lease_low, lease_high) = (invoked + lease, acked + lease);
 
     // Step 3.
@@ -132,7 +137,7 @@ async fn lease(driver: Arc<Driver>, leader_ppm: i64, voter_ppm: i64) -> Result<(
         "isolate",
         json!({
             "leader": leader, "voters": voters, "pin_invoked_ms": ms(invoked),
-            "pin_acked_ms": ms(acked), "lease_window_local_ms": ms(lease_window()),
+            "pin_acked_ms": ms(acked), "lease_window_local_ms": ms(window),
             "lease_ends_ms": [ms(lease_low), ms(lease_high)],
         }),
     );
@@ -223,14 +228,14 @@ async fn lease(driver: Arc<Driver>, leader_ppm: i64, voter_ppm: i64) -> Result<(
 
 /// Runs the twin on the selected seeds (`NABEDRA_SEED`, `NABEDRA_SEEDS`; default 1 and 1)
 /// and checks each verdict: `stale` says whether the checker must find the stale read.
-fn judge(name: &str, leader_ppm: i64, voter_ppm: i64, stale: bool) {
+fn judge(name: &str, leader_ppm: i64, voter_ppm: i64, window: Duration, stale: bool) {
     let var = |name: &str, default: u64| {
         env::var(name).map_or(default, |value| value.parse().expect("an integer"))
     };
     let first = var("NABEDRA_SEED", 1);
     let mut wrong = Vec::new();
     for seed in first..first + var("NABEDRA_SEEDS", 1) {
-        let run = run_schedule(seed, move |driver| lease(driver, leader_ppm, voter_ppm));
+        let run = run_schedule(seed, move |driver| lease(driver, leader_ppm, voter_ppm, window));
         let kinds = shrink::kinds(&run.violations);
         let history = String::from_utf8_lossy(&run.history);
         // Everything from the isolation on: the computed window, the writes and the reads.
@@ -262,21 +267,36 @@ fn judge(name: &str, leader_ppm: i64, voter_ppm: i64, stale: bool) {
 #[test]
 #[ignore = "starts a cluster; oltp-sim-lease-drift runs it"]
 fn lease_beyond_bound() {
-    judge("lease_beyond_bound", -50_000, 50_000, true);
+    judge("lease_beyond_bound", -50_000, 50_000, lease_window(), true);
 }
 
 #[test]
 #[ignore = "starts a cluster; oltp-sim-lease-drift runs it"]
 fn lease_near_bound() {
     let near = LEASE_DRIFT_BOUND_PPM * 3 / 2;
-    judge("lease_near_bound", -near, near, false);
+    judge("lease_near_bound", -near, near, lease_window(), false);
 }
 
 #[test]
 #[ignore = "starts a cluster; oltp-sim-lease-drift runs it"]
 fn lease_in_bound() {
     let bound = LEASE_DRIFT_BOUND_PPM;
-    judge("lease_in_bound", -bound, bound, false);
+    judge("lease_in_bound", -bound, bound, lease_window(), false);
+}
+
+/// The lease of `probes/long-lease.patch`, which serves a lease read for this long after a
+/// quorum acknowledged the leader.
+const PLANTED_LEASE: Duration = Duration::from_secs(10);
+
+/// The red twin of SIM-10 and its clean twin: the same schedule, without drift, with reads
+/// sent while a 10 s lease would still run. With `probes/long-lease.patch` applied
+/// (`NABEDRA_SIM_LEASE_PLANTED=1`) the old leader serves them and the checker must find the
+/// stale read; on the product build they must not be served stale.
+#[test]
+#[ignore = "starts a cluster; oltp-sim-lease-drift runs it with and without probes/long-lease.patch"]
+fn lease_planted_long_lease() {
+    let planted = env::var("NABEDRA_SIM_LEASE_PLANTED").as_deref() == Ok("1");
+    judge("lease_planted_long_lease", 0, 0, PLANTED_LEASE, planted);
 }
 
 #[test]
