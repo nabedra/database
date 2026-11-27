@@ -201,6 +201,9 @@ fn apply(
         };
     }
     let state = load::<State>(tx, STATE)?;
+    if let Some(state) = &state {
+        check_format(state)?;
+    }
     let reply = match (state, command) {
         (
             None,
@@ -223,6 +226,7 @@ fn apply(
                     ready_count: 0,
                 };
                 let state = State {
+                    format: CONTROL_STATE_FORMAT,
                     policy: authorization.policy,
                     ready,
                     owner: None,
@@ -284,6 +288,14 @@ fn apply(
     commit(tx, &reply)
 }
 
+/// A Control state of another format is refused, never read.
+pub(super) fn check_format(state: &State) -> Result<(), ProtocolError> {
+    if state.format != CONTROL_STATE_FORMAT {
+        return Err(unavailable("Control state format differs"));
+    }
+    Ok(())
+}
+
 fn apply_initialized(
     tx: &mut GroupTransaction<'_>,
     scope: &GroupIdentity,
@@ -315,7 +327,7 @@ fn apply_initialized(
     if matches!(command,
         PrepareRestart { .. } | PrepareDataWorker { .. } | CompleteDataWorker { .. }
         | BeginDataWorkerJoin { .. } | BeginJoin { .. } | BeginRemoval { .. } | BeginQueueRemoval { .. }
-        | BeginOwnerFence { .. } | BeginColdFence { .. } | Enroll { .. }
+        | BeginColdFence { .. } | Enroll { .. }
     ) && load::<Uuid>(tx, placement::ACTIVE)?.is_some() {
         return fault(Fault::Busy);
     }
@@ -906,6 +918,20 @@ fn apply_initialized(
             }
             pending.timestamp_fence = Some(receipt.clone());
             pending.phase = ReadyPhase::AwaitingQueueProof;
+            if pending.abandoned_join.is_some() {
+                // OQ-2, the end of AbortJoinSealed: the Timestamp group left the
+                // abandoned join's view for the published set's next revision.
+                // The joiner never held a verified copy, so no queue proof is
+                // needed; the view change ends the owner's join seal.
+                let pending = pending.clone();
+                state.ready = pending.next.ok_or_else(unknown)?;
+                state.ready_generation = pending.generation;
+                state.pending = None;
+                return Ok(ControlReply::Published {
+                    ready: state.ready,
+                    owner: state.owner,
+                });
+            }
             Ok(ControlReply::TimestampFenced {
                 transition_id: *transition_id,
                 next: receipt.next,
@@ -922,21 +948,40 @@ fn apply_initialized(
             next_owner,
             authorization,
         } => {
-            // OQ-2: an owner fence supersedes a join interrupted before its
-            // seal, as a removal does (`begin_ready`).
-            if state.pending.as_ref().is_some_and(|pending| !interrupted_join(pending)) {
+            // CONTROL-1: an active move blocks the fence only while Moving
+            // (its rollback is not implemented); PublishFence resolves the
+            // other phases (`placement::resolve_on_owner_fence`).
+            if placement::blocks_owner_fence(tx)? {
                 return fault(Fault::Busy);
             }
             if *expected != state.ready
                 || !stamp(authorization, state.policy)
                 || !current_ready(tx, state, *next_owner)?
                 || tx.get(&key(data_worker::REGISTERED, next_owner.worker_id))?.is_some()
+                || matches!(&state.pending, Some(Pending::Ready(pending)) if pending.target == *next_owner)
             {
                 return fault(Fault::Stale);
             }
-            let mut next = *expected;
-            next.view.owner_term = next.view.owner_term.checked_add(1).ok_or_else(unknown)?;
-            begin_fence(
+            let term = expected.view.owner_term.checked_add(1).ok_or_else(unknown)?;
+            // OQ-2 (route 1') and CONTROL-1: an owner fence supersedes a
+            // pending ready-set transition instead of waiting for the owner it
+            // replaces. `carried` is that transition rebased on the new term;
+            // `base` is the Timestamp group's ready view, which the fence keeps.
+            let (base, carried) = match &state.pending {
+                None => (state.ready, None),
+                Some(Pending::Fence(_)) => return fault(Fault::Busy),
+                Some(Pending::Ready(pending)) => {
+                    let Some(base) = pending.timestamp_ready() else {
+                        // FenceTso first: the idempotent FenceReady settles
+                        // which view the Timestamp group holds.
+                        return fault(Fault::Busy);
+                    };
+                    (base, supersede_ready(state, pending, *operation_id, term)?)
+                }
+            };
+            let mut next = base;
+            next.view.owner_term = term;
+            let reply = begin_fence(
                 tx,
                 scope,
                 state,
@@ -948,7 +993,11 @@ fn apply_initialized(
                 authorization.clone(),
                 position,
                 command_digest,
-            )
+            )?;
+            if let Some(Pending::Fence(fence)) = &mut state.pending {
+                fence.carried = carried;
+            }
+            Ok(reply)
         }
         BeginColdFence {
             operation_id,
@@ -962,7 +1011,9 @@ fn apply_initialized(
             // Control publishes the new run.
             let extra_exclusion = match &state.pending {
                 Some(Pending::Fence(_)) => return fault(Fault::Busy),
-                Some(Pending::Ready(pending)) if pending.change == ReadyChange::Join => {
+                Some(Pending::Ready(pending))
+                    if pending.change == ReadyChange::Join || pending.abandoned_join.is_some() =>
+                {
                     Some(pending.target)
                 }
                 _ => None,
@@ -1120,7 +1171,17 @@ fn apply_initialized(
                 return fault(Fault::Incomplete);
             }
             let pending = pending.clone();
-            state.ready = pending.next;
+            if !pending.cold
+                && let Some(next_owner) = pending.next_owner
+                && let Some(fault) =
+                    placement::resolve_on_owner_fence(tx, next_owner, pending.next.view.authority())?
+            {
+                return Ok(ControlReply::Rejected(fault));
+            }
+            // The superseded transition's view was never published: Control
+            // publishes its own set under the new term (`published`), and the
+            // carried transition continues under the new owner.
+            state.ready = pending.published();
             state.owner = pending.next_owner;
             if pending.cold {
                 system_recovery::retire_on_cold_fence(tx)?;
@@ -1145,7 +1206,7 @@ fn apply_initialized(
                     &(*transition_id, pending.next.view.authority()),
                 )?;
             }
-            state.pending = None;
+            state.pending = pending.carried.map(Pending::Ready);
             Ok(ControlReply::Published {
                 ready: state.ready,
                 owner: state.owner,
@@ -1154,12 +1215,82 @@ fn apply_initialized(
     }
 }
 
-/// OQ-2: a pending join that has not sealed changed only its own staged ready
-/// pages (under its generation id), so another view change may replace it. A
-/// sealed join may already have fenced Timestamps to its `next` view.
+/// OQ-2 (AbortJoinBuilding): a pending join that has not sealed changed only
+/// its own staged ready pages (under its generation id), so another view
+/// change may replace it. A sealed join may already have fenced Timestamps to
+/// its `next` view.
 fn interrupted_join(pending: &Pending) -> bool {
     matches!(pending, Pending::Ready(pending)
         if pending.change == ReadyChange::Join && pending.phase == ReadyPhase::Building)
+}
+
+/// OQ-2 (AbortJoinSealed, route 1'): the removal of a sealed join's joiner.
+/// The join's Timestamp fence is complete (FenceTso), so the removal expects
+/// the join's `next` view and leaves it for the published set under the next
+/// revision, without publishing the join. The published keys
+/// (`state.ready_generation`) already hold that set, so it needs no pages.
+fn abandon_join(
+    state: &State,
+    join: &ReadyPending,
+    transition_id: Uuid,
+    owner_term: u64,
+) -> Result<ReadyPending, ProtocolError> {
+    let mut expected = join.next.ok_or_else(unknown)?;
+    expected.view.owner_term = owner_term;
+    let mut view = expected.view;
+    view.membership_revision = view.membership_revision.checked_add(1).ok_or_else(unknown)?;
+    Ok(ReadyPending {
+        transition_id,
+        expected,
+        target: join.target,
+        change: ReadyChange::Remove,
+        generation: state.ready_generation,
+        source_after: None,
+        target_seen: true,
+        root: ReadySetHasher::default(),
+        next: Some(ReadyMembership {
+            view,
+            ready_root: state.ready.ready_root,
+            ready_count: state.ready.ready_count,
+        }),
+        phase: ReadyPhase::AwaitingTimestampFence,
+        timestamp_fence: None,
+        abandoned_join: Some(join.transition_id),
+    })
+}
+
+/// OQ-2 and CONTROL-1: the transition an owner fence `fence` carries when it
+/// supersedes `pending` (not in `AwaitingTimestampFence`, see
+/// `ReadyPending::timestamp_ready`), under the new `owner_term`. A join that
+/// has not sealed is dropped; a sealed one becomes the removal of its joiner;
+/// a removal continues under the new owner from where it stopped.
+fn supersede_ready(
+    state: &State,
+    pending: &ReadyPending,
+    fence: Uuid,
+    owner_term: u64,
+) -> Result<Option<ReadyPending>, ProtocolError> {
+    let rebase = |ready: &mut ReadyMembership| ready.view.owner_term = owner_term;
+    Ok(match (pending.change, pending.phase) {
+        (ReadyChange::Join, ReadyPhase::Building) => None,
+        (ReadyChange::Join, _) => {
+            let digest = crate::oltp_replication::owned::serialized_digest(&(
+                "nabedra/control/abandoned-join/v1",
+                fence,
+                pending.transition_id,
+            ))?;
+            let id = Uuid::from_slice(&digest.as_bytes()[..16]).map_err(|_| unknown())?;
+            Some(abandon_join(state, pending, id, owner_term)?)
+        }
+        (ReadyChange::Remove, _) => {
+            let mut carried = pending.clone();
+            rebase(&mut carried.expected);
+            if let Some(next) = &mut carried.next {
+                rebase(next);
+            }
+            Some(carried)
+        }
+    })
 }
 
 fn begin_ready(
@@ -1172,15 +1303,51 @@ fn begin_ready(
     removed: Option<&ExclusionStamp>,
     logical_fence: bool,
 ) -> Result<ControlReply, ProtocolError> {
+    let mut sealed_join = None;
     if let Some(pending) = &state.pending {
-        // OQ-2: a removal supersedes a join interrupted before its seal, so a
-        // crashed owner or joiner cannot stop every admission and recovery.
-        if !(change == ReadyChange::Remove && interrupted_join(pending)) {
-            return fault(Fault::Busy);
+        match pending {
+            // OQ-2: a removal supersedes a join interrupted before its seal, so
+            // a crashed owner or joiner cannot stop every admission and
+            // recovery.
+            _ if change == ReadyChange::Remove && interrupted_join(pending) => {}
+            // OQ-2, route 1': the removal of a sealed join's own joiner, once
+            // the join's Timestamp fence is recorded.
+            Pending::Ready(join)
+                if change == ReadyChange::Remove
+                    && join.change == ReadyChange::Join
+                    && join.target == target
+                    && join.phase == ReadyPhase::AwaitingQueueProof =>
+            {
+                sealed_join = Some(join.clone());
+            }
+            _ => return fault(Fault::Busy),
         }
     }
     if state.ready.view != expected || target.validate().is_err() {
         return fault(Fault::Stale);
+    }
+    if let Some(join) = sealed_join {
+        let enrolled = load::<WorkerRecord>(tx, &key(WORKERS, target.worker_id))?;
+        if enrolled.as_ref().map(|w| WorkerIdentity::from(&w.enrollment)) != Some(target)
+            || !logical_fence
+                && !removed.is_some_and(|proof| proof.worker == target && exclusion(proof, state.policy))
+        {
+            return fault(Fault::Unauthorized);
+        }
+        if let Some(proof) = removed {
+            record_process_exclusion(tx, proof)?;
+        }
+        let pending = abandon_join(state, &join, id, state.ready.view.owner_term)?;
+        let ticket = JoinTicket {
+            ticket_id: id,
+            target,
+            source_ready: pending.expected,
+        };
+        state.pending = Some(Pending::Ready(pending));
+        return Ok(ControlReply::JoinBegun {
+            ticket,
+            bootstrap: false,
+        });
     }
     if change == ReadyChange::Join && system_recovery::waits_for_groups(tx, target.worker_id)? {
         return fault(Fault::Busy);
@@ -1240,6 +1407,7 @@ fn begin_ready(
         next: None,
         phase: ReadyPhase::Building,
         timestamp_fence: None,
+        abandoned_join: None,
     }));
     Ok(ControlReply::JoinBegun {
         ticket: JoinTicket {
@@ -1427,6 +1595,7 @@ fn begin_fence(
         fenced_groups: 1,
         excluded_workers: 0,
         extra_exclusion,
+        carried: None,
     };
     save(
         tx,

@@ -172,10 +172,62 @@ pub(super) fn arm(
     {
         return fault(Fault::Stale);
     }
+    // CONTROL-1: an owner fence that began while the move was Claimed cancels
+    // it at publication, so the move cannot reach Moving meanwhile.
+    if matches!(state.pending, Some(Pending::Fence(_))) {
+        return fault(Fault::Busy);
+    }
     plan.phase = ReplicaMovePhase::Moving;
     plan.guard = Some(guard.clone());
     save(tx, &move_key(id), &plan)?;
     Ok(ControlReply::ReplicaMove(Box::new(plan)))
+}
+
+/// CONTROL-1: the run owner that retires a published move after an owner
+/// fence released its cluster slot, and the authority it holds.
+fn steward_key(id: Uuid) -> Vec<u8> {
+    key(b"ct/replica-move-steward/", id)
+}
+
+/// CONTROL-1 (`specs/oltp/control`, PublishFence `Resolve`): an owner fence
+/// resolves the active move by its phase, so a lost move owner cannot block
+/// owner change. Claimed: cancelled, as `cancel` does (no replica was added
+/// and no guard armed). Published: the cluster's slot is released and the new
+/// owner retires the removed replica; the group's claim stays until then.
+/// Moving needs the rollback of the plan and is refused at BeginOwnerFence.
+pub(super) fn resolve_on_owner_fence(
+    tx: &mut GroupTransaction<'_>,
+    next_owner: WorkerIdentity,
+    next: Authority,
+) -> Result<Option<Fault>, ProtocolError> {
+    let Some(id) = load::<Uuid>(tx, ACTIVE)? else {
+        return Ok(None);
+    };
+    let mut plan = load::<ReplicaMove>(tx, &move_key(id))?.ok_or_else(unknown)?;
+    match plan.phase {
+        ReplicaMovePhase::Claimed => {
+            plan.phase = ReplicaMovePhase::Cancelled;
+            save(tx, &move_key(id), &plan)?;
+            tx.delete(&claim_key(plan.request.group.group_id))?;
+            tx.delete(ACTIVE)?;
+            tx.delete(&occupied(plan.request.group.group_id, plan.request.target.node_id))?;
+        }
+        ReplicaMovePhase::Published { .. } => {
+            tx.delete(ACTIVE)?;
+            save(tx, &steward_key(id), &(next_owner, next))?;
+        }
+        ReplicaMovePhase::Moving => return Ok(Some(Fault::Busy)),
+        ReplicaMovePhase::Retired { .. } | ReplicaMovePhase::Cancelled => tx.delete(ACTIVE)?,
+    }
+    Ok(None)
+}
+
+/// CONTROL-1: whether the active move lets an owner fence begin.
+pub(super) fn blocks_owner_fence(tx: &mut GroupTransaction<'_>) -> Result<bool, ProtocolError> {
+    let Some(id) = load::<Uuid>(tx, ACTIVE)? else {
+        return Ok(false);
+    };
+    Ok(load::<ReplicaMove>(tx, &move_key(id))?.is_some_and(|plan| plan.phase == ReplicaMovePhase::Moving))
 }
 
 pub(super) fn cancel(
@@ -345,8 +397,12 @@ pub(super) fn retire(
         None => serialized_digest(proof)?,
     };
     let source_worker = plan.source_worker();
+    // CONTROL-1: after an owner fence, the new owner retires (`steward_key`).
+    // The plan's own owner and authority stay in its binding and guard.
+    let steward = load::<(WorkerIdentity, Authority)>(tx, &steward_key(plan.id))?;
+    let (owner, authority) = steward.unwrap_or((plan.owner, plan.authority));
     if !stamp(authorization, state.policy)
-        || authorization.subject != plan.owner.certificate_sha256
+        || authorization.subject != owner.certificate_sha256
         || authorization.evidence != evidence
         || proof.worker != source_worker
         || match (plan.remote_source.as_ref(), remote) {
@@ -385,13 +441,14 @@ pub(super) fn retire(
         _ => return fault(Fault::Conflict),
     };
     let claim = claim_key(placement.identity.group_id);
-    if load::<Uuid>(tx, ACTIVE)? != Some(plan.id)
+    let active = load::<Uuid>(tx, ACTIVE)?;
+    if (active != Some(plan.id) && steward.is_none())
         || load::<Uuid>(tx, &claim)? != Some(plan.id)
         || load::<GroupRecord>(tx, &key(GROUPS, placement.identity.group_id))?.as_ref()
             != Some(&placement)
-        || state.owner != Some(plan.owner)
-        || state.ready.view.authority() != plan.authority
-        || !current_ready(tx, state, plan.owner)?
+        || state.owner != Some(owner)
+        || state.ready.view.authority() != authority
+        || !current_ready(tx, state, owner)?
         || !current_ready(tx, state, source_worker)?
         || proof.applied_at.index < placement.membership_position.index
     {
@@ -406,7 +463,12 @@ pub(super) fn retire(
     };
     save(tx, &move_key(plan.id), &plan)?;
     tx.delete(&claim)?;
-    tx.delete(ACTIVE)?;
+    if active == Some(plan.id) {
+        tx.delete(ACTIVE)?;
+    }
+    if steward.is_some() {
+        tx.delete(&steward_key(plan.id))?;
+    }
     Ok(ControlReply::GroupRetirement {
         generation: plan.id,
         remaining: 0,
