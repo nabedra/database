@@ -36,6 +36,16 @@ use uuid::Uuid;
 mod common;
 use common::safe_path;
 pub use common::{Namespace, StorageError};
+
+/// A jittered pause before CAS round `retry + 1` of a mutation (OLAP-9):
+/// uniform in `[0, min(200 ms, 25 ms * 2^(retry - 1))]`.
+pub fn cas_retry_delay(retry: u32) -> std::time::Duration {
+    common::jitter(
+        retry,
+        std::time::Duration::from_millis(25),
+        std::time::Duration::from_millis(200),
+    )
+}
 /// Only canonical table objects and explicitly typed metadata can be addressed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectKey(String);
