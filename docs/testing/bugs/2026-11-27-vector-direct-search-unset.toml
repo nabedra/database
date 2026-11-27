@@ -1,0 +1,17 @@
+id = "VEC-BUG-direct-search-unset"
+title = "A direct write to a range with search columns is rejected because the leader never sends its vectors"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G10", "VEC-G09"]
+scenarios = ["VS15", "VS16"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/src/oltp_runtime/direct/tests/search_range.rs::vs15_every_direct_row_write_of_a_fenced_search_range_is_applied"
+seed = "unknown"
+why_not_caught = "No server fixture fenced a range with search columns before writing to it, so every vector write met a plain range."
+invariant_added = "After a SearchFence every direct row write of the table names its vectors, deletes included, and lands. The regression is ignored and fails today with InternalError \"direct commit rejected\"."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "oltp-vector C1 with task J (column ids in the Catalog)"
+expires = "2026-12-27"

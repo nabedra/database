@@ -789,7 +789,7 @@ async fn adv_vs15_the_latch_window_blocks_neither_other_keys_nor_starves_the_sam
         nabedra_rt::task::spawn(async move {
             let mut worst = Duration::ZERO;
             for round in 0..windows {
-                let started = std::time::Instant::now();
+                let started = nabedra_rt::time::now_std();
                 let answers = replies(
                     cluster
                         .run(
@@ -800,7 +800,7 @@ async fn adv_vs15_the_latch_window_blocks_neither_other_keys_nor_starves_the_sam
                         )
                         .await,
                 );
-                worst = worst.max(started.elapsed());
+                worst = worst.max(nabedra_rt::time::elapsed(started));
                 assert!(
                     answers.iter().all(|a| *a == done("null")),
                     "round {round}: {:?}",
@@ -842,11 +842,11 @@ async fn adv_vs15_the_latch_window_blocks_neither_other_keys_nor_starves_the_sam
             let mut n = 0i64;
             while !stop.load(Ordering::SeqCst) {
                 n += 1;
-                let started = std::time::Instant::now();
+                let started = nabedra_rt::time::now_std();
                 let r = cluster
                     .op(leader, "table.upsert", json!({"row": row(id, n)}))
                     .await;
-                latencies.push(started.elapsed());
+                latencies.push(nabedra_rt::time::elapsed(started));
                 if !matches!(r, DirectResponse::Done(_)) {
                     failures.push(format!("{r:?}"));
                 }

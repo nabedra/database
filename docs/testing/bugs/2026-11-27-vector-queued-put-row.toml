@@ -1,0 +1,17 @@
+id = "VEC-BUG-queued-put-row"
+title = "A queued row write to a range with search columns is refused because the planner builds a plain Put"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G10"]
+scenarios = ["VS16"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/src/oltp_runtime/worker_runtime/archive/tests/search.rs::vs15_a_queued_row_write_of_a_fenced_search_range_is_applied"
+seed = "unknown"
+why_not_caught = "No server fixture fenced a range with search columns before a queued write."
+invariant_added = "After a SearchFence and its Catalog publication every queued row write of the table persists as PutRow and lands. The regression is ignored and fails today with Conflict at prepare."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "oltp-vector C1 with task J (column ids and fence publication in the Catalog)"
+expires = "2026-12-27"

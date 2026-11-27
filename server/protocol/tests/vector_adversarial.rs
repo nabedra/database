@@ -721,6 +721,7 @@ fn collect(filter: &str) -> String {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)] // A test thread with a small stack; this crate has no nabedra-rt.
 fn adv_filters_stop_at_depth_32_without_recursing_further() {
     let _g = lock();
     // Depth counts the text node: 31 nots around it is depth 32.
@@ -760,6 +761,7 @@ fn adv_filters_stop_at_depth_32_without_recursing_further() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)] // A test thread with a small stack; this crate has no nabedra-rt.
 fn adv_deep_json_in_vector_values_does_not_recurse() {
     let _g = lock();
     let handle = std::thread::Builder::new()
@@ -789,6 +791,7 @@ fn adv_deep_json_in_vector_values_does_not_recurse() {
 
 /// Membership against a long filter list stays bounded per row.
 #[test]
+#[allow(clippy::disallowed_methods)] // A wall-clock ratio in a test; this crate has no nabedra-rt.
 fn adv_contains_any_evaluation_cost_is_not_quadratic_in_the_list() {
     let _g = lock();
     let rows = |tags: usize| -> Row {

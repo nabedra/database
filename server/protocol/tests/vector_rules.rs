@@ -782,7 +782,7 @@ fn rule_error_classes_of_refusals() {
     );
     let many = format!(
         r#","x":0,"rankings":[{}]"#,
-        vec![r#"{"column":"body","op":"match","value":"x"}"#; 3].join(",")
+        [r#"{"column":"body","op":"match","value":"x"}"#; 3].join(",")
     );
     let _ = many;
     let batch = |n: usize| {

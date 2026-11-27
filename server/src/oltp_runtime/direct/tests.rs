@@ -69,6 +69,7 @@ mod gc1;
 mod gc2;
 mod adv_many;
 mod many;
+mod search_range;
 #[cfg(target_os = "linux")]
 mod reservations;
 
