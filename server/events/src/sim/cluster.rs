@@ -846,7 +846,14 @@ impl Cluster {
         }
         let anomalies = {
             let state = self.sim.lock();
-            history::check(&state.history, &log, reference.checkpoint, reference.earliest)
+            let removed: BTreeSet<Uuid> = state.retained.values().flatten().copied().collect();
+            history::check(
+                &state.history,
+                &log,
+                reference.checkpoint,
+                reference.earliest,
+                &removed,
+            )
         };
         for anomaly in anomalies {
             self.violate(anomaly);
@@ -1701,6 +1708,64 @@ mod wipe_tests {
         let removed = nabedra_rt::time::timeout(Duration::from_secs(5), task).await??;
         cluster.stats.retained_removed = removed?;
         Ok(cluster)
+    }
+
+    /// EVENTS-2, beyond the stated bound with only two voters reachable: the leader runs
+    /// 10 s fast and one follower is cut off. The two samples disagree by more than the
+    /// uncertainty budget, so the leader has no interval: publishes are refused and
+    /// retention pauses, past the retention period in true time, with nothing removed.
+    /// Once the third clock answers again, the outlier is discarded and retention resumes.
+    async fn fast_leader_with_a_voter_cut_off(mut cluster: Cluster) -> Result<Cluster> {
+        let leader_id = wait_for_leader(&mut cluster, &[1, 2, 3]).await?;
+        let mut client = Client::new(cluster.sim.clone(), PRODUCER, 3, 3);
+        for n in 1..=5 {
+            publish_acknowledged(&mut cluster, &mut client, n).await?;
+        }
+        let cut_off = leader_id % 3 + 1;
+        {
+            let mut state = cluster.sim.lock();
+            state.net.block(leader_id, cut_off);
+            state.net.block(cut_off, leader_id);
+        }
+        cluster
+            .world()
+            .jump_wall_forward(leader_id, Duration::from_millis(10_000));
+        let stop = Arc::new(AtomicBool::new(false));
+        let task = nabedra_rt::task::spawn(retention(cluster.sim.clone(), stop.clone(), 3, 3_000, false));
+        // Wait out the sample age, then try to publish and let retention run 6 s.
+        run_for(&mut cluster, 1_500).await?;
+        let refused = client.uuid();
+        if let Some((id, group)) = leader(&cluster.sim, 3)
+            && id == leader_id
+            && in_node(id, group.time_bounds()).await.is_ok()
+        {
+            cluster.violate(format!(
+                "EVENTS-2: the leader built an interval from a 10 s fast clock and one other ({refused})"
+            ));
+        }
+        run_for(&mut cluster, 6_000).await?;
+        stop.store(true, Ordering::Release);
+        let paused = nabedra_rt::time::timeout(Duration::from_secs(5), task).await??;
+        if paused? != 0 {
+            cluster.violate("EVENTS-2: retention removed events without a guarded interval".into());
+        }
+        cluster.sim.lock().net.heal_links();
+        let stop = Arc::new(AtomicBool::new(false));
+        let task = nabedra_rt::task::spawn(retention(cluster.sim.clone(), stop.clone(), 3, 3_000, false));
+        run_for(&mut cluster, 3_000).await?;
+        stop.store(true, Ordering::Release);
+        let resumed = nabedra_rt::time::timeout(Duration::from_secs(5), task).await??;
+        cluster.stats.retained_removed = resumed?;
+        if cluster.stats.retained_removed == 0 {
+            cluster.violate("EVENTS-2: retention did not resume once three clocks answered".into());
+        }
+        Ok(cluster)
+    }
+
+    #[test]
+    fn events_2_beyond_the_bound_without_a_third_clock_pauses_retention() {
+        let violations = scripted_with(19, with_retention(false), fast_leader_with_a_voter_cut_off);
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 
     fn with_retention(unguarded: bool) -> impl FnOnce(&mut SimConfig) {

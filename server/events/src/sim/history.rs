@@ -146,6 +146,7 @@ pub fn check(
     log: &FinalLog,
     final_checkpoint: u64,
     earliest: u64,
+    removed: &BTreeSet<Uuid>,
 ) -> Vec<String> {
     let mut anomalies = Vec::new();
     let mut offset_of: BTreeMap<Uuid, u64> = BTreeMap::new();
@@ -155,9 +156,12 @@ pub fn check(
     let retained: BTreeSet<_> = log.values().copied().collect();
     let mut delivered: BTreeSet<u64> = BTreeSet::new();
     let mut claim = |id: Uuid, offset: u64, source: &str, index: usize, out: &mut Vec<String>| {
+        // Retention removed the ID and its deduplication record, so a later publish of
+        // it gets a new offset (EVT-G03 holds within retention; the replicas check the
+        // order of removal and reassignment as they apply).
         if let Some(previous) = offset_of
             .insert(id, offset)
-            .filter(|prior| *prior != offset)
+            .filter(|prior| *prior != offset && !removed.contains(&id))
         {
             out.push(format!(
                 "EVT-G03 offset-reassigned: event {id} at offset {previous} and {offset} ({source}, history index {index})"

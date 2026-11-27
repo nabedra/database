@@ -453,7 +453,7 @@ mod checkers {
             ("ok", "poll", poll(0, &[(1, 1), (2, 2)])),
         ]);
         assert_eq!(
-            history::check(&h, &log(&[(1, 1), (2, 2)]), 2, 1),
+            history::check(&h, &log(&[(1, 1), (2, 2)]), 2, 1, &Default::default()),
             Vec::<String>::new()
         );
     }
@@ -543,7 +543,7 @@ mod checkers {
             ),
         ];
         for (expected, h, final_log, checkpoint) in cases {
-            let anomalies = history::check(h, final_log, *checkpoint, 1);
+            let anomalies = history::check(h, final_log, *checkpoint, 1, &Default::default());
             assert!(
                 anomalies.iter().any(|a| a.contains(expected)),
                 "{expected} not flagged: {anomalies:?}"
