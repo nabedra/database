@@ -1,5 +1,5 @@
-# Fixed in fx-events for the stated bound (one wrong clock in RF3): guarded stamps from raft::clock. The
-# activation fence is the open record EVENTS-GUARDED-ACTIVATION-FENCE.
+# Fixed in fx-events for the stated bound (one wrong clock in RF3): guarded stamps from raft::clock, the only
+# time mode (no legacy clock, no activation step; user decision 2026-11-27).
 # Design review rv-events, finding EVENTS-2 (wave-rv/findings/events.md). The plan states no clock bound ("monitor
 # clock skew"). The retention cutoff is the leader's wall clock minus the retention (control/operate.rs:474), and
 # events::retain and publish keep the maximum of every cutoff and publish time (partition/events.rs:56-58, 240), so a

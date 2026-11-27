@@ -38,7 +38,7 @@ pub(crate) struct State {
     /// of it, so they neither vote nor acknowledge.
     pub lost: BTreeSet<u64>,
     /// Clients stamp commands from `Group::time_bounds`, as a product leader does after
-    /// EVENTS-2. Off in the default sweep, whose commands carry the target's raw clock.
+    /// EVENTS-2. Off only for the planted `unguarded_clock`.
     pub guarded_time: bool,
     /// Per replica, in apply order: the offset each event ID was assigned, and the IDs
     /// retention removed. A new offset for an ID is legal only after its removal (EVT-G03

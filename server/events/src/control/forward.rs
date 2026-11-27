@@ -21,8 +21,9 @@ use crate::{
     raft::{GroupError, GroupStatus},
 };
 
-const CONTROL_PATH: &str = "/internal/events/v1/control";
-const DATA_PATH: &str = "/internal/events/v1/data";
+// v2 with the raft routes (`raft/network.rs`): a v1 broker is refused with 404.
+const CONTROL_PATH: &str = "/internal/events/v2/control";
+const DATA_PATH: &str = "/internal/events/v2/data";
 const INBOUND_BYTES: usize = 2 * 1024 * 1024 + 4096;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(450);
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,8 +61,7 @@ pub(super) enum Rpc {
         group: String,
         call: GroupCall,
     },
-    /// What the target's volume holds for `group` (EVENTS-1). Brokers released before
-    /// this request answer 400, which the caller treats as no answer.
+    /// What the target's volume holds for `group` (EVENTS-1).
     DiskState {
         group: String,
     },

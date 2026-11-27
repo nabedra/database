@@ -11,12 +11,8 @@
 //! at least f+1 fresh samples: for RF3, the second of each, which discards one outlier
 //! with three samples and takes the union of two. The interval must be nonempty and at
 //! most `max_uncertainty_ms` wide; otherwise the stamp is refused and retention waits.
-//! `specs/events-time/EventsTime.tla` checks these rules.
-//!
-//! A peer that runs a release without sampling answers 404. While any voter of a group
-//! does, its leader stamps from its own clock as before (lower and upper both equal to
-//! it): the entry format is the same either way, so a mixed-version group stays safe and
-//! a downgrade is safe.
+//! `specs/events-time/EventsTime.tla` checks these rules. Guarded time is the only mode:
+//! there is no fallback to the leader's own clock.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -69,19 +65,6 @@ impl Default for ClockPolicy {
 pub struct TimeBounds {
     pub lower_ms: i64,
     pub upper_ms: i64,
-    /// False when a voter cannot sample clocks: both bounds are the local clock.
-    pub guarded: bool,
-}
-
-impl TimeBounds {
-    /// The interval of a stamp taken from one clock, as before EVENTS-2.
-    pub fn local(now_ms: i64) -> Self {
-        Self {
-            lower_ms: now_ms,
-            upper_ms: now_ms,
-            guarded: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -102,7 +85,6 @@ struct Sample {
 pub(crate) struct Clocks {
     policy: Mutex<ClockPolicy>,
     samples: Mutex<BTreeMap<u64, Sample>>,
-    unsupported: Mutex<BTreeSet<u64>>,
     /// One sampling round at a time; concurrent stamps share its result.
     pub(super) round: tokio::sync::Mutex<()>,
 }
@@ -112,7 +94,6 @@ impl Clocks {
         Self {
             policy: Mutex::new(policy),
             samples: Mutex::default(),
-            unsupported: Mutex::default(),
             round: tokio::sync::Mutex::new(()),
         }
     }
@@ -125,35 +106,16 @@ impl Clocks {
         *self.policy.lock().expect("clock policy lock") = policy;
     }
 
-    /// Records `peer`'s answer to a request sent at `sent`: a wall-clock reading, or
-    /// `Some(None)` from a release without sampling. An unreachable peer (`None`) keeps
-    /// what was known about it.
-    pub fn record(&self, peer: u64, sent: Instant, answer: Option<Option<i64>>) {
-        match answer {
-            Some(Some(wall_ms)) => {
-                self.unsupported
-                    .lock()
-                    .expect("clock support lock")
-                    .remove(&peer);
-                let mut samples = self.samples.lock().expect("clock samples lock");
-                if samples.get(&peer).is_none_or(|old| old.sent <= sent) {
-                    samples.insert(peer, Sample { wall_ms, sent });
-                }
-            }
-            Some(None) => {
-                self.unsupported
-                    .lock()
-                    .expect("clock support lock")
-                    .insert(peer);
-            }
-            None => {}
+    /// Records `peer`'s wall-clock reading for a request sent at `sent`. An unreachable
+    /// peer (`None`) keeps its older sample until that ages out.
+    pub fn record(&self, peer: u64, sent: Instant, answer: Option<i64>) {
+        let Some(wall_ms) = answer else {
+            return;
+        };
+        let mut samples = self.samples.lock().expect("clock samples lock");
+        if samples.get(&peer).is_none_or(|old| old.sent <= sent) {
+            samples.insert(peer, Sample { wall_ms, sent });
         }
-    }
-
-    /// Whether a voter runs a release that cannot sample clocks.
-    pub fn legacy(&self, voters: &BTreeSet<u64>) -> bool {
-        let unsupported = self.unsupported.lock().expect("clock support lock");
-        voters.iter().any(|voter| unsupported.contains(voter))
     }
 
     /// Whether some peer voter has no sample young enough to skip a new round.
@@ -176,9 +138,6 @@ impl Clocks {
         now: Instant,
         voters: &BTreeSet<u64>,
     ) -> Result<TimeBounds, ClockError> {
-        if self.legacy(voters) {
-            return Ok(TimeBounds::local(local_wall_ms));
-        }
         let policy = self.policy();
         let max_age = Duration::from_millis(policy.sample_max_age_ms);
         let error = policy.max_clock_error_ms;
@@ -205,11 +164,7 @@ impl Clocks {
             }
         }
         let (lower_ms, upper_ms) = interval(&policy, voters.len(), endpoints)?;
-        Ok(TimeBounds {
-            lower_ms,
-            upper_ms,
-            guarded: true,
-        })
+        Ok(TimeBounds { lower_ms, upper_ms })
     }
 }
 
@@ -288,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn events_2_samples_age_and_unsupported_peers_fall_back() {
+    fn events_2_samples_age_out() {
         let clocks = Clocks::new(policy());
         let voters = BTreeSet::from([1, 2, 3]);
         let start = tokio::time::Instant::now();
@@ -297,22 +252,19 @@ mod tests {
             Err(ClockError::Insufficient)
         );
         assert!(clocks.needs_round(1, &voters, start));
-        clocks.record(2, start, Some(Some(10_010)));
+        clocks.record(2, start, Some(10_010));
         let bounds = clocks.bounds(1, 10_000, start, &voters).expect("two samples");
-        assert!(bounds.guarded && bounds.lower_ms <= 10_000 && bounds.upper_ms >= 10_010);
+        assert!(bounds.lower_ms <= 10_000 && bounds.upper_ms >= 10_010);
         // A sample older than its age limit no longer counts.
         let later = start + Duration::from_millis(1_001);
         assert_eq!(
             clocks.bounds(1, 11_001, later, &voters),
             Err(ClockError::Insufficient)
         );
-        // A voter on a release without sampling: stamp from the local clock, as before.
-        clocks.record(3, start, Some(None));
-        assert_eq!(
-            clocks.bounds(1, 11_001, later, &voters),
-            Ok(TimeBounds::local(11_001))
-        );
-        clocks.record(3, later, Some(Some(11_000)));
-        assert!(!clocks.legacy(&voters));
+        // An unreachable peer adds nothing; a fresh answer counts again.
+        clocks.record(3, later, None);
+        assert!(clocks.bounds(1, 11_001, later, &voters).is_err());
+        clocks.record(3, later, Some(11_000));
+        assert!(clocks.bounds(1, 11_001, later, &voters).is_ok());
     }
 }

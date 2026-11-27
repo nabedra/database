@@ -215,7 +215,7 @@ pub fn run(config: SimConfig) -> Report {
 
 impl Cluster {
     fn new(sim: Arc<Harness>, config: SimConfig) -> Self {
-        sim.lock().guarded_time = config.retention_ms.is_some() && !config.knobs.unguarded_clock;
+        sim.lock().guarded_time = !config.knobs.unguarded_clock;
         let mut rng = stream(config.seed, "nemesis");
         let volumes = (1..=config.nodes)
             .map(|id| {

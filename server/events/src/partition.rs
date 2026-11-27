@@ -22,8 +22,7 @@ const HEAD_KEY: &[u8] = b"partition/v1/head";
 /// "Brokers and storage"). A publish gets the upper bound, so an event's age never runs
 /// ahead of true time. Lease commands get the lower bound, against which the replicated
 /// lease clock tests expiry, and a TTL widened by the interval's width, so a new lease's
-/// deadline is the upper bound plus the requested TTL. The entry format is the one an
-/// unguarded leader writes; with `TimeBounds::local` the stamps are unchanged.
+/// deadline is the upper bound plus the requested TTL.
 pub fn stamp(command: &mut Command, bounds: crate::raft::TimeBounds) {
     match command {
         Command::Publish { now_ms, .. } | Command::PublishMany { now_ms, .. } => {

@@ -25,7 +25,7 @@ class Gate(BaseHTTPRequestHandler):
         # Keep this observer private to the fixture network and cap every
         # request. It relays routine control/Raft HTTP to the same broker.
         self.connection.settimeout(10)
-        snapshot = self.path == f"/internal/raft/v1/{BOOTSTRAP_GROUP}/snapshot"
+        snapshot = self.path == f"/internal/raft/v2/{BOOTSTRAP_GROUP}/snapshot"
         try:
             with socket.create_connection(TARGET, timeout=3) as outgoing:
                 outgoing.settimeout(20)
