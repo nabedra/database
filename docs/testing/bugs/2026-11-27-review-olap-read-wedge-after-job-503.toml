@@ -1,0 +1,36 @@
+# Found by the bench agent on main 2cbfb7f4 (Actions runs 45972521812, 45976460728, 45979286742: dense
+# streaming setup collect gets no reply within the ORM's 40 s; 45986355076: a sparse_wide 202 table.get or
+# query.count does not settle in 20 s, about 1 in 47). Reproduced by fx-sched with release builds: the
+# dense_fast setup plus its first collect fails 6 of 30 on main 12b4f011 (server code identical to 2cbfb7f4)
+# and 0 of 30 on nabedra/fx-sched c857dd78. Instrumented main builds trace it. (1) A remote worker answers
+# one partition job of the read with 503 storage_unavailable: prepare_captured fails with LimitExceeded
+# (payload_owner.rs maps it to OwnerError::Invalid, runtime.rs to unavailable). (2) The coordinator maps
+# the job 503 to outcome Unknown for the whole read. (3) The pump skipped any record with three failed
+# attempts forever (SCHED-3); takeovers reset the counter, so each stalled read shows exactly six failed
+# attempts and then never runs again. Neither the trace TCP forwarder nor keep-alive is involved: the
+# client pools no idle connections, and the remote's own job handler returns the 503.
+# Root of the job failure (instrumented main): engine/partition.rs download_file reserves the whole
+# task_memory_limit_bytes (256 MiB) for every partition read, even a 10 KB file. A second concurrent
+# read on a 1-thread bench worker is refused at once with "worker resource limit exceeded" or, when the
+# same request already retains output there, "bounded operator cannot retain output while awaiting more
+# memory" (resources/src/scheduling.rs check_buffered_growth). No object read failed. Routed to fx-olap
+# (memory accounting, OLAP-7).
+# The wedge is fixed by the SCHED-3 commit 923d68b7256e5f98483b69745e7886e9229af297 (capped backoff). The job-level 503 is still open: a collect
+# can need several attempts and take up to 10 s on the fixed head.
+id = "REVIEW-olap-read-wedge-after-job-503"
+title = "An OLAP read whose partition job hits a transient LimitExceeded on a worker turns unknown and, after three attempts, is never dispatched again"
+class = "uncertain-outcome"
+module = "scheduler"
+guarantees = ["OLAP-G07", "SCHED-G03"]
+scenarios = ["B01", "B02", "ST06"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "scripts/benchmark_olap_streaming.py --profile dense_fast, first collect, about 30 invocations (fx-sched scratch loop stall_loop.sh)"
+seed = "unknown"
+why_not_caught = "No test fails a remote partition job of a read with a resource error. The pump's permanent skip after three attempts had no regression, and the job error was collapsed into storage_unavailable."
+invariant_added = "An accepted read whose attempts fail transiently keeps retrying with capped backoff (f2_reconciling_mutation_retries_after_three_failures_and_backoff_uses_no_slot); the job-level cause is not yet covered."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-26"
