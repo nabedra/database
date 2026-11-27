@@ -167,6 +167,17 @@ async fn shared_worker_case(two_workers: bool) {
  assert!(matches!(Box::pin(worker.queue_command(&root,None,QueueCommand::Lookup{run_id:fence.run_id,request_id,context:Some(rotated.clone())})).await.unwrap(),QueueReply::Receipt{..}));
  allowed.store(false,Ordering::SeqCst);assert!(Box::pin(worker.queue_command(&root,None,QueueCommand::Lookup{run_id:fence.run_id,request_id,context:Some(rotated)})).await.is_err());
  assert!(storage.load_cluster_catalog().await.unwrap().catalog().tables.is_empty());
+ // OLAP-2: a database still fenced by an older run (say run 9, whose root PUT may
+ // be delayed in flight) must not let that run's receipt say `abandoned`.
+ allowed.store(true,Ordering::SeqCst);
+ let old=CatalogFence{run_id:id(9),scheduler_term:1};
+ let grant=Box::pin(worker.open_database(a.clone())).await.unwrap();let data=grant.storage();
+ let current=data.load_cluster_catalog().await.unwrap();data.fence_cluster_catalog(&current,old,crate::storage::FenceTransition::ColdStart).await.unwrap();drop(data);drop(grant);
+ let reply=Box::pin(worker.queue_command(&root,None,QueueCommand::Lookup{run_id:old.run_id,request_id:id(98),context:Some(a.clone())})).await;
+ let grant=Box::pin(worker.open_database(a.clone())).await.unwrap();let after=grant.storage().load_cluster_catalog().await.unwrap();drop(grant);
+ if let Ok(QueueReply::Receipt{receipt})=&reply && receipt.state==crate::request_queue::RequestState::Abandoned {
+   assert_eq!(after.catalog().fence.map(|f|f.run_id),Some(fence.run_id),"OLAP-2: abandoned from a root still fenced by the request's own run");
+ }
  if let Some((w,o,t,p,s))=second {s.abort();let _=s.await;drop(w);o.close_and_drain().await.unwrap();drop(o);t.shutdown().await.unwrap();assert_eq!(p.scheduler().usage()[0].2,0);}
  server.abort();let _=server.await;drop(worker);owners.close_and_drain().await.unwrap();drop(owners);threads.shutdown().await.unwrap();assert_eq!(pool.scheduler().usage()[0].2,0);
  }).await.unwrap();

@@ -1660,6 +1660,28 @@ impl Worker {
                                 | crate::request_queue::QueueError::NotFound
                         ) =>
                     {
+                        // OLAP-2: `abandoned` needs a root fenced by the current
+                        // run, so that no PUT of the request's run can still
+                        // apply. Fence it first, as dispatch does; without that
+                        // proof the receipt stays retryable.
+                        let loaded = if error == crate::request_queue::QueueError::Abandoned {
+                            let run = self.queue.fence()?.run_id;
+                            if loaded.catalog().fence.is_some_and(|f| f.run_id == run) {
+                                loaded
+                            } else {
+                                let grant = fresh_grant
+                                    .as_ref()
+                                    .filter(|_| !root.template.mode.is_fixed())
+                                    .ok_or_else(unavailable)?;
+                                let fenced = self.owned_catalog(root, grant).await?;
+                                if fenced.catalog().fence.is_none_or(|f| f.run_id != run) {
+                                    return Err(unavailable());
+                                }
+                                fenced
+                            }
+                        } else {
+                            loaded
+                        };
                         let budget = crate::storage::HistoryBudget::new(
                             4096,
                             64 << 20,
