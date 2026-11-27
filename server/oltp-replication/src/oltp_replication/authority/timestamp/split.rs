@@ -311,6 +311,20 @@ const OPEN: &[u8] = b"ts/shard-split-open/v1/";
 pub(super) fn open_key(id: Uuid) -> Vec<u8> {
     [OPEN, id.as_bytes()].concat()
 }
+/// One page of open attempt ids after `after`.
+pub(super) fn open_page(
+    view: &mut crate::oltp::pool::GroupRead<'_>,
+    after: Option<Uuid>,
+) -> Result<Vec<Uuid>, ProtocolError> {
+    let after = after.map(open_key);
+    let mut ids = Vec::new();
+    view.scan_page(OPEN, after.as_deref(), OPEN_PAGE, |key, _| {
+        let id = key.get(OPEN.len()..).ok_or_else(unknown)?;
+        ids.push(Uuid::from_slice(id).map_err(|_| unknown())?);
+        Ok(())
+    })?;
+    Ok(ids)
+}
 /// At most this many open attempts per listing page.
 pub const OPEN_PAGE: usize = 64;
 pub(super) fn apply(
@@ -614,13 +628,7 @@ impl TimestampHandle {
             .machine
             .store()
             .read_metadata(BUDGET, move |view| {
-                let after = after.map(open_key);
-                let mut ids = Vec::new();
-                view.scan_page(OPEN, after.as_deref(), OPEN_PAGE, |key, _| {
-                    let id = key.get(OPEN.len()..).ok_or_else(unknown)?;
-                    ids.push(Uuid::from_slice(id).map_err(|_| unknown())?);
-                    Ok(())
-                })?;
+                let ids = open_page(view, after)?;
                 view.encode(&ids)
             })
             .await?;

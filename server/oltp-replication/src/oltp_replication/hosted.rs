@@ -1117,15 +1117,7 @@ where
             unavailable()
         };
         let raft: &HostRaft<C, M> = &self.raft;
-        let option = match policy {
-            // RANGES-3: never the bare lease; see `lease_read_window`.
-            ReadPolicy::LeaseRead => openraft::LinearizerOption::new(
-                Some(lease_read_window(raft.config().election_timeout_max)),
-                false,
-            )
-            .with_wait_timeout(std::time::Duration::ZERO),
-            ReadPolicy::ReadIndex => policy.into(),
-        };
+        let option = lease_read_option(policy, raft.config().election_timeout_max);
         let linearizer = raft
             .get_local_read_linearizer(option)
             .await
@@ -1267,6 +1259,23 @@ pub fn lease_read_window(election_timeout_max_ms: u64) -> std::time::Duration {
     let drift_us = lease_us * 2 * u128::from(LEASE_DRIFT_PPM) / 1_000_000;
     let window_us = u64::try_from(lease_us - drift_us).unwrap_or(u64::MAX);
     std::time::Duration::from_micros(window_us).saturating_sub(LEASE_EPSILON)
+}
+
+/// RANGES-3: the linearizer option every read of `policy` uses. A lease
+/// read never uses the bare lease: its acknowledgement age is capped at
+/// [`lease_read_window`]. ReadIndex keeps openraft's fresh quorum round.
+pub fn lease_read_option(
+    policy: ReadPolicy,
+    election_timeout_max_ms: u64,
+) -> openraft::LinearizerOption {
+    match policy {
+        ReadPolicy::LeaseRead => openraft::LinearizerOption::new(
+            Some(lease_read_window(election_timeout_max_ms)),
+            false,
+        )
+        .with_wait_timeout(std::time::Duration::ZERO),
+        ReadPolicy::ReadIndex => policy.into(),
+    }
 }
 
 pub(crate) fn position(id: LogId) -> AppliedPosition {

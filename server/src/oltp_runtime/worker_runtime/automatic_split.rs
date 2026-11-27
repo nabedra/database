@@ -5,7 +5,7 @@ use crate::{
         authority::{
             control::{GroupRecord, InventoryPage, ReplicaMove},
             timestamp::split::{
-                AUTOMATIC_ATTEMPTS, AutomaticSplitOrigin, SplitIntent, SplitPlacement,
+                AUTOMATIC_ATTEMPTS, AutomaticSplitOrigin, SplitAttempt, SplitIntent, SplitPlacement,
                 SplitSourcePlacement,
             },
         },
@@ -451,7 +451,10 @@ impl OwnerLoop {
         let Some(attempt) = client.job(id).await? else {
             return Ok(false);
         };
-        if attempt.closed.is_some() || self.blocked.contains(&attempt.intent.source.group_id) {
+        if attempt.closed.is_some()
+            || self.blocked.contains(&attempt.intent.source.group_id)
+            || leave_to_select_work(&attempt, authority)
+        {
             return Ok(false);
         }
         let automatic = attempt.intent.automatic.is_some();
@@ -684,6 +687,17 @@ async fn select_work(
         Some(ErrorCode::Conflict),
     );
     Ok(None)
+}
+
+/// Review F4: an automatic attempt of this owner term without bound children
+/// still needs select_work's capacity check, which fixes its placement before
+/// Bind; resuming it here with no placement would skip that check. Its source
+/// is still observed (a paused source reports its usage), so select_work
+/// resumes it when the threshold holds.
+fn leave_to_select_work(attempt: &SplitAttempt, authority: Authority) -> bool {
+    attempt.intent.automatic.is_some()
+        && attempt.authority == authority
+        && attempt.children().is_err()
 }
 
 fn threshold_crossed(bytes: u64, policy: AutomaticSplitPolicy) -> bool {

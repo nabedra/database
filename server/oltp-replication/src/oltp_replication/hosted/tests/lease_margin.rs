@@ -45,3 +45,19 @@ fn o18_ranges3_lease_window_is_inside_the_voter_refusal_at_the_drift_bound() {
     let (leader, voter) = true_ends(lease, lease, LEASE_DRIFT_PPM);
     assert!(leader >= voter, "the bare lease overruns the voters' refusal");
 }
+
+/// RANGES-3: the read path's option (what `linearized` passes openraft)
+/// carries the margin. The bare `ReadPolicy::LeaseRead` would show
+/// `max_quorum_ack_age: None` (openraft then uses the full lease).
+#[test]
+fn o18_ranges3_lease_reads_use_the_margin_option() {
+    use openraft::ReadPolicy;
+    let lease = super::super::lease_read_option(ReadPolicy::LeaseRead, 3_000).to_string();
+    assert!(lease.contains("max_quorum_ack_age: Some(2.993s)"), "{lease}");
+    assert!(lease.contains("heartbeat_if_quorum_ack_stale: false"), "{lease}");
+    assert!(lease.contains("wait_timeout: Some(0ns)"), "{lease}");
+    let bare = openraft::LinearizerOption::from(ReadPolicy::LeaseRead).to_string();
+    assert_ne!(lease, bare);
+    let index = super::super::lease_read_option(ReadPolicy::ReadIndex, 3_000).to_string();
+    assert_eq!(index, openraft::LinearizerOption::from(ReadPolicy::ReadIndex).to_string());
+}

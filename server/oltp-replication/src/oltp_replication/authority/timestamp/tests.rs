@@ -1260,6 +1260,86 @@ async fn o16_o21_o26_o27_o28_automatic_split_keeps_bound_placement_on_exact_retr
     let old_encoding = serde_json::to_value(&old).unwrap();
     assert!(old_encoding.get("placement").is_none());
     assert_eq!(serde_json::from_value::<ImageCut>(old_encoding).unwrap(), old);
+
+    // RANGES-2: Close (commit here, abort below) removes the attempt from
+    // the open index, and the listing then holds only open attempts.
+    use crate::oltp_replication::authority::status::{SettlementStatement, VerifiedSettlement};
+    let listed = |store: GroupStore| async move {
+        let raw = store
+            .read_metadata(split::BUDGET, |view| {
+                let ids = split::open_page(view, None)?;
+                view.encode(&ids)
+            })
+            .await
+            .unwrap();
+        serde_json::from_slice::<Vec<Uuid>>(raw.as_slice()).unwrap()
+    };
+    let open_other = |slot: u8| {
+        let origin = AutomaticSplitOrigin { epoch: origin.epoch, slot };
+        let intent = SplitIntent { split_id: origin.id(&intent.source), automatic: Some(origin), ..intent.clone() };
+        let reservation = IdentityReservation {
+            request_id: intent.split_id,
+            digest: intent.digest().unwrap(),
+            reservation_id: nabedra_rt::ids::uuid_v4(),
+            ..reservation
+        };
+        (intent.split_id, TimestampCommand::SplitMetadata {
+            command: SplitTimestampCommand::Open {
+                authority, intent, catalog_group_id, reservation, pin_id: nabedra_rt::ids::uuid_v4(),
+            },
+        })
+    };
+    let (aborted_id, open_aborted) = open_other(2);
+    let (kept_id, open_kept) = open_other(3);
+    for command in [open_aborted, open_kept] {
+        assert!(matches!(fixture.apply(command).await, TimestampReply::Snapshot(_)));
+    }
+    let mut ids = vec![split_id, aborted_id, kept_id];
+    ids.sort();
+    assert_eq!(listed(fixture.machine.store().clone()).await, ids);
+    let settle = |attempt: &SplitAttempt, decision: TxnDecision, participant_count: u64| {
+        let manifest = ManifestRef {
+            status_group_id: nabedra_rt::ids::uuid_v4(),
+            digest: Digest::from_bytes([9; 32]),
+            participant_count,
+        };
+        let position = AppliedPosition { term: 1, node_id: 1, index: 99 };
+        VerifiedSettlement::model_for_test(SettlementStatement {
+            txn: attempt.txn,
+            request: attempt.request,
+            manifest,
+            decision: DecisionStatement {
+                txn: attempt.txn,
+                request: attempt.request,
+                manifest,
+                decided_at: position,
+                decision,
+            },
+            resolved_count: participant_count,
+            settled_at: position,
+        })
+        .unwrap()
+        .into_sealed()
+    };
+    let close = |id, settled| TimestampCommand::SplitMetadata {
+        command: SplitTimestampCommand::Close { authority, split_id: id, settled },
+    };
+    let bound = read(fixture.machine.store().clone()).await;
+    let commit_ts = crate::oltp_replication::types::Timestamp::new(image.read_ts.get() + 1).unwrap();
+    assert_eq!(
+        fixture.apply(close(split_id, settle(&bound, TxnDecision::Commit { commit_ts }, 1))).await,
+        TimestampReply::Released
+    );
+    let raw = fixture.machine.store().read_metadata(split::BUDGET, move |view| {
+        view.get(&split::key(aborted_id))?.ok_or_else(unknown)
+    }).await.unwrap();
+    let unbound: SplitAttempt = serde_json::from_slice(raw.as_slice()).unwrap();
+    let abort = TxnDecision::Abort { reason: AbortReason::ResourceLimit };
+    assert_eq!(
+        fixture.apply(close(aborted_id, settle(&unbound, abort, 0))).await,
+        TimestampReply::Released
+    );
+    assert_eq!(listed(fixture.machine.store().clone()).await, vec![kept_id]);
 }
 
 #[tokio::test]
