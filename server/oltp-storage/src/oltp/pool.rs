@@ -74,6 +74,9 @@ use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
 const POOL_MANIFEST: &str = "NABEDRA_OLTP_POOL.json";
+/// The manifest before it is published by a rename. A pool directory that holds only this
+/// file is still new: a crash stopped its first open before the manifest existed.
+const POOL_MANIFEST_TEMPORARY: &str = "NABEDRA_OLTP_POOL.json.tmp";
 const POOL_KEY: &[u8] = b"\0typed-pool-v1";
 const MAX_KEY_BYTES: usize = 2 * crate::protocol::MAX_BODY_BYTES + 256;
 const MAX_IDENTITY_BYTES: u64 = 4096;
@@ -285,7 +288,7 @@ impl OltpPool {
         shared.bind_worker(identity.worker_id)?;
         let pool_slot = shared.reserve_pool_slot()?;
         let overhead = shared.pool_overhead()?;
-        open_pool_manifest(path, &identity, mount.is_some())?;
+        open_pool_manifest(path, &identity)?;
         let mut options =
             storage::store_options(&shared.storage, fs, shared.config().write_buffer_bytes);
         tune(&mut options);
@@ -2065,19 +2068,18 @@ fn group_key(id: Uuid, tag: u8, suffix: &[u8]) -> Vec<u8> {
 fn identity_key(id: Uuid) -> Vec<u8> {
     group_key(id, b'i', &[])
 }
-fn open_pool_manifest(
-    path: &Path,
-    identity: &PoolIdentity,
-    mounted: bool,
-) -> Result<(), ProtocolError> {
+fn open_pool_manifest(path: &Path, identity: &PoolIdentity) -> Result<(), ProtocolError> {
     if fs::try_exists(path).unwrap_or(false) {
         let meta = fs::symlink_metadata(path).map_err(|_| storage_error_message())?;
         if !meta.is_dir() || meta.file_type().is_symlink() {
             return Err(storage_error_message());
         }
-    } else {
-        fs::create_dir_all(path).map_err(|_| storage_error_message())?;
     }
+    // Every open, in both profiles, makes the pool entry durable in its parent (through
+    // the verified mount descriptor when mounted). A retry after a crash between the mkdir
+    // and its sync finds the directory and must still sync it (DUR-6). KV only syncs
+    // directories inside the pool.
+    fs::create_dir_all_synced(path).map_err(|_| storage_error_message())?;
     let manifest = path.join(POOL_MANIFEST);
     if fs::try_exists(&manifest).unwrap_or(false) {
         let file = File::open(&manifest).map_err(|_| storage_error_message())?;
@@ -2109,33 +2111,34 @@ fn open_pool_manifest(
         if stored.as_ref() != Some(identity) {
             return Err(storage_error_message());
         }
+        // The manifest's entry, which a crash before the publishing sync left pending.
+        fs::sync_dir(path).map_err(|_| storage_error_message())?;
         return Ok(());
     }
-    if fs::read_dir(path)
-        .map_err(|_| storage_error_message())?
-        .next()
-        .is_some()
-    {
+    for entry in fs::read_dir(path).map_err(|_| storage_error_message())? {
+        let entry = entry.map_err(|_| storage_error_message())?;
+        if entry.file_name() == POOL_MANIFEST_TEMPORARY {
+            continue;
+        }
         if let Some(found) = storage::legacy_store_marker(path) {
             return Err(unsupported_format(&found));
         }
         return Err(storage_error_message());
     }
-    if mounted {
-        // Make the pool entry durable through the verified mount descriptor before
-        // publishing its first manifest. KV only syncs directories inside the pool.
-        let parent = path.parent().ok_or_else(storage_error_message)?;
-        fs::sync_dir(parent).map_err(|_| storage_error_message())?;
-    }
+    // Publish the manifest whole: a crash while it is written leaves only the temporary
+    // file, which the next open replaces, never a partial manifest that refuses the pool.
+    let temporary = path.join(POOL_MANIFEST_TEMPORARY);
     let mut file = OpenOptions::new()
         .write(true)
-        .create_new(true)
-        .open(&manifest)
+        .create(true)
+        .truncate(true)
+        .open(&temporary)
         .map_err(|_| storage_error_message())?;
     serde_json::to_writer(&mut file, identity).map_err(|_| storage_error_message())?;
     file.flush()
         .and_then(|_| file.sync_all())
         .map_err(|_| storage_error_message())?;
+    fs::rename(&temporary, &manifest).map_err(|_| storage_error_message())?;
     fs::sync_dir(path).map_err(|_| storage_error_message())?;
     Ok(())
 }

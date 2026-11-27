@@ -383,3 +383,186 @@ fn o11_snapshot_install_recovers_the_generation_at_activation() {
         assert_eq!(replay(after_activation), replay(after_activation));
     }
 }
+
+/// A development pool directory inside the data volume, so its entry lives in the volume.
+const POOL: &str = "/sim/n1/data/pool";
+
+fn open_pool_at(path: &str) -> OltpPool {
+    OltpPool::open_development_on(
+        path,
+        identity(),
+        shared(SharedResourceConfig::default()),
+        nabedra_rt::fs::real(),
+    )
+    .unwrap()
+}
+
+/// DUR-6: a development pool's directory survives the loss of unsynced state after a
+/// synced write. Before the fix only a mounted open synced the pool's parent.
+#[test]
+fn dur6_development_pool_directory_survives_power_loss() {
+    sim::run(SEED, |world| async move {
+        mount_data(&world);
+        let pool = sim::in_node(NODE, async {
+            let pool = open_pool_at(POOL);
+            put(&pool, b"base", Durability::Sync).unwrap();
+            pool
+        })
+        .await;
+        world.crash(NODE);
+        drop(pool);
+        world.restart_with(NODE, Cut::Crash);
+        sim::in_node(NODE, async {
+            assert!(
+                fs::try_exists(Path::new(POOL).join(POOL_MANIFEST)).unwrap(),
+                "the pool directory was lost with its synced write"
+            );
+            assert_key(&open_pool_at(POOL), b"base", true);
+        })
+        .await;
+        assert_eq!(world.unmounted_path_errors(), 0);
+    });
+}
+
+/// Opens the pool manifest with the volume cut after `cut` mutating operations, kills the
+/// node, opens it again (which must succeed), then loses every unsynced write: the
+/// manifest the retry returned for must be there. Returns the operations of the first open.
+fn pool_manifest_cut(cut: Option<u64>) -> u64 {
+    sim::run(SEED, |world| async move {
+        mount_data(&world);
+        let volume = world.volume(NODE, Path::new(DATA)).unwrap();
+        let path = Path::new(POOL);
+        let operations = sim::in_node(NODE, async {
+            let start = volume.mutating_ops();
+            if let Some(cut) = cut {
+                world.crash_volume_after(NODE, Path::new(DATA), start + cut);
+            }
+            let _ = open_pool_manifest(path, &identity());
+            volume.mutating_ops() - start
+        })
+        .await;
+        world.restart_with(NODE, Cut::Kill);
+        sim::in_node(NODE, async {
+            open_pool_manifest(path, &identity())
+                .unwrap_or_else(|error| panic!("retry after a kill at cut {cut:?}: {error:?}"));
+        })
+        .await;
+        world.restart_with(NODE, Cut::Crash);
+        sim::in_node(NODE, async {
+            let bytes = fs::read(path.join(POOL_MANIFEST)).unwrap_or_else(|error| {
+                panic!("the retried manifest was lost at cut {cut:?}: {error:?}")
+            });
+            assert_eq!(
+                serde_json::from_slice::<PoolIdentity>(&bytes).unwrap(),
+                identity()
+            );
+        })
+        .await;
+        assert_eq!(world.unmounted_path_errors(), 0);
+        operations
+    })
+}
+
+/// DUR-6: a kill at every step of a development pool's first open, then a retry, then a
+/// power loss. Before the fix the retry skipped the parent sync (the pool was lost) and a
+/// kill inside the manifest write left a partial manifest that refused every later open.
+#[test]
+fn dur6_pool_manifest_survives_a_kill_at_every_step_then_power_loss() {
+    let total = pool_manifest_cut(None);
+    assert!(total > 0, "the test must enumerate volume mutations");
+    for cut in 0..total {
+        assert_eq!(pool_manifest_cut(Some(cut)), cut);
+    }
+    eprintln!("pool manifest: {total} cuts replayed");
+}
+
+struct Excluded(nabedra_oltp_types::types::WorkerIdentity);
+
+impl mount::PoolExclusionProof for Excluded {
+    fn excluded_worker(&self) -> nabedra_oltp_types::types::WorkerIdentity {
+        self.0.clone()
+    }
+}
+
+/// Verifies the volume manifest with the volume cut after `cut` mutating operations, kills
+/// the node, verifies again (which must succeed), then loses every unsynced write: the
+/// manifest that retry accepted must be durable, and with `bump` the replaced generation
+/// stays fenced. With `bump` the manifest is first written at generation 1 and then
+/// replaced by generation 2 of a new incarnation; otherwise it is created.
+fn volume_manifest_cut(cut: Option<u64>, bump: bool) -> u64 {
+    sim::run(SEED, |world| async move {
+        let info = mount_data(&world);
+        let first = expectation(&info);
+        let second = mount::PoolMountExpectation {
+            generation: 2,
+            worker: mount::tests::worker_identity(first.identity.worker_id, Uuid::from_u128(5)),
+            ..first.clone()
+        };
+        let target = if bump { second } else { first.clone() };
+        let verify = |expected: &mount::PoolMountExpectation, excluded: bool| {
+            let proof = Excluded(first.worker.clone());
+            let exclusion = excluded.then_some(&proof as &dyn mount::PoolExclusionProof);
+            VerifiedPoolMount::verify(expected.clone(), exclusion).map(drop)
+        };
+        if bump {
+            sim::in_node(NODE, async { verify(&first, false).unwrap() }).await;
+        }
+        let volume = world.volume(NODE, Path::new(DATA)).unwrap();
+        let operations = sim::in_node(NODE, async {
+            let start = volume.mutating_ops();
+            if let Some(cut) = cut {
+                world.crash_volume_after(NODE, Path::new(DATA), start + cut);
+            }
+            let _ = verify(&target, bump);
+            volume.mutating_ops() - start
+        })
+        .await;
+        world.restart_with(NODE, Cut::Kill);
+        sim::in_node(NODE, async {
+            verify(&target, bump)
+                .unwrap_or_else(|error| panic!("retry after a kill at cut {cut:?}: {error:?}"));
+        })
+        .await;
+        world.restart_with(NODE, Cut::Crash);
+        sim::in_node(NODE, async {
+            verify(&target, false).unwrap_or_else(|error| {
+                panic!("the accepted volume manifest was lost at cut {cut:?}: {error:?}")
+            });
+            if bump {
+                assert!(
+                    verify(&first, false).is_err(),
+                    "generation 1 came back after a power loss at cut {cut:?}"
+                );
+            }
+        })
+        .await;
+        assert_eq!(world.unmounted_path_errors(), 0);
+        operations
+    })
+}
+
+/// DUR-3: a kill at every step of the first volume verify, a retry, then a power loss.
+/// Before the fix a kill inside the manifest write left a partial manifest that refused
+/// the volume for good.
+#[test]
+fn dur3_volume_manifest_creation_survives_a_kill_at_every_step() {
+    let total = volume_manifest_cut(None, false);
+    assert!(total > 0, "the test must enumerate volume mutations");
+    for cut in 0..total {
+        assert_eq!(volume_manifest_cut(Some(cut), false), cut);
+    }
+    eprintln!("volume manifest creation: {total} cuts replayed");
+}
+
+/// DUR-3: a kill at every step of a generation bump, a retry, then a power loss. Before
+/// the fix a kill between the rename and the mount root sync made the retry skip the sync,
+/// and the power loss restored generation 1, which verified again: the fence was undone.
+#[test]
+fn dur3_volume_manifest_generation_bump_survives_a_kill_at_every_step() {
+    let total = volume_manifest_cut(None, true);
+    assert!(total > 0, "the test must enumerate volume mutations");
+    for cut in 0..total {
+        assert_eq!(volume_manifest_cut(Some(cut), true), cut);
+    }
+    eprintln!("volume manifest bump: {total} cuts replayed");
+}

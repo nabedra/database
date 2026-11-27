@@ -498,11 +498,7 @@ mod linux {
                     {
                         return Err(invalid());
                     }
-                    let temporary =
-                        base.join(format!(".nabedra-volume-{}.tmp", nabedra_rt::ids::uuid_v4()));
-                    write_manifest(&temporary, &expected)?;
-                    fs::rename(&temporary, &path).map_err(|_| invalid())?;
-                    directory.sync_all().map_err(|_| invalid())?;
+                    publish_manifest(&base, &path, expected)?;
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -511,11 +507,15 @@ mod linux {
                 {
                     return Err(invalid());
                 }
-                write_manifest(&path, &expected)?;
-                directory.sync_all().map_err(|_| invalid())?;
+                publish_manifest(&base, &path, expected)?;
             }
             Err(_) => return Err(invalid()),
         }
+        // Every verify makes the manifest it accepts durable, not only the one that
+        // published it: a retry after a crash between the publishing rename and this sync
+        // reads the new manifest as current, and without the sync a power loss would bring
+        // back the previous generation and with it the fenced worker (DUR-3).
+        directory.sync_all().map_err(|_| invalid())?;
         revalidate(&directory, &observation)?;
         Ok(VerifiedPoolMount {
             observation,
@@ -619,6 +619,25 @@ mod linux {
         mount.directory.sync_all().map_err(|_| invalid())?;
         reobserve(&mount)?;
         Ok(mount)
+    }
+    /// Replaces the volume manifest at `path` by `expected` with a rename, so a crash
+    /// leaves the old manifest or the new one whole, never a partial file that refuses
+    /// the volume. The caller syncs the mount root.
+    fn publish_manifest(
+        base: &Path,
+        path: &Path,
+        expected: &PoolMountExpectation,
+    ) -> Result<(), ProtocolError> {
+        let temporary = base.join(format!(
+            ".nabedra-volume-{}.tmp",
+            nabedra_rt::ids::uuid_v4()
+        ));
+        let result = write_manifest(&temporary, expected)
+            .and_then(|()| fs::rename(&temporary, path).map_err(|_| invalid()));
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
     fn write_manifest(path: &Path, expected: &PoolMountExpectation) -> Result<(), ProtocolError> {
         let bytes = serde_json::to_vec(expected).map_err(|_| invalid())?;

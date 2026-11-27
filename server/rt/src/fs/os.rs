@@ -710,6 +710,54 @@ pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     std::fs::create_dir_all(path)
 }
 
+/// [`create_dir_all`], then makes `path` durable: on every call it syncs the parent of
+/// `path` and of each ancestor up to the first one that is a mount root or that another
+/// user owns. A retry after a crash between a `mkdir` and its sync, at any depth, finds
+/// the directories present and still makes them durable; directories this process could
+/// not have created are left alone.
+pub fn create_dir_all_synced(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
+    create_dir_all(path)?;
+    let owner = euid();
+    for dir in path.ancestors() {
+        if dir.as_os_str().is_empty() || is_mount_root(dir)? || metadata(dir)?.uid() != owner {
+            break;
+        }
+        match dir.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent)?,
+            _ => {
+                sync_dir(".")?;
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the directory `path` is the root of a mounted filesystem: `/` or a directory on
+/// another device than its parent. A descriptor alias (`File::fd_path`) counts as one, as
+/// its parent is procfs. On a simulated volume: its mount path, or a path whose parent is
+/// on no volume.
+fn is_mount_root(path: &Path) -> io::Result<bool> {
+    #[cfg(feature = "sim")]
+    {
+        use crate::sim::volumes::{Route, route, volume_for};
+        if let Route::Volume(_, resolved) = route(path)? {
+            if volume_for(&resolved).is_some_and(|v| v.mount_path.as_path() == resolved.as_ref()) {
+                return Ok(true);
+            }
+            return Ok(path
+                .parent()
+                .is_none_or(|parent| !matches!(route(parent), Ok(Route::Volume(..)))));
+        }
+    }
+    match path.parent() {
+        None => Ok(true),
+        Some(parent) if parent.as_os_str().is_empty() => Ok(false),
+        Some(parent) => Ok(std::fs::metadata(path)?.dev() != std::fs::metadata(parent)?.dev()),
+    }
+}
+
 /// `std::fs::DirBuilder::new().mode(mode).create(path)`: `mkdir(path, mode)`, less the
 /// umask in product and exactly `mode` on a simulated volume.
 #[inline]

@@ -478,3 +478,43 @@ fn product_wrappers_are_the_std_types() {
     assert_eq!(size_of::<super::ReadDir>(), size_of::<std::fs::ReadDir>());
     assert_eq!(size_of::<super::DirEntry>(), size_of::<std::fs::DirEntry>());
 }
+
+#[test]
+fn create_dir_all_synced_creates_nested_directories_on_the_host() {
+    let root = host_dir("synced");
+    super::create_dir_all_synced(root.join("a/b")).unwrap();
+    super::create_dir_all_synced(root.join("a/b")).unwrap();
+    assert!(metadata(root.join("a/b")).unwrap().is_dir());
+    assert!(super::is_mount_root(Path::new("/")).unwrap());
+    assert!(!super::is_mount_root(&root.join("a")).unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Every directory `create_dir_all_synced` returns for survives losing unsynced state, also
+/// on a retry that finds it and an ancestor created but unsynced, and a mount root is not
+/// synced in its parent (outside every volume).
+#[cfg(feature = "sim")]
+#[test]
+fn create_dir_all_synced_survives_a_crash_after_a_retry() {
+    use crate::sim::{Cut, NodeClock, in_node, run};
+    run(1, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.mount(1, "/sim/n1/data");
+        in_node(1, async {
+            super::create_dir_all_synced("/sim/n1/data").unwrap();
+            super::create_dir_all_synced("/sim/n1/data/a/b/c").unwrap();
+            // A crashed earlier call created both levels and synced neither.
+            super::create_dir_all("/sim/n1/data/r/s").unwrap();
+            super::create_dir_all_synced("/sim/n1/data/r/s").unwrap();
+        })
+        .await;
+        world.restart_with(1, Cut::Crash);
+        in_node(1, async {
+            for dir in ["/sim/n1/data/a/b/c", "/sim/n1/data/r/s"] {
+                assert!(metadata(dir).unwrap().is_dir(), "{dir} lost");
+            }
+        })
+        .await;
+        assert_eq!(world.unmounted_path_errors(), 0);
+    });
+}
