@@ -188,9 +188,9 @@ except `.live` which uses three.
 | `CacheCluster.peer.cfg` | 4 | 1 | Peer partition and crash while the replica lags. |
 | `CacheCluster.reset.cfg` | 4 | 1 | Operator cold reset (scoped or fleet) and delayed replication reply, SET only. |
 | `CacheCluster.restart.cfg` | 4 | 0 | Crash, restart with a new incarnation, and lost heartbeat reply. |
-| `CacheCluster.skew.cfg` | 4 | 0 | Clock drift and controller partition from extreme initial clock skew. |
+| `CacheCluster.skew.cfg` | 3 | 0 | Clock drift and controller partition from extreme initial clock skew. |
 | `CacheCluster.skewcut.cfg` | 3 | 2 | Controller partition from extreme initial clock skew, SET only. |
-| `CacheCluster.skewttl.cfg` | 4 | 1 | Controller partition from extreme initial clock skew, one TTL write. |
+| `CacheCluster.skewttl.cfg` | 3 | 1 | Controller partition from extreme initial clock skew, one TTL write. |
 | `CacheCluster.skewstaged.cfg` | 5 | 0 | Live source re-enrollment from extreme initial clock skew. |
 | `CacheCluster.staged.cfg` | 4 | 1 | Live source re-enrollment during staged promotion. |
 | `CacheCluster.stagedcut.cfg` | 5 | 0 | Controller partition during staged promotion or reset. |
