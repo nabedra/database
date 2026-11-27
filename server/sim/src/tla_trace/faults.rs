@@ -467,7 +467,7 @@ impl Inner {
             _ => 0,
         };
         let name = |id: u64| self.node_name(&NodeRef::World(id));
-        let any_name = |id: Option<u64>| id.map_or_else(|| EXTERNAL.to_owned(), |id| name(id));
+        let any_name = |id: Option<u64>| id.map_or_else(|| EXTERNAL.to_owned(), &name);
         let to = |id: u64| Some(json!({"to": name(id)}));
         let node = NodeRef::World;
         let any_node = |id: Option<u64>| id.map_or_else(|| NodeRef::from(EXTERNAL), NodeRef::World);
