@@ -1,0 +1,15 @@
+# Finding SCHED-3 of wave-rv; confirmed by the regression with the fix reverted (fx-sched).
+id = "REVIEW-queue-retry-wedge"
+title = "An accepted request that failed three attempts was never dispatched again, and failing records consumed dispatch slots"
+class = "uncertain-outcome"
+module = "scheduler"
+guarantees = ["OLAP-G07", "SCHED-G03"]
+scenarios = ["F02"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/src/node/queue_runtime.rs f2_reconciling_mutation_retries_after_three_failures_and_backoff_uses_no_slot"
+seed = "unknown"
+why_not_caught = "No test failed a mutation attempt three times and then looked for a fourth attempt or for other tenants waiting behind it."
+invariant_added = "A record whose backoff elapsed is eligible again, and a record in backoff takes no dispatch slot."
+fix_commits = ["923d68b7256e5f98483b69745e7886e9229af297"]
+revert_patch_ok = true

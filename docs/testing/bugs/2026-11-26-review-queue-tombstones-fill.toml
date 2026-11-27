@@ -1,0 +1,15 @@
+# Finding SCHED-5 of wave-rv; confirmed by the regression with the fix reverted (fx-sched).
+id = "REVIEW-queue-tombstones-fill"
+title = "Expired terminal records were never removed, so a long run filled the queue bytes and then rejected every request"
+class = "resource-release-order"
+module = "scheduler"
+guarantees = ["OLAP-G07"]
+scenarios = ["Q01", "Q06"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/src/node/queue_runtime.rs q01_long_run_beyond_queue_bytes_keeps_admitting"
+seed = "unknown"
+why_not_caught = "Q01 submits 1,000 requests, far below the roughly 240,000 that fill the default 256 MiB per replica."
+invariant_added = "A run longer than the queue byte budget keeps admitting; decided mutations stay answerable from history and undecided ones stay tombstones."
+fix_commits = ["3d9133dd489bb5ffae3fd88d94b63975f7ebf9b3", "923d68b7256e5f98483b69745e7886e9229af297"]
+revert_patch_ok = true

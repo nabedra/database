@@ -1,0 +1,15 @@
+# Finding SCHED-4 of wave-rv; confirmed by the regression with the fix reverted (fx-sched).
+id = "REVIEW-queue-key-order-dispatch"
+title = "The queue pump dispatched in storage-key order, so one database or a low UUID could starve older requests"
+class = "other"
+module = "scheduler"
+guarantees = ["SCHED-G03"]
+scenarios = ["C05"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/src/node/queue_runtime.rs c05_pump_dispatches_in_acceptance_order_across_databases"
+seed = "unknown"
+why_not_caught = "SCHED-G03 tests covered the resource scheduler only, not the queue pump that feeds it."
+invariant_added = "Queue dispatch candidates follow acceptance order across databases."
+fix_commits = ["923d68b7256e5f98483b69745e7886e9229af297"]
+revert_patch_ok = true
