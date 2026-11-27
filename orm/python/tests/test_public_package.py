@@ -80,12 +80,12 @@ class PackageCommandTests(unittest.TestCase):
 
     def test_database_routes_are_grouped_once(self):
         parser = cli._parser()
-        for command in ('init', 'serve', 'doctor', 'worker', 'cluster', 'migrate'):
+        for command in ('init', 'serve', 'doctor', 'worker', 'cluster'):
             with self.subTest(command=command), contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaises(SystemExit) as result:
                     parser.parse_args(['database', command, '--help'])
                 self.assertEqual(result.exception.code, 0)
-        for args in (['init'], ['database', 'database', 'migrate']):
+        for args in (['init'], ['database', 'database', 'cluster'], ['database', 'migrate']):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as result:
                 parser.parse_args(args)
             self.assertEqual(result.exception.code, 2)

@@ -524,7 +524,6 @@ struct OlapEngine {
 impl OlapEngine {
     async fn start() -> Self {
         let storage = Storage::new(Fake::default(), Namespace::new("logic/").unwrap());
-        storage.initialize_catalog().await.unwrap();
         let (pool, workers) = WorkerPool::start(
             NonZeroUsize::new(2).unwrap(),
             tokio::runtime::Handle::current(),
@@ -532,16 +531,10 @@ impl OlapEngine {
         .unwrap();
         let engine = Engine::new(storage, pool, PartitionSize::default());
         let executor = Executor::new(2, 64).unwrap();
-        let router = api::router_with_migration(
-            engine,
-            executor,
-            TOKEN.into(),
-            Default::default(),
-            false,
-            true,
-        )
-        .unwrap()
-        .0;
+        let router =
+            api::router_configured(engine, executor, TOKEN.into(), Default::default(), false)
+                .unwrap()
+                .0;
         Self {
             router,
             _workers: workers,

@@ -71,12 +71,11 @@ async fn q02_q04_f03_task_admission_precedes_acceptance_and_actor_memory_survive
         let mut config = ExecutionConfig::default();
         config.max_pending_requests = 1;
         let ingress = Executor::new(1, 0).unwrap();
-        let (app, tasks) = api::router_with_migration(
+        let (app, tasks) = api::router_configured(
             engine.clone(),
             ingress.clone(),
             "test-token".into(),
             config,
-            false,
             false,
         )
         .unwrap();
@@ -178,7 +177,6 @@ async fn q02_q04_f03_task_admission_precedes_acceptance_and_actor_memory_survive
 #[tokio::test]
 async fn q04_q05_u01_accepted_work_outlives_its_transport_and_deduplicates() {
     let storage = Storage::new(Fake::default(), Namespace::new("queued-api/").unwrap());
-    storage.initialize_catalog().await.unwrap();
     let (pool, threads) = WorkerPool::start(
         NonZeroUsize::new(1).unwrap(),
         tokio::runtime::Handle::current(),
@@ -196,13 +194,12 @@ async fn q04_q05_u01_accepted_work_outlives_its_transport_and_deduplicates() {
         .unwrap();
     waiting.await.unwrap();
     let engine = Engine::new(storage, pool, PartitionSize::default());
-    let (app, tasks) = api::router_with_migration(
+    let (app, tasks) = api::router_configured(
         engine.clone(),
         Executor::new(4, 4).unwrap(),
         "test-token".into(),
         ExecutionConfig::default(),
         false,
-        true,
     )
     .unwrap();
     let id = Uuid::new_v4();
@@ -255,7 +252,6 @@ async fn q04_q05_u01_accepted_work_outlives_its_transport_and_deduplicates() {
 #[tokio::test]
 async fn q06_r04_receipts_reconcile_commits_and_expired_reads_are_explicit() {
     let storage = Storage::new(Fake::default(), Namespace::new("cold-queue/").unwrap());
-    storage.initialize_catalog().await.unwrap();
     let (pool, threads) = WorkerPool::start(
         NonZeroUsize::new(1).unwrap(),
         tokio::runtime::Handle::current(),
@@ -264,13 +260,12 @@ async fn q06_r04_receipts_reconcile_commits_and_expired_reads_are_explicit() {
     let engine = Engine::new(storage, pool, PartitionSize::default());
     let mut execution = ExecutionConfig::default();
     execution.result_retention_ms = 100;
-    let (app, tasks) = api::router_with_migration(
+    let (app, tasks) = api::router_configured(
         engine.clone(),
         Executor::new(4, 4).unwrap(),
         "test-token".into(),
         execution.clone(),
         false,
-        true,
     )
     .unwrap();
     let mutation = Uuid::new_v4();
@@ -308,13 +303,12 @@ async fn q06_r04_receipts_reconcile_commits_and_expired_reads_are_explicit() {
     );
     tasks.stop_accepting();
     tasks.drain().await;
-    let (new, tasks) = api::router_with_migration(
+    let (new, tasks) = api::router_configured(
         engine.clone(),
         Executor::new(4, 4).unwrap(),
         "test-token".into(),
         execution,
         true,
-        false,
     )
     .unwrap();
     let (status, committed) = send(new.clone(), &path, None, "test-token").await;
@@ -349,12 +343,11 @@ async fn r05_cold_fence_prevents_a_paused_local_read_from_settling_as_success() 
     )
     .unwrap();
     let engine = Engine::new(storage, pool.clone(), PartitionSize::default());
-    let (app, tasks) = api::router_with_migration(
+    let (app, tasks) = api::router_configured(
         engine.clone(),
         Executor::new(4, 4).unwrap(),
         "test-token".into(),
         ExecutionConfig::default(),
-        false,
         false,
     )
     .unwrap();
@@ -401,13 +394,12 @@ async fn r05_cold_fence_prevents_a_paused_local_read_from_settling_as_success() 
     })
     .await
     .unwrap();
-    let (new, new_tasks) = api::router_with_migration(
+    let (new, new_tasks) = api::router_configured(
         engine.clone(),
         Executor::new(4, 4).unwrap(),
         "test-token".into(),
         ExecutionConfig::default(),
         true,
-        false,
     )
     .unwrap();
     let (status, abandoned) = send(new, &path, None, "test-token").await;
@@ -434,20 +426,18 @@ async fn a01_local_fixed_worker_explicitly_rejects_provisioning_without_changing
         Fake::default(),
         Namespace::new("manual-capability/").unwrap(),
     );
-    storage.initialize_catalog().await.unwrap();
     let (pool, threads) = WorkerPool::start(
         NonZeroUsize::new(1).unwrap(),
         tokio::runtime::Handle::current(),
     )
     .unwrap();
     let engine = Engine::new(storage, pool, PartitionSize::default());
-    let (app, tasks) = api::router_with_migration(
+    let (app, tasks) = api::router_configured(
         engine,
         Executor::new(2, 0).unwrap(),
         "test-token".into(),
         ExecutionConfig::default(),
         false,
-        true,
     )
     .unwrap();
     let body = json!({"request_id":Uuid::new_v4(),"operation":"cluster.autoscale","payload":{"min_nodes":1,"max_nodes":2}});

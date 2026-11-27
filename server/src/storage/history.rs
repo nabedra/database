@@ -1,14 +1,15 @@
-//! Conditional v3 initialization and bounded lookup in one captured history.
+//! Catalog root initialization, fencing and indexed decision lookup.
 use super::{
-    Catalog, CatalogFence, ClusterCatalog, Decision, MAX_DECISION_BYTES, Object, ObjectAccessError,
-    ObjectKey, ObjectStore, Storage, StorageError, WriteCondition,
+    CatalogFence, ClusterCatalog, Decision, MAX_DECISION_BYTES, ObjectAccessError, ObjectKey,
+    ObjectStore, Storage, StorageError, WriteCondition,
+    decision_index::{PageHash, Reads},
 };
 use crate::protocol::MAX_CATALOG_BYTES;
+use futures_util::{StreamExt, TryStreamExt};
 use nabedra_rt::time::{Instant, timeout_at};
-use serde::Deserialize;
 use uuid::Uuid;
 
-/// A complete validated v3 representation and its nonempty opaque version.
+/// A complete validated root and its nonempty opaque version.
 /// Private fields prevent callers from changing relationships after validation.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LoadedClusterCatalog {
@@ -45,6 +46,9 @@ impl LoadedClusterCatalog {
     }
 }
 
+/// Object permission probes in flight at once for one catalog (OLAP-5).
+const AUTHORIZE_CONCURRENCY: usize = 16;
+
 /// Caller-selected work limits for one lookup. No runtime defaults or TTL.
 /// The deadline is absolute and monotonic, including backend GET and body reads.
 #[derive(Debug, Clone, Copy)]
@@ -73,6 +77,9 @@ impl HistoryBudget {
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
     }
+    fn caps(&self) -> (usize, usize) {
+        (self.max_records, self.max_bytes)
+    }
     fn check_deadline(&self) -> Result<(), StorageError> {
         if nabedra_rt::time::now() >= self.deadline {
             Err(StorageError::Unavailable)
@@ -91,37 +98,11 @@ pub enum HistoryLookup {
     Absent,
 }
 
-enum Root {
-    Cluster(LoadedClusterCatalog),
-    Legacy(Catalog, String),
-}
-fn decode_root(object: Object) -> Result<Root, StorageError> {
-    // Only select a codec here. Both codecs still consume the ORIGINAL bytes,
-    // preserving duplicate fields and all nested strict validation evidence.
-    #[derive(Deserialize)]
-    struct Version {
-        format_version: u32,
-    }
-    let version: Version =
-        serde_json::from_slice(&object.bytes).map_err(|_| StorageError::InvalidCatalog)?;
-    if matches!(version.format_version, 3 | 4 | 5) {
-        Ok(Root::Cluster(LoadedClusterCatalog::new(
-            ClusterCatalog::decode(&object.bytes)?,
-            object.etag,
-        )?))
-    } else {
-        let catalog = Catalog::decode(&object.bytes)?;
-        if object.etag.is_empty() {
-            return Err(StorageError::Unavailable);
-        }
-        Ok(Root::Legacy(catalog, object.etag))
-    }
-}
-/// Migration requires compatible old writers stopped; ColdStart requires explicit
-/// operator evidence that all old queue holders stopped. Heartbeats are not proof.
+/// Takeover raises the scheduler term within a run; ColdStart requires
+/// explicit operator evidence that all old queue holders stopped.
+/// Heartbeats are not proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FenceTransition {
-    Migrate,
     Takeover,
     ColdStart,
 }
@@ -134,218 +115,144 @@ impl<B: ObjectStore> Storage<B> {
     }
 
     /// Reauthorize all backing objects before exposing a retained result through
-    /// a fresh grant. A successful GET establishes object permission; the body
-    /// is immediately dropped rather than downloaded into a shared cache.
+    /// a fresh grant. A successful probe establishes object permission; no body
+    /// is downloaded into a shared cache.
     pub async fn authorize_catalog_objects(
         &self,
         loaded: &LoadedClusterCatalog,
         deadline: Instant,
     ) -> Result<(), StorageError> {
+        self.authorize_catalog_access(loaded, deadline)
+            .await
+            .map_err(ObjectAccessError::into_storage_error)
+    }
+
+    /// As `authorize_catalog_objects`, keeping an explicit denial apart from a
+    /// storage failure or the deadline (OLAP-5), so that callers can answer
+    /// `unauthorized` only for a denial. Probes run concurrently, at most
+    /// `AUTHORIZE_CONCURRENCY` at a time, under the one deadline.
+    pub async fn authorize_catalog_access(
+        &self,
+        loaded: &LoadedClusterCatalog,
+        deadline: Instant,
+    ) -> Result<(), ObjectAccessError> {
         loaded.catalog.validate()?;
+        let mut keys = Vec::new();
         for entry in loaded.catalog.tables.values() {
             match &entry.data {
                 super::TableData::Legacy { snapshot } => {
-                    let key = ObjectKey::parse_snapshot(snapshot, entry.id)?;
-                    timeout_at(deadline, self.authorize_object(&key))
-                        .await
-                        .map_err(|_| StorageError::Unavailable)?
-                        .map_err(ObjectAccessError::into_storage_error)?;
+                    keys.push(ObjectKey::parse_snapshot(snapshot, entry.id)?);
                 }
                 super::TableData::Partitioned { files } => {
                     for file in files {
-                        let key = ObjectKey::parse_partition(&file.object, entry.id)?;
-                        timeout_at(deadline, self.authorize_object(&key))
-                            .await
-                            .map_err(|_| StorageError::Unavailable)?
-                            .map_err(ObjectAccessError::into_storage_error)?;
+                        keys.push(ObjectKey::parse_partition(&file.object, entry.id)?);
                     }
                 }
             }
         }
-        Ok(())
+        futures_util::stream::iter(keys)
+            .map(|key| async move {
+                timeout_at(deadline, self.authorize_object(&key))
+                    .await
+                    .map_err(|_| ObjectAccessError::Storage(StorageError::Unavailable))?
+            })
+            .buffer_unordered(AUTHORIZE_CONCURRENCY)
+            .try_collect::<Vec<()>>()
+            .await
+            .map(drop)
     }
 
-    /// Initialize a customer catalog or explicitly migrate after old writers stop.
-    /// Ownership, run and term are published in the same conditional root write.
-    /// Attaching with fresh credentials never changes the run or cluster owner.
+    /// Create the root on first use, attach to it, or fence it. Ownership, run
+    /// and term are published in the same conditional root write. Attaching
+    /// with fresh credentials never changes the run or cluster owner. A root of
+    /// any other format is refused (`UnsupportedCatalog`).
     pub async fn initialize_owned_cluster_catalog(
         &self,
         cluster_id: Uuid,
         fence: CatalogFence,
-        migration_allowed: bool,
         cold: bool,
     ) -> Result<LoadedClusterCatalog, StorageError> {
         fence.validate()?;
         if cluster_id.is_nil() {
             return Err(StorageError::InvalidCatalog);
         }
-        let (mut catalog, token) = match self.read(&ObjectKey::catalog(), MAX_CATALOG_BYTES).await {
-            Ok(object) => match decode_root(object)? {
-                Root::Cluster(loaded) if loaded.catalog.owner_cluster.is_some() => {
-                    if loaded.catalog.owner_cluster != Some(cluster_id) {
-                        return Err(StorageError::Conflict);
-                    }
-                    if loaded.catalog.fence == Some(fence) {
-                        return Ok(loaded);
-                    }
-                    let old = loaded.catalog.fence.ok_or(StorageError::InvalidCatalog)?;
-                    let transition = if old.run_id == fence.run_id {
-                        FenceTransition::Takeover
-                    } else if cold {
-                        FenceTransition::ColdStart
-                    } else {
-                        return Err(StorageError::Conflict);
-                    };
-                    return self.fence_cluster_catalog(&loaded, fence, transition).await;
+        match self.load_cluster_catalog().await {
+            Ok(loaded) => {
+                if loaded.catalog.owner_cluster != Some(cluster_id) {
+                    return Err(StorageError::Conflict);
                 }
-                Root::Cluster(loaded) => {
-                    if loaded.catalog.owner_cluster.is_some() {
-                        return Err(StorageError::Conflict);
-                    }
-                    if !migration_allowed {
-                        return Err(StorageError::UnsupportedCatalog);
-                    }
-                    (loaded.catalog, Some(loaded.etag))
-                }
-                Root::Legacy(catalog, token) => {
-                    if !migration_allowed {
-                        return Err(StorageError::UnsupportedCatalog);
-                    }
-                    (ClusterCatalog::from_catalog(&catalog)?, Some(token))
-                }
-            },
-            Err(StorageError::NotFound) => (ClusterCatalog::from_catalog(&Catalog::empty())?, None),
-            Err(error) => return Err(error),
-        };
-        catalog.format_version = 5;
-        catalog.owner_cluster = Some(cluster_id);
-        catalog.fence = Some(fence);
-        let condition = token
-            .as_deref()
-            .map_or(WriteCondition::Create, WriteCondition::Match);
-        match self
-            .put(&ObjectKey::catalog(), catalog.encode()?, condition)
-            .await
-        {
-            Ok(etag) if !etag.is_empty() => LoadedClusterCatalog::new(catalog, etag),
-            Ok(_) | Err(StorageError::Ambiguous) => {
-                let current = self.load_cluster_catalog().await?;
-                if current.catalog.owner_cluster == Some(cluster_id)
-                    && current.catalog.fence == Some(fence)
-                {
-                    Ok(current)
-                } else {
-                    Err(StorageError::Ambiguous)
-                }
+                self.attach_or_fence(loaded, fence, cold).await
+            }
+            Err(StorageError::NotFound) => {
+                self.create_root(ClusterCatalog::empty(fence, Some(cluster_id))?)
+                    .await
             }
             Err(error) => Err(error),
         }
     }
 
-    /// Load v3/v4 with bounded complete reads and root/head validation.
+    /// Load with a bounded complete read and root/head validation.
     pub async fn load_cluster_catalog(&self) -> Result<LoadedClusterCatalog, StorageError> {
         let object = self.read(&ObjectKey::catalog(), MAX_CATALOG_BYTES).await?;
         LoadedClusterCatalog::new(ClusterCatalog::decode(&object.bytes)?, object.etag)
     }
 
-    /// Attach, create, or conditionally migrate once. The old standalone writer
-    /// MUST be stopped before migration; remote process absence is not checked.
-    /// Conflict/ambiguity triggers one fresh read, never a second PUT.
-    pub async fn initialize_cluster_catalog(&self) -> Result<LoadedClusterCatalog, StorageError> {
-        let (catalog, token) = match self.read(&ObjectKey::catalog(), MAX_CATALOG_BYTES).await {
-            Ok(object) => match decode_root(object)? {
-                Root::Cluster(loaded) => {
-                    if loaded.catalog.owner_cluster.is_some() {
-                        return Err(StorageError::Conflict);
-                    }
-                    return Ok(loaded);
-                }
-                Root::Legacy(catalog, token) => {
-                    (ClusterCatalog::from_catalog(&catalog)?, Some(token))
-                }
-            },
-            Err(StorageError::NotFound) => (ClusterCatalog::from_catalog(&Catalog::empty())?, None),
-            Err(error) => return Err(error),
-        };
-        let condition = token
-            .as_deref()
-            .map_or(WriteCondition::Create, WriteCondition::Match);
-        match self
-            .put(&ObjectKey::catalog(), catalog.encode()?, condition)
-            .await
-        {
-            Ok(etag) if !etag.is_empty() => LoadedClusterCatalog::new(catalog, etag),
-            result => {
-                let error = match result {
-                    Ok(_) => StorageError::Ambiguous,
-                    Err(error @ (StorageError::Conflict | StorageError::Ambiguous)) => error,
-                    Err(error) => return Err(error),
-                };
-                match self.read(&ObjectKey::catalog(), MAX_CATALOG_BYTES).await {
-                    Ok(object) => match decode_root(object)? {
-                        Root::Cluster(loaded) => Ok(loaded),
-                        Root::Legacy(_, _) => Err(error),
-                    },
-                    Err(StorageError::NotFound) => Err(error),
-                    Err(error) => Err(error),
-                }
-            }
-        }
-    }
-
-    /// Production bootstrap creates v4 directly when the root is absent.
-    /// Existing legacy/v3 writers require an explicit compatible migration
-    /// acknowledgement; even an empty existing v3 root is a migration. Existing
-    /// v4 attaches without changing authority unless cold start was authorized.
-    /// Cold start requires evidence that all previous queue holders stopped.
-    /// Every transition submits at most one conditional root PUT.
+    /// Fixed-cluster bootstrap: create the unowned root when it is absent,
+    /// attach to it, or fence it for a cold start. Cold start requires evidence
+    /// that all previous queue holders stopped. Every transition submits at most
+    /// one conditional root PUT.
     pub async fn initialize_fenced_cluster_catalog(
         &self,
         fence: CatalogFence,
-        migration_allowed: bool,
         cold: bool,
     ) -> Result<LoadedClusterCatalog, StorageError> {
         fence.validate()?;
-        let (mut catalog, token) = match self.read(&ObjectKey::catalog(), MAX_CATALOG_BYTES).await {
-            Ok(object) => match decode_root(object)? {
-                Root::Cluster(loaded) if loaded.catalog.format_version == 4 => {
-                    if cold {
-                        return self
-                            .fence_cluster_catalog(&loaded, fence, FenceTransition::ColdStart)
-                            .await;
-                    }
-                    return Ok(loaded);
-                }
-                Root::Cluster(loaded) => {
-                    if loaded.catalog.owner_cluster.is_some() {
-                        return Err(StorageError::Conflict);
-                    }
-                    if !migration_allowed {
-                        return Err(StorageError::UnsupportedCatalog);
-                    }
-                    (loaded.catalog, Some(loaded.etag))
-                }
-                Root::Legacy(catalog, token) => {
-                    if !migration_allowed {
-                        return Err(StorageError::UnsupportedCatalog);
-                    }
-                    (ClusterCatalog::from_catalog(&catalog)?, Some(token))
-                }
-            },
-            Err(StorageError::NotFound) => (ClusterCatalog::from_catalog(&Catalog::empty())?, None),
-            Err(error) => return Err(error),
-        };
-        catalog.format_version = if catalog.owner_cluster.is_some() {
-            5
+        match self.load_cluster_catalog().await {
+            Ok(loaded) if loaded.catalog.owner_cluster.is_some() => Err(StorageError::Conflict),
+            Ok(loaded) if cold => {
+                self.fence_cluster_catalog(&loaded, fence, FenceTransition::ColdStart)
+                    .await
+            }
+            Ok(loaded) => Ok(loaded),
+            Err(StorageError::NotFound) => {
+                self.create_root(ClusterCatalog::empty(fence, None)?).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn attach_or_fence(
+        &self,
+        loaded: LoadedClusterCatalog,
+        fence: CatalogFence,
+        cold: bool,
+    ) -> Result<LoadedClusterCatalog, StorageError> {
+        if loaded.catalog.fence == Some(fence) {
+            return Ok(loaded);
+        }
+        let old = loaded.catalog.fence.ok_or(StorageError::InvalidCatalog)?;
+        let transition = if old.run_id == fence.run_id {
+            FenceTransition::Takeover
+        } else if cold {
+            FenceTransition::ColdStart
         } else {
-            4
+            return Err(StorageError::Conflict);
         };
-        catalog.fence = Some(fence);
-        let condition = token
-            .as_deref()
-            .map_or(WriteCondition::Create, WriteCondition::Match);
+        self.fence_cluster_catalog(&loaded, fence, transition).await
+    }
+
+    /// One `Create` of a new root. A conflict or ambiguous reply triggers one
+    /// fresh read, never a second PUT; only this exact root confirms it.
+    async fn create_root(
+        &self,
+        catalog: ClusterCatalog,
+    ) -> Result<LoadedClusterCatalog, StorageError> {
         match self
-            .put(&ObjectKey::catalog(), catalog.encode()?, condition)
+            .put(
+                &ObjectKey::catalog(),
+                catalog.encode()?,
+                WriteCondition::Create,
+            )
             .await
         {
             Ok(etag) if !etag.is_empty() => LoadedClusterCatalog::new(catalog, etag),
@@ -355,14 +262,14 @@ impl<B: ObjectStore> Storage<B> {
                     Err(error @ (StorageError::Conflict | StorageError::Ambiguous)) => error,
                     Err(error) => return Err(error),
                 };
-                // A fresh complete read can confirm only this exact intended
-                // fence. A competing root never proves our transition applied.
-                match self.read(&ObjectKey::catalog(), MAX_CATALOG_BYTES).await {
-                    Ok(object) => match decode_root(object)? {
-                        Root::Cluster(loaded) if loaded.catalog.fence == Some(fence) => Ok(loaded),
-                        _ => Err(error),
-                    },
-                    Err(StorageError::NotFound) => Err(error),
+                match self.load_cluster_catalog().await {
+                    Ok(current)
+                        if current.catalog.fence == catalog.fence
+                            && current.catalog.owner_cluster == catalog.owner_cluster =>
+                    {
+                        Ok(current)
+                    }
+                    Ok(_) | Err(StorageError::NotFound) => Err(error),
                     Err(error) => Err(error),
                 }
             }
@@ -380,18 +287,12 @@ impl<B: ObjectStore> Storage<B> {
     ) -> Result<LoadedClusterCatalog, StorageError> {
         fence.validate()?;
         match (base.catalog.fence, transition) {
-            (None, FenceTransition::Migrate) if base.catalog.format_version == 3 => {}
             (Some(old), FenceTransition::Takeover)
                 if old.run_id == fence.run_id && fence.scheduler_term > old.scheduler_term => {}
             (Some(old), FenceTransition::ColdStart) if old.run_id != fence.run_id => {}
             _ => return Err(StorageError::Conflict),
         }
         let mut catalog = base.catalog.clone();
-        catalog.format_version = if catalog.owner_cluster.is_some() {
-            5
-        } else {
-            4
-        };
         catalog.fence = Some(fence);
         let result = self
             .put(
@@ -414,11 +315,10 @@ impl<B: ObjectStore> Storage<B> {
         }
     }
 
-    /// Search only this captured root's reachable chain. Authorize the caller
-    /// BEFORE lookup. Identity is normalized UUID plus exact original body bytes.
-    /// Only a validated null terminus proves absence; a matching prefix suffices
-    /// for Found. Cost is linear with retained history; auxiliary space is one
-    /// bounded record, with no chain/body collection, caching, GC or retries.
+    /// Search only this captured root's index. Authorize the caller BEFORE
+    /// lookup. Identity is the UUID plus the exact original body bytes. Only a
+    /// validated index path proves absence. At most 16 page reads (none for
+    /// cached pages) and one decision read, within the supplied caps.
     pub async fn lookup_decision(
         &self,
         loaded: &LoadedClusterCatalog,
@@ -447,7 +347,8 @@ impl<B: ObjectStore> Storage<B> {
             HistoryLookup::IdentityConflict => Err(StorageError::InvalidCatalog),
         }
     }
-    async fn lookup_decision_inner(
+
+    pub(crate) async fn lookup_decision_inner(
         &self,
         loaded: &LoadedClusterCatalog,
         request_id: Uuid,
@@ -455,59 +356,61 @@ impl<B: ObjectStore> Storage<B> {
         budget: HistoryBudget,
     ) -> Result<HistoryLookup, StorageError> {
         budget.check_deadline()?;
-        let mut next = loaded.catalog.decision_head;
-        let mut revision = loaded.catalog.revision;
-        let mut records = 0usize;
-        let mut bytes = 0usize;
-        while let Some(id) = next {
+        let Some(root) = loaded.catalog.index_root()? else {
+            return Ok(HistoryLookup::Absent);
+        };
+        let mut reads = Reads {
+            records: 0,
+            bytes: 0,
+        };
+        let caps = budget.caps();
+        let Some(id) = self
+            .index_find(&root, request_id, budget.deadline, &mut reads, caps)
+            .await?
+        else {
             budget.check_deadline()?;
-            records = records.checked_add(1).ok_or(StorageError::LimitExceeded)?;
-            if records > budget.max_records {
-                return Err(StorageError::LimitExceeded);
+            return Ok(HistoryLookup::Absent);
+        };
+        reads.records += 1;
+        if reads.records > caps.0 {
+            return Err(StorageError::LimitExceeded);
+        }
+        let remaining = caps
+            .1
+            .checked_sub(reads.bytes)
+            .ok_or(StorageError::LimitExceeded)?;
+        let object = timeout_at(
+            budget.deadline,
+            self.read(&ObjectKey::decision(id), MAX_DECISION_BYTES.min(remaining)),
+        )
+        .await
+        .map_err(|_| StorageError::Unavailable)?
+        .map_err(|error| {
+            if error == StorageError::NotFound {
+                StorageError::InvalidCatalog
+            } else {
+                error
             }
-            let remaining = budget
-                .max_bytes
-                .checked_sub(bytes)
-                .ok_or(StorageError::LimitExceeded)?;
-            let object = timeout_at(
-                budget.deadline,
-                self.read(&ObjectKey::decision(id), MAX_DECISION_BYTES.min(remaining)),
-            )
-            .await
-            .map_err(|_| StorageError::Unavailable)?
-            .map_err(|error| {
-                if error == StorageError::NotFound {
-                    StorageError::InvalidCatalog
-                } else {
-                    error
-                }
-            })?;
-            budget.check_deadline()?;
-            bytes = bytes
-                .checked_add(object.bytes.len())
-                .ok_or(StorageError::LimitExceeded)?;
-            let decision = Decision::decode(&object.bytes)?;
-            if decision.id != id
-                || decision.revision != revision
-                || revision.checked_sub(1) != Some(decision.base_revision)
-            {
-                return Err(StorageError::InvalidCatalog);
-            }
-            budget.check_deadline()?;
-            if decision.request_id == request_id {
-                return Ok(
-                    if request_body.is_none_or(|body| decision.request_body.as_bytes() == body) {
-                        HistoryLookup::Found(decision)
-                    } else {
-                        HistoryLookup::IdentityConflict
-                    },
-                );
-            }
-            // Strict decrease detects cycles without a visited-ID allocation.
-            revision = decision.base_revision;
-            next = decision.parent;
+        })?;
+        let decision = Decision::decode(&object.bytes)?;
+        if decision.id != id
+            || decision.request_id != request_id
+            || decision.revision > loaded.catalog.revision
+        {
+            return Err(StorageError::InvalidCatalog);
         }
         budget.check_deadline()?;
-        Ok(HistoryLookup::Absent)
+        Ok(
+            if request_body.is_none_or(|body| decision.request_body.as_bytes() == body) {
+                HistoryLookup::Found(decision)
+            } else {
+                HistoryLookup::IdentityConflict
+            },
+        )
     }
+}
+
+/// The index root of a loaded catalog, for publication.
+pub(crate) fn index_of(loaded: &LoadedClusterCatalog) -> Result<Option<PageHash>, StorageError> {
+    loaded.catalog.index_root()
 }

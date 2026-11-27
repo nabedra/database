@@ -1,0 +1,23 @@
+# Evidence: wave-rv findings OLAP-3 (rv-olap sizes measured with ClusterCatalog::encode). The whole catalog root is one
+# JSON document capped at MAX_CATALOG_BYTES (1 MiB) and rewritten on every commit: about 1,900 tables of 10 columns,
+# 370 of 128 columns or 5,000 partition files fill it. fx-olap 2831c46d makes the cap a definite, replayable 413
+# decision with unchanged tables (regression below), so the outcome is no longer unknown, but the database still
+# cannot grow past the cap. The redesign (per-table manifests referenced from the root, loaded lazily) is deferred:
+# plans/olap-commit.md, "Capacity plan".
+id = "REVIEW-olap-root-cap-manifests"
+title = "The OLAP catalog root is one 1 MiB document rewritten per commit, so a database stops growing at about 1,900 tables or 5,000 partition files"
+class = "other"
+module = "olap"
+guarantees = ["OLAP-G05", "OLAP-G08"]
+scenarios = ["T06"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "server/tests/fenced_requests.rs::olap_3_root_over_the_catalog_cap_is_a_replayable_413"
+seed = "unknown"
+why_not_caught = "The commit tests use catalogs of a few tables; nothing grew a root to the cap until the design review measured it."
+invariant_added = "Intended: a database can grow its table and file counts without a fixed root-size ceiling; until then the cap answers a replayable 413, never outcome_unknown."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-26"

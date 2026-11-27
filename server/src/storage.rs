@@ -7,10 +7,12 @@ pub mod registry;
 pub use backend::RuntimeStore;
 mod control_decision;
 mod decision;
+mod decision_index;
 mod history;
 mod publication;
 pub use control_decision::{ControlDecision, MAX_CONTROL_BODY_BYTES, MAX_CONTROL_DECISION_BYTES};
 pub use decision::{CatalogFence, ClusterCatalog, Decision, MAX_DECISION_BYTES};
+pub use decision_index::MAX_INDEX_PAGE_BYTES;
 pub use history::{FenceTransition, HistoryBudget, HistoryLookup, LoadedClusterCatalog};
 pub use publication::{PreparedPublication, PublicationOutcome};
 pub mod http;
@@ -34,6 +36,16 @@ use uuid::Uuid;
 mod common;
 use common::safe_path;
 pub use common::{Namespace, StorageError};
+
+/// A jittered pause before CAS round `retry + 1` of a mutation (OLAP-9):
+/// uniform in `[0, min(200 ms, 25 ms * 2^(retry - 1))]`.
+pub fn cas_retry_delay(retry: u32) -> std::time::Duration {
+    common::jitter(
+        retry,
+        std::time::Duration::from_millis(25),
+        std::time::Duration::from_millis(200),
+    )
+}
 /// Only canonical table objects and explicitly typed metadata can be addressed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectKey(String);
@@ -43,6 +55,10 @@ impl ObjectKey {
     }
     pub fn decision(id: Uuid) -> Self {
         Self(format!("decisions/{id}.json"))
+    }
+    /// An immutable decision index page, named by the SHA-256 of its bytes.
+    pub fn decision_index_page(hash: &[u8; 32]) -> Self {
+        Self(format!("decision-index/{}.bin", decision_index::hex(hash)))
     }
     pub fn control_decision(id: Uuid) -> Self {
         Self(format!("control-decisions/{id}.json"))
@@ -88,6 +104,13 @@ impl ObjectKey {
         }
         if path == "cluster/control.json" {
             return Ok(Self::control());
+        }
+        if let Some(hash) = path
+            .strip_prefix("decision-index/")
+            .and_then(|s| s.strip_suffix(".bin"))
+        {
+            let hash = decision_index::parse_hex(hash).ok_or(StorageError::InvalidPath)?;
+            return Ok(Self::decision_index_page(&hash));
         }
         for (prefix, constructor) in [
             ("decisions/", Self::decision as fn(Uuid) -> Self),
@@ -170,7 +193,7 @@ pub enum ObjectAccessError {
     Storage(StorageError),
 }
 impl ObjectAccessError {
-    fn into_storage_error(self) -> StorageError {
+    pub(crate) fn into_storage_error(self) -> StorageError {
         match self {
             Self::Denied => StorageError::Unavailable,
             Self::Storage(error) => error,
@@ -224,10 +247,15 @@ pub trait ObjectStore: Send + Sync {
 pub struct Storage<B> {
     backend: B,
     namespace: Namespace,
+    index_cache: decision_index::PageCache,
 }
 impl<B: ObjectStore> Storage<B> {
     pub fn new(backend: B, namespace: Namespace) -> Self {
-        Self { backend, namespace }
+        Self {
+            backend,
+            namespace,
+            index_cache: Default::default(),
+        }
     }
     pub fn backend(&self) -> &B {
         &self.backend

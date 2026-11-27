@@ -31,10 +31,9 @@ A configured provider can establish a new empty run only after fresh inventory
 proves that every retained member stopped, as described in
 [provider configuration](../../docs/testing/provisioning-adapters.md).
 
-A brand new namespace creates a fenced format 4 catalog. An existing format
-1/2/3 catalog requires `--migrate-catalog`, which confirms that previous writers
-have been stopped. Keep old writers stopped after the transition. Migration and
-cold start are separate operations.
+A brand new namespace creates a fenced format 6 catalog. Format 6 is the only
+catalog format: a root of any other format is refused at startup and never
+migrated.
 
 For local `serve`, `--execution-config PATH` and `--resources-config PATH` read
 strict JSON configuration objects matching
@@ -167,7 +166,6 @@ Clap help/version options:
 | `--queue-size` | `64` | Legacy additional pending-request default and ingress coordination backlog; zero is valid. An execution file supplies the request queue limit directly. |
 | `--execution-config` | Absent | Readable strict JSON execution limits, including request count, replica/result bytes, retention and partition size. |
 | `--resources-config` | Absent | Readable strict JSON compute and memory ceilings; `max_threads` overrides `--workers`. |
-| `--migrate-catalog` | `false` | Explicitly confirm that previous writers are stopped before upgrading a format 1/2/3 catalog to fenced format 4. |
 | `--cold-start` | `false` | Explicitly fence a previous stopped local run and start an empty request queue while retaining committed data. |
 | `--tls-cert` | Absent | Readable PEM certificate file, supplied with `--tls-key`. |
 | `--tls-key` | Absent | Readable matching PEM private key, supplied with `--tls-cert`. |
@@ -257,13 +255,15 @@ configuration values.
 
 ## Storage behavior and limits
 
-Within the prefix, `catalog.json` is the conditional publication root. Current
-runtime publications use format 4, which stores the durable decision head and
-`run_id`/scheduler-term fence alongside table references. An ownership takeover
+Within the prefix, `catalog.json` is the conditional publication root. It uses
+format 6, which stores the durable decision head, the root of the immutable
+decision index and the `run_id`/scheduler-term fence alongside table references.
+The decision index (`decision-index/<sha256>.bin` pages) proves whether a request
+ID was already decided in a bounded number of reads, however long the history. An ownership takeover
 or cold start updates that same root, so an old attempt's catalog ETag cannot
 publish after its fence has been superseded.
 
-The table layouts introduced in format 2 remain supported inside format 4:
+Two table layouts are supported inside format 6:
 Legacy entries at `tables/<table_id>/<commit_id>.parquet` and Partitioned entries
 at `tables/<table_id>/<commit_id>/<ordinal>.parquet`.
 A manifest records each file's typed primary-key range, row count, closed byte
@@ -271,11 +271,7 @@ size and decoded payload size. Ranges are ordered, contiguous, lower-inclusive
 and upper-exclusive, with unbounded outer ends. Empty tables use `files: []`
 and create no Parquet object.
 
-Existing format 1/2/3 roots require `--migrate-catalog` after their previous
-writers have stopped. Migration preserves table/file references and existing
-decision history, then establishes a format 4 fence before accepting work. Keep
-older writers stopped afterward. Upgrading the root does not rewrite table data:
-a Legacy table becomes partitioned on an actual data change, while reads and
+A Legacy table becomes partitioned on an actual data change, while reads and
 no-op mutations retain its existing file. Mixed table layouts remain valid.
 
 Each read captures one fresh catalog and retains its referenced files during
@@ -418,8 +414,7 @@ profiles. Its startup exchange demonstrates `nabedra-db api --config PATH`
 over the inherited `NABEDRA_SUPERVISOR_FD` socket and
 `nabedra-db worker --bootstrap PATH`. An API requires that supervisor
 exchange; it is not an unsupervised standalone command. `api` also accepts
-`--migrate-catalog` and `--cold-start` with the same migration and cold-run
-confirmation requirements described above.
+`--cold-start` with the same cold-run confirmation requirement described above.
 
 The supervised cluster uses the HTTP object backend. It supports heterogeneous
 workers, replicated in-memory requests, fenced publication, public cluster

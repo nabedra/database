@@ -1,9 +1,9 @@
-//! Metadata-only publication against one captured v3 root. No execution or table
+//! Metadata-only publication against one captured root. No execution or table
 //! uploads happen here. See PreparedPublication for the caller's sequencing duty.
 use super::{
     CatalogEntry, CatalogFence, ClusterCatalog, Decision, HistoryBudget, HistoryLookup,
     LoadedClusterCatalog, MAX_DECISION_BYTES, ObjectKey, ObjectStore, Storage, StorageError,
-    TableData, WriteCondition,
+    TableData, WriteCondition, decision_index::hex,
 };
 use nabedra_rt::time::timeout_at;
 use std::{collections::BTreeMap, future::Future};
@@ -32,7 +32,8 @@ pub enum PublicationOutcome {
 pub struct PreparedPublication {
     base: LoadedClusterCatalog,
     decision: Decision,
-    root_bytes: Vec<u8>,
+    /// The candidate root; `publish` sets its index root.
+    root: ClusterCatalog,
     decision_bytes: Vec<u8>,
 }
 impl std::fmt::Debug for PreparedPublication {
@@ -44,16 +45,6 @@ impl std::fmt::Debug for PreparedPublication {
     }
 }
 impl PreparedPublication {
-    pub fn prepare(
-        base: LoadedClusterCatalog,
-        tables: BTreeMap<String, CatalogEntry>,
-        decision: Decision,
-    ) -> Result<Self, StorageError> {
-        if base.catalog().fence.is_some() {
-            return Err(StorageError::Conflict);
-        }
-        Self::prepare_inner(base, tables, decision)
-    }
     /// Capture the expected owner from admitted work, never from a fresh root.
     pub fn prepare_fenced(
         base: LoadedClusterCatalog,
@@ -62,7 +53,7 @@ impl PreparedPublication {
         expected: CatalogFence,
     ) -> Result<Self, StorageError> {
         expected.validate()?;
-        if base.catalog().fence != Some(expected) || base.catalog().format_version != 4 {
+        if base.catalog().fence != Some(expected) || base.catalog().owner_cluster.is_some() {
             return Err(StorageError::Conflict);
         }
         Self::prepare_inner(base, tables, decision)
@@ -78,7 +69,6 @@ impl PreparedPublication {
         expected.validate()?;
         if cluster_id.is_nil()
             || base.catalog().owner_cluster != Some(cluster_id)
-            || base.catalog().format_version != 5
             || base.catalog().fence != Some(expected)
         {
             return Err(StorageError::Conflict);
@@ -117,6 +107,8 @@ impl PreparedPublication {
                 return Err(StorageError::InvalidCatalog);
             }
         }
+        // The placeholder has the final index hash's length, so this size
+        // check is the publication's.
         let root = ClusterCatalog {
             owner_cluster: old.owner_cluster,
             format_version: old.format_version,
@@ -125,13 +117,14 @@ impl PreparedPublication {
             tables,
             decision_head: Some(decision.id),
             fence: old.fence,
+            decision_index: Some("0".repeat(64)),
         };
         let decision_bytes = decision.encode()?;
-        let root_bytes = root.encode()?;
+        root.encode()?;
         Ok(Self {
             base,
             decision,
-            root_bytes,
+            root,
             decision_bytes,
         })
     }
@@ -148,19 +141,33 @@ impl PreparedPublication {
         storage: &Storage<B>,
         budget: HistoryBudget,
     ) -> Result<PublicationOutcome, StorageError> {
-        match storage
-            .lookup_decision(
+        let lookup = storage
+            .lookup_decision_inner(
                 &self.base,
                 self.decision.request_id,
-                self.decision.request_body.as_bytes(),
+                Some(self.decision.request_body.as_bytes()),
                 budget,
             )
-            .await?
-        {
+            .await?;
+        match lookup {
             HistoryLookup::Found(d) => return Ok(PublicationOutcome::Terminal(d)),
             HistoryLookup::IdentityConflict => return Ok(PublicationOutcome::IdentityConflict),
             HistoryLookup::Absent => {}
         }
+        // The next index is the base's exact index plus this one fresh pair,
+        // so the conditional root PUT keeps it exact.
+        let (index, pages) = storage
+            .index_insert(
+                super::history::index_of(&self.base)?,
+                self.decision.request_id,
+                self.decision.id,
+                budget.deadline(),
+            )
+            .await?;
+        let mut root = self.root;
+        root.decision_index = Some(hex(&index));
+        storage.put_index_pages(pages, budget.deadline()).await?;
+        let root_bytes = root.encode()?;
         let key = ObjectKey::decision(self.decision.id);
         match bounded(
             budget,
@@ -184,7 +191,7 @@ impl PreparedPublication {
             budget.deadline(),
             storage.put(
                 &ObjectKey::catalog(),
-                self.root_bytes,
+                root_bytes,
                 WriteCondition::Match(self.base.etag()),
             ),
         )

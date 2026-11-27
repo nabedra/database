@@ -116,7 +116,7 @@ impl<B: ObjectStore + 'static> Engine<B> {
             nabedra_rt::time::now() + Duration::from_secs(60),
         )
         .map_err(|_| unavailable())?;
-        for _ in 0..3 {
+        for attempt in 1..=3u32 {
             let loaded = if mutation {
                 self.storage()
                     .load_cluster_catalog()
@@ -204,8 +204,33 @@ impl<B: ObjectStore + 'static> Engine<B> {
                 response_status: encoded.status,
                 response_body: String::from_utf8(encoded.body).map_err(|_| unavailable())?,
             };
-            let candidate = PreparedPublication::prepare_fenced(loaded, tables, decision, fence)
-                .map_err(|_| unavailable())?;
+            let unchanged = base.tables.clone();
+            let candidate = match PreparedPublication::prepare_fenced(
+                loaded.clone(),
+                tables,
+                decision.clone(),
+                fence,
+            ) {
+                Ok(candidate) => candidate,
+                // OLAP-3: a changed root above the catalog cap is a definite
+                // limit, published as a 413 decision with unchanged tables.
+                Err(StorageError::LimitExceeded) if decision.response_status == 200 => {
+                    let fallback = response::encode_error(
+                        Some(request_id),
+                        failure(ErrorCode::LimitExceeded, "catalog size limit exceeded"),
+                    );
+                    let decision = Decision {
+                        id: nabedra_rt::ids::uuid_v4(),
+                        response_status: fallback.status,
+                        response_body: String::from_utf8(fallback.body)
+                            .map_err(|_| unavailable())?,
+                        ..decision
+                    };
+                    PreparedPublication::prepare_fenced(loaded, unchanged, decision, fence)
+                        .map_err(|_| unavailable())?
+                }
+                Err(_) => return Err(unavailable()),
+            };
             match candidate
                 .publish(self.storage(), budget)
                 .await
@@ -220,6 +245,10 @@ impl<B: ObjectStore + 'static> Engine<B> {
                 }
                 PublicationOutcome::Unknown => return Err(unavailable()),
                 PublicationOutcome::NeedsRecompute => {}
+            }
+            // OLAP-9: CAS losers that lost together must not retry together.
+            if mutation && attempt < 3 {
+                nabedra_rt::time::sleep(crate::storage::cas_retry_delay(attempt)).await;
             }
         }
         Err(unavailable())

@@ -13,7 +13,6 @@ export interface ServeOptions {
   stopNode?: ProviderCallbacks["stopNode"] | null
   listNodes?: ProviderCallbacks["listNodes"] | null
   coldStart?: boolean
-  migrateCatalog?: boolean
 }
 
 interface Reservation { active: boolean; bridge?: CallbackBridge }
@@ -39,9 +38,9 @@ function configPath(): string {
 export async function serve(
   name: string, nodes: number | readonly [number, number] = 1, options: ServeOptions = {},
 ): Promise<void> {
-  const { startNode, stopNode, listNodes, coldStart = false, migrateCatalog = false } = options
-  if (typeof coldStart !== "boolean" || typeof migrateCatalog !== "boolean") {
-    throw new ValidationError("coldStart and migrateCatalog must be booleans")
+  const { startNode, stopNode, listNodes, coldStart = false } = options
+  if (typeof coldStart !== "boolean") {
+    throw new ValidationError("coldStart must be a boolean")
   }
   name = validateIdentifier(name)
   const managed = startNode != null || stopNode != null || listNodes != null
@@ -83,7 +82,7 @@ export async function serve(
       startup = { ...initial, provisioning: "external", bridge: null }
     }
     await superviseApi(config, startup, {
-      coldStart, migrateCatalog,
+      coldStart,
       onPrepared: ({ cluster_id, authorize_url }) => {
         if (owner.bridge && authorize_url !== null) owner.bridge.activate(cluster_id, authorize_url)
       },

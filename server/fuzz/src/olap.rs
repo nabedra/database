@@ -66,14 +66,27 @@ mod tests {
         assert!(predicate(include_bytes!("../corpus/olap_predicate/comparison.json")).is_ok());
         assert!(predicate(include_bytes!("../corpus/olap_predicate/too-deep.json")).is_err());
 
+        // Format 6 is the only catalog format; older roots are refused.
         let catalog =
-            ClusterCatalog::decode(include_bytes!("../corpus/olap_catalog/v3-empty.json")).unwrap();
-        assert_eq!(catalog.format_version, 3);
+            ClusterCatalog::decode(include_bytes!("../corpus/olap_catalog/v6-empty.json")).unwrap();
+        assert_eq!(catalog.format_version, 6);
         assert!(
             ClusterCatalog::decode(include_bytes!(
-                "../corpus/olap_catalog/v3-partitioned-table.json"
+                "../corpus/olap_catalog/v6-partitioned-table.json"
             ))
             .is_ok()
+        );
+        assert!(
+            ClusterCatalog::decode(include_bytes!("../corpus/olap_catalog/v6-indexed-head.json"))
+                .is_ok()
+        );
+        assert_eq!(
+            ClusterCatalog::decode(include_bytes!("../corpus/olap_catalog/v3-empty.json")),
+            Err(StorageError::UnsupportedCatalog)
+        );
+        assert_eq!(
+            ClusterCatalog::decode(include_bytes!("../corpus/olap_catalog/v5-owned.json")),
+            Err(StorageError::UnsupportedCatalog)
         );
         assert!(
             ClusterCatalog::decode(include_bytes!("../corpus/olap_catalog/absent-head.json"))

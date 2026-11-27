@@ -23,7 +23,7 @@ const cliVersion = "0.2.2"
 const binaryFailure = "Cannot launch compatible nabedra-db. Set NABEDRA_SERVER_BINARY to an executable file path or put nabedra-db on PATH."
 const tokenKeys = ["admin_token", "data_token", "enrollment_token"] as const
 const signaled = ["SIGINT", "SIGTERM"] as const
-const commandNames = ["init", "serve", "doctor", "worker", "cluster", "migrate"] as const
+const commandNames = ["init", "serve", "doctor", "worker", "cluster"] as const
 type Command = typeof commandNames[number]
 type Auth = Record<typeof tokenKeys[number], string>
 type Values = Record<string, string | boolean | (string | boolean)[] | undefined>
@@ -42,7 +42,6 @@ const commandOptions: Record<Command, NonNullable<ParseArgsConfig["options"]>> =
   doctor: options(["config"], ["json"]),
   worker: options(["bootstrap"]),
   cluster: options(["url", "admin-token-file", "ca-file"], ["json"]),
-  migrate: options(["storage", "region", "cluster-id"], ["confirm-writers-stopped"]),
 }
 
 function string(values: Values, key: string): string | undefined {
@@ -346,17 +345,6 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       const [, result] = await control.request("cluster." + action, payload, { deadline: performance.now() / 1_000 + 30 })
       printJson(result, !values.json && !json)
       return 0
-    }
-    if (command === "migrate") {
-      const storage = required(values, "storage")
-      const region = required(values, "region")
-      const clusterId = required(values, "cluster-id")
-      s3Storage(storage, region)
-      if (!values["confirm-writers-stopped"] || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(clusterId)) {
-        throw new ConfigError("Migration requires valid cluster identity and explicit confirmation")
-      }
-      return await forward(["database", "migrate", "--storage", storage, "--region", region, "--cluster-id", clusterId,
-        "--confirm-writers-stopped"])
     }
     const source = string(values, "config") ?? configName
     const config = resolvePaths(load(source), source)

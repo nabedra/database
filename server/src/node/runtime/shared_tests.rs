@@ -95,7 +95,7 @@ async fn shared_worker_case(two_workers: bool) {
  let typed:crate::cluster::configuration::Template=serde_json::from_value(template.clone()).unwrap();
  let mut root:crate::cluster::state::Control=serde_json::from_value(json!({"version":1,"cluster_id":id(1),"name":"Shared_fixture","config":{"generation":2,"storage_fingerprint":ready.backend.storage.as_str(),"auth_fingerprint":"b".repeat(64),"template_fingerprint":typed.fingerprint().unwrap(),"lifecycle_fingerprint":"c".repeat(64),"worker_semantic_fingerprint":"d".repeat(64),"adapter_contract":null},"provisioning":"external","template":template,"timing":crate::cluster::configuration::Timing::default(),"revision":1,"change_id":id(20),"policy":{"revision":1,"mode":"fixed","desired":1,"min_nodes":1,"max_nodes":1},"controller":{"owner_id":null,"epoch":0,"lease_state":"released","lease_until_ms":null},"scheduler":{"coordinator_node":id(3),"scheduler_term":1,"cooldown_until_ms":0,"backoff_until_ms":0,"failures":0,"low_since_ms":null},"admin_seq":0,"admin_head":null,"nodes":[{"node_id":id(3),"launch_id":null,"resource_id":format!("external:{}",id(3)),"ownership":"external","state":"ready","incarnation":id(4),"retired_incarnations":[],"endpoint":endpoint,"operation_slots":slots,"partition_slots":job_slots,"resources":resources,"queue_size":64,"registration":"verified","session":{"id":id(5),"verifier":http::hex(&auth::worker_verifier(id(1),id(3),id(4),id(5),&key.public_key()))},"drain":null}],"intents":[]})).unwrap();
  let storage=Arc::new(Storage::new(RuntimeStore::Http(service.adapter("control/")),Namespace::new("control/").unwrap()));storage.put(&ObjectKey::control(),root.encode().unwrap(),WriteCondition::Create).await.unwrap();
- let fence=CatalogFence{run_id:id(10),scheduler_term:1}; storage.initialize_fenced_cluster_catalog(fence,false,false).await.unwrap();
+ let fence=CatalogFence{run_id:id(10),scheduler_term:1}; storage.initialize_fenced_cluster_catalog(fence,false).await.unwrap();
  let (pool,threads)=WorkerPool::start_with_resources(resources,tokio::runtime::Handle::current()).unwrap();
  let local=LocalAdmission::new_with_job_slots(id(1),&key,sender.clone(),id(30),slots,job_slots,64).unwrap();let boot=local.boot();let receiver=Arc::new(Mutex::new(ReceiverState::distributed(local)));
  let owners=Arc::new(PayloadOwners::from_receiver_with_streams(pool.clone(),receiver.clone(),32)); let scratch=service.path.join("scratch");std::fs::create_dir(&scratch).unwrap();
@@ -167,6 +167,17 @@ async fn shared_worker_case(two_workers: bool) {
  assert!(matches!(Box::pin(worker.queue_command(&root,None,QueueCommand::Lookup{run_id:fence.run_id,request_id,context:Some(rotated.clone())})).await.unwrap(),QueueReply::Receipt{..}));
  allowed.store(false,Ordering::SeqCst);assert!(Box::pin(worker.queue_command(&root,None,QueueCommand::Lookup{run_id:fence.run_id,request_id,context:Some(rotated)})).await.is_err());
  assert!(storage.load_cluster_catalog().await.unwrap().catalog().tables.is_empty());
+ // OLAP-2: a database still fenced by an older run (say run 9, whose root PUT may
+ // be delayed in flight) must not let that run's receipt say `abandoned`.
+ allowed.store(true,Ordering::SeqCst);
+ let old=CatalogFence{run_id:id(9),scheduler_term:1};
+ let grant=Box::pin(worker.open_database(a.clone())).await.unwrap();let data=grant.storage();
+ let current=data.load_cluster_catalog().await.unwrap();data.fence_cluster_catalog(&current,old,crate::storage::FenceTransition::ColdStart).await.unwrap();drop(data);drop(grant);
+ let reply=Box::pin(worker.queue_command(&root,None,QueueCommand::Lookup{run_id:old.run_id,request_id:id(98),context:Some(a.clone())})).await;
+ let grant=Box::pin(worker.open_database(a.clone())).await.unwrap();let after=grant.storage().load_cluster_catalog().await.unwrap();drop(grant);
+ if let Ok(QueueReply::Receipt{receipt})=&reply && receipt.state==crate::request_queue::RequestState::Abandoned {
+   assert_eq!(after.catalog().fence.map(|f|f.run_id),Some(fence.run_id),"OLAP-2: abandoned from a root still fenced by the request's own run");
+ }
  if let Some((w,o,t,p,s))=second {s.abort();let _=s.await;drop(w);o.close_and_drain().await.unwrap();drop(o);t.shutdown().await.unwrap();assert_eq!(p.scheduler().usage()[0].2,0);}
  server.abort();let _=server.await;drop(worker);owners.close_and_drain().await.unwrap();drop(owners);threads.shutdown().await.unwrap();assert_eq!(pool.scheduler().usage()[0].2,0);
  }).await.unwrap();

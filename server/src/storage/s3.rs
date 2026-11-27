@@ -135,25 +135,28 @@ impl S3Store {
     }
     async fn get_with_access_error(&self, key: &str) -> Result<Download, ObjectAccessError> {
         self.check_key(key)?;
-        let response = self
-            .reads
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(
-                |error| match error.raw_response().map(|r| r.status().as_u16()) {
-                    Some(401 | 403) => ObjectAccessError::Denied,
-                    Some(404)
-                        if error.as_service_error().and_then(|e| e.code())
-                            != Some("NoSuchBucket") =>
-                    {
-                        StorageError::NotFound.into()
-                    }
-                    _ => StorageError::Unavailable.into(),
-                },
-            )?;
+        // OLAP-9: SDK retries are off; a throttled or failed GET is retried a
+        // bounded number of times with full jitter. GET is idempotent.
+        let response = super::common::retry_reads(
+            || async {
+                self.reads
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        let status = error.raw_response().map(|r| r.status().as_u16());
+                        (
+                            access_error(status, error.as_service_error().and_then(|e| e.code())),
+                            transient(status),
+                        )
+                    })
+            },
+            |(_, transient)| *transient,
+        )
+        .await
+        .map_err(|(error, _)| error)?;
         let etag = response
             .e_tag
             .filter(|s| !s.is_empty())
@@ -167,14 +170,46 @@ impl S3Store {
         ))
     }
 }
+/// A failed request with no response (connect, dispatch or timeout) or a 5xx,
+/// including 503 SlowDown, may succeed when an idempotent read is repeated.
+fn transient(status: Option<u16>) -> bool {
+    matches!(status, None | Some(500..=599))
+}
+fn access_error(status: Option<u16>, code: Option<&str>) -> ObjectAccessError {
+    match status {
+        Some(401 | 403) => ObjectAccessError::Denied,
+        Some(404) if code != Some("NoSuchBucket") => StorageError::NotFound.into(),
+        _ => StorageError::Unavailable.into(),
+    }
+}
 impl ObjectStore for S3Store {
     async fn get(&self, key: &str) -> Result<Download, StorageError> {
         self.get_with_access_error(key)
             .await
             .map_err(ObjectAccessError::into_storage_error)
     }
+    /// HeadObject needs the same s3:GetObject permission and transfers no body
+    /// (OLAP-5: the old probe opened a full GET per object).
     async fn authorize_get(&self, key: &str) -> Result<(), ObjectAccessError> {
-        self.get_with_access_error(key).await.map(drop)
+        self.check_key(key)?;
+        super::common::retry_reads(
+            || async {
+                self.reads
+                    .head_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .map(drop)
+                    .map_err(|error| {
+                        let status = error.raw_response().map(|r| r.status().as_u16());
+                        (access_error(status, None), transient(status))
+                    })
+            },
+            |(_, transient)| *transient,
+        )
+        .await
+        .map_err(|(error, _)| error)
     }
     async fn put(
         &self,
@@ -353,7 +388,7 @@ mod live_context_probe {
         };
         eprintln!("live-context-probe phase=owned-init");
         let loaded = storage
-            .initialize_owned_cluster_catalog(owner, fence, false, false)
+            .initialize_owned_cluster_catalog(owner, fence, false)
             .await
             .unwrap();
         assert_eq!(loaded.catalog().owner_cluster, Some(owner));

@@ -252,18 +252,20 @@ impl Api {
             self.authority_epoch.store(owner.epoch, Ordering::Release);
             return Ok(());
         }
-        let transition = if old.is_none() {
-            FenceTransition::Migrate
-        } else if cold {
+        // Every catalog root carries a fence (format 6); nothing migrates.
+        let Some(previous_fence) = old else {
+            return Err(unavailable());
+        };
+        let transition = if cold {
             FenceTransition::ColdStart
         } else {
             FenceTransition::Takeover
         };
-        let new_run = cold || old.is_none();
+        let new_run = cold;
         let run_id = if new_run {
             ids::uuid_v4()
         } else {
-            old.unwrap().run_id
+            previous_fence.run_id
         };
         self.storage
             .fence_cluster_catalog(
@@ -980,18 +982,17 @@ fn supervisor() -> Result<UnixStream> {
     crate::supervisor::open().map_err(|_| invalid())
 }
 pub async fn run_api(path: PathBuf) -> std::result::Result<(), &'static str> {
-    run_api_configured(path, false, false).await
+    run_api_configured(path, false).await
 }
 pub async fn run_api_with_cold_start(
     path: PathBuf,
     cold_start: bool,
 ) -> std::result::Result<(), &'static str> {
-    run_api_configured(path, cold_start, false).await
+    run_api_configured(path, cold_start).await
 }
 pub async fn run_api_configured(
     path: PathBuf,
     cold_start: bool,
-    migrate_catalog: bool,
 ) -> std::result::Result<(), &'static str> {
     let mut channel = supervisor().map_err(|_| "protocol_error")?;
     let (pool, threads) = WorkerPool::start(
@@ -999,7 +1000,7 @@ pub async fn run_api_configured(
         tokio::runtime::Handle::current(),
     )
     .map_err(|_| "startup_failed")?;
-    let result = api_process(path, &mut channel, pool, cold_start, migrate_catalog).await;
+    let result = api_process(path, &mut channel, pool, cold_start).await;
     if result.is_err() {
         let _ = send(
             &mut channel,
@@ -1016,7 +1017,6 @@ async fn api_process(
     channel: &mut UnixStream,
     pool: WorkerPool,
     cold_start: bool,
-    migrate_catalog: bool,
 ) -> Result<()> {
     let startup_end = time::now() + Duration::from_secs(30);
     let init: Init =
@@ -1141,11 +1141,7 @@ async fn api_process(
         let storage = storage.clone();
         move |runtime| {
             let catalog = runtime
-                .block_on(storage.initialize_fenced_cluster_catalog(
-                    proposed_fence,
-                    migrate_catalog,
-                    false,
-                ))
+                .block_on(storage.initialize_fenced_cluster_catalog(proposed_fence, false))
                 .map_err(|e| {
                     eprintln!("nabedra-db: catalog initialization {e}");
                     unavailable()
