@@ -112,10 +112,15 @@ fn directory_at(parent: &File, name: &str, create: bool) -> Result<File, Protoco
     }
     if create {
         match parent.create_dir_at(name, 0o700) {
-            Ok(()) => parent.sync_all().map_err(|_| unavailable())?,
+            Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(_) => return Err(unavailable()),
         }
+        // Sync the entry on every put, not only on the one that created it: a put that
+        // finds the directory may follow a crash before that sync, or run beside a
+        // creator still inside it, and its object would be lost with the directory
+        // (DUR-2). The archive directory sync after each object covers only the object.
+        parent.sync_all().map_err(|_| unavailable())?;
     }
     let directory = parent
         .open_at(
@@ -148,10 +153,7 @@ fn file_at(directory: &File, name: &str, flags: i32) -> Result<File, ProtocolErr
         )
         .map_err(|_| unavailable())?;
     let metadata = file.metadata().map_err(|_| unavailable())?;
-    if !metadata.is_file()
-        || metadata.uid() != fs::euid()
-        || metadata.mode() & 0o077 != 0
-    {
+    if !metadata.is_file() || metadata.uid() != fs::euid() || metadata.mode() & 0o077 != 0 {
         return Err(corrupt());
     }
     Ok(file)
@@ -241,3 +243,5 @@ fn put_native(
     directory.sync_all().map_err(|_| unavailable())?;
     written
 }
+#[cfg(all(test, feature = "sim", target_os = "linux"))]
+mod sim_tests;
