@@ -1,0 +1,22 @@
+# Found by the rv-dense review (2026-11-27). Scheduler::pop sums `served` with a plain u64 sum
+# (sched.rs:105 and :121). Each entry saturates, but their sum does not: with Limits.cost near
+# u64::MAX (the fields are public and a task declares its own cost), served [u64::MAX / 2,
+# u64::MAX, 0, 0, 0] overflows. Debug builds panic; run_core calls pop outside catch_unwind, so the
+# core's thread dies and every later call to that core waits for ever. Release builds wrap, which
+# breaks the apply share. Evidence: `cargo-slot test -p nabedra-vector --lib -- --ignored vs50_ vs51_`
+# on 267e55dc + the tests, log /home/dev/logs/oltp-vector/w3/rv-dense/b/t1.log ("attempt to add with
+# overflow" in vector-core-0; vs51 "no answer within 5 s").
+id = "VECTOR-scheduler-served-sum-overflow"
+title = "A core's scheduler overflows summing served work and the core's thread dies"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS17"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/vector/src/runtime/tests.rs::vs50_a_pop_after_costs_near_the_limit_does_not_overflow"
+seed = "unknown"
+why_not_caught = "Every scheduler test caps the cost limit at u64::MAX / 8, below the point where five saturated counters overflow their sum."
+invariant_added = "pop never panics, whatever the limits and declared costs; a core thread survives any queue state."
+fix_commits = ["98b28e727d09845a37b0bcd2f4c1db44abc21aea"]
+revert_patch_ok = true

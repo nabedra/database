@@ -1,0 +1,24 @@
+# Found by the rv-dense review (2026-11-27). RecordFile::put takes released records last in,
+# first out (file.rs:194). Reusing one reads its page from disk to keep the neighbours (file.rs:125,
+# dirty); if that page is damaged the put fails and pushes the record back on top of the free list
+# (file.rs:198-213), so every later put of the file takes the same record and fails, although an
+# appended record would work. In an index each failed put is Error::Store and fails the range
+# (index/mod.rs:631), so after one damaged page a resync of any range of that core fails as soon
+# as its puts reach the record, contrary to plan section 5 (damaged NVMe recovers). Evidence:
+# `cargo-slot test -p nabedra-vector --lib -- --ignored vs52_` on 267e55dc + the test, both backends:
+# "10 of 10 later puts failed on the one damaged free record", log
+# /home/dev/logs/oltp-vector/w3/rv-dense/b/t1.log.
+id = "VECTOR-nvme-damaged-free-record-blocks-puts"
+title = "A released record on a damaged NVMe page refuses every later put of its file"
+class = "resource-release-order"
+module = "vector"
+guarantees = ["VEC-G10", "VEC-G11"]
+scenarios = ["VS10"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/vector/src/store/tests.rs::vs52_a_damaged_free_record_does_not_refuse_every_later_put_pread"
+seed = "unknown"
+why_not_caught = "The damage tests read damaged records or fail a range once; none puts again after a damaged record was released."
+invariant_added = "After damage, a put that cannot read a record page fails once and marks the page: no later put takes a released record of it or appends a record onto it, and later puts of other versions succeed and read back exactly (store/tests.rs vs52_a_damaged_page_costs_one_failed_put_whatever_its_records)."
+fix_commits = ["5bd3ac76fea5d95517b6504346918adb46cc4efa"]
+revert_patch_ok = true

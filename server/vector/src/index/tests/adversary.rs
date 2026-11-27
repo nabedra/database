@@ -115,22 +115,31 @@ fn adv07_many_tenants_with_one_row_each() {
     assert!(after - before.min(after) < 40 * n / 1000, "memory per tenant is too large");
 }
 
-/// Each query of one tenant costs no more than a few partitions, whatever the number of tenants.
+/// Each query of one tenant costs no more than a few partitions, whatever the number of tenants:
+/// its pin holds the tree of that tenant only, and a search under it visits that tenant's
+/// partitions only. Counted, not timed, so that a loaded machine cannot fail it or hide a change.
 #[test]
 fn adv07_a_pin_of_one_tenant_does_not_depend_on_their_number() {
-    let cost = |n: u64| {
+    for n in [2_000u64, 40_000] {
         let (mut ix, _) = tenants(n);
+        assert_eq!(ix.shared.roots.len() as u64, n, "one tree per tenant");
         let filter = Filter::Eq(0, Value::Int(3));
-        let start = nabedra_rt::time::now_std();
-        for _ in 0..200 {
-            let pin = latest(&mut ix, Some(&filter));
-            drop(pin);
-        }
-        nabedra_rt::time::elapsed(start)
-    };
-    let (small, large) = (cost(2_000), cost(40_000));
-    println!("small {small:?}, large {large:?}");
-    assert!(large < small * 20, "a pin costs {large:?} against {small:?}: it grows with the tenants");
+        let pin = latest(&mut ix, Some(&filter));
+        let trees = pin.0.roots.len();
+        let parts: usize = pin.0.roots.iter().map(|r| r.tree.parts().len()).sum();
+        let undirected = pin.0.roots.iter().filter(|r| r.undirected.is_some()).count();
+        assert_eq!((trees, parts + undirected), (1, 1), "{n} tenants: the pin of one");
+        let q = Query {
+            filter: Some(filter),
+            ..query(Op::L2, &[1.0, 0.0], 10)
+        };
+        let mut scan = ix.scan(&pin, &q, Box::new(RecallEstimate)).unwrap();
+        while ix.visit(&mut scan).unwrap() {}
+        let (visited, scored) = (scan.visited, scan.seen.len());
+        assert!(visited <= 2, "{n} tenants: a search of one read {visited} units");
+        assert_eq!(scored, 1, "{n} tenants: a search of one scored {scored} rows");
+        assert_eq!(ix.finish(scan).unwrap().len(), 1);
+    }
 }
 
 // ----- Approximate search under filters.

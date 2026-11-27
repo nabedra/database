@@ -252,6 +252,88 @@ both!(vs10_restart_empties_the_files, |b| {
 
 // ----- Damage.
 
+// Review rv-dense (2026-11-27). A released record on a damaged page goes back to the top of the
+// free list when its put fails, so every later put of the file takes it again and fails, although
+// appending a new record would work. In an index each failed put fails the range (Error::Store),
+// so a resync of any range of that core fails as soon as its puts reach that record.
+#[test]
+fn vs52_a_damaged_free_record_does_not_refuse_every_later_put_uring() {
+    if have(Backend::Uring) {
+        damaged_free_record(Backend::Uring);
+    }
+}
+
+#[test]
+fn vs52_a_damaged_free_record_does_not_refuse_every_later_put_pread() {
+    damaged_free_record(Backend::Pread);
+}
+
+fn damaged_free_record(b: Backend) {
+    let dim = 16; // 64 bytes: 64 records per page.
+    let f = files("poisoned-free", b, 1);
+    let s = NvmeVectors::on(f.disks.clone(), dim).unwrap();
+    for i in 0..256u32 {
+        s.put(key(i, 1), &vector(dim, u64::from(i))).unwrap();
+    }
+    s.flush().unwrap();
+    // Damage page 0 (records 0 to 63) on disk, and release record 0.
+    flip(&f.dir.join("raw-0"), 100);
+    s.release(key(0, 1));
+    // Taking the released record has to read page 0: an error, once, is fair.
+    assert!(matches!(s.put(key(1000, 1), &vector(dim, 1000)), Err(Error::Store(_))));
+    // Later puts of other versions must not all fail on the same damaged record.
+    let failed = (1001..1011u32)
+        .filter(|&i| s.put(key(i, 1), &vector(dim, u64::from(i))).is_err())
+        .count();
+    assert_eq!(failed, 0, "{failed} of 10 later puts failed on the one damaged free record");
+}
+
+// The same for every record of a damaged page: one put learns that the page is damaged, and no
+// later put takes a record of it, neither one released before nor after, nor a new record that
+// would share the page with the tail on disk. Every later put reads back exactly.
+both!(vs52_a_damaged_page_costs_one_failed_put_whatever_its_records, |b| {
+    let dim = 16; // 64 bytes: 64 records per page.
+    let later = |s: &NvmeVectors, from: u32| {
+        let failed = (from..from + 10)
+            .filter(|&i| s.put(key(i, 1), &vector(dim, u64::from(i))).is_err())
+            .count();
+        s.flush().unwrap();
+        for i in from..from + 10 {
+            if let Ok(v) = s.get(key(i, 1)) {
+                assert_eq!(&*v, &vector(dim, u64::from(i))[..], "{i}");
+            }
+        }
+        failed
+    };
+    // Records released on a damaged page, before and after the put that finds it damaged.
+    let f = files("bad-page-free", b, 1);
+    let s = NvmeVectors::on(f.disks.clone(), dim).unwrap();
+    for i in 0..256u32 {
+        s.put(key(i, 1), &vector(dim, u64::from(i))).unwrap();
+    }
+    s.flush().unwrap();
+    flip(&f.dir.join("raw-0"), 100);
+    for i in 0..5 {
+        s.release(key(i, 1));
+    }
+    assert_eq!(later(&s, 1000), 1, "records released on one damaged page");
+    for i in 5..10 {
+        s.release(key(i, 1));
+    }
+    assert_eq!(later(&s, 2000), 0, "records released on a page known to be damaged");
+    // A new record whose page is the damaged tail on disk.
+    let f = files("bad-page-tail", b, 1);
+    let s = NvmeVectors::on(f.disks.clone(), dim).unwrap();
+    for i in 0..70u32 {
+        s.put(key(i, 1), &vector(dim, u64::from(i))).unwrap();
+    }
+    s.flush().unwrap();
+    flip(&f.dir.join("raw-0"), 4096 + 100);
+    assert_eq!(later(&s, 1000), 1, "new records on a damaged tail page");
+    assert_eq!(later(&s, 2000), 0);
+    assert_eq!(&*s.get(key(3, 1)).unwrap(), &vector(dim, 3)[..], "page 0 is whole");
+});
+
 /// Every key reads back exactly what was put, or an error.
 fn exact_or_error(s: &NvmeVectors, dim: usize, keys: &[(VecKey, u64)]) -> usize {
     let mut errors = 0;
@@ -1040,4 +1122,54 @@ fn vs17_racing_puts_of_one_extension_take_one_place_and_one_charge() {
             assert_eq!(ext.tier(&k), None);
         }
     }
+}
+
+/// A file whose reads panic, as a buggy filesystem layer might.
+struct PanickyFile;
+
+impl nabedra_rt::fs::FsFile for PanickyFile {
+    fn write_all_at(&self, _: &[u8], _: u64) -> io::Result<()> {
+        Ok(())
+    }
+    fn read_exact_at(&self, _: &mut [u8], offset: u64) -> io::Result<()> {
+        std::panic::panic_any(format!("a read at {offset} panics"))
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn preallocate(&self, _: u64) -> io::Result<()> {
+        Ok(())
+    }
+    fn set_len(&self, _: u64) -> io::Result<()> {
+        Ok(())
+    }
+    fn len(&self) -> io::Result<u64> {
+        Ok(0)
+    }
+}
+
+/// A read whose pool threads all panicked answers, with an error for every request, and so does
+/// every later read: a panicking read must not take its pool thread with it, or a batch queued
+/// behind dead threads waits for ever.
+#[test]
+fn vs10_a_pool_whose_reads_all_panic_still_answers_every_read() {
+    let disk = Arc::new(PreadDisk::new(Arc::new(PanickyFile), 2).unwrap());
+    let (tell, told) = std::sync::mpsc::channel();
+    let reader = disk.clone();
+    let reads = move || {
+        for _ in 0..4 {
+            let mut reqs: Vec<Req> = (0..3).map(|i| Req::new(i * PAGE as u64, 1)).collect();
+            reader.read(&mut reqs);
+            let _ = tell.send(reqs.iter().all(|r| r.result.is_err()));
+        }
+    };
+    let thread = nabedra_rt::task::spawn_service("vs10-panicky-reads", reads).unwrap();
+    for round in 0..4 {
+        let answer = told.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(answer, Ok(true), "read {round} of a pool whose reads panicked");
+    }
+    thread.join().unwrap();
 }

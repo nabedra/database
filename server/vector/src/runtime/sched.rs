@@ -102,10 +102,9 @@ impl<T> Scheduler<T> {
 
     /// The task to run next.
     pub fn pop(&mut self) -> Option<(Class, T)> {
-        let total: u64 = self.served.iter().sum();
         let apply = Class::Apply.index();
         let starved = !self.queues[apply].is_empty()
-            && self.served[apply].saturating_mul(100) < total.saturating_mul(APPLY_SHARE);
+            && u128::from(self.served[apply]) * 100 < self.served_total() * u128::from(APPLY_SHARE);
         let class = if starved {
             Class::Apply
         } else {
@@ -118,10 +117,16 @@ impl<T> Scheduler<T> {
         self.queued[i] = self.queued[i].saturating_sub(cost);
         // At least one unit, so that free tasks still count toward the shares.
         self.served[i] = self.served[i].saturating_add(cost.max(1));
-        if self.served.iter().sum::<u64>() > WINDOW {
+        if self.served_total() > u128::from(WINDOW) {
             self.served.iter_mut().for_each(|s| *s /= 2);
         }
         Some((class, task))
+    }
+
+    /// Work served lately. Each class saturates at `u64::MAX`, and their sum in `u128` cannot
+    /// overflow, whatever costs tasks declare.
+    fn served_total(&self) -> u128 {
+        self.served.iter().map(|&s| u128::from(s)).sum()
     }
 
     pub fn len(&self) -> usize {

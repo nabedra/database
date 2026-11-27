@@ -11,7 +11,7 @@
 //! it uses, so a torn, misdirected or damaged page, a short read or an I/O error is an error and
 //! never a record. A page that changed while it was read is read again.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -45,6 +45,8 @@ struct State<K> {
     map: HashMap<K, u64>,
     /// Released records, reused last in, first out.
     free: Vec<u64>,
+    /// Pages on disk that a put could not read. Their records are never taken again.
+    bad: BTreeSet<u64>,
     /// Records ever placed.
     records: u64,
     /// The checksum of every page on disk.
@@ -97,6 +99,7 @@ impl<K: Copy + Eq + Hash> RecordFile<K> {
             state: Mutex::new(State {
                 map: HashMap::new(),
                 free: Vec::new(),
+                bad: BTreeSet::new(),
                 records: 0,
                 crcs: Vec::new(),
                 dirty: BTreeMap::new(),
@@ -191,25 +194,12 @@ impl<K: Copy + Eq + Hash> RecordFile<K> {
         if st.map.contains_key(&key) {
             return Err(Error::Internal("a stored version is stored again"));
         }
-        let (i, new) = match st.free.pop() {
-            Some(i) => (i, false),
-            None => (st.records, true),
-        };
-        let undo = |st: &mut State<K>| {
-            if !new {
-                st.free.push(i);
-            }
-        };
-        let (start, first, last) = match self.span(i) {
-            Ok(s) => s,
-            Err(e) => {
-                undo(&mut st);
-                return Err(e);
-            }
-        };
+        let (i, new) = self.place(&mut st)?;
+        let (start, first, last) = self.span(i)?;
         for p in first..=last {
             if let Err(e) = self.dirty(&mut st, p) {
-                undo(&mut st);
+                // The record is not given back: every later put would take it and fail again.
+                st.bad.insert(p);
                 return Err(e);
             }
         }
@@ -236,6 +226,26 @@ impl<K: Copy + Eq + Hash> RecordFile<K> {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// The record a put takes: the last released one, otherwise a new one. A record on a page that
+    /// could not be read is never taken: that page stays damaged, and its records are lost.
+    fn place(&self, st: &mut State<K>) -> Result<(u64, bool)> {
+        let bad = |st: &State<K>, i: u64| -> Result<Option<u64>> {
+            let (_, first, last) = self.span(i)?;
+            Ok(st.bad.range(first..=last).next_back().copied())
+        };
+        while let Some(i) = st.free.pop() {
+            if bad(st, i)?.is_none() {
+                return Ok((i, false));
+            }
+        }
+        // New records skip a bad page, leaving a hole that no key ever names.
+        while let Some(p) = bad(st, st.records)? {
+            let next = (p + 1).saturating_mul(PAGE64);
+            st.records = next.div_ceil(self.rec);
+        }
+        Ok((st.records, true))
     }
 
     /// The record goes, and its place may be reused. Returns whether it was there.

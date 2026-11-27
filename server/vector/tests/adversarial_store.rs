@@ -440,7 +440,7 @@ fn nt07_extreme_offsets_and_lengths_fail_alike_on_both_backends() {
     let what = ["read a page and two", "write a page", "write 100 bytes", "write half a page", "write a page and a byte"];
     for o in &outcomes[1..] {
         for (j, (a, b)) in outcomes[0].iter().zip(o).enumerate() {
-            let short = |x: &(Norm<Vec<u8>>, Norm<()>)| (x.0.as_ref().map(|v| v.len()).map_err(|e| *e), x.1.clone());
+            let short = |x: &(Norm<Vec<u8>>, Norm<()>)| (x.0.as_ref().map(|v| v.len()).map_err(|e| *e), x.1);
             assert_eq!(short(a), short(b), "offset {}: {}", offs[j / 5], what[j % 5]);
         }
     }
@@ -518,7 +518,7 @@ fn nt27_readers_of_stable_records_are_exact_while_neighbours_are_rewritten() {
         let readers: Vec<_> = (0..3u32)
             .map(|r| {
                 let (s, stop) = (s.clone(), stop.clone());
-                std::thread::spawn(move || {
+                spawn_thread(move || {
                     let mut reads = 0u64;
                     while !stop.load(Ordering::SeqCst) {
                         let keys: Vec<VecKey> = (0..32u32).map(|i| key(2 * ((i + r) % 32), 1)).collect();
@@ -537,7 +537,7 @@ fn nt27_readers_of_stable_records_are_exact_while_neighbours_are_rewritten() {
             .collect();
         let writer = {
             let s = s.clone();
-            std::thread::spawn(move || {
+            spawn_thread(move || {
                 let mut next = 1000u32;
                 for round in 0..3000u32 {
                     let odd = 2 * (round % 32) + 1;
@@ -698,7 +698,7 @@ fn nt09_a_failing_operation_does_not_disturb_the_others_or_the_ring() {
     let mut buf = vec![0u8; 64];
     let ones = vec![1u8; 64];
     for _ in 0..5 {
-        let r = ring.run(&wo, &mut [RingOp::Read { buf: &mut buf, offset: 0 }, RingOp::Read { buf: &mut vec![0u8; 8], offset: 0 }]);
+        let r = ring.run(&wo, &mut [RingOp::Read { buf: &mut buf, offset: 0 }, RingOp::Read { buf: &mut [0u8; 8], offset: 0 }]);
         assert!(r.iter().all(|r| r.as_ref().is_err_and(|e| e.raw_os_error() == Some(9))), "{r:?}");
         let r = ring.run(&ro, &mut [RingOp::Write { buf: &ones, offset: 0 }]);
         assert!(r[0].as_ref().is_err_and(|e| e.raw_os_error() == Some(9)), "{r:?}");
@@ -747,13 +747,13 @@ fn nt11_a_call_waits_for_a_completion_that_comes_later() {
     let ring = Arc::new(Ring::new(4).unwrap());
     let returned = Arc::new(AtomicBool::new(false));
     let (r2, ret2) = (ring.clone(), returned.clone());
-    let reader = std::thread::spawn(move || {
+    let reader = spawn_thread(move || {
         let mut buf = vec![0u8; 8];
         let res = r2.run(&fifo, &mut [RingOp::Read { buf: &mut buf, offset: 0 }]);
         ret2.store(true, Ordering::SeqCst);
         (res.into_iter().map(|r| r.unwrap()).collect::<Vec<_>>(), buf, fifo)
     });
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    nabedra_rt::time::thread_sleep(std::time::Duration::from_millis(300));
     assert!(!returned.load(Ordering::SeqCst), "the call returned with its read still in flight");
     let mut w = os::OpenOptions::new().write(true).open(&path).unwrap();
     std::io::Write::write_all(&mut w, b"abcdefgh").unwrap();
@@ -775,7 +775,7 @@ fn nt12_threads_sharing_a_ring_get_their_own_bytes() {
     let hs: Vec<_> = (0..8u64)
         .map(|th| {
             let (f, ring) = (f.clone(), ring.clone());
-            std::thread::spawn(move || {
+            spawn_thread(move || {
                 for round in 0..200u64 {
                     let n = 1 + (round + th) as usize % 40;
                     let mut bufs: Vec<Vec<u8>> = (0..n).map(|i| vec![0u8; 50 + i]).collect();
@@ -1163,16 +1163,16 @@ fn workload(g: &mut Gen, backend: Option<Backend>, damage: bool) -> Result<(), S
                     // A checkpoint that went out must recover into the same rows, or fail.
                     let rec = Audit::new(Arc::new(RamVectors::new()));
                     let cfg2 = ix_config(dim, Some(rec.clone() as Arc<dyn Vectors>));
-                    if let Ok((mut back, _)) = Index::recover(cfg2, ExactCodec, store.clone()) {
-                        if back.caught_up(RANGE, at).is_ok() {
-                            let hits = search(&mut back, &q(dim));
-                            match hits {
-                                Ok(hits) => expect_rows(&hits, &truth, &format!("step {step}: recovered"))?,
-                                Err(e) if damaged => {
-                                    let _ = e;
-                                }
-                                Err(e) => return Err(format!("step {step}: recovered index failed: {e}")),
+                    if let Ok((mut back, _)) = Index::recover(cfg2, ExactCodec, store.clone())
+                        && back.caught_up(RANGE, at).is_ok()
+                    {
+                        let hits = search(&mut back, &q(dim));
+                        match hits {
+                            Ok(hits) => expect_rows(&hits, &truth, &format!("step {step}: recovered"))?,
+                            Err(e) if damaged => {
+                                let _ = e;
                             }
+                            Err(e) => return Err(format!("step {step}: recovered index failed: {e}")),
                         }
                     }
                     check(&rec, "recovered index")?;

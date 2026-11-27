@@ -186,8 +186,31 @@ fn vs02_filter_evaluation_counts_against_the_cpu_budget() {
 /// `DirectionCodec`, a partition centroid that is not a unit vector reaches the asserts of
 /// `CodeBlock::push` through `Shard::put` and recovery panics.
 #[test]
-#[ignore = "VEC-BUG-forged-centroid-panics-recovery"]
 fn vs03_a_forged_centroid_fails_recovery_without_a_panic() {
+    recovers_forged("a centroid of length 2", |bytes| {
+        bytes[24..28].copy_from_slice(&2.0f32.to_le_bytes());
+    });
+    recovers_forged("a centroid that is not a number", |bytes| {
+        bytes[28..32].copy_from_slice(&f32::NAN.to_le_bytes());
+    });
+}
+
+/// The same for a row of a directed partition whose vector has no direction (decision L3: such
+/// rows live in the undirected list): `CodeBlock::push` asserts a positive length.
+#[test]
+fn vs03_a_forged_zero_vector_in_a_directed_partition_fails_recovery_without_a_panic() {
+    recovers_forged("a zero vector", |bytes| {
+        // Range (16), key length (4) and key (8), four positions (32), vector length (4).
+        assert_eq!(u32::from_le_bytes(bytes[48..52].try_into().unwrap()), 8, "a key");
+        assert_eq!(u32::from_le_bytes(bytes[92..96].try_into().unwrap()), 8, "a vector");
+        bytes[96..104].fill(0);
+    });
+}
+
+/// Writes a checkpoint of three rows in a directed partition with the direction codec, edits its
+/// first frame and puts the right checksum back, and recovers: recovery must report the range
+/// damaged, out of service, and never panic.
+fn recovers_forged(what: &str, edit: impl FnOnce(&mut Vec<u8>)) {
     use std::path::Path;
 
     use nabedra_rt::fs::{FaultFs, Fs, OpenMode};
@@ -213,7 +236,7 @@ fn vs03_a_forged_centroid_fails_recovery_without_a_panic() {
         8,
         "a directed partition"
     );
-    bytes[24..28].copy_from_slice(&2.0f32.to_le_bytes());
+    edit(&mut bytes);
     let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
     let crc = crc32c(&bytes[16..16 + len]).to_le_bytes();
     bytes[12..16].copy_from_slice(&crc);
@@ -222,9 +245,15 @@ fn vs03_a_forged_centroid_fails_recovery_without_a_panic() {
     f.write_all_at(&bytes, 0).unwrap();
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        Index::recover(cfg.clone(), codec(), store()).map(|(_, damage)| damage.len())
+        let (ix, damage) = Index::recover(cfg.clone(), codec(), store()).unwrap();
+        let ranges: Vec<RangeId> = damage.iter().flat_map(|d| d.ranges.clone()).collect();
+        (ranges, ix.status(RANGE).unwrap().damage.is_some())
     }));
-    assert!(outcome.is_ok(), "recovery of a forged centroid panics");
+    let Ok((ranges, failed)) = outcome else {
+        panic!("recovery of {what} panics");
+    };
+    assert_eq!(ranges, [RANGE], "recovery of {what} reports the damage of its range");
+    assert!(failed, "recovery of {what} leaves its range in service");
 }
 
 /// A vector store whose reads can be made to fail.
@@ -263,7 +292,6 @@ impl crate::store::Vectors for Flaky {
 /// that `put_version` took, so after the range fails and is dropped its slot and stored vector stay
 /// forever. The same holds for a copy in `Shard::land`.
 #[test]
-#[ignore = "VEC-BUG-unreadable-append-leaks-its-version"]
 fn vs04_an_unreadable_append_releases_its_version_once_the_range_is_gone() {
     let store = Arc::new(Flaky::default());
     let cfg = Config {
@@ -299,4 +327,37 @@ fn vs04_an_unreadable_append_releases_its_version_once_the_range_is_gone() {
         "stored vectors of a dropped range; slots held: {held:?}"
     );
     assert!(held.is_empty(), "slots of a dropped range: {held:?}");
+}
+
+/// VEC-G10, a copy from the other search replica (plan section 5): a peer segment whose size is not
+/// the one its manifest states is not the file that manifest names. The copy refuses it before
+/// anything is installed, and the local checkpoint recovers as it was. Copying the prefix the
+/// manifest states would install a peer checkpoint made of another file.
+#[test]
+fn vs10_a_peer_segment_of_another_size_is_refused_before_anything_is_installed() {
+    use std::path::Path;
+
+    use nabedra_rt::fs::{FaultFs, Fs, OpenMode};
+
+    let cfg = Config::new(schema(2, &[], None), 1);
+    let checkpointed = |rows: u64| {
+        let fs = FaultFs::new();
+        fs.create_dir_all_durable(Path::new("/data"));
+        let store = Store::new(Arc::new(fs.clone()), "/data/ck");
+        let mut ix = serving(cfg.clone(), ExactCodec, Some(store));
+        let all = (1..=rows).map(|k| (k, Some(row(&[1.0, k as f32], vec![], k))));
+        feed(&mut ix, RANGE, &page(0, all.collect()));
+        ix.checkpoint().unwrap();
+        fs
+    };
+    let store = |fs: &FaultFs| Store::new(Arc::new(fs.clone()), "/data/ck");
+    let (local, peer) = (checkpointed(1), checkpointed(2));
+    let segment = Path::new("/data/ck/seg-0000000000000000");
+    let grown = peer.open(segment, OpenMode::ReadWrite).unwrap();
+    let len = grown.len().unwrap();
+    grown.write_all_at(&[0], len).unwrap();
+    assert!(copy_checkpoint(&store(&peer), &store(&local)).is_err(), "a grown peer segment is copied");
+    let (ix, damage) = Index::recover(cfg.clone(), ExactCodec, store(&local)).unwrap();
+    assert!(damage.is_empty(), "{damage:?}");
+    assert_eq!(ix.status(RANGE).unwrap().applied, 1, "the local checkpoint was replaced");
 }

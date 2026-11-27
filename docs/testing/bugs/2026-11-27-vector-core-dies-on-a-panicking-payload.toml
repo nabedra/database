@@ -1,0 +1,21 @@
+# Found by task fix-dense (2026-11-27) while adding the test the rv-dense review asked for: no test
+# covered a core that dies after it started (since 8c074ad3). run_core contained a task's panic with
+# catch_unwind and then dropped its payload outside it (cores.rs, `.is_err()` on the result). A
+# payload whose drop panics unwinds the core's thread, and every later call to that core waits for
+# ever. Evidence: `cargo-slot test -p nabedra-vector --test adversarial_runtime -- nr22_` with the
+# fix taken out: "a call after the bad job: no answer in 5 s", log
+# /home/dev/logs/oltp-vector/w3/fix-dense/red.log.
+id = "VECTOR-core-dies-on-a-panicking-payload"
+title = "A core's thread dies when the payload of a contained panic panics as it is dropped"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS17"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/vector/tests/adversarial_runtime.rs::nr22_a_started_core_survives_a_job_whose_panic_panics_again"
+seed = "unknown"
+why_not_caught = "The panic tests panic with plain strings, and the test of a dead core was rewritten in 8c074ad3 to cover a core that fails to start only."
+invariant_added = "A task's panic, its payload's drop included, never unwinds its core's thread: the panic is counted and the core answers every later call."
+fix_commits = ["907f5d278ab09a9c836148c46a341dcbe6a6f25f"]
+revert_patch_ok = false

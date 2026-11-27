@@ -10,5 +10,6 @@ mod sched;
 mod tests;
 
 pub use budget::{Budget, Memory, Meter, Tier, Usage};
+pub(crate) use cores::contained;
 pub use cores::{Cores, Ctx, Job};
 pub use sched::{APPLY_SHARE, Class, Limits, Scheduler};

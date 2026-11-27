@@ -315,3 +315,35 @@ fn vs17_a_meter_refuses_before_the_limit_and_stays_refused() {
     assert_eq!(m.used().memory, 50, "the refused growth is not charged");
     assert_eq!(Meter::new(Budget { io: 3, ..Budget::UNLIMITED }).io(u64::MAX), Err(Error::OverBudget("io")));
 }
+
+// ----- Review rv-dense (2026-11-27).
+
+/// Limits are public and a task declares its own cost, so a class may accept costs near
+/// `u64::MAX`. `pop` must still not overflow while it sums the work served: it runs outside the
+/// core's `catch_unwind`, so a panic there kills the core's thread.
+#[test]
+fn vs50_a_pop_after_costs_near_the_limit_does_not_overflow() {
+    let mut s = Scheduler::new(limits(16, u64::MAX));
+    s.submit(Class::Apply, u64::MAX, 0u8).unwrap();
+    assert!(s.pop().is_some());
+    s.submit(Class::Interactive, u64::MAX, 1u8).unwrap();
+    // served is now [u64::MAX / 2, u64::MAX, 0, 0, 0]: their sum overflows.
+    assert!(s.pop().is_some());
+}
+
+/// The same through the cores: after such a pop the core's thread is gone, and a later call
+/// waits for ever instead of answering.
+#[test]
+fn vs51_a_core_answers_after_a_task_of_huge_declared_cost() {
+    let cores = Arc::new(Cores::start(1, limits(16, u64::MAX), false, |_| 3u32).unwrap());
+    assert_eq!(cores.call(0, Class::Apply, u64::MAX, |s, _| *s).unwrap(), 3);
+    let _ = cores.call(0, Class::Interactive, u64::MAX, |s, _| *s);
+    let (tell, told) = std::sync::mpsc::channel();
+    let c = cores.clone();
+    nabedra_rt::task::spawn_service("vs51-caller", move || {
+        let _ = tell.send(c.call(0, Class::Interactive, 1, |s, _| *s));
+    })
+    .unwrap();
+    let answer = told.recv_timeout(std::time::Duration::from_secs(5));
+    assert!(answer.is_ok(), "no answer within 5 s: the core's thread died in pop");
+}
