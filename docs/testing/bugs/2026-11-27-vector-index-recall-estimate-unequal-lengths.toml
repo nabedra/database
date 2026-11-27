@@ -1,13 +1,13 @@
 id = "VECTOR-index-recall-estimate-unequal-lengths"
 title = "An approximate scan that asks for recall 0.99 stops at recall@10 0.84 (dot) and 0.91 (l2) on vectors of unequal lengths"
-class = "recall-stop-rule"
+class = "other"
 module = "vector"
 guarantees = ["VEC-G05"]
 scenarios = ["VS07"]
-found_by = "benchmark"
+found_by = "campaign"
 found_date = "2026-11-27"
 lowest_regression = "server/vector/tests/recall_estimate.rs::vs07_an_approximate_scan_reaches_its_recall_on_unequal_lengths"
-seed = "20261127 (SplitMix64, in the test); bench: GloVe-100 first 100K rows, 300 queries, numpy float64 ground truth"
+seed = 20261127
 evidence = """
 cargo-slot test --release -p nabedra-vector --test recall_estimate -- --ignored --nocapture:
 Cosine 0.983, Dot 0.840, L2 0.909 at target 0.99, the same values at target 0.95.
@@ -16,6 +16,6 @@ target 0.99: cosine 0.949, dot 0.905, l2 0.893; targets 0.95 and 0.99 read the s
 `exact: true` reached 1.000 in every case, so the rows are there and the reference agrees.
 """
 why_not_caught = "RecallEstimate is documented as a heuristic that the recall gates measure; no test compared an approximate scan with brute force on unequal lengths. Its estimate moves in steps of 1/limit, so at limit 10 every target above 0.9 is the same rule (no top-10 hit in the last window), and the window does not see the length bands that dot and l2 read last."
-invariant_added = "An approximate scan that asks for recall 0.99 reaches recall@10 >= 0.95 against brute force in f64, for cosine, dot and l2, on clustered vectors with log-normal lengths."
-fix_commits = []
+invariant_added = "An approximate scan that asks for recall 0.99 reaches recall@10 >= 0.95 against brute force in f64, for cosine, dot and l2, on clustered vectors with log-normal lengths (measured 0.997-0.998)."
+fix_commits = ["fc5298fab0d651822c54d3f01639c8ba53be896b", "d22472df1a03ec0ff2a500174ee1b3fec4dffc02"]
 revert_patch_ok = false
