@@ -14,8 +14,8 @@ use crate::{
     node::{
         http,
         queue_runtime::{
-            Command as QueueCommand, Reply as QueueReply, STREAM_CAPABILITY_CURSOR, members,
-            scheduler,
+            Command as QueueCommand, JoinBase, JoinReset, Reply as QueueReply,
+            STREAM_CAPABILITY_CURSOR, members, scheduler,
         },
         queue_transport,
         runtime::Worker,
@@ -107,6 +107,9 @@ enum Command {
     },
     StreamReset {
         run: Uuid,
+        /// The fenced join's control-root base; absent for a legacy join.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<JoinBase>,
     },
     StreamPage {
         run: Uuid,
@@ -424,14 +427,20 @@ impl Driver for WorkerDriver {
             .node_id()
             .ok_or_else(wire::unavailable)?;
         let ready = members(&root);
+        // Transfer to every holder concurrently: the critical section under
+        // the stream change lock is one round trip, not one per holder
+        // (OLAPS-2). The reply still waits for every acknowledgement.
         let install = async {
-            for node in root
-                .nodes
-                .iter()
-                .filter(|node| node.node_id != own && ready.contains(&node.node_id))
-            {
-                self.0.transfer_stream(&root, node, &stored, false).await?;
-            }
+            let transfers = futures_util::future::join_all(
+                root.nodes
+                    .iter()
+                    .filter(|node| node.node_id != own && ready.contains(&node.node_id))
+                    .map(|node| self.0.transfer_stream(&root, node, &stored, false)),
+            )
+            .await;
+            transfers
+                .into_iter()
+                .collect::<Result<Vec<()>, ProtocolError>>()?;
             Ok::<(), ProtocolError>(())
         };
         nabedra_rt::time::timeout(TRANSACTION_TIMEOUT, install)
@@ -610,6 +619,16 @@ impl Worker {
     }
 
     async fn stream_fence(&self, root: &Control) -> Result<Authority, ProtocolError> {
+        // With the fresh root still at the term of a fence already read, that
+        // fence is current: a term's catalog fence is written once, after the
+        // root moved to the term. One catalog read per term on each worker
+        // instead of two per commit and one per install (OLAPS-2).
+        if let Some(fence) = self.queue.current_fence(root) {
+            return Ok(Authority {
+                run: fence.run_id,
+                term: fence.scheduler_term,
+            });
+        }
         let _catalog = self.charge_stream_bootstrap(FENCE_READ_BYTES)?;
         let loaded = self
             .storage
@@ -620,6 +639,7 @@ impl Worker {
         if fence.scheduler_term != root.scheduler.scheduler_term {
             return Err(wire::unavailable());
         }
+        self.queue.observe_fence(fence);
         Ok(Authority {
             run: fence.run_id,
             term: fence.scheduler_term,
@@ -817,6 +837,7 @@ impl Worker {
         root: &Control,
         node: &Node,
         run: Uuid,
+        base: Option<JoinBase>,
     ) -> Result<(), ProtocolError> {
         let authority = Authority {
             run,
@@ -826,7 +847,7 @@ impl Worker {
             .stream_exchange(
                 root,
                 node,
-                &Command::StreamReset { run },
+                &Command::StreamReset { run, base },
                 CONTROL_REPLY_BYTES,
                 true,
             )
@@ -1083,7 +1104,7 @@ async fn accept(
             worker.install_stream_replica(fence, *entry)?;
             ControlReply::Installed
         }
-        Command::StreamReset { run } => {
+        Command::StreamReset { run, base } => {
             let fence = worker.stream_fence(root).await?;
             let own = worker
                 .signer
@@ -1103,7 +1124,11 @@ async fn accept(
             {
                 return Err(wire::unauthorized().into());
             }
-            worker.queue.streams.reset_replica(fence)?;
+            worker
+                .queue
+                .admit_join_reset(JoinReset::Stream, base, root, || {
+                    worker.queue.streams.reset_replica(fence)
+                })?;
             ControlReply::Installed
         }
         Command::StreamPage { run, after } => {

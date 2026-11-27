@@ -52,21 +52,26 @@ JoinAndPublish(d) ==
     /\ UNCHANGED <<owner, accepted, losses>>
 
 \* probe when scheduler(&root) fails: no Join, readiness is published anyway.
-\* Candidate fix (baseline): only the first enrollment of a run, before any
-\* request was accepted, may publish without a copy.
+\* Fix (baseline, runtime.rs join_requirement): publish without a copy only
+\* when no Ready worker exists, the first enrollment of a run or after every
+\* holder was lost. While any Ready worker may hold accepted requests, the
+\* probe waits for a reassigned scheduler and joins through it.
 PublishWithoutScheduler(d) ==
     /\ state[d] = "starting" /\ ~OwnerReady
-    /\ Mutant # "prefix_ready_without_join" => accepted = {}
+    /\ Mutant # "prefix_ready_without_join" => Ready = {}
     /\ state' = [state EXCEPT ![d] = "ready"]
     /\ UNCHANGED <<owner, held, accepted, losses>>
 
-\* observe_losses: a ready node is lost with its RAM copy.
+\* observe_losses: a ready node is lost with its RAM copy. When the last
+\* holder goes, the plan abandons its accepted requests ("stopping every
+\* worker abandons it"); they leave the scope of G07.
 Lose(n) ==
     /\ losses < MaxLosses /\ losses' = losses + 1
     /\ state[n] = "ready"
     /\ state' = [state EXCEPT ![n] = "lost"]
     /\ held' = [held EXCEPT ![n] = {}]
-    /\ UNCHANGED <<owner, accepted>>
+    /\ accepted' = IF Ready = {n} THEN {} ELSE accepted
+    /\ UNCHANGED owner
 
 \* runtime.rs coordinator choice: a Ready node replaces a lost owner and keeps
 \* its own copy. In the code the controller publishes the loss

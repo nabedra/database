@@ -199,7 +199,7 @@ pub(super) fn preauthenticate(
     root: &Control,
     local: &auth::Sender,
     pinned: &[u8; 32],
-    seen: &mut BTreeMap<Uuid, u64>,
+    seen: &mut ReplayCache,
 ) -> Result<(Uuid, Option<Uuid>, String, String, String)> {
     let c = verify(headers, root, local, pinned, false)?;
     admit_nonce(&c, seen)?;
@@ -220,7 +220,7 @@ pub(super) fn preauthenticate_stream(
     root: &Control,
     local: &auth::Sender,
     pinned: &[u8; 32],
-    seen: &mut BTreeMap<Uuid, u64>,
+    seen: &mut ReplayCache,
 ) -> Result<StreamAuthentication> {
     let c = verify(headers, root, local, pinned, true)?;
     admit_nonce(&c, seen)?;
@@ -234,19 +234,100 @@ pub(super) fn preauthenticate_stream(
     })
 }
 
-fn admit_nonce(c: &Claims, seen: &mut BTreeMap<Uuid, u64>) -> Result<()> {
+/// Live nonces one receiver remembers across its 30 s replay window. At the
+/// cap the receiver answers `overloaded`. 65,536 nonces bound the cache to
+/// about 5 MiB and admit about 2,180 signed queue and stream messages per
+/// second per receiver; the old cap of 8,192 admitted about 273 (SCHED-8).
+pub(crate) const MAX_LIVE_NONCES: usize = 65_536;
+
+/// Replay protection for signed queue and stream messages. Expired nonces
+/// leave in expiry order, so admitting one costs O(log n) instead of a scan
+/// of every remembered nonce under the receiver's lock.
+#[derive(Default)]
+pub(crate) struct ReplayCache {
+    by_nonce: BTreeMap<Uuid, u64>,
+    by_expiry: std::collections::BTreeSet<(u64, Uuid)>,
+}
+
+impl ReplayCache {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.by_nonce.len()
+    }
+
+    fn admit(&mut self, nonce: Uuid, expires_at_ms: u64, now_ms: u64) -> Result<()> {
+        while let Some(&(expiry, old)) = self.by_expiry.first() {
+            if expiry >= now_ms {
+                break;
+            }
+            self.by_expiry.pop_first();
+            self.by_nonce.remove(&old);
+        }
+        if self.by_nonce.contains_key(&nonce) {
+            return Err(http::failure(ErrorCode::Conflict));
+        }
+        if self.by_nonce.len() >= MAX_LIVE_NONCES {
+            return Err(http::failure(ErrorCode::Overloaded));
+        }
+        self.by_nonce.insert(nonce, expires_at_ms);
+        self.by_expiry.insert((expires_at_ms, nonce));
+        Ok(())
+    }
+}
+
+fn admit_nonce(c: &Claims, seen: &mut ReplayCache) -> Result<()> {
     let now = super::queue_runtime::now_ms();
     if c.expires_at_ms < now || c.expires_at_ms > now.saturating_add(30000) {
         return Err(invalid());
     }
-    seen.retain(|_, expiry| *expiry >= now);
-    if seen.len() >= 8192 {
-        return Err(http::failure(ErrorCode::Overloaded));
+    seen.admit(c.nonce, c.expires_at_ms, now)
+}
+
+#[cfg(test)]
+mod replay_cache_tests {
+    use super::*;
+
+    #[test]
+    fn u02_sustained_300_installs_per_second_not_rejected() {
+        // 300 messages per second for 60 s, each valid for the full 30 s
+        // window: about 9,000 live nonces, above the old cap of 8,192.
+        let mut cache = ReplayCache::new();
+        let mut peak = 0;
+        for tick in 0..60_000u64 {
+            for n in 0..(if tick % 10 == 0 { 3 } else { 0 }) {
+                let nonce = Uuid::from_u128(u128::from(tick) << 8 | n);
+                cache.admit(nonce, tick + 30_000, tick).unwrap();
+            }
+            peak = peak.max(cache.len());
+        }
+        assert!(peak > 8_192, "the load exceeds the old cap: {peak}");
+        assert!(peak <= 9_100);
     }
-    if seen.insert(c.nonce, c.expires_at_ms).is_some() {
-        return Err(http::failure(ErrorCode::Conflict));
+
+    #[test]
+    fn u02_replay_is_refused_and_expired_nonces_leave() {
+        let mut cache = ReplayCache::new();
+        let nonce = Uuid::from_u128(7);
+        cache.admit(nonce, 100, 0).unwrap();
+        assert_eq!(
+            cache.admit(nonce, 100, 50).unwrap_err().code,
+            ErrorCode::Conflict
+        );
+        cache.admit(Uuid::from_u128(8), 200, 101).unwrap();
+        assert_eq!(cache.len(), 1, "the expired nonce left in expiry order");
+        let mut full = ReplayCache::new();
+        for n in 0..MAX_LIVE_NONCES as u128 {
+            full.admit(Uuid::from_u128(n + 10), 1_000, 0).unwrap();
+        }
+        assert_eq!(
+            full.admit(Uuid::from_u128(1), 1_000, 0).unwrap_err().code,
+            ErrorCode::Overloaded
+        );
+        full.admit(Uuid::from_u128(1), 2_000, 1_001).unwrap();
     }
-    Ok(())
 }
 // API replies target the API's ephemeral process, so response authenticity is
 // checked against the exact worker and request nonce instead of a member receiver.

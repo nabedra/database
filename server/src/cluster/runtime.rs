@@ -437,7 +437,7 @@ impl Api {
             .check(sample())
             .map_err(|_| unavailable())?;
         let root = loaded.root().clone();
-        use crate::node::queue_runtime::{Command, JoinBase, Reply, scheduler};
+        use crate::node::queue_runtime::{Command, JoinBase, Reply};
         let node_id = node.node_id;
         let observation = reply.observation().clone();
         let candidate = cpu(&self.pool, {
@@ -456,7 +456,17 @@ impl Api {
         })
         .await?;
 
-        let sealed = if let Ok(scheduler) = scheduler(&root) {
+        let scheduler = match join_requirement(&root) {
+            Ok(JoinRequirement::Copy(scheduler)) => Some(scheduler),
+            Ok(JoinRequirement::FirstEnrollment) => None,
+            Err(error) => {
+                // Ready holders exist but no Ready scheduler can copy their
+                // queue (SCHED-1). Repair the assignment; a later probe joins.
+                let _ = self.ensure_catalog_fence(owner).await;
+                return Err(error);
+            }
+        };
+        let sealed = if let Some(scheduler) = scheduler {
             let base = JoinBase::of(&root);
             let result = async {
                 let bytes = serde_json::to_vec(&Command::FencedJoin { node_id, base })
@@ -731,6 +741,29 @@ impl receipt_observation::QueueAccess for Api {
         Api::lookup(self, run_id, request_id, context).await
     }
 }
+/// How the controller may publish a Starting worker Ready (R03).
+enum JoinRequirement<'a> {
+    /// Copy the queue and stream registry from this Ready scheduler first.
+    Copy(&'a Node),
+    /// No worker holds a queue copy: the first enrollment of a run, or every
+    /// holder is gone. Nothing accepted can be missing from the joiner.
+    FirstEnrollment,
+}
+
+/// A worker is never published Ready without a copy while any Ready worker
+/// may hold accepted requests (SCHED-1). The old probe skipped the copy
+/// whenever the coordinator was not Ready, for example between a published
+/// owner loss and the coordinator reassignment.
+fn join_requirement(root: &Control) -> Result<JoinRequirement<'_>> {
+    match crate::node::queue_runtime::scheduler(root) {
+        Ok(node) => Ok(JoinRequirement::Copy(node)),
+        Err(_) if crate::node::queue_runtime::members(root).is_empty() => {
+            Ok(JoinRequirement::FirstEnrollment)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn heartbeat_binding(root: &Control, node: &Node) -> Result<HeartbeatBinding> {
     let session = node.session.as_ref().ok_or_else(unavailable)?;
     Ok(HeartbeatBinding {
@@ -1358,6 +1391,47 @@ mod queue_response_tests {
         controller.lease_state = LeaseState::Held;
         controller.owner_id = None;
         assert!(!follower_ready(&controller, 7, Some(fence), 1000, false));
+    }
+    #[test]
+    fn r01_r03_joiner_without_scheduler_is_not_published_ready() {
+        let joiner = |root: &mut Control| {
+            let mut node = root.nodes[0].clone();
+            node.node_id = Uuid::from_u128(99);
+            node.state = NodeState::Starting;
+            node.registration = Registration::Registered;
+            root.nodes.push(node);
+        };
+        // A owns the queue; B and C hold copies; D is starting.
+        let mut root = crate::node::queue_runtime::fixture_root(3);
+        joiner(&mut root);
+        assert!(matches!(
+            join_requirement(&root),
+            Ok(JoinRequirement::Copy(node)) if node.node_id == Uuid::from_u128(10)
+        ));
+        // The owner's loss is published but the coordinator is not yet
+        // reassigned. B and C still hold every accepted request: D must wait.
+        root.nodes[0].state = NodeState::Lost;
+        assert!(join_requirement(&root).is_err());
+        // No holder is left: the first enrollment of a run may publish.
+        for node in &mut root.nodes[1..3] {
+            node.state = NodeState::Lost;
+        }
+        assert!(matches!(
+            join_requirement(&root),
+            Ok(JoinRequirement::FirstEnrollment)
+        ));
+        let mut fresh = crate::node::queue_runtime::fixture_root(0);
+        joiner_into_empty(&mut fresh);
+        assert!(matches!(
+            join_requirement(&fresh),
+            Ok(JoinRequirement::FirstEnrollment)
+        ));
+    }
+    fn joiner_into_empty(root: &mut Control) {
+        let mut node = crate::node::queue_runtime::fixture_root(1).nodes[0].clone();
+        node.state = NodeState::Starting;
+        node.registration = Registration::Registered;
+        root.nodes.push(node);
     }
     #[test]
     fn q04_t04_post_accept_lookup_failure_preserves_identity_and_unknown_outcome() {
