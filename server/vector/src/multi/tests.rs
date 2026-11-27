@@ -2,7 +2,7 @@ use nabedra_check::Gen;
 use nabedra_simd::wide;
 
 use super::*;
-use crate::types::Op;
+use crate::types::{MAX_DIM, Op};
 
 fn tokens(dim: usize, values: &[f32]) -> Tokens<'_> {
     Tokens::new(dim, values).unwrap()
@@ -117,7 +117,8 @@ fn vs07_maxsim_and_quantized_bounds_against_brute_force() {
     ];
     for seed in 0..320 {
         let g = &mut Gen::from_seed(seed);
-        let dim = *g.pick(&[1, 2, 3, 8, 17, 129]);
+        // Small dimensions, the tails of the kernels' strides, and the largest dimension.
+        let dim = *g.pick(&[1, 2, 3, 8, 17, 129, 255, 256, 769, 1536, MAX_DIM]);
         let op = *g.pick(&[Op::Dot, Op::Cosine]);
         let q_count = 1 + g.below(9) as usize;
         let p_count = g.below(10) as usize;
@@ -204,6 +205,35 @@ fn vs07_muvera_uses_asymmetric_fixed_dimensional_encodings() {
             );
         }
     }
+}
+
+/// The properties of the encodings that do not depend on the dimension hold up to the largest one:
+/// fixed lengths, a doubled query token doubles the dot product, a scaled document token changes
+/// nothing, a negated one negates it, and the seed alone decides the encoding.
+#[test]
+fn vs07_muvera_encodings_keep_their_shape_up_to_the_largest_dimension() {
+    for (seed, dim) in [(1u64, 129usize), (2, 256), (3, 769), (4, 1536), (5, MAX_DIM)] {
+        let g = &mut Gen::from_seed(seed);
+        let mut token = || (0..dim).map(|_| g.range_i64(-8, 8) as f32 / 8.0).collect::<Vec<_>>();
+        let (a, b) = (token(), token());
+        let encoder = Muvera::new(dim, seed).unwrap();
+        let q = encoder.query(tokens(dim, &a)).unwrap();
+        let p = encoder.document(tokens(dim, &b)).unwrap().unwrap();
+        assert_eq!((q.len(), p.len()), (FDE_DIM, FDE_DIM), "dim {dim}");
+        let twice = [a.clone(), a.clone()].concat();
+        let q_twice = encoder.query(tokens(dim, &twice)).unwrap();
+        assert_eq!(wide::dot(&q_twice, &p), 2.0 * wide::dot(&q, &p), "dim {dim}");
+        let scaled: Vec<f32> = b.iter().map(|x| 4.0 * x).collect();
+        let both = [b.clone(), scaled].concat();
+        assert_eq!(encoder.document(tokens(dim, &both)).unwrap().unwrap(), p, "dim {dim}");
+        let negated: Vec<f32> = b.iter().map(|x| -x).collect();
+        let p_negated = encoder.document(tokens(dim, &negated)).unwrap().unwrap();
+        assert_eq!(wide::dot(&q, &p_negated), -wide::dot(&q, &p), "dim {dim}");
+        assert_eq!(q, Muvera::new(dim, seed).unwrap().query(tokens(dim, &a)).unwrap());
+        assert_ne!(q, Muvera::new(dim, seed + 1).unwrap().query(tokens(dim, &a)).unwrap());
+    }
+    assert!(Muvera::new(MAX_DIM + 1, 1).is_err());
+    assert!(Tokens::new(MAX_DIM + 1, &[0.0; MAX_DIM + 1]).is_err());
 }
 
 #[test]

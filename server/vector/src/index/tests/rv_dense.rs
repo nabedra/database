@@ -329,3 +329,36 @@ fn vs04_an_unreadable_append_releases_its_version_once_the_range_is_gone() {
     );
     assert!(held.is_empty(), "slots of a dropped range: {held:?}");
 }
+
+/// VEC-G10, a copy from the other search replica (plan section 5): a peer segment whose size is not
+/// the one its manifest states is not the file that manifest names. The copy refuses it before
+/// anything is installed, and the local checkpoint recovers as it was. Copying the prefix the
+/// manifest states would install a peer checkpoint made of another file.
+#[test]
+fn vs10_a_peer_segment_of_another_size_is_refused_before_anything_is_installed() {
+    use std::path::Path;
+
+    use nabedra_rt::fs::{FaultFs, Fs, OpenMode};
+
+    let cfg = Config::new(schema(2, &[], None), 1);
+    let checkpointed = |rows: u64| {
+        let fs = FaultFs::new();
+        fs.create_dir_all_durable(Path::new("/data"));
+        let store = Store::new(Arc::new(fs.clone()), "/data/ck");
+        let mut ix = serving(cfg.clone(), ExactCodec, Some(store));
+        let all = (1..=rows).map(|k| (k, Some(row(&[1.0, k as f32], vec![], k))));
+        feed(&mut ix, RANGE, &page(0, all.collect()));
+        ix.checkpoint().unwrap();
+        fs
+    };
+    let store = |fs: &FaultFs| Store::new(Arc::new(fs.clone()), "/data/ck");
+    let (local, peer) = (checkpointed(1), checkpointed(2));
+    let segment = Path::new("/data/ck/seg-0000000000000000");
+    let grown = peer.open(segment, OpenMode::ReadWrite).unwrap();
+    let len = grown.len().unwrap();
+    grown.write_all_at(&[0], len).unwrap();
+    assert!(copy_checkpoint(&store(&peer), &store(&local)).is_err(), "a grown peer segment is copied");
+    let (ix, damage) = Index::recover(cfg.clone(), ExactCodec, store(&local)).unwrap();
+    assert!(damage.is_empty(), "{damage:?}");
+    assert_eq!(ix.status(RANGE).unwrap().applied, 1, "the local checkpoint was replaced");
+}
