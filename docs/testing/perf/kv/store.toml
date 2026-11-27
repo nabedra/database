@@ -1,0 +1,24 @@
+name = "Native store microbench (NS5, NS18)"
+module = "kv"
+# {bin} is the release `store_bench` test executable of nabedra-kv. Both ignored benches run:
+# NS5 for flush and compaction throughput, NS18 for put, read and install costs.
+command = ["{bin}", "--ignored", "--nocapture", "--test-threads", "1"]
+warmup = 2
+rounds = 24
+timeout_s = 900
+
+# Gating metrics first, so the top of results.json describes one. Hot get, install and flush had
+# an A/A sd of 8% to 11% on hosted runners: at 5% they would leave most clean runs inconclusive,
+# so they gate at 10%. The 1-writer put and append costs follow the runner's fsync and journal
+# timing; their noise is far above 10%, so they are reported and do not gate (README).
+[metrics]
+put_synced_16w_us = 'ns18 put synced 100 B writers=16: \d+ ops/s \(([\d.]+) \S+/op\)'
+get_cold_us = 'ns18 get cold \(1 MiB cache\): \d+ ops/s \(([\d.]+) \S+/op\)'
+scan10_hot_us = 'ns18 scan 10 hot \(256 MiB cache, second pass\): \d+ ops/s \(([\d.]+) \S+/op\)'
+compaction_mibps = { pattern = 'compaction: [\d.]+ MiB written in \S+ \((\d+) MiB/s\)', higher_is_better = true }
+get_hot_us = { pattern = 'ns18 get hot \(256 MiB cache, second pass\): \d+ ops/s \(([\d.]+) \S+/op\)', threshold_pct = 10 }
+install_mibps = { pattern = 'ns18 install 256 MiB: \S+ \((\d+) MiB/s\)', higher_is_better = true, threshold_pct = 10 }
+flush_mibps = { pattern = 'flush: [\d.]+ MiB of memtable -> [\d.]+ MiB of runs in \S+ \((\d+) MiB/s written\)', higher_is_better = true, threshold_pct = 10 }
+put_unsynced_us = { pattern = 'ns18 put unsynced 100 B writers= 1: \d+ ops/s \(([\d.]+) \S+/op\)', gate = false }
+put_synced_p99_us = { pattern = 'ns18 put synced 100 B writers= 1: [^;]*; p50 \d+ \S+, p95 \d+ \S+, p99 (\d+) ', gate = false }
+raft_append_us = { pattern = 'ns18 raft append 64 x 1 KiB synced writers= 1: \d+ ops/s \(([\d.]+) \S+/op\)', gate = false }

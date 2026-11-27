@@ -626,7 +626,6 @@ fn check_counter(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly>
         .filter_map(|(o, _)| as_int(&o.complete_value).map(|v| (*o, v)))
         .collect();
     let at = |o: &Op| o.complete_index.unwrap_or(o.invoke_index);
-    let expiry_tolerance = ctx.opts.expiry_tolerance_ns;
     for x in ops
         .iter()
         .copied()

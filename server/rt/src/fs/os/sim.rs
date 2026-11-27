@@ -246,7 +246,7 @@ impl SimFile {
 
     pub(super) fn statvfs(&self) -> io::Result<Space> {
         let used = self.fs.used_bytes().div_ceil(BLOCK);
-        let blocks = CAPACITY_BYTES / BLOCK;
+        let blocks = self.fs.capacity().unwrap_or(CAPACITY_BYTES) / BLOCK;
         Ok(Space {
             fsid: self.fs.device(),
             block_size: BLOCK,

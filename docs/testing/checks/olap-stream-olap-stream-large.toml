@@ -1,0 +1,14 @@
+# T2 simulation of the OLAP stream data protocol with two full client streams (no OpenOnly
+# abstraction). A TLC simulation, labelled as one: it never replaces the exhaustive T1 run.
+id = "olap-stream-olap-stream-large"
+module = "olap-stream"
+kinds = ["T"]
+guarantees = ["OLAP-STR-G01", "OLAP-STR-G02", "OLAP-STR-G03", "OLAP-STR-G04", "OLAP-STR-G05", "OLAP-STR-G06"]
+scenarios = ["ST01", "ST03", "ST04"]
+tiers = ["T2"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/olap-stream", "OlapStream", "--tier", "T2",
+           "--simulate", "--seed", "1", "--num", "20000"]
+cwd = "."
+timeout_s = 3600
+needs = ["tlc"]
+result_parser = "tlc"

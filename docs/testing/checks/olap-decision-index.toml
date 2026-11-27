@@ -1,0 +1,11 @@
+id = "olap-decision-index"
+module = "olap"
+kinds = ["T"]
+guarantees = []
+scenarios = ["T01", "T03", "T04", "T05", "T06"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/olap/index", "OlapDecisionIndex", "--module", "olap"]
+cwd = "."
+timeout_s = 3600
+needs = ["tlc"]
+result_parser = "tlc"

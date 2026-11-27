@@ -97,6 +97,38 @@ impl Default for PowerLoss {
     }
 }
 
+/// What a power loss did to the state no sync covered ([`FaultFs::power_loss_report`]).
+/// Units are [`PowerLoss::unit`]s holding at least one sector written since its file's
+/// last sync.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PowerLossReport {
+    /// The atomic unit in bytes.
+    pub unit: u64,
+    /// Units that kept their new bytes.
+    pub kept: u64,
+    /// Units that kept their old bytes.
+    pub lost: u64,
+    /// Units torn: new bytes up to a point inside the unit, old bytes after it.
+    pub torn: u64,
+    /// Units that read back as zeros or garbage, synced bytes in them included.
+    pub destroyed: u64,
+    /// Files whose unsynced length change was kept, and dropped.
+    pub lengths_kept: u64,
+    pub lengths_lost: u64,
+    /// Unsynced directory operations kept, and lost (a lost one takes the later ones that
+    /// depend on it with it).
+    pub dir_ops_kept: u64,
+    pub dir_ops_lost: u64,
+}
+
+impl PowerLossReport {
+    /// Whether the cut left anything else than the synced state plus every completed write:
+    /// some unit, length change or directory operation was lost, torn or destroyed.
+    pub fn lost_anything(&self) -> bool {
+        self.lost + self.torn + self.destroyed + self.lengths_lost + self.dir_ops_lost > 0
+    }
+}
+
 impl PowerLoss {
     /// A 4 KiB device page that is destroyed whole: new, old, torn, zeros or garbage.
     pub fn destroy_4k() -> PowerLoss {
@@ -146,10 +178,14 @@ pub struct FsCall {
     pub offset: u64,
     pub len: u64,
     pub ok: bool,
+    /// The injected error this call returned: a [`Fault`] rule, or the volume's capacity
+    /// ([`FaultFs::set_capacity`]). `None` for a call that succeeded or failed otherwise,
+    /// such as one on a halted image.
+    pub fault: Option<FaultError>,
 }
 
 /// The error an injected fault returns.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FaultError {
     /// `EIO`.
     Eio,
@@ -318,17 +354,24 @@ impl Inode {
     }
 
     /// The bytes a power loss leaves, choosing per unit from `rng`.
-    fn after_power_loss(&self, rng: &mut SplitMix, mode: PowerLoss) -> Vec<u8> {
+    fn after_power_loss(
+        &self,
+        rng: &mut SplitMix,
+        mode: PowerLoss,
+        report: &mut PowerLossReport,
+    ) -> Vec<u8> {
         if !self.unsynced() {
             return self.durable.clone();
         }
         let length_changed =
             self.os.len() != self.durable.len() || self.min_len as usize != self.durable.len();
         let mut bytes = if length_changed && rng.below(2) == 0 {
+            report.lengths_kept += 1;
             let mut b = self.durable[..self.min_len as usize].to_vec();
             b.resize(self.os.len(), 0);
             b
         } else {
+            report.lengths_lost += u64::from(length_changed);
             self.durable.clone()
         };
         let limit = bytes.len().min(self.os.len());
@@ -363,7 +406,14 @@ impl Inode {
                     }
                 }
             };
-            match rng.below(outcomes) {
+            let outcome = rng.below(outcomes);
+            match outcome {
+                0 => report.kept += 1,
+                1 => report.lost += 1,
+                2 => report.torn += 1,
+                _ => report.destroyed += 1,
+            }
+            match outcome {
                 0 => copy_new(&mut bytes, end),
                 1 => {}
                 2 => {
@@ -662,6 +712,13 @@ struct State {
     #[cfg(all(unix, feature = "sim"))]
     directory_locks: BTreeSet<Ino>,
     faults: Vec<Fault>,
+    /// The injected error of the call being admitted, for its log entry.
+    fired: Option<FaultError>,
+    /// See [`FaultFs::set_capacity`].
+    capacity: Option<u64>,
+    /// See [`FaultFs::set_list_seed`]: the seed, and listings so far.
+    list_seed: Option<u64>,
+    lists: u64,
     mutating_ops: u64,
     crash_after: Option<u64>,
     crashed: bool,
@@ -792,8 +849,30 @@ impl State {
         }
         for fault in &mut self.faults {
             if fault.fires(op, path, bytes) {
+                self.fired = Some(fault.error);
                 return Err(fault.error.to_io());
             }
+        }
+        Ok(())
+    }
+
+    /// `ENOSPC` when growing a file from `from` to `to` bytes would take the volume past its
+    /// capacity. Only growth counts: rewriting bytes a file already holds never fails.
+    fn reserve(&mut self, from: u64, to: u64) -> io::Result<()> {
+        let Some(capacity) = self.capacity else {
+            return Ok(());
+        };
+        if to <= from {
+            return Ok(());
+        }
+        let used: u64 = self
+            .inodes
+            .values()
+            .map(|inode| inode.os.len() as u64)
+            .sum();
+        if used.saturating_add(to - from) > capacity {
+            self.fired = Some(FaultError::Enospc);
+            return Err(FaultError::Enospc.to_io());
         }
         Ok(())
     }
@@ -807,6 +886,7 @@ impl State {
         len: u64,
         ok: bool,
     ) {
+        let fault = self.fired.take().filter(|_| !ok);
         let call = FsCall {
             op,
             path: path.to_path_buf(),
@@ -814,6 +894,7 @@ impl State {
             offset,
             len,
             ok,
+            fault,
         };
         if let Some(observer) = &self.observer.0 {
             observer(&call);
@@ -1002,6 +1083,8 @@ impl State {
     fn rebuilt(&self, ns: Namespace, mut bytes_of: impl FnMut(Ino) -> Vec<u8>) -> State {
         let mut state = State::fresh_on(self.dev, self.ino_base);
         state.next_number = self.next_number;
+        state.capacity = self.capacity;
+        state.list_seed = self.list_seed;
         state.os.dirs = ns.dirs;
         for (path, &meta) in &state.os.dirs {
             if !is_root(path) {
@@ -1158,6 +1241,8 @@ impl FaultFs {
         next.pending = state.pending.clone();
         next.next_ino = state.next_ino;
         next.next_number = state.next_number;
+        next.capacity = state.capacity;
+        next.list_seed = state.list_seed;
         next.inodes = state
             .inodes
             .iter()
@@ -1192,12 +1277,21 @@ impl FaultFs {
     /// [`FaultFs::power_loss`] with another unit and more outcomes per unit (see
     /// [`PowerLoss`]).
     pub fn power_loss_with(&self, seed: u64, mode: PowerLoss) -> FaultFs {
+        self.power_loss_report(seed, mode).0
+    }
+
+    /// [`FaultFs::power_loss_with`], and what it kept, lost and tore. The image is the same.
+    pub fn power_loss_report(&self, seed: u64, mode: PowerLoss) -> (FaultFs, PowerLossReport) {
         assert!(
             mode.unit >= POWER_LOSS_SECTOR && mode.unit.is_multiple_of(POWER_LOSS_SECTOR),
             "the unit is a multiple of 512 bytes"
         );
         let state = self.state();
         let mut rng = SplitMix(seed);
+        let mut report = PowerLossReport {
+            unit: mode.unit,
+            ..PowerLossReport::default()
+        };
         let mut durable = state.durable.clone();
         // Entries a lost operation linked or unlinked: a later operation naming one of them
         // in the same directory inode depends on it and is lost too.
@@ -1208,10 +1302,12 @@ impl FaultFs {
                 .iter()
                 .any(|effect| effect.touches().any(|path| lost.contains(path)));
             if coin && !depends {
+                report.dir_ops_kept += 1;
                 for effect in op {
                     durable.apply(effect);
                 }
             } else {
+                report.dir_ops_lost += 1;
                 lost.extend(op.iter().flat_map(PendingEffect::touches));
             }
         }
@@ -1219,9 +1315,33 @@ impl FaultFs {
         let bytes: BTreeMap<Ino, Vec<u8>> = state
             .inodes
             .iter()
-            .map(|(&ino, inode)| (ino, inode.after_power_loss(&mut rng, mode)))
+            .map(|(&ino, inode)| (ino, inode.after_power_loss(&mut rng, mode, &mut report)))
             .collect();
-        FaultFs::from_state(state.rebuilt(state.durable_image(&durable), |ino| bytes[&ino].clone()))
+        let image = state.rebuilt(state.durable_image(&durable), |ino| bytes[&ino].clone());
+        (FaultFs::from_state(image), report)
+    }
+
+    /// Makes writes, `set_len` and `preallocate` that would grow the files of this volume
+    /// past `bytes` in total fail with `ENOSPC`, as a full disk does; `None` (the default)
+    /// is unbounded. The capacity is the device's, so the `kill`, `crash` and power-loss
+    /// images keep it. A disk that frees up again is `set_capacity(None)` or a larger one.
+    /// Usage is counted in the OS layer, as [`FaultFs::used_bytes`] does.
+    pub fn set_capacity(&self, bytes: Option<u64>) {
+        self.state().capacity = bytes;
+    }
+
+    /// See [`FaultFs::set_capacity`].
+    pub fn capacity(&self) -> Option<u64> {
+        self.state().capacity
+    }
+
+    /// Lists directories in a seeded order instead of sorted (`None`, the default), since
+    /// no real filesystem promises an order; each listing draws its own order from `seed`.
+    /// The images keep it.
+    pub fn set_list_seed(&self, seed: Option<u64>) {
+        let mut state = self.state();
+        state.list_seed = seed;
+        state.lists = 0;
     }
 
     /// Adds a fault rule.
@@ -1769,11 +1889,19 @@ impl Fs for FaultFs {
             state.require_dir(dir)?;
             let files = state.os.files.keys();
             let dirs = state.os.dirs.keys().filter(|d| !is_root(d));
-            Ok(files
+            let mut listed: Vec<PathBuf> = files
                 .chain(dirs)
                 .filter(|p| p.parent() == Some(dir))
                 .cloned()
-                .collect())
+                .collect();
+            if let Some(seed) = state.list_seed {
+                state.lists += 1;
+                let mut rng = SplitMix(seed ^ state.lists.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                for i in (1..listed.len()).rev() {
+                    listed.swap(i, rng.below(i as u64 + 1) as usize);
+                }
+            }
+            Ok(listed)
         })();
         state.log(FsOp::List, dir, None, 0, 0, result.is_ok());
         result
@@ -1906,6 +2034,15 @@ impl FaultFile {
             .and_then(|()| {
                 if mutating && !self.writable {
                     return Err(io::ErrorKind::PermissionDenied.into());
+                }
+                let grow_to = match op {
+                    FsOp::Write if len > 0 => Some(offset.saturating_add(len)),
+                    FsOp::Preallocate | FsOp::SetLen => Some(len),
+                    _ => None,
+                };
+                if let Some(to) = grow_to {
+                    let from = state.inodes[&self.ino].os.len() as u64;
+                    state.reserve(from, to)?;
                 }
                 let inode = state.inodes.get_mut(&self.ino).expect("open inode exists");
                 body(inode)
@@ -2559,6 +2696,7 @@ mod tests {
                 offset: 0,
                 len: 100,
                 ok: true,
+                fault: None,
             }
         );
         let syncs: Vec<(FsOp, PathBuf)> = calls

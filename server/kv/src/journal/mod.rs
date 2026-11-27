@@ -460,6 +460,17 @@ impl Journal {
         replay_after: Seq,
         sink: Arc<dyn JournalSink>,
     ) -> Result<(Journal, RecoveryReport)> {
+        Self::open_with_manifest_segments(fs, dir, options, replay_after, sink, &[])
+    }
+
+    pub(crate) fn open_with_manifest_segments(
+        fs: Arc<dyn Fs>,
+        dir: &Path,
+        options: JournalOptions,
+        replay_after: Seq,
+        sink: Arc<dyn JournalSink>,
+        required: &[(u64, u64)],
+    ) -> Result<(Journal, RecoveryReport)> {
         if !options.segment_bytes.is_multiple_of(BLOCK)
             || options.segment_bytes < RECORDS_START + BLOCK
         {
@@ -468,8 +479,15 @@ impl Journal {
             ));
         }
         let started = nabedra_rt::time::now_std();
-        ensure_durable_dir(&*fs, dir)?;
+        if let Some(&(segment, _)) = required.first() {
+            if !fs.exists(dir).map_err(segment::io)? {
+                return Err(recovery::missing_segment(segment));
+            }
+        } else {
+            ensure_durable_dir(&*fs, dir)?;
+        }
         let recovered = recovery::recover(&*fs, dir, &options, replay_after, &*sink)?;
+        recovered.validate_segments(required)?;
         let mut report = recovered.report.clone();
         let shared = Arc::new(Shared {
             fs,
