@@ -1,4 +1,5 @@
 import { randomUUID, X509Certificate } from "node:crypto"
+import { attachRetry } from "./unknownRetry.js"
 import { readFileSync } from "node:fs"
 import * as http from "node:http"
 import * as https from "node:https"
@@ -637,6 +638,26 @@ export class Transport {
     }
     const requestId = randomUUID()
     const body = operationBody(operation, payload, requestId)
+    return this.#operation(operation, requestId, body, mutation, decode)
+  }
+
+  /** A mutation's `UnknownOutcomeError` retries this identity: the same ID and bytes. */
+  async #operation<T>(
+    operation: string, requestId: string, body: Buffer, mutation: boolean, decode?: (data: unknown) => T,
+  ): Promise<T> {
+    try {
+      return await this.#sendOperation(operation, requestId, body, mutation, decode)
+    } catch (error) {
+      if (mutation && error instanceof UnknownOutcomeError) {
+        attachRetry(error, () => this.#operation(operation, requestId, body, mutation, decode))
+      }
+      throw error
+    }
+  }
+
+  async #sendOperation<T>(
+    operation: string, requestId: string, body: Buffer, mutation: boolean, decode?: (data: unknown) => T,
+  ): Promise<T> {
     const { status, value } = await this.#envelope("POST", "/v1/operations", {
       body, requestId, mutation, integers: strictIntegers.has(operation) ? "bigint" : undefined,
     })
@@ -659,11 +680,36 @@ export class Transport {
     }
   }
 
-  async submit(operation: string, payload: JsonObject, requestId?: string | null): Promise<ReceiptData> {
+  /** `wrap` turns the acceptance into the caller's receipt, for the result and for a retry's. */
+  async submit(operation: string, payload: JsonObject, requestId?: string | null): Promise<ReceiptData>
+  async submit<R>(
+    operation: string, payload: JsonObject, requestId: string | null | undefined, wrap: (data: ReceiptData) => R,
+  ): Promise<R>
+  async submit<R>(
+    operation: string, payload: JsonObject, requestId?: string | null, wrap?: (data: ReceiptData) => R,
+  ): Promise<R | ReceiptData> {
     const mutation = mutations.has(operation)
     if (!mutation && !reads.has(operation)) throw new ValidationError("Unsupported operation")
     requestId = requestId == null ? randomUUID() : canonicalUuid(requestId)
     const body = operationBody(operation, payload, requestId)
+    return this.#submitBody<R | ReceiptData>(requestId, body, mutation, wrap ?? ((data: ReceiptData) => data))
+  }
+
+  /** A mutation's `UnknownOutcomeError` retries this identity: the same ID and bytes. */
+  async #submitBody<R>(
+    requestId: string, body: Buffer, mutation: boolean, wrap: (data: ReceiptData) => R,
+  ): Promise<R> {
+    try {
+      return wrap(await this.#sendSubmit(requestId, body, mutation))
+    } catch (error) {
+      if (mutation && error instanceof UnknownOutcomeError) {
+        attachRetry(error, () => this.#submitBody(requestId, body, mutation, wrap))
+      }
+      throw error
+    }
+  }
+
+  async #sendSubmit(requestId: string, body: Buffer, mutation: boolean): Promise<ReceiptData> {
     const { status, value } = await this.#envelope("POST", "/v1/requests", { body, requestId, mutation })
     const failure = (message: string): NabedraError => {
       const kind = mutation ? UnknownOutcomeError : ProtocolError

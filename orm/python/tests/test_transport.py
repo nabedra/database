@@ -230,6 +230,60 @@ class TransportTests(unittest.TestCase):
                 self.transport.request('table.upsert', {})
             self.assertEqual(opened.call_count, 2)
 
+    def test_od3_unknown_mutation_retries_only_its_own_identity(self):
+        # D12 after OD-3: a full leader answers a mutation 503 outcome_unknown. The
+        # client raises at once (no resend of its own); retry() sends the same request
+        # ID and bytes, and answers that identity's result.
+        overloaded = {'code': 'outcome_unknown', 'outcome': 'unknown',
+                      'message': 'direct request outcome unknown after overloaded: direct in-flight budget '
+                                 'is full; retry the same request_id and body'}
+        answers = []
+
+        def reply(request):
+            answers.append(request['request_id'])
+            if len(answers) == 1:
+                return {'request_id': request['request_id'], 'error': overloaded}
+            return {'request_id': request['request_id'], 'data': True}
+        self.set_reply(reply, 503)
+        with self.assertRaises(errors.UnknownOutcomeError) as caught:
+            self.transport.request('table.update', {'table_id': 't', 'key': 1, 'values': {'v': 2}},
+                                   decode=lambda data: data)
+        error = caught.exception
+        self.assertEqual((error.code, error.status_code, error.outcome), ('outcome_unknown', 503, 'unknown'))
+        self.assertIn('after overloaded: direct in-flight budget is full', str(error))
+        self.assertEqual(len(self.seen), 1, 'the client does not resend by itself')
+        self.assertTrue(error.retryable)
+        self.set_reply(reply)
+        self.assertIs(error.retry(), True)
+        self.assertEqual(len(self.seen), 2)
+        (_, _, first, sent), (_, _, again, resent) = self.seen
+        self.assertEqual(again, first, 'the retry sends the exact body')
+        self.assertEqual(resent['request_id'], sent['request_id'])
+        self.assertEqual(error.request_id, sent['request_id'])
+        # A read has no identity to retry; a later call is a new request.
+        self.set_reply(lambda r: {'request_id': r['request_id'], 'error': overloaded}, 503)
+        with self.assertRaises(errors.UnknownOutcomeError) as caught:
+            self.transport.request('table.get', {})
+        self.assertFalse(caught.exception.retryable)
+        with self.assertRaises(errors.ValidationError):
+            caught.exception.retry()
+
+    def test_od3_unknown_submit_retries_its_own_identity(self):
+        overloaded = {'code': 'outcome_unknown', 'outcome': 'unknown',
+                      'message': 'direct request outcome unknown after overloaded: worker handler lane full; '
+                                 'retry the same request_id and body'}
+        run_id = str(uuid.uuid4())
+        self.set_reply(lambda r: {'request_id': r['request_id'], 'error': overloaded}, 503)
+        with self.assertRaises(errors.UnknownOutcomeError) as caught:
+            self.transport.submit('table.insert', {'table_id': 't', 'row': {'id': 1}})
+        self.assertTrue(caught.exception.retryable)
+        self.set_reply(lambda r: {'request_id': r['request_id'], 'run_id': run_id, 'state': 'queued'}, 202)
+        receipt = caught.exception.retry()
+        self.assertEqual((receipt.request_id, receipt.run_id), (caught.exception.request_id, run_id))
+        (_, _, first, sent), (path, _, again, resent) = self.seen
+        self.assertTrue(path.endswith('/v1/requests'))
+        self.assertEqual((again, resent['request_id']), (first, sent['request_id']))
+
 
 if __name__ == '__main__':
     unittest.main()

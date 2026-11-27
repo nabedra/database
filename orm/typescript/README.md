@@ -30,9 +30,11 @@ Building a query is synchronous, and anything that talks to the server returns
 a promise. For an HTTPS server with a private CA, pass `caFile`. Timeouts are
 in seconds.
 
-The client never retries a write. When it can't authenticate or validate a
-write's response, it throws `UnknownOutcomeError`, which carries the request
-identity so you can find out what happened. To track accepted work yourself,
+The client never retries a write by itself. When a write gets no definite
+answer (a lost or invalid response, a full or unreachable leader), it throws
+`UnknownOutcomeError`, which carries the request identity. `await error.retry()`
+sends the same request ID and exact body again and resolves to that identity's
+one result; never send the write again under a new request ID. To track accepted work yourself,
 use `submit` and `receipt` with the run and request ID.
 
 Queries can also stream their results in batches:

@@ -1,7 +1,7 @@
 """Nabedra Database failures and request diagnostics.
 
-An unknown outcome means a mutation may have committed. Inspect current data
-before deciding whether to submit another write.
+An unknown outcome means a mutation may have committed. Retry it with the same
+request ID and body (``UnknownOutcomeError.retry()``), never as a new request.
 """
 from __future__ import annotations
 
@@ -72,8 +72,28 @@ class ProtocolError(NabedraError):
 
 
 class UnknownOutcomeError(NabedraError):
+    """A mutation may have committed: the server gave no definite answer for it
+    (an overloaded, unreachable or slow leader, a lost or invalid response).
+
+    When ``retryable`` is true, ``retry()`` sends the same request ID and exact
+    body again and returns that identity's one result, or raises its definite
+    failure or another ``UnknownOutcomeError``. Never send the write again under
+    a new request ID: that is a second logical write. The client does not retry
+    by itself.
+    """
+
     code = "outcome_unknown"
     _default_outcome = "unknown"
+    _retry = None
+
+    @property
+    def retryable(self) -> bool:
+        return self._retry is not None
+
+    def retry(self):
+        if self._retry is None:
+            raise ValidationError('This unknown outcome has no request to retry')
+        return self._retry()
 
 
 class StreamUnsupportedError(NabedraError):

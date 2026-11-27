@@ -151,8 +151,10 @@ class _Transport:
         Decoders must validate server data and raise ValidationError,
         LimitExceededError or ProtocolError for invalid results. Those failures
         become ProtocolError for reads and UnknownOutcomeError for mutations.
-        Other decoder exceptions propagate as programming errors. Never retry;
-        request IDs identify one queued operation and are never automatically resubmitted.
+        Other decoder exceptions propagate as programming errors. Never retries
+        by itself: a request ID identifies one logical operation. A mutation's
+        UnknownOutcomeError is retryable: its retry() sends the same request ID
+        and exact body again, which answers that identity's one outcome.
         All raised transport/server failures retain the client's request ID and
         HTTP status when available. Successful results are returned unwrapped.
         """
@@ -170,12 +172,25 @@ class _Transport:
             raise ValidationError('Operation payload must encode as finite UTF-8 JSON') from None
         if len(body) > _MAX_BODY:
             raise LimitExceededError('Encoded request exceeds 8 MiB')
+        return self._operation(request_id, body, operation in _MUTATIONS, decode)
+
+    def _operation(self, request_id: str, body: bytes, mutation: bool,
+                   decode: Callable[[object], _T] | None) -> _T | object:
+        try:
+            return self._send_operation(request_id, body, mutation, decode)
+        except UnknownOutcomeError as error:
+            if mutation:
+                # The same identity and bytes: the server answers its one outcome.
+                error._retry = lambda: self._operation(request_id, body, mutation, decode)
+            raise
+
+    def _send_operation(self, request_id: str, body: bytes, mutation: bool,
+                        decode: Callable[[object], _T] | None) -> _T | object:
         request = Request(self._url, data=body, method='POST', headers={
             **self._database_headers,
             'Content-Type': 'application/json', 'Accept': 'application/json',
             'Authorization': 'Bearer ' + self._require_token(),
         })
-        mutation = operation in _MUTATIONS
         status = None
 
         def failure(message, *, network=False):
@@ -319,6 +334,17 @@ class _Transport:
             raise ValidationError('Operation payload must encode as finite UTF-8 JSON') from None
         if len(body) > _MAX_BODY:
             raise LimitExceededError('Encoded request exceeds 8 MiB')
+        return self._submit_body(operation, request_id, body)
+
+    def _submit_body(self, operation: str, request_id: str, body: bytes) -> RequestReceipt:
+        try:
+            return self._send_submit(operation, request_id, body)
+        except UnknownOutcomeError as error:
+            if operation in _MUTATIONS:
+                error._retry = lambda: self._submit_body(operation, request_id, body)
+            raise
+
+    def _send_submit(self, operation: str, request_id: str, body: bytes) -> RequestReceipt:
         status, value = self._receipt_exchange('POST', '/v1/requests', body, request_id,
                                                mutation=operation in _MUTATIONS)
         if status != 202 or set(value) != {'request_id', 'run_id', 'state'} or value['request_id'] != request_id or value['state'] != 'queued':

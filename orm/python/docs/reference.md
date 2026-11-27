@@ -271,8 +271,12 @@ and exact body attaches to that request; a different body conflicts. The client
 does not automatically resubmit operations.
 
 After `UnknownOutcomeError`, keep the original identity. A request can still
-commit after its response disappears. Use its receipt or durable mutation
-decision to reconcile the outcome before submitting another logical mutation.
+commit after its response disappears, and a full or unreachable leader answers
+a mutation `outcome_unknown` too, since an earlier attempt of the same identity
+may still commit. When `error.retryable` is true, `error.retry()` sends the same
+request ID and exact body again and returns that identity's one result (or
+raises its definite failure, or another `UnknownOutcomeError`). Never send the
+write again under a new request ID: that is a second logical mutation.
 
 ## Queue receipts
 

@@ -152,6 +152,64 @@ test("receipt identity and uncertain writes survive client and HTTP boundaries",
   )
 })
 
+test("OD-3: an unknown mutation retries only its own identity", { timeout: 8_000 }, async (t) => {
+  // D12 after OD-3: a full leader answers a mutation 503 outcome_unknown. The client
+  // rejects at once (no resend of its own); retry() sends the same ID and bytes.
+  const runId = randomUUID()
+  const seen = []
+  let refuse = true
+  const address = await loopback(t, createServer(async (request, response) => {
+    const chunks = []
+    for await (const chunk of request) chunks.push(chunk)
+    const raw = Buffer.concat(chunks).toString()
+    const requestId = parseJson(raw).request_id
+    seen.push({ route: request.url, raw, requestId })
+    if (refuse) {
+      return reply(response, 503, { request_id: requestId, error: {
+        code: "outcome_unknown", outcome: "unknown",
+        message: "direct request outcome unknown after overloaded: direct in-flight budget is full; "
+          + "retry the same request_id and body",
+      } })
+    }
+    if (request.url.endsWith("/operations")) return reply(response, 200, { request_id: requestId, data: true })
+    return reply(response, 202, { request_id: requestId, run_id: runId, state: "queued" })
+  }))
+  const transport = new Transport(address, "token")
+  const caught = await transport.request("table.update", { table_id: "t", key: 1, values: { v: 2 } }, (data) => data)
+    .then(() => assert.fail("a full leader answered"), (error) => error)
+  assert.ok(caught instanceof UnknownOutcomeError)
+  assert.deepEqual([caught.code, caught.statusCode, caught.outcome], ["outcome_unknown", 503, "unknown"])
+  assert.match(caught.message, /after overloaded: direct in-flight budget is full/)
+  assert.equal(seen.length, 1, "the client does not resend by itself")
+  assert.equal(caught.retryable, true)
+  refuse = false
+  assert.equal(await caught.retry(), true)
+  assert.equal(seen.length, 2)
+  assert.deepEqual([seen[1].raw, seen[1].requestId], [seen[0].raw, seen[0].requestId])
+  assert.equal(caught.requestId, seen[0].requestId)
+
+  refuse = true
+  const failedAgain = await caught.retry().then(() => assert.fail("refused"), (error) => error)
+  assert.ok(failedAgain instanceof UnknownOutcomeError && failedAgain.retryable)
+  assert.equal(seen[2].raw, seen[0].raw)
+
+  // A read has no identity to retry.
+  const read = await transport.request("table.get", { table_id: "t", key: 1 }).then(() => assert.fail(), (error) => error)
+  assert.ok(read instanceof UnknownOutcomeError)
+  assert.equal(read.retryable, false)
+  await assert.rejects(read.retry(), ValidationError)
+
+  const submitted = await transport.submit("table.insert", { table_id: "t", row: { id: 1 } })
+    .then(() => assert.fail("a full leader accepted"), (error) => error)
+  assert.ok(submitted instanceof UnknownOutcomeError && submitted.retryable)
+  refuse = false
+  const receipt = await submitted.retry()
+  assert.deepEqual([receipt.requestId, receipt.runId, receipt.state], [submitted.requestId, runId, "queued"])
+  const [first, again] = seen.slice(-2)
+  assert.ok(again.route.endsWith("/v1/requests"))
+  assert.deepEqual([again.raw, again.requestId], [first.raw, first.requestId])
+})
+
 test("private CA enables HTTPS while unknown certificates remain rejected", { timeout: 8_000 }, async (t) => {
   assert.throws(() => new Transport("https://example.com", "token", { caFile: fileURLToPath(import.meta.url) }), ValidationError)
   const work = await mkdtemp(join(tmpdir(), "nabedra-transport-"))

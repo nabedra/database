@@ -155,8 +155,9 @@ export class Database {
   }
 
   async submit(operation: string, payload: JsonObject, options: SubmitOptions = {}): Promise<RequestReceipt> {
-    const { requestId, runId, state, result, error } = await this.#transport.submit(operation, submitPayload(operation, payload), options.requestId)
-    return new RequestReceipt(requestId, runId, state, result, error, this.#transport)
+    return this.#transport.submit(operation, submitPayload(operation, payload), options.requestId,
+      ({ requestId, runId, state, result, error }) =>
+        new RequestReceipt(requestId, runId, state, result, error, this.#transport))
   }
 
   async receipt(runId: string, requestId: string): Promise<RequestReceipt> {
