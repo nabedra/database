@@ -35,7 +35,6 @@ const ID: &str = "11111111-1111-4111-8111-111111111111";
 
 async fn fixture(queue: usize) -> (Router, Engine<Fake>, Executor, WorkerThreads) {
     let storage = Storage::new(Fake::default(), Namespace::new("api/").unwrap());
-    storage.initialize_catalog().await.unwrap();
     let (pool, workers) = WorkerPool::start(
         NonZeroUsize::new(2).unwrap(),
         tokio::runtime::Handle::current(),
@@ -50,7 +49,7 @@ async fn fixture(queue: usize) -> (Router, Engine<Fake>, Executor, WorkerThreads
             "test-token".into(),
             Default::default(),
             false,
-            true,
+            false,
         )
         .unwrap()
         .0,

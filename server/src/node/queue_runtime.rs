@@ -746,7 +746,7 @@ impl Worker {
             Err(_) => return Err(unavailable()),
         };
         storage
-            .initialize_owned_cluster_catalog(root.cluster_id, fence, false, cold)
+            .initialize_owned_cluster_catalog(root.cluster_id, fence, cold)
             .await
             .map_err(|_| unavailable())
     }

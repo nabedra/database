@@ -70,7 +70,6 @@ async fn seeded() -> (Engine<Store>, WorkerThreads, Uuid, Uuid) {
                 scheduler_term: 1,
             },
             false,
-            false,
         )
         .await
         .unwrap();

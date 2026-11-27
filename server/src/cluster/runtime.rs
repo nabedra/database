@@ -252,18 +252,20 @@ impl Api {
             self.authority_epoch.store(owner.epoch, Ordering::Release);
             return Ok(());
         }
-        let transition = if old.is_none() {
-            FenceTransition::Migrate
-        } else if cold {
+        // Every catalog root carries a fence (format 6); nothing migrates.
+        let Some(previous_fence) = old else {
+            return Err(unavailable());
+        };
+        let transition = if cold {
             FenceTransition::ColdStart
         } else {
             FenceTransition::Takeover
         };
-        let new_run = cold || old.is_none();
+        let new_run = cold;
         let run_id = if new_run {
             ids::uuid_v4()
         } else {
-            old.unwrap().run_id
+            previous_fence.run_id
         };
         self.storage
             .fence_cluster_catalog(
@@ -1018,6 +1020,11 @@ async fn api_process(
     cold_start: bool,
     migrate_catalog: bool,
 ) -> Result<()> {
+    // Catalog format 6 is the only format, so there is nothing to migrate.
+    if migrate_catalog {
+        eprintln!("nabedra-db: --migrate-catalog is not supported: catalog format 6 is the only format");
+        return Err(invalid());
+    }
     let startup_end = time::now() + Duration::from_secs(30);
     let init: Init =
         serde_json::from_slice(&frame(channel, Some(startup_end)).await?).map_err(|_| invalid())?;
@@ -1141,11 +1148,7 @@ async fn api_process(
         let storage = storage.clone();
         move |runtime| {
             let catalog = runtime
-                .block_on(storage.initialize_fenced_cluster_catalog(
-                    proposed_fence,
-                    migrate_catalog,
-                    false,
-                ))
+                .block_on(storage.initialize_fenced_cluster_catalog(proposed_fence, false))
                 .map_err(|e| {
                     eprintln!("nabedra-db: catalog initialization {e}");
                     unavailable()

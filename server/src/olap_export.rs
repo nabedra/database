@@ -171,7 +171,7 @@ fn decode_catalog(bytes: &[u8]) -> Result<crate::storage::Catalog, ProtocolError
         .format_version
     {
         1 | 2 => crate::storage::Catalog::decode(bytes).map_err(|_| storage_error()),
-        3..=6 => {
+        6 => {
             let root =
                 crate::storage::ClusterCatalog::decode(bytes).map_err(|_| storage_error())?;
             Ok(crate::storage::Catalog {

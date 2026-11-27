@@ -353,7 +353,7 @@ mod live_context_probe {
         };
         eprintln!("live-context-probe phase=owned-init");
         let loaded = storage
-            .initialize_owned_cluster_catalog(owner, fence, false, false)
+            .initialize_owned_cluster_catalog(owner, fence, false)
             .await
             .unwrap();
         assert_eq!(loaded.catalog().owner_cluster, Some(owner));

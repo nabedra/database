@@ -706,7 +706,7 @@ async fn u03_seeded_queue_resources_membership_and_fenced_catalog_match_serial_o
             scheduler_term: 1,
         };
         storage
-            .initialize_fenced_cluster_catalog(fence, false, false)
+            .initialize_fenced_cluster_catalog(fence, false)
             .await
             .unwrap();
         let (pool, threads) = WorkerPool::start(

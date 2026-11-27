@@ -102,15 +102,23 @@ impl LocalQueue {
             run_id: nabedra_rt::ids::uuid_v4(),
             scheduler_term: 1,
         };
+        // Catalog format 6 is the only format, so there is nothing to migrate.
+        if self.migration_allowed {
+            return Err(ProtocolError::new(
+                ErrorCode::ValidationError,
+                "--migrate-catalog is not supported: catalog format 6 is the only format",
+                Outcome::NotApplied,
+            ));
+        }
         let loaded = engine
             .storage()
-            .initialize_fenced_cluster_catalog(proposed, self.migration_allowed, self.cold_start)
+            .initialize_fenced_cluster_catalog(proposed, self.cold_start)
             .await
             .map_err(|error| {
                 ProtocolError::new(
                     ErrorCode::StorageUnavailable,
                     if error == crate::storage::StorageError::UnsupportedCatalog {
-                        "legacy catalog requires --migrate-catalog after stopping old writers"
+                        "catalog has an unsupported format; only format 6 is read"
                     } else {
                         "request queue initialization unavailable"
                     },

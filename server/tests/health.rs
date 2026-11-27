@@ -79,17 +79,16 @@ async fn readiness_reads_fresh_validated_catalogs_without_writes() {
     // Readiness validates all supported formats without authorizing migration.
     let mut legacy: serde_json::Value = serde_json::from_slice(&valid).unwrap();
     legacy["format_version"] = 1.into();
-    let mut cluster =
-        nabedra_database_server::storage::ClusterCatalog::from_catalog(&Catalog::empty()).unwrap();
-    let v3 = cluster.encode().unwrap();
-    cluster.format_version = 4;
-    cluster.fence = Some(nabedra_database_server::storage::CatalogFence {
-        run_id: uuid::Uuid::new_v4(),
-        scheduler_term: 1,
-    });
+    let cluster = nabedra_database_server::storage::ClusterCatalog::empty(
+        nabedra_database_server::storage::CatalogFence {
+            run_id: uuid::Uuid::new_v4(),
+            scheduler_term: 1,
+        },
+        None,
+    )
+    .unwrap();
     for bytes in [
         serde_json::to_vec(&legacy).unwrap(),
-        v3,
         cluster.encode().unwrap(),
     ] {
         engine
@@ -151,7 +150,8 @@ async fn readiness_reads_fresh_validated_catalogs_without_writes() {
     assert_eq!(status(app, "/health/ready").await, 200);
     {
         let state = engine.storage().backend().state.lock().unwrap();
-        assert_eq!(state.gets, 9);
+        // One catalog variant fewer than before: format 3 and 4 roots are gone.
+        assert_eq!(state.gets, 8);
         assert_eq!(state.puts, 0);
         assert!(state.put_keys.is_empty());
     }
@@ -180,4 +180,44 @@ async fn readiness_times_out_a_gated_read_while_live_stays_available() {
     })
     .await
     .expect("health read must finish within seven seconds");
+}
+
+#[allow(dead_code)]
+fn test_fence() -> nabedra_database_server::storage::CatalogFence {
+    nabedra_database_server::storage::CatalogFence {
+        run_id: uuid::Uuid::from_u128(0xf3),
+        scheduler_term: 1,
+    }
+}
+/// A format 6 root holding a legacy-shaped table set, fenced by `test_fence`.
+#[allow(dead_code)]
+fn test_root(
+    catalog: &nabedra_database_server::storage::Catalog,
+) -> Result<
+    nabedra_database_server::storage::ClusterCatalog,
+    nabedra_database_server::storage::StorageError,
+> {
+    let mut root = nabedra_database_server::storage::ClusterCatalog::empty(test_fence(), None)?;
+    root.revision = catalog.revision;
+    root.commit_id = catalog.commit_id;
+    root.tables = catalog.tables.clone();
+    Ok(root)
+}
+/// Prepare under the base's own fence (every root is fenced).
+#[allow(dead_code)]
+fn prepare_test(
+    base: nabedra_database_server::storage::LoadedClusterCatalog,
+    tables: std::collections::BTreeMap<String, nabedra_database_server::storage::CatalogEntry>,
+    decision: nabedra_database_server::storage::Decision,
+) -> Result<
+    nabedra_database_server::storage::PreparedPublication,
+    nabedra_database_server::storage::StorageError,
+> {
+    let fence = base
+        .catalog()
+        .fence
+        .ok_or(nabedra_database_server::storage::StorageError::InvalidCatalog)?;
+    nabedra_database_server::storage::PreparedPublication::prepare_fenced(
+        base, tables, decision, fence,
+    )
 }

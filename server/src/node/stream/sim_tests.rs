@@ -132,7 +132,6 @@ impl World {
                     scheduler_term: 1,
                 },
                 false,
-                false,
             )
             .await
             .unwrap();
@@ -262,7 +261,6 @@ impl World {
                     run_id: self.run,
                     scheduler_term: 1,
                 },
-                false,
                 true,
             )
             .await

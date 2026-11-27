@@ -30,6 +30,11 @@ impl CatalogFence {
         Ok(())
     }
 }
+/// The only catalog root format. Older roots (formats 1 to 5) are refused.
+pub const CATALOG_FORMAT: u32 = 6;
+
+/// The catalog root `catalog.json`: tables, the run and term fence, the head
+/// of the decision history and the root page of its immutable UUID index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClusterCatalog {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,32 +44,28 @@ pub struct ClusterCatalog {
     pub commit_id: Uuid,
     pub tables: BTreeMap<String, CatalogEntry>,
     pub decision_head: Option<Uuid>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always present; `validate` refuses a root without it.
     pub fence: Option<CatalogFence>,
-    /// Format 6: the SHA-256 (lowercase hex) of the root page of the immutable
-    /// UUID index over every decision reachable from `decision_head`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The SHA-256 (lowercase hex) of the root page of the immutable UUID
+    /// index over every decision reachable from `decision_head`.
     pub decision_index: Option<String>,
 }
 impl ClusterCatalog {
-    /// Prepare an in-memory v3 root. Performs no conditional migration or I/O.
-    pub fn from_catalog(catalog: &Catalog) -> Result<Self, StorageError> {
-        catalog.validate()?;
-        Ok(Self {
-            owner_cluster: None,
-            format_version: 3,
-            revision: catalog.revision,
-            commit_id: catalog.commit_id,
-            tables: catalog.tables.clone(),
+    /// An empty root fenced for `fence`. Performs no I/O.
+    pub fn empty(fence: CatalogFence, owner_cluster: Option<Uuid>) -> Result<Self, StorageError> {
+        let empty = Catalog::empty();
+        let root = Self {
+            owner_cluster,
+            format_version: CATALOG_FORMAT,
+            revision: empty.revision,
+            commit_id: empty.commit_id,
+            tables: empty.tables,
             decision_head: None,
-            fence: None,
+            fence: Some(fence),
             decision_index: None,
-        })
-    }
-    /// Format 6 carries the decision index; 4 and 5 are its legacy fenced
-    /// predecessors, read and migrated by the first commit.
-    pub fn indexed(&self) -> bool {
-        self.format_version == 6
+        };
+        root.validate()?;
+        Ok(root)
     }
     /// The validated index root, or None when the history is empty.
     pub(crate) fn index_root(&self) -> Result<Option<[u8; 32]>, StorageError> {
@@ -74,27 +75,13 @@ impl ClusterCatalog {
             .transpose()
     }
     pub fn validate(&self) -> Result<(), StorageError> {
-        match (self.format_version, self.fence) {
-            (3, None) => {}
-            (4..=6, Some(fence)) => fence.validate()?,
-            (3..=6, _) => return Err(StorageError::InvalidCatalog),
-            _ => return Err(StorageError::UnsupportedCatalog),
+        if self.format_version != CATALOG_FORMAT {
+            return Err(StorageError::UnsupportedCatalog);
         }
-        // Format 5 is the owned form of 4; format 6 keeps either ownership.
-        let owner_ok = match self.format_version {
-            5 => self.owner_cluster.is_some(),
-            6 => true,
-            _ => self.owner_cluster.is_none(),
-        };
-        if !owner_ok || self.owner_cluster.is_some_and(|id| id.is_nil()) {
-            return Err(StorageError::InvalidCatalog);
-        }
-        let index_ok = if self.indexed() {
-            self.index_root()?.is_some() == self.decision_head.is_some()
-        } else {
-            self.decision_index.is_none()
-        };
-        if !index_ok {
+        self.fence.ok_or(StorageError::InvalidCatalog)?.validate()?;
+        if self.owner_cluster.is_some_and(|id| id.is_nil())
+            || self.index_root()?.is_some() != self.decision_head.is_some()
+        {
             return Err(StorageError::InvalidCatalog);
         }
         Catalog {
@@ -106,26 +93,32 @@ impl ClusterCatalog {
         .validate()
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
+        // Refuse any other format before reading its fields.
+        #[derive(Deserialize)]
+        struct Version {
+            format_version: u32,
+        }
+        let version: Version = object(bytes, MAX_CATALOG_BYTES)?;
+        if version.format_version != CATALOG_FORMAT {
+            return Err(StorageError::UnsupportedCatalog);
+        }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
             #[serde(default)]
             owner_cluster: Option<Uuid>,
+            #[allow(dead_code)]
             format_version: u32,
             revision: u64,
             commit_id: Uuid,
             tables: Box<RawValue>,
             #[serde(deserialize_with = "required_nullable")]
             decision_head: Option<Uuid>,
-            #[serde(default)]
-            fence: Option<CatalogFence>,
-            #[serde(default)]
+            fence: CatalogFence,
+            #[serde(deserialize_with = "required_nullable_string")]
             decision_index: Option<String>,
         }
         let wire: Wire = object(bytes, MAX_CATALOG_BYTES)?;
-        if !matches!(wire.format_version, 3..=6) {
-            return Err(StorageError::UnsupportedCatalog);
-        }
         // Keep raw tables through the legacy decoder, which owns object shape,
         // duplicate/schema/key/path/range and partition aggregate validation.
         #[derive(Serialize)]
@@ -147,12 +140,12 @@ impl ClusterCatalog {
         let catalog = Catalog::decode(&bytes)?;
         let decoded = Self {
             owner_cluster: wire.owner_cluster,
-            format_version: wire.format_version,
+            format_version: CATALOG_FORMAT,
             revision: catalog.revision,
             commit_id: catalog.commit_id,
             tables: catalog.tables,
             decision_head: wire.decision_head,
-            fence: wire.fence,
+            fence: Some(wire.fence),
             decision_index: wire.decision_index,
         };
         decoded.validate()?;
@@ -260,6 +253,11 @@ impl Decision {
 // A deserialize_with Option has no implicit missing-field default.
 fn required_nullable<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Uuid>, D::Error> {
     Option::<Uuid>::deserialize(d)
+}
+fn required_nullable_string<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(d)
 }
 fn object<T: DeserializeOwned>(bytes: &[u8], limit: usize) -> Result<T, StorageError> {
     if bytes.len() > limit {

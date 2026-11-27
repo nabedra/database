@@ -4,7 +4,7 @@ use nabedra_database_server::storage::{Catalog, ClusterCatalog};
 #[test]
 fn cluster_catalog_requires_head_and_keeps_standalone_separate() {
     let legacy = Catalog::empty();
-    let cluster = ClusterCatalog::from_catalog(&legacy).unwrap();
+    let cluster = test_root(&legacy).unwrap();
     let bytes = cluster.encode().unwrap();
     assert_eq!(ClusterCatalog::decode(&bytes).unwrap(), cluster);
     assert!(Catalog::decode(&bytes).is_err());
@@ -160,19 +160,14 @@ fn legacy_and_partition_manifest_validation_is_shared() {
     let v1 = legacy();
     let v2 = Catalog::decode(&v1.encode().unwrap()).unwrap();
     for c in [v1, v2] {
-        let cluster = ClusterCatalog::from_catalog(&c).unwrap();
+        let cluster = test_root(&c).unwrap();
         assert_eq!(cluster.tables, c.tables);
         assert_eq!(cluster.commit_id, c.commit_id);
         assert_eq!(cluster.revision, c.revision);
     }
     // Same partition fixture shape as storage.rs, with a single full-range file.
-    let mut v: Value = serde_json::from_slice(
-        &ClusterCatalog::from_catalog(&legacy())
-            .unwrap()
-            .encode()
-            .unwrap(),
-    )
-    .unwrap();
+    let mut v: Value =
+        serde_json::from_slice(&test_root(&legacy()).unwrap().encode().unwrap()).unwrap();
     v["tables"]["users"]["data"] = json!({"layout":"partitioned","files":[{"object":format!("tables/{TABLE}/{ID}/0.parquet"),"range":{"lower":null,"upper":null},"row_count":1,"byte_size":100,"payload_bytes":8}]});
     assert!(ClusterCatalog::decode(&serde_json::to_vec(&v).unwrap()).is_ok());
     for (field, bad) in [("row_count", json!(2)), ("byte_size", json!(0))] {
@@ -219,7 +214,7 @@ fn independent_bounds_and_escaping_above_control_limit() {
     d = decode(&record()).unwrap();
     d.response_body.push_str(&" ".repeat(MAX_BODY_BYTES));
     assert!(matches!(d.encode(), Err(StorageError::LimitExceeded)));
-    let mut c = ClusterCatalog::from_catalog(&legacy()).unwrap();
+    let mut c = test_root(&legacy()).unwrap();
     let entry = c.tables["users"].clone();
     for i in 0..6000u128 {
         let mut table = entry.clone();
@@ -253,4 +248,44 @@ fn independent_bounds_and_escaping_above_control_limit() {
         "response body changed"
     );
     assert_eq!(d.request_id, Uuid::parse_str(ID).unwrap());
+}
+
+#[allow(dead_code)]
+fn test_fence() -> nabedra_database_server::storage::CatalogFence {
+    nabedra_database_server::storage::CatalogFence {
+        run_id: uuid::Uuid::from_u128(0xf3),
+        scheduler_term: 1,
+    }
+}
+/// A format 6 root holding a legacy-shaped table set, fenced by `test_fence`.
+#[allow(dead_code)]
+fn test_root(
+    catalog: &nabedra_database_server::storage::Catalog,
+) -> Result<
+    nabedra_database_server::storage::ClusterCatalog,
+    nabedra_database_server::storage::StorageError,
+> {
+    let mut root = nabedra_database_server::storage::ClusterCatalog::empty(test_fence(), None)?;
+    root.revision = catalog.revision;
+    root.commit_id = catalog.commit_id;
+    root.tables = catalog.tables.clone();
+    Ok(root)
+}
+/// Prepare under the base's own fence (every root is fenced).
+#[allow(dead_code)]
+fn prepare_test(
+    base: nabedra_database_server::storage::LoadedClusterCatalog,
+    tables: std::collections::BTreeMap<String, nabedra_database_server::storage::CatalogEntry>,
+    decision: nabedra_database_server::storage::Decision,
+) -> Result<
+    nabedra_database_server::storage::PreparedPublication,
+    nabedra_database_server::storage::StorageError,
+> {
+    let fence = base
+        .catalog()
+        .fence
+        .ok_or(nabedra_database_server::storage::StorageError::InvalidCatalog)?;
+    nabedra_database_server::storage::PreparedPublication::prepare_fenced(
+        base, tables, decision, fence,
+    )
 }

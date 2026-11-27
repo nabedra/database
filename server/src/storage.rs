@@ -50,10 +50,6 @@ impl ObjectKey {
     pub fn decision_index_page(hash: &[u8; 32]) -> Self {
         Self(format!("decision-index/{}.bin", decision_index::hex(hash)))
     }
-    /// One resumable migration chunk of the legacy chain under `head`.
-    pub fn decision_index_chunk(head: Uuid, ordinal: u32) -> Self {
-        Self(format!("decision-index-build/{head}/{ordinal}.bin"))
-    }
     pub fn control_decision(id: Uuid) -> Self {
         Self(format!("control-decisions/{id}.json"))
     }
@@ -105,22 +101,6 @@ impl ObjectKey {
         {
             let hash = decision_index::parse_hex(hash).ok_or(StorageError::InvalidPath)?;
             return Ok(Self::decision_index_page(&hash));
-        }
-        if let Some(rest) = path.strip_prefix("decision-index-build/") {
-            let (head, ordinal) = rest
-                .strip_suffix(".bin")
-                .and_then(|s| s.split_once('/'))
-                .ok_or(StorageError::InvalidPath)?;
-            let head = Uuid::parse_str(head).map_err(|_| StorageError::InvalidPath)?;
-            let ordinal = ordinal
-                .parse::<u32>()
-                .map_err(|_| StorageError::InvalidPath)?;
-            let key = Self::decision_index_chunk(head, ordinal);
-            return if key.0 == path {
-                Ok(key)
-            } else {
-                Err(StorageError::InvalidPath)
-            };
         }
         for (prefix, constructor) in [
             ("decisions/", Self::decision as fn(Uuid) -> Self),
@@ -203,7 +183,7 @@ pub enum ObjectAccessError {
     Storage(StorageError),
 }
 impl ObjectAccessError {
-    fn into_storage_error(self) -> StorageError {
+    pub(crate) fn into_storage_error(self) -> StorageError {
         match self {
             Self::Denied => StorageError::Unavailable,
             Self::Storage(error) => error,
