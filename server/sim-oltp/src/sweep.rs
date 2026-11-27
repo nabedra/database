@@ -587,7 +587,14 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
     }
 
     let mut defect_reports = Vec::new();
-    if test_defects && report.passed() {
+    // The seeded defects run on the first seed of the range. Their clean twin is that seed
+    // unmodified, so they need it clean and replayed, not every other seed of the sweep: one
+    // red seed elsewhere (an open record) must not leave the detectors unchecked (SIM-8).
+    let twin_clean = report
+        .seeds
+        .iter()
+        .any(|seed| seed.seed == config.first && seed.passed && seed.replayed && seed.deterministic);
+    if test_defects && twin_clean {
         for defect in [Defect::LostWrite, Defect::StaleRead] {
             let tested = test_defect(&config, defect)?;
             assertions.insert(defect.name(), tested.detected);
@@ -672,7 +679,7 @@ pub fn run(command: Command) -> Result<bool, Box<dyn Error>> {
             assertions,
             unjudged,
             unreplayed,
-            defects_skipped: test_defects && !report.passed(),
+            defects_skipped: test_defects && !twin_clean,
             duration_s,
             total_cpu_s,
             config_hash,
@@ -816,7 +823,7 @@ fn write_record(
 ) -> Result<bool, Box<dyn Error>> {
     let mut record = Record::new(&config.label, "S H");
     record.fill_from_env();
-    record.guarantees = env_list("NABEDRA_SIM_GUARANTEES");
+    record.guarantees = claim(&input).0;
     // Claim only scenarios whose every clause executed its assertions in this range.
     let complete: BTreeSet<&str> = SCENARIOS
         .iter()
@@ -929,7 +936,13 @@ fn not_run(input: &RecordInput, seeds: u64, replayed: u64) -> Vec<NotRun> {
         });
     };
     if input.defects_skipped {
-        row("seeded defects", "the unmodified smoke sweep failed");
+        row(
+            "seeded defects",
+            "their seed, the first of the range, was red or not replayed unmodified",
+        );
+    }
+    for (guarantee, why) in claim(input).1 {
+        row(&guarantee, &why);
     }
     for (rule, why) in rules_not_run(&input.exercised) {
         row(&rule, &why);
@@ -1006,6 +1019,95 @@ fn not_run(input: &RecordInput, seeds: u64, replayed: u64) -> Vec<NotRun> {
     share_reasons(rows)
 }
 
+/// The history assertions that judge per-key linearizability, one per path.
+const LINEARIZABILITY: &[&str] = &[
+    "linearizability and keyed dedup",
+    "transactions, per-key linearizability and outcomes",
+];
+
+/// SIM-8: what a range must have run before its record claims a guarantee. Each need is
+/// met by any one of its names: a probe rule that ran (its count in the range) or a per-seed
+/// assertion that executed in some seed of it, whatever its verdict. A guarantee without a
+/// row here, or with a need that nothing met, is not claimed, and the record says why.
+const GUARANTEE_NEEDS: &[(&str, &[&[&str]])] = {
+    use crate::invariants::{
+        protocol::{
+            DEDUP_UNIQUE, EXACTLY_ONCE_RELEASE, KEYSPACE_COVERAGE, MAJORITY_REACHED,
+            NOT_APPLIED_NEVER_COMMITTED, RESOURCE_BASELINE,
+        },
+        queued::{ACCEPTED_SETTLES, RETENTION},
+        resources::RELEASE_AFTER_WORK,
+    };
+    &[
+        ("OLTP-G02", &[LINEARIZABILITY]),
+        (
+            "OLTP-G03",
+            &[
+                LINEARIZABILITY,
+                &[DEDUP_UNIQUE],
+                &[NOT_APPLIED_NEVER_COMMITTED],
+            ],
+        ),
+        ("OLTP-G06", &[&[KEYSPACE_COVERAGE]]),
+        ("OLTP-G07", &[&[ACCEPTED_SETTLES], &[RETENTION]]),
+        (
+            "OLTP-G08",
+            &[
+                &[MAJORITY_REACHED],
+                &["final writes and reads through both gateways"],
+            ],
+        ),
+        (
+            "OLTP-G09",
+            &[
+                &[EXACTLY_ONCE_RELEASE],
+                &[RELEASE_AFTER_WORK],
+                &[RESOURCE_BASELINE],
+            ],
+        ),
+    ]
+};
+
+/// The guarantees of `NABEDRA_SIM_GUARANTEES` that the range checked, and those it did not,
+/// with the reason.
+fn claim(input: &RecordInput) -> (Vec<String>, Vec<(String, String)>) {
+    claim_from(
+        env_list("NABEDRA_SIM_GUARANTEES"),
+        &input.exercised,
+        &input.assertions,
+    )
+}
+
+fn claim_from(
+    listed: Vec<String>,
+    exercised: &BTreeMap<&'static str, u64>,
+    assertions: &BTreeMap<&'static str, bool>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let met = |name: &str| {
+        exercised.get(name).is_some_and(|times| *times > 0) || assertions.contains_key(name)
+    };
+    let mut claimed = Vec::new();
+    let mut unclaimed = Vec::new();
+    for guarantee in listed {
+        let needs = GUARANTEE_NEEDS
+            .iter()
+            .find(|(id, _)| *id == guarantee)
+            .map(|(_, needs)| *needs);
+        let missing = match needs {
+            None => Some("no rule of the OLTP simulator is mapped to it".to_owned()),
+            Some(needs) => needs
+                .iter()
+                .find(|need| !need.iter().any(|name| met(name)))
+                .map(|need| format!("not claimed: {} did not run in this range", need.join(" or "))),
+        };
+        match missing {
+            None => claimed.push(guarantee),
+            Some(why) => unclaimed.push((guarantee, why)),
+        }
+    }
+    (claimed, unclaimed)
+}
+
 /// The longest ID of a `not_run` entry.
 const NOT_RUN_ID: usize = 200;
 
@@ -1072,6 +1174,29 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    /// SIM-8: a record claims a guarantee only when every rule it rests on ran, and says
+    /// why it does not claim the others.
+    #[test]
+    fn a_guarantee_is_claimed_only_from_rules_that_ran() {
+        use crate::invariants::protocol::{DEDUP_UNIQUE, NOT_APPLIED_NEVER_COMMITTED};
+        let ran = BTreeMap::from([(DEDUP_UNIQUE, 3), (NOT_APPLIED_NEVER_COMMITTED, 0)]);
+        // A failed assertion executed: its guarantee was checked, and the record fails.
+        let assertions = BTreeMap::from([("linearizability and keyed dedup", false)]);
+        let listed = ["OLTP-G02", "OLTP-G03", "OLTP-G99"].map(str::to_owned).to_vec();
+        let (claimed, unclaimed) = claim_from(listed.clone(), &ran, &assertions);
+        assert_eq!(claimed, ["OLTP-G02"]);
+        let why: BTreeMap<_, _> = unclaimed.into_iter().collect();
+        assert!(why["OLTP-G03"].contains(NOT_APPLIED_NEVER_COMMITTED), "{why:?}");
+        assert!(why["OLTP-G99"].contains("no rule"), "{why:?}");
+        // Nothing ran: nothing is claimed.
+        let (claimed, unclaimed) = claim_from(listed, &BTreeMap::new(), &BTreeMap::new());
+        assert!(claimed.is_empty());
+        assert_eq!(unclaimed.len(), 3);
+        let ran = BTreeMap::from([(NOT_APPLIED_NEVER_COMMITTED, 1), (DEDUP_UNIQUE, 1)]);
+        let (claimed, _) = claim_from(vec!["OLTP-G03".into()], &ran, &assertions);
+        assert_eq!(claimed, ["OLTP-G03"]);
+    }
 
     /// Seed 2 panics below the hit at seed 3. Its line is a violation of kind `harness`, the
     /// search goes on to the hit, and no panicked seed of the prefix is reported as a pass.
