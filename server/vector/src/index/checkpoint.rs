@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicBool;
 
 use nabedra_rt::fs::{Fs, FsFile, OpenMode};
 
-use super::codec::Codec;
+use super::codec::{Codec, direction, length};
 use super::mutant::mutant;
 use super::rows::{Gen, Point, Slot};
 use super::{Append, Config, Entry, Index, PinInner, Range, Service};
@@ -562,6 +562,12 @@ impl<C: Codec> Index<C> {
         let old = r.u32()?;
         let centroid = r.floats(self.cfg.schema.dim)?;
         let undirected = centroid.is_empty();
+        // Codes are made against the centroid and assert unit directions, so nothing read from a
+        // file may reach them unchecked: a centroid is a unit vector, as `direction` makes it.
+        let unit = |v: &[f32]| (length(v) - 1.0).abs() <= 1e-4;
+        if !undirected && !unit(&centroid) {
+            return Err(damaged("a centroid is not a unit vector"));
+        }
         while !r.0.is_empty() {
             let id = RangeId(u128::from_le_bytes(r.array()?));
             let key: Key = r.bytes()?.into();
@@ -578,6 +584,10 @@ impl<C: Codec> Index<C> {
             };
             if !self.fits(&row) {
                 return Err(damaged("a row does not fit the schema"));
+            }
+            // A directed partition holds only vectors with a direction (decision L3).
+            if !undirected && row.vec.as_deref().and_then(direction).is_none() {
+                return Err(damaged("an undirected vector in a directed partition"));
             }
             let sh = &mut self.shared;
             // A range that was dropped since is in the file and not in the manifest.

@@ -187,8 +187,31 @@ fn vs02_filter_evaluation_counts_against_the_cpu_budget() {
 /// `DirectionCodec`, a partition centroid that is not a unit vector reaches the asserts of
 /// `CodeBlock::push` through `Shard::put` and recovery panics.
 #[test]
-#[ignore = "VEC-BUG-forged-centroid-panics-recovery"]
 fn vs03_a_forged_centroid_fails_recovery_without_a_panic() {
+    recovers_forged("a centroid of length 2", |bytes| {
+        bytes[24..28].copy_from_slice(&2.0f32.to_le_bytes());
+    });
+    recovers_forged("a centroid that is not a number", |bytes| {
+        bytes[28..32].copy_from_slice(&f32::NAN.to_le_bytes());
+    });
+}
+
+/// The same for a row of a directed partition whose vector has no direction (decision L3: such
+/// rows live in the undirected list): `CodeBlock::push` asserts a positive length.
+#[test]
+fn vs03_a_forged_zero_vector_in_a_directed_partition_fails_recovery_without_a_panic() {
+    recovers_forged("a zero vector", |bytes| {
+        // Range (16), key length (4) and key (8), four positions (32), vector length (4).
+        assert_eq!(u32::from_le_bytes(bytes[48..52].try_into().unwrap()), 8, "a key");
+        assert_eq!(u32::from_le_bytes(bytes[92..96].try_into().unwrap()), 8, "a vector");
+        bytes[96..104].fill(0);
+    });
+}
+
+/// Writes a checkpoint of three rows in a directed partition with the direction codec, edits its
+/// first frame and puts the right checksum back, and recovers: recovery must report the range
+/// damaged, out of service, and never panic.
+fn recovers_forged(what: &str, edit: impl FnOnce(&mut Vec<u8>)) {
     use std::path::Path;
 
     use nabedra_rt::fs::{FaultFs, Fs, OpenMode};
@@ -214,7 +237,7 @@ fn vs03_a_forged_centroid_fails_recovery_without_a_panic() {
         8,
         "a directed partition"
     );
-    bytes[24..28].copy_from_slice(&2.0f32.to_le_bytes());
+    edit(&mut bytes);
     let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
     let crc = crc32c(&bytes[16..16 + len]).to_le_bytes();
     bytes[12..16].copy_from_slice(&crc);
@@ -223,9 +246,15 @@ fn vs03_a_forged_centroid_fails_recovery_without_a_panic() {
     f.write_all_at(&bytes, 0).unwrap();
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        Index::recover(cfg.clone(), codec(), store()).map(|(_, damage)| damage.len())
+        let (ix, damage) = Index::recover(cfg.clone(), codec(), store()).unwrap();
+        let ranges: Vec<RangeId> = damage.iter().flat_map(|d| d.ranges.clone()).collect();
+        (ranges, ix.status(RANGE).unwrap().damage.is_some())
     }));
-    assert!(outcome.is_ok(), "recovery of a forged centroid panics");
+    let Ok((ranges, failed)) = outcome else {
+        panic!("recovery of {what} panics");
+    };
+    assert_eq!(ranges, [RANGE], "recovery of {what} reports the damage of its range");
+    assert!(failed, "recovery of {what} leaves its range in service");
 }
 
 /// A vector store whose reads can be made to fail.
