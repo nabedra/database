@@ -1,0 +1,15 @@
+# The OLAP stream data protocol spec (specs/olap-stream/OlapStream.tla) with a 5-hour budget per run. The T1
+# baseline at the L2 bounds (3 workers, 2 clients) does not finish within the 15-minute T1 budget, so the T1 check
+# reports it not-run; this T2 check runs the same baselines and mutants exhaustively with more time. It never makes
+# the T1 cell green.
+id = "olap-stream-olap-stream-long"
+module = "olap-stream"
+kinds = ["T"]
+guarantees = ["OLAP-STR-G01", "OLAP-STR-G02", "OLAP-STR-G03", "OLAP-STR-G04", "OLAP-STR-G05", "OLAP-STR-G06"]
+scenarios = ["ST01", "ST03", "ST04"]
+tiers = ["T2"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/olap-stream", "OlapStream", "--budget-s", "18000"]
+cwd = "."
+timeout_s = 21000
+needs = ["tlc"]
+result_parser = "tlc"

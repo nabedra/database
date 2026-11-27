@@ -1,0 +1,20 @@
+# Evidence: specs/olap (design review, rv-olap). The shipped lookup is the mutant prefix_history_budget; the liveness
+# baseline uses the candidate bounded window. The cap numbers come from server/src/node/coordinator.rs:450 and
+# server/src/storage/history.rs:450-512. The fix changes the catalog root format, so it waits for the user.
+id = "DESIGN-olap-decision-chain-cap"
+title = "Every OLAP mutation walks the whole uncompacted decision chain within a fixed budget, so writes stop after 4096 decisions or 64 MiB"
+class = "uncertain-outcome"
+module = "olap"
+guarantees = ["OLAP-G03", "OLAP-G05"]
+scenarios = ["T04", "T06"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/olap/mutants/prefix_history_budget.cfg"
+seed = "unknown"
+why_not_caught = "The commit protocol tests and the history tests use chains of a few decisions; the budget tests check that a budget failure never proves absence, which is right for safety, but nothing checks that a database keeps accepting writes after more decisions than the budget."
+invariant_added = "G05_Progress with a lookup budget smaller than the history: every accepted mutation settles after the faults stop."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

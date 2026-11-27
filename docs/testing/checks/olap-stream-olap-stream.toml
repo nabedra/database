@@ -1,0 +1,15 @@
+# Design spec of the OLAP stream data protocol (specs/olap-stream/OlapStream.tla): demand,
+# checkpoint, replay, takeover and cold start at L2 bounds (3 workers, 2 concurrent clients,
+# one crash, loss, duplicate, delay and partition each) plus a liveness run at reduced bounds.
+# Design review: plans/olap-streaming.md, "Design review".
+id = "olap-stream-olap-stream"
+module = "olap-stream"
+kinds = ["T"]
+guarantees = ["OLAP-STR-G01", "OLAP-STR-G02", "OLAP-STR-G03", "OLAP-STR-G04", "OLAP-STR-G05", "OLAP-STR-G06"]
+scenarios = ["ST01", "ST03", "ST04"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/olap-stream", "OlapStream"]
+cwd = "."
+timeout_s = 14400
+needs = ["tlc"]
+result_parser = "tlc"
