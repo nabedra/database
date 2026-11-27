@@ -1,0 +1,13 @@
+# Design check of journal values and journal GC in nabedra-kv (plans/native-storage-engine.md, design review
+# section): specs/lsm/gc/JournalGc, its safety and liveness baselines exhaustive with coverage, then every mutant.
+id = "lsm-journal-gc"
+module = "lsm"
+kinds = ["T"]
+guarantees = ["LSM-G01", "LSM-G02"]
+scenarios = ["LSM01", "NS03", "NS04", "NS05", "NS13"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/lsm/gc", "JournalGc", "--module", "lsm"]
+cwd = "."
+timeout_s = 7200
+needs = ["tlc"]
+result_parser = "tlc"

@@ -1,0 +1,12 @@
+# LSM-2 recovery refinement: synced manifest coverage and pre-repair validation.
+id = "lsm-flushed-prefix"
+module = "lsm"
+kinds = ["T"]
+guarantees = []
+scenarios = ["NS07"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/lsm/flushed-prefix", "FlushedPrefixRecovery", "--module", "lsm"]
+cwd = "."
+timeout_s = 1800
+needs = ["tlc"]
+result_parser = "tlc"

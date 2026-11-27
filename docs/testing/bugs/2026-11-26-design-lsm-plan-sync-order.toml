@@ -1,0 +1,18 @@
+# Design review rv-lsm (wave-rv), finding LSM-3. Open until the plan fix of this PR merges; the code is right.
+id = "RV-LSM-3"
+title = "The plan's group commit pads after fdatasync, syncs only the previous segment across rolls and allows zero padding, each of which loses acknowledged writes"
+class = "other"
+module = "lsm"
+guarantees = ["LSM-G01", "LSM-G03"]
+scenarios = ["NS05", "NS08", "NS25"]
+found_by = "review"
+found_date = "2026-11-26"
+lowest_regression = "specs/lsm/mutants/pad_after_sync.cfg"
+seed = "unknown"
+why_not_caught = "The plan had no design review; the code was written to its own comments, which differ from the plan text."
+invariant_added = "No write touches a page that holds synced bytes, and every sync covers every segment with unsynced bytes (G01_AckedSurvive against the pad_after_sync, sync_prev_segment_only, no_sync_pad and roll_gap_is_end mutants)."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "zPy52"
+expires = "2026-12-24"

@@ -1,0 +1,14 @@
+# Design check of damage detection, quarantine, release and backup reads in nabedra-kv and its pool
+# (plans/native-storage-engine.md, section 3 and the design review section): specs/lsm/quarantine/Quarantine,
+# its safety and liveness baselines exhaustive with coverage, then every mutant.
+id = "lsm-quarantine"
+module = "lsm"
+kinds = ["T"]
+guarantees = ["LSM-G01", "LSM-G03"]
+scenarios = ["LSM01", "NS07", "NS20", "NS23"]
+tiers = ["T1"]
+command = ["python3", "scripts/testing/tla_check.py", "specs/lsm/quarantine", "Quarantine", "--module", "lsm"]
+cwd = "."
+timeout_s = 7200
+needs = ["tlc"]
+result_parser = "tlc"
