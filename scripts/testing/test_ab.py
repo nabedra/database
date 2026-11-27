@@ -150,13 +150,31 @@ class PairedBenchmarkTests(unittest.TestCase):
         self.assertGreater(result["metrics"]["total"]["pairs"][0]["base"], 0)
         self.assertGreater(result["runtime_seconds"], 0)
 
+    def test_report_only_metric_cannot_decide_the_comparison(self):
+        spec = write_spec(
+            'command = ["{bin}"]\nwarmup = 0\nrounds = 3\n[metrics]\n'
+            r"steady = 'steady=(\d+)'" "\n"
+            r"noisy = { pattern = 'noisy=(\d+)', gate = false }" "\n"
+        )
+        side = lambda noisy: [sys.executable, "-c", f"print('steady=10 noisy={noisy}')"]
+        result = ab.benchmark(spec, side(10), side(20))
+        noisy = result["metrics"]["noisy"]
+        self.assertEqual((noisy["regression"], noisy["gate"]), (True, False))
+        self.assertFalse(result["regression"])
+        with self.assertRaisesRegex(ValueError, "at least one metric must gate"):
+            write_spec('command = ["{bin}"]\nwarmup = 0\nrounds = 2\n[metrics]\n'
+                       r"a = { pattern = 'a=(\d+)', gate = false }" "\n")
+        with self.assertRaisesRegex(ValueError, "boolean gate"):
+            write_spec('command = ["{bin}"]\nwarmup = 0\nrounds = 2\n[metrics]\n'
+                       r"a = { pattern = 'a=(\d+)', gate = 0 }" "\n")
+
     def test_spec_validation_and_overrides(self):
         for text, message in (
             ("", "exactly one of metric and metrics"),
             ("metric = 'wall'\n[metrics]\nb = 'wall'\n", "exactly one of metric and metrics"),
             ("[metrics]\n" r"b = 'b=\d+'" "\n", "exactly one capturing group"),
             ("[metrics]\n" r"b = { pattern = 'b=(\d+)', file = '../x' }" "\n", "relative to the scratch"),
-            ("[metrics]\n" r"b = { pattern = 'b=(\d+)', other = 1 }" "\n", "table of pattern, file"),
+            ("[metrics]\n" r"b = { pattern = 'b=(\d+)', other = 1 }" "\n", "a table of pattern, file"),
             ("[metrics]\nb = { pattern = 'wall', higher_is_better = true }\n", "wall time is a cost"),
             ("timeout_s = -1\nmetric = 'wall'\n", "timeout_s"),
         ):

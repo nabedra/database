@@ -37,9 +37,14 @@ class Spec:
     # Named metrics measured from the same command: {name = "regex" | "wall"} or
     # {name = {pattern = "regex", file = "relative/path", higher_is_better = true}}.
     # The first one is the primary. A higher-is-better value (a rate) is compared as its
-    # reciprocal, so every ratio is a cost.
+    # reciprocal, so every ratio is a cost. `gate = false` reports a metric without letting it
+    # decide the comparison, for one whose A/A noise is above the threshold.
     metrics: dict = field(default_factory=dict)
     timeout_s: float | None = None
+
+    def gated(self, name):
+        value = self.metrics.get(name)
+        return not isinstance(value, dict) or value.get("gate", True)
 
     def measurements(self):
         """Return (name, pattern, file, higher_is_better) per metric."""
@@ -82,9 +87,13 @@ def load_spec(path):
         raise ValueError("give exactly one of metric and metrics")
     if not isinstance(spec.metrics, dict) or not all(
             isinstance(value, str) or (isinstance(value, dict)
-                                       and set(value) <= {"pattern", "file", "higher_is_better"})
+                                       and set(value) <= {"pattern", "file", "higher_is_better", "gate"}
+                                       and type(value.get("gate", True)) is bool)
             for value in spec.metrics.values()):
-        raise ValueError("metrics values must be a pattern or a table of pattern, file and higher_is_better")
+        raise ValueError("metrics values must be a pattern or a table of pattern, file, higher_is_better "
+                         "and a boolean gate")
+    if not any(spec.gated(row[0]) for row in spec.measurements()):
+        raise ValueError("at least one metric must gate the comparison")
     if (not isinstance(spec.command, list)
             or not all(isinstance(arg, str) for arg in spec.command)
             or not any("{bin}" in arg for arg in spec.command)):
@@ -208,13 +217,14 @@ def benchmark(spec, base, head):
         pairs = [{"order": order, "base": pair["base"][name], "head": pair["head"][name]}
                  for order, pair in runs]
         result = compare(pairs, spec.threshold_pct, spec.bootstrap_samples)
-        metrics[name] = {"pairs": pairs, **result, "noise": noise(pairs, result["ci95"])}
+        metrics[name] = {"pairs": pairs, **result, "gate": spec.gated(name),
+                         "noise": noise(pairs, result["ci95"])}
     primary = metrics[patterns[0][0]]
     return {
         "pairs": primary["pairs"],
         "median_ratio": primary["median_ratio"],
         "ci95": primary["ci95"],
-        "regression": any(row["regression"] for row in metrics.values()),
+        "regression": any(row["regression"] and row["gate"] for row in metrics.values()),
         "metrics": metrics,
         "runtime_seconds": time.perf_counter() - started,
     }
@@ -250,7 +260,8 @@ def write_result(output, result):
         lower, upper = row["ci95"]
         rows.append(
             f"| {name} | {len(row['pairs'])} | {row['median_ratio']:.4f} | {lower:.4f} to {upper:.4f} "
-            f"| {row['noise']['ratio_mad_pct']:.2f}% | {'yes' if row['regression'] else 'no'} |"
+            f"| {row['noise']['ratio_mad_pct']:.2f}% | {'yes' if row['regression'] else 'no'}"
+            f"{'' if row['gate'] else ' (report only)'} |"
         )
     summary = (
         f"# {spec['name']}\n\n"

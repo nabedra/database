@@ -6,7 +6,7 @@ command = [
     "cache-benchmark", "{bin}", "{work}",
 ]
 warmup = 1
-rounds = 6
+rounds = 10
 timeout_s = 600
 
 # One run measures both workloads, 24 requests each at 24 offered requests/s with the stock client.

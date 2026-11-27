@@ -2401,70 +2401,16 @@ jobs:
           path: perf-out
           retention-days: 14
 
-  # Paired A/B benchmarks (docs/testing/perf/README.md). Opt-in with jobs=ab. One leg per target builds
-  # release binaries of ab_base (default: sha, an A/A run) and sha; then one runner per spec runs
+  # Paired A/B benchmarks (docs/testing/perf/README.md). Opt-in with jobs=ab. One runner per spec
+  # builds release binaries of ab_base (default: sha, an A/A run) and sha, then runs
   # scripts/testing/ab.py with both sides. The harness (ab.py, the specs and their drivers) comes from
-  # the workflow ref, so both sides run the same driver.
-  ab-bin:
-    name: A/B binaries (${{ matrix.target }})
+  # the workflow ref, so both sides run the same driver; the code under test is in code-under-test/.
+  ab:
+    name: A/B ${{ matrix.spec }}
     needs: revision
     if: contains(needs.revision.outputs.jobs, ',ab,')
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [oltp, cache, olap, events, kv, sim]
-    env:
-      TARGET: ${{ matrix.target }}
-      AB_BASE: ${{ needs.revision.outputs.ab_base }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TESTED_SHA }}
-          fetch-depth: 0
-      - name: Build each side
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
-          mkdir -p "$RUNNER_TEMP/ab-bin"
-          for sha in $(printf '%s\n' "$TESTED_SHA" "$AB_BASE" | awk '!seen[$0]++'); do
-            git checkout --quiet --detach "$sha"
-            out="$RUNNER_TEMP/ab-bin/$TARGET-$sha"
-            start=$(date +%s)
-            case "$TARGET" in
-              oltp|cache|olap)
-                # The Dockerfile's bookworm base, so the binary also runs in the OLTP benchmark image.
-                docker run --rm -v "$PWD:/w" -w /w/server -e CARGO_BUILD_JOBS -e CARGO_TERM_COLOR "rust:${RUST_TOOLCHAIN}-bookworm" \
-                  cargo build --locked --release --no-default-features --features "$TARGET" --bin nabedra-db
-                cp server/target/release/nabedra-db "$out" ;;
-              events)
-                docker build -q -f server/events/deploy/Dockerfile --build-arg BUILD_JOBS=4 -t "nabedra-events:$sha" server
-                docker save "nabedra-events:$sha" | gzip -1 > "$out.tar.gz" ;;
-              kv)
-                exe=$(cd server && cargo test --locked --release -p nabedra-kv --test store_bench --no-run --message-format=json \
-                  | jq -r 'select(.executable != null and .target.name == "store_bench") | .executable')
-                cp "$exe" "$out" ;;
-              sim)
-                (cd server && RUSTFLAGS="--cfg tokio_unstable" CARGO_TARGET_DIR=target/sim \
-                  cargo build --locked --release -p nabedra-sim-oltp --bin nabedra-sim)
-                cp server/target/sim/release/nabedra-sim "$out" ;;
-            esac
-            echo "$TARGET ${sha::10} built in $(( $(date +%s) - start )) s" | tee -a "$GITHUB_STEP_SUMMARY"
-          done
-          ls -la "$RUNNER_TEMP/ab-bin"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ab-bin-${{ matrix.target }}
-          path: ${{ runner.temp }}/ab-bin
-          retention-days: 7
-
-  ab:
-    name: A/B ${{ matrix.spec }}
-    needs: [revision, ab-bin]
-    # A failed target fails only the specs that need it.
-    if: ${{ !cancelled() && contains(needs.revision.outputs.jobs, ',ab,') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -2483,21 +2429,49 @@ jobs:
       AB_BASE: ${{ needs.revision.outputs.ab_base }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TESTED_SHA }}
+          fetch-depth: 0
+          path: code-under-test
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - uses: actions/download-artifact@v4
-        with:
-          name: ab-bin-${{ matrix.target }}
-          path: ${{ runner.temp }}/ab-bin
+      - name: Build each side
+        working-directory: code-under-test
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+          mkdir -p "$RUNNER_TEMP/ab-bin"
+          for sha in $(printf '%s\n' "$TESTED_SHA" "$AB_BASE" | awk '!seen[$0]++'); do
+            git checkout --quiet --detach "$sha"
+            out="$RUNNER_TEMP/ab-bin/$TARGET-$sha"
+            start=$(date +%s)
+            case "$TARGET" in
+              oltp|cache|olap)
+                # The Dockerfile's bookworm base, so the binary also runs in the OLTP benchmark image.
+                docker run --rm -v "$PWD:/w" -w /w/server -e CARGO_BUILD_JOBS -e CARGO_TERM_COLOR "rust:${RUST_TOOLCHAIN}-bookworm" \
+                  cargo build --locked --release --no-default-features --features "$TARGET" --bin nabedra-db
+                cp server/target/release/nabedra-db "$out" ;;
+              events)
+                docker build -q -f server/events/deploy/Dockerfile --build-arg BUILD_JOBS=4 -t "nabedra-events:$sha" server
+                docker image inspect --format '{{.Id}}' "nabedra-events:$sha" > "$out" ;;
+              kv)
+                exe=$(cd server && cargo test --locked --release -p nabedra-kv --test store_bench --no-run --message-format=json \
+                  | jq -r 'select(.executable != null and .target.name == "store_bench") | .executable')
+                cp "$exe" "$out" ;;
+              sim)
+                (cd server && RUSTFLAGS="--cfg tokio_unstable" CARGO_TARGET_DIR=target/sim \
+                  cargo build --locked --release -p nabedra-sim-oltp --bin nabedra-sim)
+                cp server/target/sim/release/nabedra-sim "$out" ;;
+            esac
+            echo "$TARGET ${sha::10} built in $(( $(date +%s) - start )) s" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          sha256sum "$RUNNER_TEMP"/ab-bin/*
       - name: Runner setup
         run: |
-          chmod +x "$RUNNER_TEMP"/ab-bin/*
-          sha256sum "$RUNNER_TEMP"/ab-bin/*
           base="$RUNNER_TEMP/ab-bin/$TARGET-$AB_BASE"; head="$RUNNER_TEMP/ab-bin/$TARGET-$TESTED_SHA"
           case "$TARGET" in
             events)
-              for archive in "$RUNNER_TEMP"/ab-bin/events-*.tar.gz; do gunzip -c "$archive" | docker load; done
               base="nabedra-events:$AB_BASE"; head="nabedra-events:$TESTED_SHA" ;;
             oltp)
               printf 'FROM python:3.11-slim-bookworm\nENV TOKIO_WORKER_THREADS=2\n' | docker build -t nabedra-perf-ci:1 -
