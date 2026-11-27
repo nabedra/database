@@ -130,6 +130,17 @@ struct Work {
     failures: u8,
     cancel: bool,
 }
+impl Work {
+    /// Settle an open automatic attempt by abort (`drive`'s cancel path).
+    fn abort(attempt: &SplitAttempt) -> Self {
+        Self {
+            intent: attempt.intent.clone(),
+            placement: attempt.placement().cloned(),
+            failures: 0,
+            cancel: true,
+        }
+    }
+}
 #[derive(Default)]
 struct OwnerLoop {
     sweep: Sweep,
@@ -140,10 +151,17 @@ struct OwnerLoop {
     /// the listing's cursor.
     since_open_check: u32,
     open_after: Option<Uuid>,
+    /// Unbound automatic attempts of this owner term that `resume_open` left
+    /// to `select_work`, by source group, with the epoch they were opened at.
+    /// The sweep's next observation of the source resumes or aborts each.
+    left: BTreeMap<Uuid, (Uuid, ShardEpoch)>,
 }
 /// RANGES-2: list the open split attempts every this many observations
 /// (about 5 s), independently of the group sweep.
 const OPEN_CHECK_EVERY: u32 = 10;
+/// At most this many entries in `OwnerLoop::left`, inside the loop's scratch
+/// reservation. A source left out is recorded on a later listing.
+const MAX_LEFT: usize = 512;
 
 impl WorkerRuntime {
     pub(in crate::oltp_runtime) fn spawn_automatic_split(
@@ -339,7 +357,7 @@ impl OwnerLoop {
         let authority = ready.view.authority();
         if self.since_open_check >= OPEN_CHECK_EVERY {
             self.since_open_check = 0;
-            if self.resume_open(client, authority).await? {
+            if self.resume_open(client, authority, policy).await? {
                 return Ok(());
             }
         }
@@ -389,6 +407,7 @@ impl OwnerLoop {
                 // an open attempt is resumed here, whatever started it, until
                 // the attempt publishes or aborts.
                 runtime.clear_split_deficit(source.group_id);
+                self.left.remove(&source.group_id);
                 let automatic = (1..=AUTOMATIC_ATTEMPTS)
                     .any(|slot| AutomaticSplitOrigin { epoch, slot }.id(source) == split_id);
                 if let Some(attempt) = client.job(split_id).await?
@@ -421,7 +440,17 @@ impl OwnerLoop {
                     epoch,
                     observed_committed_bytes: bytes,
                 });
-                if threshold_crossed(bytes, policy) {
+                let crossed = threshold_crossed(bytes, policy);
+                if let Some(split_id) = self.orphan(source.group_id, epoch, crossed)
+                    && let Some(attempt) = client.job(split_id).await?
+                    && attempt.closed.is_none()
+                    && attempt.intent.source == *source
+                    && leave_to_select_work(&attempt, authority)
+                {
+                    self.active = Some(Work::abort(&attempt));
+                    return Ok(());
+                }
+                if crossed {
                     self.active = select_work(
                         runtime,
                         client,
@@ -451,6 +480,7 @@ impl OwnerLoop {
         &mut self,
         client: &SplitClient,
         authority: Authority,
+        policy: Option<AutomaticSplitPolicy>,
     ) -> Result<bool, ProtocolError> {
         let ids = client.open_jobs(self.open_after).await?;
         let Some(&id) = ids.first() else {
@@ -461,20 +491,54 @@ impl OwnerLoop {
         let Some(attempt) = client.job(id).await? else {
             return Ok(false);
         };
-        if attempt.closed.is_some()
-            || self.blocked.contains(&attempt.intent.source.group_id)
-            || leave_to_select_work(&attempt, authority)
-        {
-            return Ok(false);
+        self.active = self.open_work(&attempt, authority, policy);
+        Ok(self.active.is_some())
+    }
+
+    /// RANGES-2: the work for an attempt that Timestamps lists as open, or
+    /// none when it is closed, its source is blocked, or it is left to
+    /// `select_work`. Without a policy `select_work` never runs, so an
+    /// attempt it would have resumed is aborted instead.
+    fn open_work(
+        &mut self,
+        attempt: &SplitAttempt,
+        authority: Authority,
+        policy: Option<AutomaticSplitPolicy>,
+    ) -> Option<Work> {
+        let source = attempt.intent.source.group_id;
+        if attempt.closed.is_some() || self.blocked.contains(&source) {
+            return None;
+        }
+        if leave_to_select_work(attempt, authority) {
+            let (Some(_), Some(origin)) = (policy, attempt.intent.automatic) else {
+                return Some(Work::abort(attempt));
+            };
+            if self.left.len() < MAX_LEFT || self.left.contains_key(&source) {
+                self.left
+                    .insert(source, (attempt.intent.split_id, origin.epoch));
+            }
+            return None;
         }
         let automatic = attempt.intent.automatic.is_some();
-        self.active = Some(Work {
+        Some(Work {
             intent: attempt.intent.clone(),
             placement: attempt.placement().cloned(),
             failures: 0,
             cancel: automatic && attempt.authority != authority,
-        });
-        Ok(true)
+        })
+    }
+
+    /// Review F4 follow-up: the attempt left to `select_work` for `source`,
+    /// when `select_work` would not resume it after this observation of the
+    /// source: below the threshold, or at another epoch than the attempt's
+    /// (`select_work` only looks at the current epoch's slots). Nothing else
+    /// would resume it before the next owner change, so the caller aborts it.
+    /// The abort uses up its slot: a later selection at the same epoch takes
+    /// the next of the `AUTOMATIC_ATTEMPTS` slots, and after the last one the
+    /// source reports `attempts_exhausted` until its epoch changes.
+    fn orphan(&mut self, source: Uuid, epoch: ShardEpoch, crossed: bool) -> Option<Uuid> {
+        let (split_id, opened) = self.left.remove(&source)?;
+        (!crossed || opened != epoch).then_some(split_id)
     }
 
     async fn drive(
@@ -703,7 +767,8 @@ async fn select_work(
 /// still needs select_work's capacity check, which fixes its placement before
 /// Bind; resuming it here with no placement would skip that check. Its source
 /// is still observed (a paused source reports its usage), so select_work
-/// resumes it when the threshold holds.
+/// resumes it when the threshold holds, and the sweep aborts it otherwise
+/// (`OwnerLoop::orphan`).
 fn leave_to_select_work(attempt: &SplitAttempt, authority: Authority) -> bool {
     attempt.intent.automatic.is_some()
         && attempt.authority == authority
@@ -1025,5 +1090,68 @@ mod tests {
                 assert!(!leave_to_select_work(&attempt(opened_by, None, bound), current));
             }
         }
+    }
+
+    #[test]
+    fn o16_o21_review_f4_an_unbound_automatic_attempt_whose_source_shrank_is_aborted() {
+        let current = authority(3);
+        let policy = Some(AutomaticSplitPolicy {
+            shard_target_bytes: 100,
+            minimum_free_bytes: 1,
+        });
+        let open = attempt(current, Some(1), false);
+        let source = open.intent.source.group_id;
+        let id = open.intent.split_id;
+        let mut state = OwnerLoop::default();
+
+        // resume_open leaves it to select_work and remembers it.
+        assert!(state.open_work(&open, current, policy).is_none());
+        assert_eq!(state.left.get(&source), Some(&(id, EPOCH)));
+        // Still above the threshold at its epoch: select_work resumes it.
+        assert_eq!(state.orphan(source, EPOCH, true), None);
+        assert!(state.left.is_empty());
+
+        // Listed again, then the source shrinks below the threshold: nothing
+        // would resume it, so it is aborted.
+        assert!(state.open_work(&open, current, policy).is_none());
+        assert_eq!(state.orphan(source, EPOCH, false), Some(id));
+        assert!(state.left.is_empty());
+        // The same when the source's epoch moved on, whatever its size.
+        let moved = ShardEpoch {
+            routing: EPOCH.routing + 1,
+            ..EPOCH
+        };
+        for crossed in [false, true] {
+            assert!(state.open_work(&open, current, policy).is_none());
+            assert_eq!(state.orphan(source, moved, crossed), Some(id));
+        }
+        // Another source's observation leaves it alone.
+        assert!(state.open_work(&open, current, policy).is_none());
+        assert_eq!(state.orphan(Uuid::from_u128(77), EPOCH, false), None);
+        assert_eq!(state.left.len(), 1);
+        state.left.clear();
+
+        // Without a policy select_work never runs: it is aborted at once.
+        let work = state.open_work(&open, current, None).unwrap();
+        assert!(work.cancel && work.intent == open.intent && work.placement.is_none());
+        assert!(state.left.is_empty());
+
+        // The abort is drive's cancel path: settle, then Close with Abort,
+        // which removes the attempt from the open index (the Timestamps test
+        // ..._automatic_split_keeps_bound_placement_on_exact_retry closes an
+        // unbound automatic attempt by abort and lists only the open one).
+        // Every other open attempt is resumed or cancelled, never left.
+        let bound = state.open_work(&attempt(current, Some(1), true), current, policy);
+        assert!(bound.is_some_and(|work| !work.cancel));
+        let older = state.open_work(&attempt(authority(2), Some(2), false), current, policy);
+        assert!(older.is_some_and(|work| work.cancel));
+        let manual = state.open_work(&attempt(current, None, false), current, policy);
+        assert!(manual.is_some_and(|work| !work.cancel));
+        let mut closed = attempt(current, Some(1), false);
+        closed.closed = Some(TxnDecision::Abort {
+            reason: AbortReason::ResourceLimit,
+        });
+        assert!(state.open_work(&closed, current, policy).is_none());
+        assert!(state.left.is_empty());
     }
 }
