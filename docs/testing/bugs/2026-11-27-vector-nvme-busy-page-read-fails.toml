@@ -1,0 +1,19 @@
+# Found by task B2b: the full `cargo test -p nabedra-vector -p nabedra-simd` failed in
+# adversarial_store nt27 with "a stable record N read as an error: vector store: raw-0: a page kept
+# changing" on a loaded machine (log /home/dev/logs/oltp-vector/w3/b2b/full.log, first run).
+# RecordFile::get_many gave up after four rounds whose page changed under the read, and in the index
+# such an error fails the whole range.
+id = "VECTOR-nvme-busy-page-read-fails"
+title = "A read of a stable record fails when its page is rewritten under every retry"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G10"]
+scenarios = ["VS10"]
+found_by = "campaign"
+found_date = "2026-11-27"
+lowest_regression = "server/vector/src/store/tests.rs::vs10_a_stable_record_reads_back_while_its_page_changes_under_every_read"
+seed = "unknown"
+why_not_caught = "nt27 races real threads and fails only under load; no test forced a change under every read."
+invariant_added = "The last retry holds the file's state lock across its read, so a stable record always reads back."
+fix_commits = ["2666694b21a206ee6a8b83861c5e2c9e293cee44"]
+revert_patch_ok = true
