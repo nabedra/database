@@ -2610,21 +2610,24 @@ async fn o09_perf2b_the_commit_timestamp_is_fetched_during_the_reads() {
     source.hold.store(true, Ordering::SeqCst);
     let calls = source.calls.load(Ordering::SeqCst);
     let before = cluster.last_index(leader);
-    let missing = cluster.op(
-        leader,
-        "table.update",
-        serde_json::json!({"key": 99, "values": {"value": 1}}),
-    );
-    tokio::pin!(missing);
-    assert!(
-        nabedra_rt::time::timeout(Duration::from_millis(300), &mut missing)
-            .await
-            .is_err(),
-        "a recorded miss waits for its timestamp"
-    );
-    assert_eq!(source.calls.load(Ordering::SeqCst), calls + 1);
-    source.hold.store(false, Ordering::SeqCst);
-    assert_eq!(missing.await, done("false"));
+    let missing = {
+        let missing = cluster.op(
+            leader,
+            "table.update",
+            serde_json::json!({"key": 99, "values": {"value": 1}}),
+        );
+        tokio::pin!(missing);
+        assert!(
+            nabedra_rt::time::timeout(Duration::from_millis(300), &mut missing)
+                .await
+                .is_err(),
+            "a recorded miss waits for its timestamp"
+        );
+        assert_eq!(source.calls.load(Ordering::SeqCst), calls + 1);
+        source.hold.store(false, Ordering::SeqCst);
+        missing.await
+    };
+    assert_eq!(missing, done("false"));
     assert_eq!(cluster.last_index(leader), before + 1, "one recorded entry");
     // Every call answered or was cancelled with a dropped fetch; later
     // calls follow it.
