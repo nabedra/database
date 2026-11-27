@@ -9,7 +9,29 @@ use std::{
 #[doc(hidden)]
 pub struct FilesystemRepository {
     root: Arc<File>,
+    synced: Arc<SyncedDirectories>,
     shared: Arc<WorkerSharedResources>,
+}
+/// The cluster and archive directory entries this repository has synced in their parent
+/// since it was opened. The repository never renames or removes a directory, so an entry
+/// synced once by this process stays durable, and later puts into the same archive skip
+/// both directory syncs (each a device cache flush on ext4). A new process starts empty,
+/// so its first put syncs again, which covers a crash before an earlier sync (DUR-2).
+#[derive(Default)]
+struct SyncedDirectories(std::sync::Mutex<std::collections::HashSet<String>>);
+impl SyncedDirectories {
+    fn contains(&self, entry: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(entry)
+    }
+    fn insert(&self, entry: String) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(entry);
+    }
 }
 impl FilesystemRepository {
     #[doc(hidden)]
@@ -36,6 +58,7 @@ impl FilesystemRepository {
             }
             Ok(Arc::new(Self {
                 root: Arc::new(root),
+                synced: Arc::default(),
                 shared,
             }))
         }
@@ -62,15 +85,16 @@ impl Repository for FilesystemRepository {
                 return Err(invalid());
             }
             let root = self.root.clone();
+            let synced = self.synced.clone();
             self.shared
                 .execute(ExecutionClass::Query, 0, 0, move || {
                     #[cfg(unix)]
                     {
-                        put_native(&root, key, &name, body)
+                        put_native(&root, &synced, key, &name, body)
                     }
                     #[cfg(not(unix))]
                     {
-                        let _ = (root, key, name, body);
+                        let _ = (root, synced, key, name, body);
                         Err(invalid())
                     }
                 })
@@ -106,21 +130,30 @@ impl Repository for FilesystemRepository {
     }
 }
 #[cfg(unix)]
-fn directory_at(parent: &File, name: &str, create: bool) -> Result<File, ProtocolError> {
+/// Opens the directory `name` in `parent`. With `create`, it is created if missing and
+/// its entry made durable before it is returned: `entry` names it in `synced`.
+fn directory_at(
+    parent: &File,
+    name: &str,
+    create: Option<(&SyncedDirectories, String)>,
+) -> Result<File, ProtocolError> {
     if name.contains(char::from(0)) {
         return Err(invalid());
     }
-    if create {
-        match parent.create_dir_at(name, 0o700) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+    if let Some((synced, entry)) = create {
+        let created = match parent.create_dir_at(name, 0o700) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
             Err(_) => return Err(unavailable()),
+        };
+        // A put that finds the directory syncs it too, unless this process already did:
+        // it may follow a crash before the creator's sync, or run beside a creator still
+        // inside it, and its object would be lost with the directory (DUR-2). The archive
+        // directory sync after each object covers only the object.
+        if created || !synced.contains(&entry) {
+            parent.sync_all().map_err(|_| unavailable())?;
+            synced.insert(entry);
         }
-        // Sync the entry on every put, not only on the one that created it: a put that
-        // finds the directory may follow a crash before that sync, or run beside a
-        // creator still inside it, and its object would be lost with the directory
-        // (DUR-2). The archive directory sync after each object covers only the object.
-        parent.sync_all().map_err(|_| unavailable())?;
     }
     let directory = parent
         .open_at(
@@ -136,9 +169,23 @@ fn directory_at(parent: &File, name: &str, create: bool) -> Result<File, Protoco
     Ok(directory)
 }
 #[cfg(unix)]
-fn archive_directory(root: &File, key: ArchiveKey, create: bool) -> Result<File, ProtocolError> {
-    let cluster = directory_at(root, &key.cluster_id.to_string(), create)?;
-    directory_at(&cluster, &key.archive_id.to_string(), create)
+fn archive_directory(
+    root: &File,
+    key: ArchiveKey,
+    create: Option<&SyncedDirectories>,
+) -> Result<File, ProtocolError> {
+    let cluster_name = key.cluster_id.to_string();
+    let archive_name = key.archive_id.to_string();
+    let cluster = directory_at(
+        root,
+        &cluster_name,
+        create.map(|synced| (synced, cluster_name.clone())),
+    )?;
+    directory_at(
+        &cluster,
+        &archive_name,
+        create.map(|synced| (synced, format!("{cluster_name}/{archive_name}"))),
+    )
 }
 #[cfg(unix)]
 fn file_at(directory: &File, name: &str, flags: i32) -> Result<File, ProtocolError> {
@@ -166,7 +213,7 @@ fn read_native(
     limit: usize,
     shared: &Arc<WorkerSharedResources>,
 ) -> Result<ChargedBytes, ProtocolError> {
-    let directory = archive_directory(root, key, false)?;
+    let directory = archive_directory(root, key, None)?;
     let mut file = file_at(&directory, name, libc::O_RDONLY)?;
     let len = usize::try_from(file.metadata().map_err(|_| unavailable())?.len())
         .map_err(|_| corrupt())?;
@@ -185,11 +232,12 @@ fn read_native(
 #[cfg(unix)]
 fn put_native(
     root: &File,
+    synced: &SyncedDirectories,
     key: ArchiveKey,
     name: &str,
     body: ChargedBytes,
 ) -> Result<Digest, ProtocolError> {
-    let directory = archive_directory(root, key, true)?;
+    let directory = archive_directory(root, key, Some(synced))?;
     let expected = hash(body.as_ref());
     let temporary = format!(".upload-{}", nabedra_rt::ids::uuid_v4());
     let mut file = file_at(

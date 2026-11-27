@@ -44,7 +44,13 @@ fn object_cut(cut: Option<u64>) -> u64 {
             if let Some(cut) = cut {
                 world.crash_volume_after(NODE, Path::new(ROOT), start + cut);
             }
-            let _ = put_native(&root, KEY, "part-0", shared.copy_bytes(b"abcd").unwrap());
+            let _ = put_native(
+                &root,
+                &SyncedDirectories::default(),
+                KEY,
+                "part-0",
+                shared.copy_bytes(b"abcd").unwrap(),
+            );
             volume.mutating_ops() - start
         })
         .await;
@@ -53,6 +59,7 @@ fn object_cut(cut: Option<u64>) -> u64 {
             let shared = shared();
             put_native(
                 &open_root(),
+                &SyncedDirectories::default(),
                 KEY,
                 "part-1",
                 shared.copy_bytes(b"efgh").unwrap(),
@@ -86,4 +93,41 @@ fn dur2_acknowledged_object_survives_a_kill_at_every_step_then_power_loss() {
         assert_eq!(object_cut(Some(cut)), cut);
     }
     eprintln!("filesystem repository: {total} cuts replayed");
+}
+
+/// The cost side of DUR-2: within one process only the first put into an archive syncs the
+/// root and cluster directories; later puts sync only the archive directory.
+#[test]
+fn dur2_later_puts_into_a_synced_archive_sync_only_the_archive_directory() {
+    sim::run(SEED, |world| async move {
+        world.add_node(NODE, NodeClock::default());
+        world.mount(NODE, ROOT);
+        let volume = world.volume(NODE, Path::new(ROOT)).unwrap();
+        sim::in_node(NODE, async {
+            let shared = shared();
+            let root = open_root();
+            let synced = SyncedDirectories::default();
+            let mut directory_syncs = Vec::new();
+            for part in ["part-0", "part-1", "part-2"] {
+                volume.clear_calls();
+                put_native(
+                    &root,
+                    &synced,
+                    KEY,
+                    part,
+                    shared.copy_bytes(b"abcd").unwrap(),
+                )
+                .unwrap();
+                directory_syncs.push(
+                    volume
+                        .calls()
+                        .iter()
+                        .filter(|call| call.op == nabedra_rt::fs::FsOp::SyncDir && call.ok)
+                        .count(),
+                );
+            }
+            assert_eq!(directory_syncs, [3, 1, 1]);
+        })
+        .await;
+    });
 }
