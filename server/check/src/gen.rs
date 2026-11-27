@@ -24,7 +24,11 @@ pub struct Gen {
 impl Gen {
     /// A fresh generator whose choices come from `SplitMix64::new(seed)`.
     pub fn from_seed(seed: u64) -> Self {
-        Self { seed, source: Source::Fresh(SplitMix64::new(seed)), tape: Vec::new() }
+        Self {
+            seed,
+            source: Source::Fresh(SplitMix64::new(seed)),
+            tape: Vec::new(),
+        }
     }
 
     /// A generator with seed 0 that replays `tape`, then returns minimal values once exhausted.
@@ -33,7 +37,11 @@ impl Gen {
     }
 
     pub(crate) fn from_seeded_tape(seed: u64, tape: Vec<u64>) -> Self {
-        Self { seed, source: Source::Replay(tape), tape: Vec::new() }
+        Self {
+            seed,
+            source: Source::Replay(tape),
+            tape: Vec::new(),
+        }
     }
 
     /// The case seed, or 0 for a generator constructed with `from_tape`.
@@ -85,7 +93,11 @@ impl Gen {
     pub fn range_i64(&mut self, lo: i64, hi: i64) -> i64 {
         assert!(lo <= hi, "Gen::range_i64({lo}, {hi})");
         let span = (hi as u64).wrapping_sub(lo as u64).wrapping_add(1);
-        let off = if span == 0 { self.u64() } else { self.below(span) };
+        let off = if span == 0 {
+            self.u64()
+        } else {
+            self.below(span)
+        };
         (lo as u64).wrapping_add(off) as i64
     }
 
@@ -115,7 +127,9 @@ impl Gen {
     pub fn ascii(&mut self, max_len: usize) -> String {
         const ORDER: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ \
 !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
-        self.vec(max_len, |g| *g.pick(ORDER) as char).into_iter().collect()
+        self.vec(max_len, |g| *g.pick(ORDER) as char)
+            .into_iter()
+            .collect()
     }
 
     /// Up to `max_len` items. The length is drawn first, so the shrinker shortens a vector by

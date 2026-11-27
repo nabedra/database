@@ -772,24 +772,56 @@ fn world_faults_are_logged_in_order() {
             path: "/data/wal".into(),
             op: "SyncData".into(),
         });
-        steps.fault(Fault::WallJump {
-            node: 1,
-            nanos: -3_000_000_000,
-        });
+        world.jump_wall_backward(1, Duration::from_secs(3));
+        world.set_drift_ppm(1, -150);
+        world.advance_mono(1, Duration::from_millis(5));
+        world.freeze(1);
+        world.thaw(1);
+        // A thaw of a node that is not frozen is no fault.
+        world.thaw(1);
+        let snapshot = world.snapshot_volume(2, Path::new("/data"));
+        world.power_off(2);
+        world.restore_volume(&snapshot);
+        world.restart(2);
+        let volume = world.volume(2, Path::new("/data")).unwrap();
+        volume.inject(nabedra_rt::fs::Fault::on(nabedra_rt::fs::FsOp::Open));
+        world.set_volume_capacity(2, Path::new("/data"), Some(0));
+        {
+            use nabedra_rt::fs::{Fs, OpenMode};
+            assert!(
+                volume
+                    .open(Path::new("/data/a"), OpenMode::CreateNew)
+                    .is_err()
+            );
+            let file = volume
+                .open(Path::new("/data/b"), OpenMode::CreateNew)
+                .unwrap();
+            assert!(file.write_all_at(b"x", 0).is_err());
+        }
     })
     .unwrap();
     assert_eq!(
         faults(&path)[1..],
         [
-            r#""node":"2","action":"Crash","vars":{},"msg":{"kind":"unspecified"}}"#,
-            r#""node":"2","action":"DiskLoss","vars":{},"msg":{"how":"reformat","mount":"/data"}}"#,
+            r#""node":"2","action":"Crash","vars":{},"msg":{"kind":"kill"}}"#,
+            r#""node":"2","action":"DiskLoss","vars":{},"msg":{"how":"reformat","mkfs":false,"mount":"/data"}}"#,
             r#""node":"2","action":"Restart","vars":{},"msg":{"cut":"none","incarnation":1}}"#,
-            r#""node":"2","action":"Crash","vars":{},"msg":{"kind":"unspecified"}}"#,
+            r#""node":"2","action":"Crash","vars":{},"msg":{"kind":"kill"}}"#,
             r#""node":"2","action":"Restart","vars":{},"msg":{"cut":"power512","incarnation":2}}"#,
+            r#""node":"2","action":"TornWrite","vars":{},"msg":{"destroyed":0,"dir_ops_kept":0,"dir_ops_lost":0,"kept":0,"lengths_kept":0,"lengths_lost":0,"lost":0,"mount":"/data","torn":0,"unit":512}}"#,
             // Node 1 was never down, and the line says so.
             r#""node":"a","action":"Restart","vars":{},"msg":{"cut":"none","incarnation":0}}"#,
             r#""node":"a","action":"SyncError","vars":{},"msg":{"mount":"/data","op":"SyncData","path":"/data/wal"}}"#,
             r#""node":"a","action":"WallJump","vars":{},"msg":{"nanos":"-3000000000"}}"#,
+            r#""node":"a","action":"ClockDrift","vars":{},"msg":{"ppm":-150}}"#,
+            r#""node":"a","action":"MonoAdvance","vars":{},"msg":{"nanos":"5000000"}}"#,
+            r#""node":"a","action":"Freeze","vars":{}}"#,
+            r#""node":"a","action":"Thaw","vars":{}}"#,
+            r#""node":"2","action":"Crash","vars":{},"msg":{"kind":"power_off"}}"#,
+            r#""node":"2","action":"StaleRestore","vars":{},"msg":{"mount":"/data","taken_ns":"0"}}"#,
+            r#""node":"2","action":"Restart","vars":{},"msg":{"cut":"none","incarnation":3}}"#,
+            r#""node":"2","action":"WriteError","vars":{},"msg":{"mount":"/data","op":"Open","path":"/data/a"}}"#,
+            r#""node":"2","action":"NoSpace","vars":{},"msg":{"mount":"/data","op":"Write","path":"/data/b"}}"#,
         ]
     );
 }
@@ -901,7 +933,13 @@ fn a_mapped_fault_must_meet_its_declaration() {
     };
     assert_eq!(
         crash(|mut line| {
-            assert_eq!(line.fault, Fault::Crash { node: 2 });
+            assert_eq!(
+                line.fault,
+                Fault::Crash {
+                    node: 2,
+                    power_off: false
+                }
+            );
             line.action = "Stop".into();
             line.vars = json!({"up": false});
             line.msg = None;
@@ -932,4 +970,103 @@ fn a_mapped_fault_must_meet_its_declaration() {
         let error = crash(map).unwrap_err().to_string();
         assert!(error.contains(why), "{error}");
     }
+}
+
+#[test]
+fn a_label_names_one_of_several_traces_of_a_seed() {
+    let dir = Dir::new();
+    for cut in ["cut-1", "cut-2"] {
+        let path = record(&dir, builder().label(cut), |_, steps| good(steps)).unwrap();
+        assert!(path.ends_with(format!("Spec-7-{cut}.ndjson")));
+    }
+    assert_eq!(dir.names(), ["Spec-7-cut-1.ndjson", "Spec-7-cut-2.ndjson"]);
+    for bad in ["", "at-3", "a/b", "a.b"] {
+        not_installed("is not a trace label", builder().label(bad));
+    }
+}
+
+/// A workload without a World of its own (the OLAP commit tests) hosts its trace on one.
+#[test]
+fn a_workload_without_a_world_traces_on_a_hosting_world() {
+    let dir = Dir::new();
+    let dir = &dir;
+    let path = runtime::run(9, |world| async move {
+        let trace = open(builder(), &world, dir).unwrap();
+        // No World node: the spec's names stand alone.
+        trace
+            .steps()
+            .step("b", "Vote", json!({"term": 1}), Some(json!({"to": "a"})));
+        trace.steps().fault(Fault::Crash {
+            node: 1,
+            power_off: false,
+        });
+        trace.finish().unwrap()
+    });
+    assert_eq!(
+        faults(&path),
+        [
+            r#""node":"b","action":"Vote","vars":{"term":1},"msg":{"to":"a"}}"#,
+            r#""node":"a","action":"Crash","vars":{},"msg":{"kind":"kill"}}"#,
+        ]
+    );
+}
+
+#[test]
+fn stream_network_faults_are_logged_in_order() {
+    use nabedra_rt::sim::net::{Fate, Planner};
+    struct DropAll;
+    impl Planner for DropAll {
+        fn message(&mut self, envelope: &nabedra_rt::sim::net::Envelope<'_>) -> Fate {
+            if envelope.bytes == b"x" {
+                Fate::Drop
+            } else {
+                Fate::NOW
+            }
+        }
+    }
+    let dir = Dir::new();
+    let dir = &dir;
+    let path = runtime::run(7, |world| async move {
+        world.add_node(1, NodeClock::default());
+        world.add_node(2, NodeClock::default());
+        let trace = open(builder(), &world, dir).unwrap();
+        good(&trace.steps());
+        let listener = world.listen(2, "0.0.0.0:7000".parse().unwrap()).unwrap();
+        let addr = listener.local_addr();
+        let pending = nabedra_rt::sim::in_node(1, async move {
+            nabedra_rt::sim::net::dial(nabedra_rt::sim::net::Target::Addr(addr)).await
+        })
+        .await
+        .unwrap();
+        let conn = pending.id();
+        let mut stream = pending.plain();
+        world.set_net_planner(DropAll);
+        {
+            use std::pin::Pin;
+            use tokio::io::AsyncWrite;
+            std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write(cx, b"x"))
+                .await
+                .unwrap();
+            std::future::poll_fn(|cx| Pin::new(&mut stream).poll_flush(cx))
+                .await
+                .unwrap();
+        }
+        world.reset_connection(conn);
+        world.black_hole(Some(1), Some(2));
+        world.heal(Some(1), None);
+        world.heal_all();
+        world.power_off(2);
+        trace.finish().unwrap()
+    });
+    assert_eq!(
+        faults(&path)[1..],
+        [
+            r#""node":"a","action":"StreamDrop","vars":{},"msg":{"conn":"1","to":"2"}}"#,
+            r#""node":"a","action":"ResetConnection","vars":{},"msg":{"cause":"world","conn":"1","to":"2"}}"#,
+            r#""node":"a","action":"LinkDown","vars":{},"msg":{"to":"2"}}"#,
+            r#""node":"a","action":"LinkUp","vars":{},"msg":{"to":"external"}}"#,
+            r#""node":"world","action":"LinkUp","vars":{},"msg":{"all":true}}"#,
+            r#""node":"2","action":"Crash","vars":{},"msg":{"kind":"power_off"}}"#,
+        ]
+    );
 }
