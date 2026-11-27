@@ -108,6 +108,7 @@ pub struct Stats {
     pub lost_replicas: u64,
     /// Events retention removed, and acks that advanced past a retention gap (EVENTS-8).
     pub retained_removed: u64,
+    /// Clock jumps cut back to the bound, so at most one clock is wrong at once.
     pub clock_steps: u64,
     pub final_events: usize,
     pub virtual_ms: u64,
@@ -162,6 +163,8 @@ struct Cluster {
     genesis_done: bool,
     /// Each node's wall-clock offset from true time, from the nemesis's jumps.
     clock_offsets: BTreeMap<u64, i64>,
+    /// When each node's clock was last outside the stated bound.
+    last_bad: BTreeMap<u64, u64>,
 }
 
 /// Runs one seed to completion.
@@ -242,6 +245,7 @@ impl Cluster {
             joining: BTreeSet::new(),
             genesis_done: false,
             clock_offsets: BTreeMap::new(),
+            last_bad: BTreeMap::new(),
         }
     }
 
@@ -657,9 +661,10 @@ impl Cluster {
                     "clock n{pick} wall{wall:+}ms mono+{}ms",
                     mono.as_millis()
                 ));
+                let before = *self.clock_offsets.entry(pick).or_default();
                 *self.clock_offsets.entry(pick).or_default() += wall;
                 if self.config.retention_ms.is_some() {
-                    self.keep_one_clock_beyond_the_bound(pick);
+                    self.keep_one_clock_beyond_the_bound(pick, before);
                 }
             }
             _ => {
@@ -683,27 +688,41 @@ impl Cluster {
     }
 
     /// The guarded clock tolerates one wrong clock among three voters (EVT-G08 holds
-    /// under that bound). After a jump of `pick`, every other node beyond the bound is
-    /// stepped back to true time, as NTP would, so at most one clock is wrong at once.
-    fn keep_one_clock_beyond_the_bound(&mut self, pick: u64) {
-        let bound = crate::raft::ClockPolicy::default().max_clock_error_ms;
-        let others: Vec<(u64, i64)> = self
-            .clock_offsets
-            .iter()
-            .filter(|(id, offset)| **id != pick && offset.abs() > bound)
-            .map(|(id, offset)| (*id, *offset))
-            .collect();
-        for (id, offset) in others {
-            let by = Duration::from_millis(offset.unsigned_abs());
-            if offset > 0 {
-                self.world().jump_wall_backward(id, by);
-            } else {
-                self.world().jump_wall_forward(id, by);
-            }
-            self.clock_offsets.insert(id, 0);
-            self.stats.clock_steps += 1;
-            self.trace(format_args!("clock step n{id} {:+}ms", -offset));
+    /// under that bound), and a leader keeps a peer's sample for up to its age limit. So a
+    /// second clock may leave the bound only once no other clock has been outside it for
+    /// two sample ages; otherwise the jump of `pick` is cut back to the bound. A stale
+    /// sample of a corrected clock would otherwise count as a second wrong clock.
+    fn keep_one_clock_beyond_the_bound(&mut self, pick: u64, before: i64) {
+        let policy = crate::raft::ClockPolicy::default();
+        let bound = policy.max_clock_error_ms;
+        let window = 2 * policy.sample_max_age_ms;
+        let now = self.now();
+        if before.abs() > bound {
+            self.last_bad.insert(pick, now);
         }
+        let offset = self.clock_offsets[&pick];
+        if offset.abs() <= bound {
+            return;
+        }
+        let other_bad = self.clock_offsets.iter().any(|(id, other)| {
+            *id != pick
+                && (other.abs() > bound
+                    || self.last_bad.get(id).is_some_and(|at| at + window > now))
+        });
+        if !other_bad {
+            self.last_bad.insert(pick, now);
+            return;
+        }
+        let target = offset.signum() * bound;
+        let by = Duration::from_millis((offset - target).unsigned_abs());
+        if offset > target {
+            self.world().jump_wall_backward(pick, by);
+        } else {
+            self.world().jump_wall_forward(pick, by);
+        }
+        self.clock_offsets.insert(pick, target);
+        self.stats.clock_steps += 1;
+        self.trace(format_args!("clock clamp n{pick} {:+}ms", target - offset));
     }
 
     async fn heal_all(&mut self) -> Result<()> {
@@ -831,7 +850,10 @@ impl Cluster {
             .iter()
             .map(|event| (event.offset, event.event_id))
             .collect();
-        let last = log.last_key_value().map_or(0, |(&offset, _)| offset);
+        // Retention can remove every event: an empty log then ends below the floor.
+        let last = log
+            .last_key_value()
+            .map_or(reference.earliest.saturating_sub(1), |(&offset, _)| offset);
         if last != reference.tail {
             self.violate(format!(
                 "EVT-G02 gap: stored tail {} differs from the last retained offset {last}",

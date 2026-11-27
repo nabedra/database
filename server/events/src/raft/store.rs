@@ -316,6 +316,12 @@ impl Database {
         }
         std::fs::create_dir_all(root.join("snapshots"))?;
         std::fs::File::open(root)?.sync_all()?;
+        // The open may have created the root itself (a data directory that is not a mount
+        // point): make its entry durable too, on every open, so a retry after a crash
+        // between the creation and this sync still syncs it.
+        if let Some(parent) = root.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
 
         let kv_dir = root.join(KV_DIR);
         wait_for_close(&kv_dir);
@@ -938,8 +944,11 @@ impl GroupStore {
         let dir = self.snapshot_dir();
         if !dir.exists() {
             std::fs::create_dir(&dir)?;
-            std::fs::File::open(self.db.root.join("snapshots"))?.sync_all()?;
         }
+        // Sync the entry on every open, not only after creating it: a crash between the
+        // creation and the sync leaves a directory whose entry may not be durable, and the
+        // next open would otherwise skip the sync (the LSM-10 pattern).
+        std::fs::File::open(self.db.root.join("snapshots"))?.sync_all()?;
         let current: Option<StoredSnapshot> = self.read(b"snapshot")?;
         let keep = current.map(|snapshot| snapshot.file_id.to_string());
         for entry in std::fs::read_dir(dir)? {
