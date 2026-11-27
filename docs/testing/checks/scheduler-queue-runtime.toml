@@ -8,7 +8,7 @@ kinds = ["U"]
 guarantees = []
 scenarios = ["R01", "R03", "R04", "F02", "C05", "Q01", "Q02", "U02", "T04"]
 tiers = ["T1"]
-command = ["cargo", "test", "--locked", "--lib", "--", "--test-threads=2", "node::queue_runtime::join_tests::", "node::queue_transport::replay_cache_tests::", "cluster::runtime::queue_response_tests::", "api::queue::tests::"]
+command = ["cargo", "test", "--locked", "--lib", "--", "--test-threads=2", "node::queue_runtime::join_tests::", "node::queue_transport::replay_cache_tests::", "cluster::runtime::queue_response_tests::", "api::queue::tests::", "node::coordinator::resources::tests::"]
 cwd = "server"
 timeout_s = 2400
 needs = []
