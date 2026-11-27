@@ -141,7 +141,7 @@ for i in $(seq 10); do
     --json databaseId,displayTitle --jq ".[] | select(.displayTitle | contains(\"$RID\")) | .databaseId")
   [ -n "$RUN" ] && break; sleep 6
 done
-echo "https://github.com/zPy52/nabedra-database/actions/runs/$RUN"
+echo "https://github.com/nabedra/database/actions/runs/$RUN"
 ```
 
 The run name is `<request_id> @ <sha>`. The run's own `headSha` is the branch head at dispatch
@@ -190,7 +190,7 @@ run can be rerun at most 50 times.
 Put this in the report, ledger or pull request for every check you rely on:
 
 ```text
-CI: https://github.com/zPy52/nabedra-database/actions/runs/<id> (attempt N), request <request_id>
+CI: https://github.com/nabedra/database/actions/runs/<id> (attempt N), request <request_id>
 Tested revision: <40-char sha>
 Jobs: oltp success, direct (on) success, direct (off) failure, ...
 Raw: test result: ok. 499 passed; 0 failed; 9 ignored; ...   (one line per suite)

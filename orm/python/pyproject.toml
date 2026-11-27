@@ -20,9 +20,9 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/zPy52/nabedra-database"
-Documentation = "https://github.com/zPy52/nabedra-database/blob/main/orm/python/README.md"
-Issues = "https://github.com/zPy52/nabedra-database/issues"
+Repository = "https://github.com/nabedra/database"
+Documentation = "https://github.com/nabedra/database/blob/main/orm/python/README.md"
+Issues = "https://github.com/nabedra/database/issues"
 
 [project.optional-dependencies]
 arrow = ["pyarrow>=14"]

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94.1"
 description = "Nabedra's in-tree test harness: seeded generators, shrinking, config randomizer, evidence records"
 license = "MIT"
-repository = "https://github.com/zPy52/nabedra-database"
+repository = "https://github.com/nabedra/database"
 publish = false
 
 [lib]
