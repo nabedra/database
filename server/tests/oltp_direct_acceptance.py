@@ -102,6 +102,13 @@ PROGRAM = dict(sections=[
 # 1 insert_many, plus the 2 misses and 2 row conflicts, which record their answers (OD-2).
 # Validation errors and gets write nothing.
 DIRECT_ENTRIES = 12
+# D12 after OD-3: the gateway's outcome_unknown for a mutation refused before execution names
+# the refusal: the leader's budget (`admission.rs`) or a full worker lane (`transport`).
+ADMISSION_REFUSAL = re.compile(
+    r'direct request outcome unknown after overloaded: '
+    r'(?:(?P<budget>direct in-flight budget is full|worker memory budget is full)'
+    r'|(?P<lane>worker (?:handler|preflight) lane full|worker outgoing lane full \([A-Za-z/]+\)))'
+    r'; retry the same request_id and body')
 
 
 def run_program(orm, url, table, *, token, ca=None, snapshot):
@@ -1138,13 +1145,19 @@ def suite_barriers(args, output):
         assert not other, other[:5]
         assert refused, 'no request exceeded the leader budget'
         assert all(reply['error']['outcome'] == 'unknown' for _, reply in refused), refused[:3]
-        # A typed 429 comes from the leader's in-flight budget or, earlier, from its
-        # full handler lane (`worker handler lane full`); both refuse before execution.
+        # Admission refuses before execution (D12): every refusal names its overload,
+        # the leader's in-flight or memory budget, or, earlier, a full worker lane
+        # (`worker handler lane full`, preflight or outgoing).
+        causes = [ADMISSION_REFUSAL.fullmatch(reply['error']['message']) for _, reply in refused]
+        assert all(causes), [reply['error']['message'] for (_, reply), cause in zip(refused, causes)
+                             if not cause][:3]
+        budget_refusals = sum(cause['budget'] is not None for cause in causes)
         overloaded = direct(after, 'overloaded_429') - direct(before, 'overloaded_429')
         executed = direct(after, 'mutations') - direct(before, 'mutations')
-        # The public 429 is gone for mutations (OD-3 answers outcome_unknown): the
-        # refused rows are checked absent below, and the report keeps the leaders'
-        # own 429 count.
+        # A leader counts a typed 429 for each budget refusal it answers; a lane refusal
+        # never reaches an executor. Each refused request met at most one leader 429
+        # (the gateway answers the first one when no earlier attempt may have run).
+        assert budget_refusals <= overloaded <= len(refused), (budget_refusals, overloaded, len(refused))
         for body in accepted:
             assert table.get(body['payload']['row']['id']) == body['payload']['row']
         for body, _ in refused:
@@ -1153,8 +1166,9 @@ def suite_barriers(args, output):
         limits = {name: value['direct']['max_in_flight'] for name, value in after.items()}
         assert all(limit == budget for limit in limits.values()), limits
         assert all(value == 0 for value in in_flight.values()), in_flight
-        report('D12', offered=96, acknowledged=len(accepted), refused_429=len(refused), leader_budget_429=overloaded,
-               lane_or_gateway_429=len(refused) - overloaded, leader_mutations_admitted=executed,
+        report('D12', offered=96, acknowledged=len(accepted), refused=len(refused), leader_budget_429=overloaded,
+               refused_budget=budget_refusals, refused_lane=len(refused) - budget_refusals,
+               leader_mutations_admitted=executed,
                max_in_flight=limits, in_flight_after=in_flight,
                scheduler_after={name: value['scheduler'] for name, value in after.items()},
                acknowledged_verified=len(accepted), refused_absent=len(refused))
