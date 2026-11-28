@@ -672,6 +672,7 @@ impl<S: PostingStore> ImpactIndex<S> {
     /// `DropRange`: the range moved away, or is about to be installed again. No pin shows its entries
     /// from now on, the checkpoint forgets it on disk first, and scans that pinned it fail.
     pub fn drop_range(&mut self, id: RangeId) -> Result<()> {
+        self.checkpoint = None;
         if let Some(store) = &self.checkpoints {
             store.forget(id)?;
         }

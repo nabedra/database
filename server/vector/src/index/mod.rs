@@ -928,6 +928,7 @@ impl<C: Codec> Index<C> {
     /// `DropRange`: the range moved away, or is about to be installed again. Its entries are gone at once,
     /// in memory after on disk, and scans that pinned it fail.
     pub fn drop_range(&mut self, id: RangeId) -> Result<()> {
+        self.checkpoint = None;
         if let Some(store) = &self.store {
             store.forget(id)?;
         }

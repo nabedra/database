@@ -218,6 +218,7 @@ impl Checkpoints {
     /// Takes a range out of the installed checkpoint, so that a crash cannot bring a dropped or
     /// replaced index back.
     pub(super) fn forget(&self, id: RangeId) -> Result<()> {
+        let _lease = self.lease()?;
         match self.load_manifest() {
             Ok(None) => Ok(()),
             Ok(Some(mut manifest)) => {
