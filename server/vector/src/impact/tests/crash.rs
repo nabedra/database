@@ -381,3 +381,19 @@ fn vs10_a_checkpoint_from_before_nfc_is_not_loaded() {
     assert_eq!(damage.len(), 1);
     assert!(ix.status(RANGE).is_err());
 }
+
+#[test]
+fn vs10_peer_copy_cannot_publish_a_checkpoint_with_missing_local_files() {
+    let local = disk();
+    let mut writer = prepared(&local);
+    writer.begin_checkpoint().unwrap();
+    while writer.write_file().unwrap() {}
+
+    let peer = disk();
+    prepared(&peer);
+    let _ = copy_checkpoint(&store(&peer), &store(&local));
+    // Either the copy or the pending checkpoint may be refused, but a manifest must stay whole.
+    let published = writer.install_manifest().is_ok();
+    let pos = if published { 30 } else { 20 };
+    assert_eq!(recovers(&local.crash(), &[pos], "copy while a local checkpoint has files"), [pos, pos]);
+}
