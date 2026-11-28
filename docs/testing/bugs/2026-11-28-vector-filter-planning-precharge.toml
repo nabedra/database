@@ -1,0 +1,15 @@
+# Deterministic. Exact lib test with --test-threads=4, w4/idx3/03-{red,green}.log.
+id = "VEC-BUG-filter-planning-precharge"
+title = "A dense scan estimates a large filter before charging its CPU budget"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS02", "VS17"]
+found_by = "review"
+found_date = "2026-11-28"
+lowest_regression = "server/vector/src/index/tests/perf1.rs::vs02_a_budgeted_scan_refuses_an_unaffordable_filter_plan_before_running_it"
+seed = "unknown"
+why_not_caught = "Prior tests checked budget exhaustion after visiting a partition, so they allowed the entire filter to be prepared before the first charge."
+invariant_added = "Scan construction charges validation as it traverses a filter and precharges routing, estimation and cloning. One CPU unit refuses a wide filter during validation, and a budget covering validation and cloning alone refuses it before estimation."
+fix_commits = ["13b7b2f290f789397b607246ea2d1e752dac041f"]
+revert_patch_ok = true
