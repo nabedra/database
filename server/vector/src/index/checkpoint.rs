@@ -6,7 +6,7 @@
 //! MANIFEST  = magic ‖ body ‖ crc32c u32   body  = ranges (pos, low, bound, closed), files
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,6 +29,7 @@ const SEGMENT_BYTES: u64 = 64 << 20;
 /// A frame is closed beyond this, and holds at most one more row.
 const FRAME_BYTES: usize = 1 << 20;
 const MAX_FRAME: usize = 16 << 20;
+const MAX_SEGMENT_BYTES: u64 = SEGMENT_BYTES + MAX_FRAME as u64 + 8;
 const MAX_MANIFEST: u64 = 64 << 20;
 const COPY_BYTES: usize = 1 << 20;
 
@@ -75,6 +76,11 @@ struct Manifest {
 struct Segment {
     file: Arc<dyn FsFile>,
     info: FileInfo,
+}
+
+struct RestoredPart {
+    centroid: Arc<[f32]>,
+    id: Option<PartId>,
 }
 
 /// The running checkpoint.
@@ -238,7 +244,7 @@ impl Store {
         let file = self
             .fs
             .open(&self.path(&segment_name(info.number)), OpenMode::Read)?;
-        if file.len()? != info.len {
+        if info.len > MAX_SEGMENT_BYTES || file.len()? != info.len {
             return Err(damaged("a file's size is wrong"));
         }
         let mut magic = [0; 8];
@@ -557,7 +563,11 @@ impl<C: Codec> Index<C> {
     }
 
     /// Puts the rows of a frame back. `parts` maps the partitions of its file to new ones.
-    fn load_frame(&mut self, frame: &[u8], parts: &mut BTreeMap<u32, PartId>) -> io::Result<()> {
+    fn load_frame(
+        &mut self,
+        frame: &[u8],
+        parts: &mut BTreeMap<u32, RestoredPart>,
+    ) -> io::Result<()> {
         let mut r = In(frame);
         let old = r.u32()?;
         let centroid = r.floats(self.cfg.schema.dim)?;
@@ -568,6 +578,16 @@ impl<C: Codec> Index<C> {
         if !undirected && !unit(&centroid) {
             return Err(damaged("a centroid is not a unit vector"));
         }
+        let restored = match parts.entry(old) {
+            btree_map::Entry::Occupied(entry) if entry.get().centroid.as_ref() != centroid => {
+                return Err(damaged("a partition has conflicting centroids"));
+            }
+            btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            btree_map::Entry::Vacant(entry) => entry.insert(RestoredPart {
+                centroid: centroid.into(),
+                id: None,
+            }),
+        };
         while !r.0.is_empty() {
             let id = RangeId(u128::from_le_bytes(r.array()?));
             let key: Key = r.bytes()?.into();
@@ -612,17 +632,17 @@ impl<C: Codec> Index<C> {
             if sh.rows.refs(slot, at) > 0 {
                 continue;
             }
-            let part = match (parts.get(&old), undirected) {
-                (Some(part), _) => *part,
+            let part = match (restored.id, undirected) {
+                (Some(part), _) => part,
                 (None, false) => sh
-                    .new_part(group, centroid.clone().into(), false)
+                    .new_part(group, Arc::clone(&restored.centroid), false)
                     .ok_or_else(full)?,
                 (None, true) => match sh.roots.get(&group).and_then(|r| r.undirected) {
                     Some(part) => part,
                     None => sh.new_part(group, Arc::new([]), true).ok_or_else(full)?,
                 },
             };
-            parts.insert(old, part);
+            restored.id = Some(part);
             sh.rows.name(slot, at);
             let a = Append {
                 slot,

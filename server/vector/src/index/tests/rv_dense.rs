@@ -371,7 +371,9 @@ fn vs10_a_peer_segment_of_another_size_is_refused_before_anything_is_installed()
 #[test]
 fn vs03_recovery_rejects_conflicting_directions_for_one_checkpoint_partition() {
     use std::path::Path;
+
     use nabedra_rt::fs::{FaultFs, Fs, OpenMode};
+
     use super::super::checkpoint::crc32c;
 
     let fs = FaultFs::new();
@@ -380,10 +382,17 @@ fn vs03_recovery_rejects_conflicting_directions_for_one_checkpoint_partition() {
     let cfg = Config::new(schema(2, &[], None), 1);
     let codec = || DirectionCodec::new(2, 5).unwrap();
     let mut ix = serving(cfg.clone(), codec(), Some(store()));
-    feed(&mut ix, RANGE, &page(0, vec![
-        (1, Some(row(&[1.0, 1.0], vec![], 1))),
-        (2, Some(row(&[0.0, 0.0], vec![], 2))),
-    ]));
+    feed(
+        &mut ix,
+        RANGE,
+        &page(
+            0,
+            vec![
+                (1, Some(row(&[1.0, 1.0], vec![], 1))),
+                (2, Some(row(&[0.0, 0.0], vec![], 2))),
+            ],
+        ),
+    );
     ix.checkpoint().unwrap();
 
     let segment = Path::new("/data/ck/seg-0000000000000000");
@@ -399,9 +408,13 @@ fn vs03_recovery_rejects_conflicting_directions_for_one_checkpoint_partition() {
     let crc = crc32c(&second[8..]).to_le_bytes();
     second[4..8].copy_from_slice(&crc);
     let forged = [&bytes[..8], directed, &second].concat();
-    fs.open(segment, OpenMode::ReadWrite).unwrap().write_all_at(&forged, 0).unwrap();
+    fs.open(segment, OpenMode::ReadWrite)
+        .unwrap()
+        .write_all_at(&forged, 0)
+        .unwrap();
 
     let (back, damage) = Index::recover(cfg, codec(), store()).unwrap();
-    assert!(!damage.is_empty(), "the partition has conflicting frame headers");
+    assert_eq!(damage.len(), 1);
+    assert_eq!(damage[0].reason, "a partition has conflicting centroids");
     assert!(back.status(RANGE).unwrap().damage.is_some());
 }
