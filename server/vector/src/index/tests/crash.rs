@@ -380,3 +380,23 @@ fn vs10_damage_of_one_file_leaves_other_ranges_in_service() {
         }
     }
 }
+
+/// rv-idx3: the dense twin of finding 05. A peer copy into a directory whose local checkpoint has
+/// written files but not published them must not clean those files away.
+#[test]
+fn rv_idx3_dense_peer_copy_cannot_delete_pending_local_segments() {
+    let local = disk();
+    let mut writer = prepared(&local);
+    writer.begin_checkpoint().unwrap();
+    while writer.write_file().unwrap() {}
+
+    let peer = disk();
+    prepared(&peer);
+    let copied = copy_checkpoint(&store(&peer), &store(&local));
+    let installed = writer.install_manifest();
+    eprintln!("copy: {copied:?}, local install: {installed:?}");
+    if installed.is_ok() {
+        let (_, damage) = Index::recover(cfg(), ExactCodec, store(&local.crash())).unwrap();
+        assert_eq!(damage, [], "the local manifest names a segment the copy removed");
+    }
+}
