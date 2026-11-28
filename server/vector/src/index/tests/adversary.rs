@@ -414,21 +414,23 @@ fn adv05_exact_search_equals_an_independent_brute_force() {
     println!("worst difference: {worst} ulps");
 }
 
-/// Known limit of the chosen accumulation (decision L1): a sum in f64 loses terms that cancel.
+/// L20 defines exact search by the fixed-order f64 evaluation of L1.
 #[test]
-#[ignore = "known precision limit of an f64 accumulation, kept as a record"]
-fn adv05_scores_survive_cancellation() {
+fn adv05_fixed_order_dot_loses_terms_below_f64_precision() {
     let mut ix = serving(Config::new(schema(3, &[], None), 1), ExactCodec, None);
-    // Row 1 has the dot product 1 with the query, row 0 has 0. A sum in f64 order loses the 1.
+    // The middle product of row 1 rounds away before the first and last products cancel.
+    let q = [1e30, 1.0, 1e30];
     let rows = [([1e30f32, 0.0, -1e30], 0u64), ([1e30, 1.0, -1e30], 1)];
-    let changes = rows.iter().map(|(v, k)| (*k, Some(row(v, Vec::new(), *k)))).collect();
+    let changes = rows
+        .iter()
+        .map(|(v, k)| (*k, Some(row(v, Vec::new(), *k))))
+        .collect();
     feed(&mut ix, RANGE, &page(0, changes));
     let pin = latest(&mut ix, None);
-    let hits = ix.search(&pin, &query(Op::Dot, &[1e30, 1.0, 1e30], 2)).unwrap();
-    let got: Vec<(u64, f32)> = hits.iter().map(|h| (images(std::slice::from_ref(h))[0], h.score)).collect();
-    let want = to_f32(reference(Op::Dot, &rows[1].0, &[1e30, 1.0, 1e30]).unwrap());
-    println!("got {got:?}, reference {want}");
-    assert_eq!(got[0].0, 1, "{got:?}");
+    let hits = ix.search(&pin, &query(Op::Dot, &q, 2)).unwrap();
+    assert_eq!(dd_dot(&rows[1].0, &q), 1.0);
+    assert_eq!(images(&hits), [0, 1]);
+    assert!(hits.iter().all(|h| h.score == 0.0));
 }
 
 // ----- Seeds.
