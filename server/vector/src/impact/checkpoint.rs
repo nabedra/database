@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use nabedra_rt::fs::{Fs, FsFile, OpenMode};
+use nabedra_rt::fs::{Fs, FsFile, FsLock, OpenMode};
 
 use super::mutant::mutant;
 use super::postings::{Entry, PostingStore, Term};
@@ -27,6 +27,7 @@ use crate::types::{ColumnType, CommitTs, Error, Key, Pos, RangeId, Result, Value
 
 const MANIFEST: &str = "MANIFEST";
 const MANIFEST_TMP: &str = "MANIFEST.tmp";
+const LOCK: &str = "LOCK";
 const FILE_MAGIC: &[u8; 8] = b"NVIDOC01";
 const MANIFEST_MAGIC: &[u8; 8] = b"NVIMAN01";
 /// A file is closed beyond this.
@@ -86,6 +87,8 @@ pub(super) struct Running {
     taken: BTreeSet<u64>,
     file: Option<OpenFile>,
     files: Vec<FileInfo>,
+    /// Excludes another writer until publication and cleanup finish.
+    _lease: Arc<FsLock>,
 }
 
 fn io_error(e: io::Error) -> Error {
@@ -147,6 +150,14 @@ impl Checkpoints {
 
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
+    }
+
+    fn lease(&self) -> Result<FsLock> {
+        self.prepare().map_err(io_error)?;
+        self.fs.lock(&self.path(LOCK)).map_err(|e| match e.kind() {
+            io::ErrorKind::WouldBlock => Error::Busy,
+            _ => io_error(e),
+        })
     }
 
     /// The numbers of the files named as [`file_name`] names them. Other names are ignored.
@@ -269,11 +280,12 @@ impl Checkpoints {
 
 /// Copies the installed checkpoint of another search replica. The manifest goes last.
 pub fn copy_checkpoint(from: &Checkpoints, to: &Checkpoints) -> Result<()> {
-    let copy = || -> io::Result<()> {
-        let mut manifest = from
-            .load_manifest()?
-            .ok_or_else(|| damaged("the peer has no checkpoint"))?;
-        to.prepare()?;
+    let manifest = from
+        .load_manifest()
+        .and_then(|m| m.ok_or_else(|| damaged("the peer has no checkpoint")))
+        .map_err(io_error)?;
+    let _lease = to.lease()?;
+    let copy = |mut manifest: Manifest| -> io::Result<()> {
         let mut taken: BTreeSet<_> = to.numbers()?.into_iter().collect();
         // A file named by the installed manifest stays reserved even if it is missing.
         match to.load_manifest() {
@@ -301,7 +313,7 @@ pub fn copy_checkpoint(from: &Checkpoints, to: &Checkpoints) -> Result<()> {
         to.clean(&manifest);
         Ok(())
     };
-    copy().map_err(io_error)
+    copy(manifest).map_err(io_error)
 }
 
 impl<S: PostingStore> ImpactIndex<S> {
@@ -315,7 +327,7 @@ impl<S: PostingStore> ImpactIndex<S> {
         if self.checkpoint.is_some() {
             return Err(Error::Busy);
         }
-        store.prepare().map_err(io_error)?;
+        let lease = store.lease()?;
         let taken = store.numbers().map_err(io_error)?.into_iter().collect();
         let held = |s: &Service| matches!(s, Service::CatchingUp | Service::Serving);
         let heads: Vec<Head> = (self.ranges.iter().filter(|(_, r)| held(&r.service)))
@@ -350,6 +362,7 @@ impl<S: PostingStore> ImpactIndex<S> {
             taken,
             file: None,
             files: Vec::new(),
+            _lease: Arc::new(lease),
         });
         Ok(())
     }

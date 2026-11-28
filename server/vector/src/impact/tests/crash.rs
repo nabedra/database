@@ -391,9 +391,15 @@ fn vs10_peer_copy_cannot_publish_a_checkpoint_with_missing_local_files() {
 
     let peer = disk();
     prepared(&peer);
-    let _ = copy_checkpoint(&store(&peer), &store(&local));
-    // Either the copy or the pending checkpoint may be refused, but a manifest must stay whole.
-    let published = writer.install_manifest().is_ok();
-    let pos = if published { 30 } else { 20 };
-    assert_eq!(recovers(&local.crash(), &[pos], "copy while a local checkpoint has files"), [pos, pos]);
+    assert_eq!(
+        copy_checkpoint(&store(&peer), &store(&local)),
+        Err(Error::Busy),
+    );
+    writer.install_manifest().unwrap();
+    assert_eq!(
+        recovers(&local.crash(), &[30], "copy while a local checkpoint has files"),
+        [30, 30],
+    );
+    copy_checkpoint(&store(&peer), &store(&local)).unwrap();
+    assert_eq!(recovers(&local.crash(), &[20], "copy retry"), [20, 20]);
 }
