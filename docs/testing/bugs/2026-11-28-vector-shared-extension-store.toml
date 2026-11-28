@@ -1,0 +1,15 @@
+# Deterministic. Exact lib test, w4/idx3/01-{red,green}.log.
+id = "VEC-BUG-shared-extension-store"
+title = "A second index deletes extensions still owned by the first index"
+class = "resource-release-order"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS17"]
+found_by = "review"
+found_date = "2026-11-28"
+lowest_regression = "server/vector/src/index/tests/codes.rs::vs17_two_live_indexes_cannot_corrupt_one_anothers_extensions"
+seed = "unknown"
+why_not_caught = "The previous extension ownership tests dropped the first index before reusing its configuration."
+invariant_added = "An extension store leases its key space to one index until that index's cleanup is complete. A second construction returns Busy, and the same store can be used again after the first index drops."
+fix_commits = ["6a55d7bd3fd55f434483b8384f28d706fe74bde0"]
+revert_patch_ok = true
