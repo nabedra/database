@@ -1,9 +1,11 @@
 //! VS10 for impact data: a crash, a power loss or an I/O error at every step of a checkpoint, damage
 //! of every kind of file, a copy from the other replica, a drop, and merges during a checkpoint.
 
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use nabedra_rt::fs::{Fault, FaultFs, Fs, FsOp};
+use nabedra_rt::fs::{Fault, FaultFs, Fs, FsFile, FsLock, FsOp, OpenMode};
 
 use super::*;
 
@@ -18,6 +20,50 @@ fn disk() -> FaultFs {
     let fs = FaultFs::new();
     fs.create_dir_all_durable(Path::new("/data"));
     fs
+}
+
+/// Runs another operation after the copy has synced its temporary manifest and before it renames it.
+struct BeforeManifestRename {
+    fs: FaultFs,
+    before: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Fs for BeforeManifestRename {
+    fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Arc<dyn FsFile>> {
+        self.fs.open(path, mode)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        if from.ends_with("MANIFEST.tmp") {
+            let before = self.before.lock().unwrap().take();
+            before.unwrap()();
+        }
+        self.fs.rename(from, to)
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        self.fs.remove(path)
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        self.fs.exists(path)
+    }
+
+    fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
+        self.fs.create_dir_all(dir)
+    }
+
+    fn list(&self, dir: &Path) -> io::Result<Vec<PathBuf>> {
+        self.fs.list(dir)
+    }
+
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        self.fs.sync_dir(dir)
+    }
+
+    fn lock(&self, path: &Path) -> io::Result<FsLock> {
+        self.fs.lock(path)
+    }
 }
 
 fn cfg() -> Config {
@@ -337,6 +383,39 @@ fn vs10_a_dropped_range_does_not_come_back_and_a_peer_copy_recovers() {
         copy_checkpoint(&store(&disk()), &store(&peer)).is_err(),
         "a peer without a checkpoint"
     );
+}
+
+#[test]
+fn vs10_impact_forget_cannot_replace_an_in_flight_peer_manifest() {
+    let local = disk();
+    let mut ix = prepared(&local);
+    let peer = disk();
+    prepared(&peer).checkpoint().unwrap();
+
+    let (send, recv) = std::sync::mpsc::channel();
+    let destination = Checkpoints::new(
+        Arc::new(BeforeManifestRename {
+            fs: local.clone(),
+            before: Mutex::new(Some(Box::new(move || {
+                send.send((ix.drop_range(RANGE), ix)).unwrap();
+            }))),
+        }),
+        DIR,
+    );
+    let copied = copy_checkpoint(&store(&peer), &destination);
+    let (dropped, mut ix) = recv.try_recv().unwrap();
+    assert_eq!(copied, Ok(()), "concurrent drop returned {dropped:?}");
+    assert_eq!(dropped, Err(Error::Busy));
+    assert!(ix.status(RANGE).is_ok());
+    assert_eq!(recovers(&local.crash(), &[30], "peer copy"), [30, 30]);
+
+    ix.begin_checkpoint().unwrap();
+    ix.drop_range(RANGE).unwrap();
+    let (back, damage) =
+        ImpactIndex::recover(cfg(), RamStore::default(), store(&local.crash())).unwrap();
+    assert_eq!(damage, []);
+    assert!(matches!(back.status(RANGE), Err(Error::NotHeld(RANGE))));
+    assert_eq!(back.status(OTHER).unwrap().applied, 30);
 }
 
 #[test]
