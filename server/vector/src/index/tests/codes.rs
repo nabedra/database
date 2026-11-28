@@ -817,3 +817,27 @@ fn vs17_a_dropped_index_gives_back_its_codes_and_extensions() {
     assert_eq!(store.memory().used(), (0, 0));
     assert_eq!(store.counts(), (0, 0));
 }
+
+#[test]
+fn vs17_two_live_indexes_cannot_corrupt_one_anothers_extensions() {
+    let codec = DirectionCodec::new(8, 5).unwrap();
+    let (_disks, store) = codes("shared-owner", &codec, 3, 4096);
+    let cfg = whole(8, store.clone());
+    let mut first = serving(cfg.clone(), codec.clone(), None);
+    let page = upserts(0, &[(1, vec![1.0; 8])]);
+    feed(&mut first, RANGE, &page);
+    charges(&first).unwrap();
+
+    // Exclusive ownership may reject the second index at construction.
+    if let Ok(mut second) = Index::new(cfg, codec, None) {
+        second.begin_load(RANGE, 0, 0).unwrap();
+        second.finish_load(RANGE).unwrap();
+        second.caught_up(RANGE, 0).unwrap();
+        let _ = second.apply(RANGE, &page);
+        second.run();
+        let damage = second.status(RANGE).unwrap().damage;
+        drop(second);
+        charges(&first).expect("dropping another index preserves our charge and extension");
+        assert_eq!(damage, None, "independent writes must succeed");
+    }
+}
