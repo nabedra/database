@@ -1,0 +1,18 @@
+# An unseeded FaultFs EIO on the manifest rename left the installed manifest naming overwritten bytes.
+# From server/: nice -n 10 /home/dev/bin/cargo-slot test --locked -p nabedra-vector -j 4 --lib
+#   impact::tests::crash::vs10_interrupted_peer_copy_preserves_the_installed_impact_checkpoint -- --exact --test-threads=4
+# W4 evidence: w4/idx2/impact-copy-red.log and w4/idx2/impact-copy-green.log.
+id = "VEC-BUG-impact-checkpoint-copy-reuses-files"
+title = "An interrupted impact peer copy corrupts the previously installed checkpoint"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G03", "VEC-G05"]
+scenarios = ["VS10"]
+found_by = "review"
+found_date = "2026-11-28"
+lowest_regression = "server/vector/src/impact/tests/crash.rs::vs10_interrupted_peer_copy_preserves_the_installed_impact_checkpoint"
+seed = "unknown"
+why_not_caught = "The existing peer-copy crash test accepted damage at a destination that already had a valid manifest."
+invariant_added = "Peer copy reserves file numbers named by the installed manifest, even for missing files. Recovery uses the old checkpoint after a failed rename and the peer checkpoint after a successful retry."
+fix_commits = ["ecc297da7fa18f1211a7058cc9449fc1c71d5f87"]
+revert_patch_ok = true

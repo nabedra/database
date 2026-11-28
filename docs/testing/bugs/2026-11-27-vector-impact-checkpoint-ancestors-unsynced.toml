@@ -1,0 +1,18 @@
+# An unseeded FaultFs crash on a fresh disk returned no ranges after a successful checkpoint.
+# From server/: nice -n 10 /home/dev/bin/cargo-slot test --locked -p nabedra-vector -j 4 --lib
+#   impact::tests::crash::vs10_impact_checkpoint_survives_creation_of_its_ancestors -- --exact --test-threads=4
+# W4 evidence: w4/idx2/impact-dirs-red.log and w4/idx2/impact-dirs-green.log.
+id = "VEC-BUG-impact-checkpoint-ancestors-unsynced"
+title = "A crash loses an impact checkpoint under newly created ancestor directories"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G03", "VEC-G05"]
+scenarios = ["VS10"]
+found_by = "review"
+found_date = "2026-11-27"
+lowest_regression = "server/vector/src/impact/tests/crash.rs::vs10_impact_checkpoint_survives_creation_of_its_ancestors"
+seed = "unknown"
+why_not_caught = "The existing impact crash tests started with a durable parent for the checkpoint directory."
+invariant_added = "A successful checkpoint persists every directory link from the filesystem root to the manifest and recovers both ranges after a crash."
+fix_commits = ["7e9f26affdf88cfe5cc64ef7500b80ba634b1284"]
+revert_patch_ok = true
