@@ -270,17 +270,23 @@ impl Checkpoints {
 /// Copies the installed checkpoint of another search replica. The manifest goes last.
 pub fn copy_checkpoint(from: &Checkpoints, to: &Checkpoints) -> Result<()> {
     let copy = || -> io::Result<()> {
-        let manifest = from
+        let mut manifest = from
             .load_manifest()?
             .ok_or_else(|| damaged("the peer has no checkpoint"))?;
         to.prepare()?;
-        for info in &manifest.files {
-            let name = file_name(info.number);
-            if to.fs.exists(&to.path(&name))? {
-                to.fs.remove(&to.path(&name))?;
-            }
-            let source = from.fs.open(&from.path(&name), OpenMode::Read)?;
-            let target = to.fs.open(&to.path(&name), OpenMode::CreateNew)?;
+        let mut taken: BTreeSet<_> = to.numbers()?.into_iter().collect();
+        // A file named by the installed manifest stays reserved even if it is missing.
+        match to.load_manifest() {
+            Ok(Some(local)) => taken.extend(local.files.into_iter().map(|file| file.number)),
+            Ok(None) => {}
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {}
+            Err(e) => return Err(e),
+        }
+        for info in &mut manifest.files {
+            let source = from.fs.open(&from.path(&file_name(info.number)), OpenMode::Read)?;
+            info.number = free_number(&taken).ok_or_else(|| damaged("no file number is free"))?;
+            taken.insert(info.number);
+            let target = to.fs.open(&to.path(&file_name(info.number)), OpenMode::CreateNew)?;
             let mut at = 0;
             while at < info.len {
                 let mut chunk = vec![0; COPY_BYTES.min((info.len - at) as usize)];
@@ -291,7 +297,9 @@ pub fn copy_checkpoint(from: &Checkpoints, to: &Checkpoints) -> Result<()> {
             target.sync_data()?;
         }
         to.fs.sync_dir(&to.dir)?;
-        to.install(&manifest)
+        to.install(&manifest)?;
+        to.clean(&manifest);
+        Ok(())
     };
     copy().map_err(io_error)
 }

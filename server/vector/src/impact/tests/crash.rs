@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use nabedra_rt::fs::FaultFs;
+use nabedra_rt::fs::{Fault, FaultFs, Fs, FsOp};
 
 use super::*;
 
@@ -337,6 +337,35 @@ fn vs10_a_dropped_range_does_not_come_back_and_a_peer_copy_recovers() {
         copy_checkpoint(&store(&disk()), &store(&peer)).is_err(),
         "a peer without a checkpoint"
     );
+}
+
+#[test]
+fn vs10_interrupted_peer_copy_preserves_the_installed_impact_checkpoint() {
+    let local = disk();
+    prepared(&local); // Installs position 20 in doc-0.
+    let peer = disk();
+    let mut ix = ImpactIndex::new(cfg(), RamStore::default(), Some(store(&peer))).unwrap();
+    ix.begin_load(RANGE, 0, 0).unwrap();
+    ix.finish_load(RANGE).unwrap();
+    ix.caught_up(RANGE, 0).unwrap();
+    advance(&mut ix, RANGE, 10);
+    ix.checkpoint().unwrap(); // Installs different contents under the same file number.
+
+    local.inject(Fault::on(FsOp::Rename));
+    assert!(copy_checkpoint(&store(&peer), &store(&local)).is_err());
+    let restored = local.crash();
+    assert_eq!(recovers(&restored, &[20], "interrupted peer copy"), [20, 20]);
+
+    copy_checkpoint(&store(&peer), &store(&restored)).unwrap();
+    assert_eq!(recovers(&restored.crash(), &[10], "retried peer copy"), [10]);
+
+    // The installed manifest still reserves the file number if its file is missing.
+    let missing = local.crash();
+    let doc = Path::new(DIR).join("doc-0000000000000000");
+    missing.remove(&doc).unwrap();
+    copy_checkpoint(&store(&peer), &store(&missing)).unwrap();
+    assert!(!missing.crash().exists(&doc).unwrap());
+    assert_eq!(recovers(&missing.crash(), &[10], "peer copy over damage"), [10]);
 }
 
 /// A checkpoint of a build before decisions L10 and L11 holds terms of unprepared text, so it is
