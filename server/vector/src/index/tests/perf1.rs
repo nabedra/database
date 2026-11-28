@@ -356,3 +356,24 @@ fn vs07_the_stop_rule_reads_on_while_a_unit_may_reach_the_result() {
         assert!((normal_quantile(p) - z).abs() < 1e-3, "{p}: {}", normal_quantile(p));
     }
 }
+
+#[test]
+fn vs02_a_budgeted_scan_refuses_an_unaffordable_filter_plan_before_running_it() {
+    use crate::runtime::Budget;
+
+    let mut ix = serving(Config::new(schema(2, &[ColumnType::Int], None), 1), ExactCodec, None);
+    let rows = (0..300)
+        .map(|k| (k, Some(row(&[1.0, 0.0], vec![Value::Int(k as i64)], k))));
+    feed(&mut ix, RANGE, &page(0, rows.collect()));
+    let pin = latest(&mut ix, None);
+    let q = Query {
+        exact: false,
+        filter: Some(Filter::Or((0..20_000).map(|i| Filter::Eq(0, Value::Int(i))).collect())),
+        ..query(Op::Dot, &[1.0, 0.0], 10)
+    };
+    let budget = Budget { cpu: 1, ..Budget::UNLIMITED };
+    assert!(matches!(
+        ix.scan_within(&pin, &q, Box::new(RecallEstimate), budget),
+        Err(Error::OverBudget("cpu"))
+    ), "planning itself exceeds the budget");
+}
