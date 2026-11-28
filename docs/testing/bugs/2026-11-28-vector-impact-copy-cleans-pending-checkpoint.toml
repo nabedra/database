@@ -1,0 +1,15 @@
+# Deterministic FaultFs interleaving. w4/idx3/05-{red,green}.log.
+id = "VEC-BUG-impact-copy-cleans-pending-checkpoint"
+title = "Impact peer copy removes files that a local checkpoint is about to publish"
+class = "resource-release-order"
+module = "vector"
+guarantees = ["VEC-G03", "VEC-G05"]
+scenarios = ["VS10"]
+found_by = "review"
+found_date = "2026-11-28"
+lowest_regression = "server/vector/src/impact/tests/crash.rs::vs10_peer_copy_cannot_publish_a_checkpoint_with_missing_local_files"
+seed = "unknown"
+why_not_caught = "The peer-copy tests used destinations with an installed manifest and no checkpoint in flight."
+invariant_added = "A local checkpoint and a peer copy acquire the same destination directory lease before creating files and hold it through manifest publication and cleanup. A refused copy can retry after the local checkpoint finishes."
+fix_commits = ["6b684f9b45add48dd20c4271f1a1abcb81aa49e5"]
+revert_patch_ok = true
