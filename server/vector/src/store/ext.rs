@@ -5,6 +5,7 @@
 //! maintenance does once memory is free again.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::disk::Disk;
@@ -23,9 +24,19 @@ pub struct ExtKey {
 pub struct Extensions {
     bytes: usize,
     memory: Arc<Memory>,
+    leased: AtomicBool,
     ram: Mutex<BTreeMap<ExtKey, Arc<[u8]>>>,
     /// One per core; the key's partition picks it.
     files: Vec<RecordFile<ExtKey>>,
+}
+
+/// Keeps one index's extension keys exclusive until the index has cleaned them up.
+pub(crate) struct ExtensionLease(Arc<Extensions>);
+
+impl Drop for ExtensionLease {
+    fn drop(&mut self) {
+        self.0.leased.store(false, Ordering::Release);
+    }
 }
 
 impl Extensions {
@@ -42,9 +53,17 @@ impl Extensions {
         Ok(Extensions {
             bytes,
             memory,
+            leased: AtomicBool::new(false),
             ram: Mutex::new(BTreeMap::new()),
             files,
         })
+    }
+
+    pub(crate) fn lease(self: &Arc<Self>) -> Result<ExtensionLease> {
+        self.leased
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| Error::Busy)?;
+        Ok(ExtensionLease(Arc::clone(self)))
     }
 
     /// Bytes of one extension.

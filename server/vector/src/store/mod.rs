@@ -26,6 +26,7 @@ mod vectors;
 mod tests;
 
 pub use disk::{Backend, Disk, PreadDisk, Req, open};
+pub(crate) use ext::ExtensionLease;
 pub use ext::{ExtKey, Extensions};
 pub use file::{FileStats, RecordFile};
 pub use pages::{PAGE, Pages};

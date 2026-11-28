@@ -828,16 +828,14 @@ fn vs17_two_live_indexes_cannot_corrupt_one_anothers_extensions() {
     feed(&mut first, RANGE, &page);
     charges(&first).unwrap();
 
-    // Exclusive ownership may reject the second index at construction.
-    if let Ok(mut second) = Index::new(cfg, codec, None) {
-        second.begin_load(RANGE, 0, 0).unwrap();
-        second.finish_load(RANGE).unwrap();
-        second.caught_up(RANGE, 0).unwrap();
-        let _ = second.apply(RANGE, &page);
-        second.run();
-        let damage = second.status(RANGE).unwrap().damage;
-        drop(second);
-        charges(&first).expect("dropping another index preserves our charge and extension");
-        assert_eq!(damage, None, "independent writes must succeed");
-    }
+    assert!(matches!(
+        Index::new(cfg.clone(), codec.clone(), None),
+        Err(Error::Busy),
+    ));
+    charges(&first).expect("a refused index preserves the owner's charge and extension");
+
+    drop(first);
+    let mut second = serving(cfg, codec, None);
+    feed(&mut second, RANGE, &page);
+    charges(&second).expect("the store can be reused after the owner releases its extensions");
 }

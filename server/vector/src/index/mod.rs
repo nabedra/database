@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
-use crate::store::{Extensions, Vectors};
+use crate::store::{ExtensionLease, Extensions, Vectors};
 use crate::types::{
     Change, ColumnType, CommitTs, Error, Key, MAX_DIM, Page, PartId, Pos, RangeId, Result, Row,
     Schema,
@@ -541,18 +541,18 @@ pub struct Index<C: Codec = ExactCodec> {
     checkpoint: Option<Running>,
     /// Where `maintain` goes on.
     cursor: PartId,
-    /// Shared by the copies of a test index: the last one that goes gives the store back.
-    owner: Arc<()>,
+    /// Released after cleanup. Copies of a test index share the lease.
+    owner: Option<Arc<ExtensionLease>>,
 }
 
 /// An index that goes gives back what it holds of the extension store and the code memory, which
 /// outlive it (L8), so that a recovery over the same configuration is charged only what it holds.
 impl<C: Codec> Drop for Index<C> {
     fn drop(&mut self) {
-        let Some(store) = &self.cfg.codes else {
+        let (Some(store), Some(owner)) = (&self.cfg.codes, &self.owner) else {
             return;
         };
-        if Arc::strong_count(&self.owner) > 1 {
+        if Arc::strong_count(owner) > 1 {
             return;
         }
         for shard in &self.shards {
@@ -581,6 +581,12 @@ impl<C: Codec> Index<C> {
         if cfg.codes.as_ref().is_some_and(|c| ext > 0 && c.bytes() != ext) {
             return Err(Error::Internal("extensions of another size"));
         }
+        let owner = cfg
+            .codes
+            .as_ref()
+            .map(Extensions::lease)
+            .transpose()?
+            .map(Arc::new);
         let shared = Shared {
             ranges: BTreeMap::new(),
             gens: BTreeMap::new(),
@@ -608,7 +614,7 @@ impl<C: Codec> Index<C> {
             store,
             checkpoint: None,
             cursor: PartId(0),
-            owner: Arc::new(()),
+            owner,
         })
     }
 
