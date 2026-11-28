@@ -24,11 +24,26 @@ pub enum Filter {
 impl Filter {
     /// Checks columns, types and depth.
     pub fn check(&self, schema: &Schema) -> Result<()> {
-        const MAX_DEPTH: usize = 64;
-        self.check_at(schema, MAX_DEPTH)
+        self.check_with(schema, |_| Ok(()))
     }
 
-    fn check_at(&self, schema: &Schema, depth: usize) -> Result<()> {
+    /// Calls `visit` before validating each node.
+    pub(super) fn check_with(
+        &self,
+        schema: &Schema,
+        mut visit: impl FnMut(&Filter) -> Result<()>,
+    ) -> Result<()> {
+        const MAX_DEPTH: usize = 64;
+        self.check_at(schema, MAX_DEPTH, &mut visit)
+    }
+
+    fn check_at(
+        &self,
+        schema: &Schema,
+        depth: usize,
+        visit: &mut impl FnMut(&Filter) -> Result<()>,
+    ) -> Result<()> {
+        visit(self)?;
         const BAD: Error = Error::InvalidQuery("a filter does not fit the column's type");
         let depth = depth
             .checked_sub(1)
@@ -54,9 +69,9 @@ impl Filter {
                 fits(column(c)? == ColumnType::Tags)
             }
             Filter::And(all) | Filter::Or(all) => {
-                all.iter().try_for_each(|f| f.check_at(schema, depth))
+                all.iter().try_for_each(|f| f.check_at(schema, depth, visit))
             }
-            Filter::Not(f) => f.check_at(schema, depth),
+            Filter::Not(f) => f.check_at(schema, depth, visit),
         }
     }
 
@@ -93,15 +108,21 @@ impl Filter {
         let mut todo = vec![self];
         let mut n = 0u64;
         while let Some(f) = todo.pop() {
-            n = n.saturating_add(1);
+            n = n.saturating_add(f.node_work());
             match f {
                 Filter::And(all) | Filter::Or(all) => todo.extend(all),
                 Filter::Not(f) => todo.push(f),
-                Filter::ContainsAny(_, any) => n = n.saturating_add(any.len() as u64),
                 _ => {}
             }
         }
         n
+    }
+
+    pub(super) fn node_work(&self) -> u64 {
+        match self {
+            Filter::ContainsAny(_, any) => 1 + any.len() as u64,
+            _ => 1,
+        }
     }
 
     /// The one value of the column that this filter allows.
@@ -395,6 +416,26 @@ impl Summary {
                 .map(|&n| f64::from(n))
                 .sum(),
         )
+    }
+
+    /// An upper bound on estimating one node, excluding its children.
+    pub(super) fn estimate_work(&self, node: &Filter) -> u64 {
+        let pairs = |c| {
+            self.cols.get(c).map_or(0, |col: &ColumnSummary| {
+                if col.values.is_some() { col.pairs as u64 } else { 0 }
+            })
+        };
+        let text = |bound: &Bound<Value>| {
+            matches!(bound, Bound::Included(Value::Text(_)) | Bound::Excluded(Value::Text(_)))
+        };
+        let text_pairs = match node {
+            Filter::StartsWith(c, _) => pairs(*c),
+            Filter::Range(c, lo, hi) if text(lo) || text(hi) => pairs(*c),
+            _ => 0,
+        };
+        node.node_work()
+            .saturating_mul(self.sizes.len() as u64 + 1)
+            .saturating_add(text_pairs.saturating_mul(2))
     }
 
     /// About how many entries match.

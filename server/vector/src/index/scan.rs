@@ -211,8 +211,6 @@ pub struct Scan {
     filter: Option<Filter>,
     /// Work units of evaluating the filter once.
     filter_work: u64,
-    /// Work of the plan, charged by the first visit.
-    planned: u64,
     recall: f64,
     stop: Box<dyn StopRule>,
     plan: Plan,
@@ -398,6 +396,16 @@ impl Stream {
 impl<C: Codec> Index<C> {
     /// Plans a ranking of a pin. Every ranking of a query uses the same pin.
     pub fn scan(&self, pin: &Pin, query: &Query, stop: Box<dyn StopRule>) -> Result<Scan> {
+        self.prepare_scan(pin, query, stop, None)
+    }
+
+    fn prepare_scan(
+        &self,
+        pin: &Pin,
+        query: &Query,
+        stop: Box<dyn StopRule>,
+        mut meter: Option<Meter>,
+    ) -> Result<Scan> {
         let schema = &self.cfg.schema;
         if query.vec.len() != schema.dim || query.vec.iter().any(|x| !x.is_finite()) {
             return Err(Error::InvalidQuery("the vector does not fit the column"));
@@ -405,8 +413,18 @@ impl<C: Codec> Index<C> {
         if !(1..=MAX_LIMIT).contains(&query.limit) || !(0.0..=1.0).contains(&query.recall) {
             return Err(Error::InvalidQuery("limit or recall is out of bounds"));
         }
-        if let Some(f) = &query.filter {
-            f.check(schema)?;
+        let mut filter_work = 0u64;
+        let mut estimate_work = 0u64;
+        if let Some(filter) = &query.filter {
+            filter.check_with(schema, |node| {
+                if let Some(meter) = &mut meter {
+                    meter.cpu(1)?;
+                    filter_work = filter_work.saturating_add(node.node_work());
+                    estimate_work =
+                        estimate_work.saturating_add(self.shared.summary.estimate_work(node));
+                }
+                Ok(())
+            })?;
         }
         let direction = direction(&query.vec);
         if query.op == Op::Cosine && query.vec.iter().all(|x| *x == 0.0) {
@@ -419,15 +437,22 @@ impl<C: Codec> Index<C> {
                 .and_then(|f| f.only(c))
                 .and_then(Scalar::of)
         };
-        if pin.0.group.is_some() && pin.0.group != schema.partition_by.and_then(only) {
-            return Err(Error::InvalidQuery("the pin holds another tree"));
+        if pin.0.group.is_some() {
+            if let Some(meter) = &mut meter {
+                meter.cpu(filter_work)?;
+            }
+            if pin.0.group != schema.partition_by.and_then(only) {
+                return Err(Error::InvalidQuery("the pin holds another tree"));
+            }
         }
         let (dir, len) = direction.unwrap_or_else(|| (query.vec.clone(), 0.0));
-        let filter_work = query.filter.as_ref().map_or(0, Filter::nodes);
-        let (plan, planned) = self.plan(pin, query, &dir, len, filter_work);
+        if let Some(meter) = &mut meter {
+            // Charge the summary estimate and cloning the validated filter before either runs.
+            meter.cpu(estimate_work.saturating_add(filter_work))?;
+        }
+        let plan = self.plan(pin, query, &dir, len);
         Ok(Scan {
             plan,
-            planned,
             pin: pin.clone(),
             op: query.op,
             vec: query.vec.clone(),
@@ -446,7 +471,7 @@ impl<C: Codec> Index<C> {
             excess: Vec::new(),
             unit_best: f64::NEG_INFINITY,
             visited: 0,
-            meter: None,
+            meter,
         })
     }
 
@@ -459,9 +484,7 @@ impl<C: Codec> Index<C> {
         stop: Box<dyn StopRule>,
         budget: Budget,
     ) -> Result<Scan> {
-        let mut scan = self.scan(pin, query, stop)?;
-        scan.meter = Some(Meter::new(budget));
-        Ok(scan)
+        self.prepare_scan(pin, query, stop, Some(Meter::new(budget)))
     }
 
     /// [`Index::search`] within a budget.
@@ -480,18 +503,15 @@ impl<C: Codec> Index<C> {
         }
     }
 
-    /// The plan and the work of making it: the filter's estimate looks at each partition.
-    fn plan(&self, pin: &Pin, query: &Query, dir: &[f32], len: f64, filter: u64) -> (Plan, u64) {
+    fn plan(&self, pin: &Pin, query: &Query, dir: &[f32], len: f64) -> Plan {
         let summary = &self.shared.summary;
         let entries: usize = pin.0.roots.iter().map(|r| r.entries).sum();
-        let work = filter.saturating_mul(self.shared.dir.len() as u64 + 1);
         let few = query
             .filter
             .as_ref()
             .is_some_and(|f| summary.estimate(f) <= self.cfg.flat as f64);
         if query.exact || entries < self.cfg.flat || few || len == 0.0 {
-            let all = Plan::All(parts_of(pin.0.roots.iter()).into_iter().collect());
-            return (all, work);
+            return Plan::All(parts_of(pin.0.roots.iter()).into_iter().collect());
         }
         let mut walk = Walk::new(dir.to_vec(), SCAN_BEAM);
         let mut exps: Vec<i32> = Vec::new();
@@ -511,12 +531,11 @@ impl<C: Codec> Index<C> {
                 })
                 .collect(),
         };
-        let stream = Plan::Stream(Stream {
+        Plan::Stream(Stream {
             walk,
             met: Vec::new(),
             bands,
-        });
-        (stream, work)
+        })
     }
 
     /// `Visit`: reads one partition. Returns whether there is more to do.
@@ -524,8 +543,6 @@ impl<C: Codec> Index<C> {
         if scan.pin.0.failed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::PinFailed);
         }
-        let planned = std::mem::take(&mut scan.planned);
-        scan.charge(planned, 0, 0)?;
         if let Plan::All(todo) = &mut scan.plan {
             return match todo.pop_front() {
                 Some(part) => self.visit_part(scan, part, None, false).map(|_| true),
@@ -634,7 +651,7 @@ impl<C: Codec> Index<C> {
             .filter(|b| band.is_none_or(|exp| b.exp == exp))
         {
             if scan.filter.is_some() {
-                let work = scan.filter_work.saturating_mul(b.entries.len() as u64);
+                let work = scan.filter_work.saturating_mul(b.entries.len().max(1) as u64);
                 scan.charge(work, 0, 0)?;
             }
             let bits = scan

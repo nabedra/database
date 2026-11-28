@@ -371,9 +371,15 @@ fn vs02_a_budgeted_scan_refuses_an_unaffordable_filter_plan_before_running_it() 
         filter: Some(Filter::Or((0..20_000).map(|i| Filter::Eq(0, Value::Int(i))).collect())),
         ..query(Op::Dot, &[1.0, 0.0], 10)
     };
-    let budget = Budget { cpu: 1, ..Budget::UNLIMITED };
-    assert!(matches!(
-        ix.scan_within(&pin, &q, Box::new(RecallEstimate), budget),
-        Err(Error::OverBudget("cpu"))
-    ), "planning itself exceeds the budget");
+    // One unit stops validation. Even funding validation and cloning must leave the estimate out.
+    for cpu in [1, 2 * (20_000 + 1)] {
+        let budget = Budget { cpu, ..Budget::UNLIMITED };
+        assert!(
+            matches!(
+                ix.scan_within(&pin, &q, Box::new(RecallEstimate), budget),
+                Err(Error::OverBudget("cpu"))
+            ),
+            "planning itself exceeds the budget of {cpu}"
+        );
+    }
 }

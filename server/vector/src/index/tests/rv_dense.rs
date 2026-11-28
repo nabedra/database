@@ -130,9 +130,8 @@ fn vs01_direction_codes_under_churn_padded_dimension() {
 }
 
 /// VEC-G11: a query's CPU budget bounds its work. Filter evaluation is work too: here a filter of
-/// 20,000 leaves runs over 300 rows (6 million leaf tests), and a budget of 1,000 work units, of
-/// which scoring 300 rows of 2 dimensions takes 600, should end it. Today filters are never
-/// charged, so it returns `Ok`.
+/// 20,000 leaves runs over 300 rows (6 million leaf tests). The budget covers planning, partition
+/// checks and scoring, but leaves too little for the filter's per-row work.
 #[test]
 fn vs02_filter_evaluation_counts_against_the_cpu_budget() {
     use crate::runtime::Budget;
@@ -157,12 +156,19 @@ fn vs02_filter_evaluation_counts_against_the_cpu_budget() {
     );
     let wide = Filter::Not(Box::new(none));
     let pin = latest(&mut ix, None);
+    let partition_work = wide.nodes() * ix.shared.dir.len() as u64;
     let q = Query {
         filter: Some(wide),
         ..query(Op::Dot, &[1.0, 0.0], 10)
     };
+    let prepared = ix
+        .scan_within(&pin, &q, Box::new(RecallEstimate), Budget::UNLIMITED)
+        .unwrap()
+        .usage()
+        .unwrap()
+        .cpu;
     let budget = Budget {
-        cpu: 1_000,
+        cpu: prepared + partition_work + 1_000,
         ..Budget::UNLIMITED
     };
     let mut scan = ix
