@@ -165,6 +165,13 @@ fn vs10_a_checkpoint_recovers_every_retained_cut() {
     }
 }
 
+#[test]
+fn vs10_impact_checkpoint_survives_creation_of_its_ancestors() {
+    let fs = FaultFs::new();
+    prepared(&fs).checkpoint().unwrap();
+    assert_eq!(recovers(&fs.crash(), &[30], "fresh checkpoint directory"), [30, 30]);
+}
+
 /// A crash at each step of a checkpoint leaves the old checkpoint or the new one, whole.
 fn crash_every_step() -> std::result::Result<(), String> {
     let steps = {
