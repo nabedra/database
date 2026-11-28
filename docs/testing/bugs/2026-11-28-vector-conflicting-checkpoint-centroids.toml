@@ -1,0 +1,15 @@
+# Deterministic FaultFs checkpoint with valid frame checksums. w4/idx3/04-{red,green}.log.
+id = "VEC-BUG-conflicting-checkpoint-centroids"
+title = "Dense recovery panics when one partition's checkpoint frames disagree about its direction"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G03", "VEC-G05", "VEC-G11"]
+scenarios = ["VS03", "VS10", "VS17"]
+found_by = "review"
+found_date = "2026-11-28"
+lowest_regression = "server/vector/src/index/tests/rv_dense.rs::vs03_recovery_rejects_conflicting_directions_for_one_checkpoint_partition"
+seed = "unknown"
+why_not_caught = "Existing forged-centroid tests checked whether a frame was valid on its own and never reused a file-local partition ID with another header."
+invariant_added = "Every frame for a file-local partition ID must agree with its first centroid header. Recovery checks before replaying a conflicting frame's rows and reports damage."
+fix_commits = ["fe6101da02ef5280101986d02dc9142fe8ca8b21"]
+revert_patch_ok = true
