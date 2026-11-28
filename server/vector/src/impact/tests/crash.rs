@@ -403,3 +403,20 @@ fn vs10_peer_copy_cannot_publish_a_checkpoint_with_missing_local_files() {
     copy_checkpoint(&store(&peer), &store(&local)).unwrap();
     assert_eq!(recovers(&local.crash(), &[20], "copy retry"), [20, 20]);
 }
+
+#[test]
+fn vs10_impact_copy_refuses_a_peer_file_with_wrong_length() {
+    use nabedra_rt::fs::OpenMode;
+
+    let local = disk();
+    prepared(&local);
+    let peer = disk();
+    prepared(&peer).checkpoint().unwrap();
+    let doc = store(&peer).files().into_iter()
+        .find(|path| path.file_name().unwrap().to_string_lossy().starts_with("doc-"))
+        .unwrap();
+    let file = peer.open(&doc, OpenMode::ReadWrite).unwrap();
+    file.set_len(file.len().unwrap() + 1).unwrap();
+    assert!(copy_checkpoint(&store(&peer), &store(&local)).is_err(), "bad peer length");
+    assert_eq!(recovers(&local.crash(), &[20], "refused peer copy"), [20, 20]);
+}
