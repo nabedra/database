@@ -296,6 +296,9 @@ pub fn copy_checkpoint(from: &Checkpoints, to: &Checkpoints) -> Result<()> {
         }
         for info in &mut manifest.files {
             let source = from.fs.open(&from.path(&file_name(info.number)), OpenMode::Read)?;
+            if source.len()? != info.len {
+                return Err(damaged("a peer file's size is wrong"));
+            }
             info.number = free_number(&taken).ok_or_else(|| damaged("no file number is free"))?;
             taken.insert(info.number);
             let target = to.fs.open(&to.path(&file_name(info.number)), OpenMode::CreateNew)?;
