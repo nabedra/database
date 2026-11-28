@@ -1,0 +1,15 @@
+# Deterministic FaultFs peer file with one extra byte. w4/idx3/06-{red,green}.log.
+id = "VEC-BUG-impact-peer-file-length"
+title = "Impact peer copy accepts files longer than the manifest declares"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G03", "VEC-G11"]
+scenarios = ["VS10", "VS17"]
+found_by = "review"
+found_date = "2026-11-28"
+lowest_regression = "server/vector/src/impact/tests/crash.rs::vs10_impact_copy_refuses_a_peer_file_with_wrong_length"
+seed = "unknown"
+why_not_caught = "Impact checkpoint length checks were exercised during recovery. Copying an oversized file could truncate it to a length that recovery accepted."
+invariant_added = "Peer copy verifies each source file's exact length before creating its destination. A size mismatch leaves the installed local checkpoint recoverable."
+fix_commits = ["0e78685e0a84d46bf419c716c4459308ffd5662e"]
+revert_patch_ok = true
