@@ -1,0 +1,16 @@
+# Closed as a documented precision limit by lead decision L20. The cited commit records the
+# accepted behavior in adv05. It changes only the test, so there is no product fix to replay.
+id = "VEC-BUG-exact-dot-cancellation"
+title = "Fixed-order f64 dot products can tie when a term is lost to rounding before cancellation"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G05"]
+scenarios = ["VS07"]
+found_by = "review"
+found_date = "2026-11-28"
+lowest_regression = "server/vector/src/index/tests/adversary.rs::adv05_fixed_order_dot_loses_terms_below_f64_precision"
+seed = "unknown"
+why_not_caught = "The previous test was opt-in and expected a score computed at higher precision."
+invariant_added = "Under L20, VEC-G05 exact search agrees with fixed-order f64 evaluation under L1. When that evaluation rounds away the middle product before cancellation, both rows score zero and sort by key."
+fix_commits = ["11ca7234ddb77830fa5ddb82f54943187c912570"]
+revert_patch_ok = false

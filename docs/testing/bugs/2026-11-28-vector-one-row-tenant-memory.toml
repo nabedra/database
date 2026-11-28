@@ -1,0 +1,24 @@
+# Deterministic in shape; the RSS figure varies a little by allocator. Ignored opt-in lib test, release
+# build; fails on 5df7214f and cef218b9 with 89 MB for 15 MB of vectors (w4/idx3/ignored-tenant.log).
+# Diagnosis (from code, not measured per structure): each one-row tenant keeps the raw vector in the
+# row store, an f32 copy of its direction in the ExactCodec block (server/vector/src/index/codec.rs:142)
+# and a dim-sized centroid for its own new partition (server/vector/src/index/mod.rs:383), so about three
+# copies before tree, summary and allocator overhead. A one-row partition could share the row direction
+# as its centroid, or the bound could be stated for the quantized codec.
+id = "VEC-BUG-one-row-tenant-memory"
+title = "A tenant with one 1024-dimension row costs about six times the row in memory"
+class = "resource-release-order"
+module = "vector"
+guarantees = ["VEC-G11"]
+scenarios = ["VS17"]
+found_by = "review"
+found_date = "2026-11-28"
+lowest_regression = "server/vector/src/index/tests/adversary.rs::adv07_a_tenant_with_one_row_costs_little_beyond_the_row"
+seed = "unknown"
+why_not_caught = "The test is ignored as a measurement with no stated budget, although it asserts four times the raw vectors, so no run fails on it."
+invariant_added = "Four thousand one-row tenants of 1024 dimensions use at most four times their raw vector bytes in resident memory. The regression is ignored and fails today with 89 MB for 15 MB of vectors."
+fix_commits = []
+revert_patch_ok = false
+status = "open"
+owner = "perf2 (per-tenant memory budget, VEC-G11)"
+expires = "2026-12-28"

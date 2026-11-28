@@ -1,0 +1,16 @@
+# Deterministic FaultFs interleaving. Evidence is in w4/idx4/dense-copy-red.log and checkpoint-green.log.
+# The range-drop fix is reverted first because it uses the dense directory lease.
+id = "VEC-BUG-dense-copy-cleans-pending-checkpoint"
+title = "Dense peer copy removes segments that a local checkpoint is about to publish"
+class = "resource-release-order"
+module = "vector"
+guarantees = ["VEC-G03", "VEC-G05"]
+scenarios = ["VS10"]
+found_by = "review"
+found_date = "2026-11-28"
+lowest_regression = "server/vector/src/index/tests/crash.rs::rv_idx3_dense_peer_copy_cannot_delete_pending_local_segments"
+seed = "unknown"
+why_not_caught = "The dense peer-copy tests had no local checkpoint in flight at the destination."
+invariant_added = "Dense local checkpoints and peer copy hold the destination directory lease through publication and cleanup. A copy refused while a local checkpoint is running can retry after it publishes."
+fix_commits = ["bc817e72ffd6a53a4ddbec0322d2e003906f3494", "81bf9529fac7c12ef799c579bd4cd4df2d0d7281"]
+revert_patch_ok = true

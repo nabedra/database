@@ -1,0 +1,15 @@
+# Deterministic FaultFs interleavings. Evidence is in w4/idx4/forget-red.log, dense-forget-red.log and checkpoint-green.log.
+id = "VEC-BUG-forget-replaces-peer-manifest"
+title = "Dropping a range can replace a peer copy's temporary manifest before publication"
+class = "resource-release-order"
+module = "vector"
+guarantees = ["VEC-G03", "VEC-G05"]
+scenarios = ["VS10"]
+found_by = "review"
+found_date = "2026-11-28"
+lowest_regression = "server/vector/src/impact/tests/crash.rs::vs10_impact_forget_cannot_replace_an_in_flight_peer_manifest"
+seed = "unknown"
+why_not_caught = "Prior tests exercised range drops and peer copies in sequence."
+invariant_added = "Dense and impact range drops release their own running checkpoint before taking the directory lease. If a peer copy owns the lease, the drop leaves the range in service and can retry once the copy finishes."
+fix_commits = ["bc817e72ffd6a53a4ddbec0322d2e003906f3494"]
+revert_patch_ok = true
