@@ -830,7 +830,12 @@ fn vs17_two_live_indexes_cannot_corrupt_one_anothers_extensions() {
 
     assert!(matches!(
         Index::new(cfg.clone(), codec.clone(), None),
-        Err(Error::Busy),
+        Err(Error::StoreOwned),
+    ));
+    let checkpoints = Store::new(Arc::new(nabedra_rt::fs::FaultFs::new()), "/ck");
+    assert!(matches!(
+        Index::recover(cfg.clone(), codec.clone(), checkpoints),
+        Err(Error::StoreOwned),
     ));
     charges(&first).expect("a refused index preserves the owner's charge and extension");
 

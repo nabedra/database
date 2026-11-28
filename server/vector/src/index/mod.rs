@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
+use crate::runtime::{Budget, Meter};
 use crate::store::{ExtensionLease, Extensions, Vectors};
 use crate::types::{
     Change, ColumnType, CommitTs, Error, Key, MAX_DIM, Page, PartId, Pos, RangeId, Result, Row,
@@ -572,6 +573,7 @@ impl<C: Codec> Drop for Index<C> {
 
 impl<C: Codec> Index<C> {
     /// An empty index. `store` keeps its checkpoints.
+    /// Drop the old index before reusing its extension store (`cfg.codes`).
     pub fn new(cfg: Config, codec: C, store: Option<Store>) -> Result<Self> {
         cfg.check()?;
         if !codec.fits(cfg.schema.dim) {
@@ -980,8 +982,27 @@ impl<C: Codec> Index<C> {
     /// `StartScan`: fixes the read points and the partitions in one step, after the caller's barrier.
     /// `filter` may limit the partitions to one tree.
     pub fn pin(&mut self, ranges: &[(RangeId, ReadAt)], filter: Option<&Filter>) -> Result<Pin> {
+        self.pin_within(ranges, filter, Budget::UNLIMITED)
+    }
+
+    /// [`Index::pin`] with a CPU budget for filter validation and routing.
+    pub fn pin_within(
+        &mut self,
+        ranges: &[(RangeId, ReadAt)],
+        filter: Option<&Filter>,
+        budget: Budget,
+    ) -> Result<Pin> {
         if let Some(filter) = filter {
-            filter.check(&self.cfg.schema)?;
+            let mut meter = Meter::new(budget);
+            let mut filter_work = 0u64;
+            filter.check_with(&self.cfg.schema, |node| {
+                meter.cpu(1)?;
+                filter_work = filter_work.saturating_add(node.node_work());
+                Ok(())
+            })?;
+            if self.cfg.schema.partition_by.is_some() {
+                meter.cpu(filter_work)?;
+            }
         }
         let (group, roots) = self.roots(filter);
         self.pin_roots(ranges, group, roots)

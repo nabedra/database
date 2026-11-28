@@ -127,6 +127,8 @@ pub enum Error {
     InvalidFeed(&'static str),
     /// Work in flight reached its limit. Try again after `step`.
     Busy,
+    /// The extension store is already owned by a live index.
+    StoreOwned,
     /// The cut is below what the worker retains.
     CutTooOld {
         oldest: u64,
@@ -163,6 +165,7 @@ impl fmt::Display for Error {
             Error::Gap { delivered } => write!(f, "the page does not continue {delivered}"),
             Error::InvalidFeed(why) => write!(f, "invalid feed: {why}"),
             Error::Busy => f.write_str("too much work in flight"),
+            Error::StoreOwned => f.write_str("the extension store is owned by another index"),
             Error::CutTooOld { oldest } => write!(f, "the oldest servable cut is {oldest}"),
             Error::CutTooNew { newest } => write!(f, "the newest servable cut is {newest}"),
             Error::PinFailed => f.write_str("the pinned index was replaced"),

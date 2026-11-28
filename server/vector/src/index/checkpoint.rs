@@ -517,6 +517,7 @@ impl<C: Codec> Index<C> {
     /// Starts from the installed checkpoint of `store`, or empty without one. Every recovered range
     /// resumes the tail at its position and serves after `caught_up`. A damaged file takes the ranges
     /// in it out of service.
+    /// Drop the old index before reusing its extension store (`cfg.codes`).
     pub fn recover(cfg: Config, codec: C, store: Store) -> Result<(Self, Vec<Damage>)> {
         let mut index = Index::new(cfg, codec, Some(store.clone()))?;
         let damage = |file: &str, ranges: Vec<RangeId>, e: io::Error| Damage {

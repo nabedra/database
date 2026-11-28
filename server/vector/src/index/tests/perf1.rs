@@ -383,3 +383,26 @@ fn vs02_a_budgeted_scan_refuses_an_unaffordable_filter_plan_before_running_it() 
         );
     }
 }
+
+#[test]
+fn vs02_a_budgeted_pin_charges_filter_validation_and_routing() {
+    let cfg = Config::new(schema(2, &[ColumnType::Int], Some(0)), 1);
+    let rows = [(0, row(&[1.0, 0.0], vec![Value::Int(42)], 0))];
+    let mut ix = build(cfg, ExactCodec, &rows);
+    let ranges = [(RANGE, ReadAt::Position(1))];
+    let budget = |cpu| Budget { cpu, ..Budget::UNLIMITED };
+    let invalid = Filter::And(vec![Filter::Eq(1, Value::Int(42))]);
+    assert!(matches!(
+        ix.pin_within(&ranges, Some(&invalid), budget(1)),
+        Err(Error::OverBudget("cpu"))
+    ));
+
+    let filter = Filter::And(vec![Filter::And(vec![]), Filter::Eq(0, Value::Int(42))]);
+    assert!(matches!(
+        ix.pin_within(&ranges, Some(&filter), budget(5)),
+        Err(Error::OverBudget("cpu"))
+    ));
+    let pin = ix.pin_within(&ranges, Some(&filter), budget(6)).unwrap();
+    assert_eq!(pin.0.group, Some(Scalar::Int(42)));
+    assert_eq!(pin.0.roots.len(), 1);
+}

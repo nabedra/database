@@ -62,7 +62,7 @@ impl Extensions {
     pub(crate) fn lease(self: &Arc<Self>) -> Result<ExtensionLease> {
         self.leased
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .map_err(|_| Error::Busy)?;
+            .map_err(|_| Error::StoreOwned)?;
         Ok(ExtensionLease(Arc::clone(self)))
     }
 
