@@ -402,3 +402,24 @@ fn rv_idx3_dense_peer_copy_cannot_delete_pending_local_segments() {
     copy_checkpoint(&store(&peer), &store(&local)).unwrap();
     assert_eq!(recovers(&local.crash(), &[20], "peer copy retry"), [20, 20]);
 }
+
+#[test]
+fn vs10_dense_forget_requires_the_directory_lease() {
+    let fs = disk();
+    let mut ix = prepared(&fs);
+    let (mut writer, damage) = Index::recover(cfg(), ExactCodec, store(&fs)).unwrap();
+    assert!(damage.is_empty());
+    writer.begin_checkpoint().unwrap();
+
+    assert_eq!(ix.drop_range(RANGE), Err(Error::Busy));
+    assert!(ix.status(RANGE).is_ok());
+    assert_eq!(recovers(&fs.crash(), &[20], "refused drop"), [20, 20]);
+
+    drop(writer);
+    ix.begin_checkpoint().unwrap();
+    ix.drop_range(RANGE).unwrap();
+    let (back, damage) = Index::recover(cfg(), ExactCodec, store(&fs.crash())).unwrap();
+    assert!(damage.is_empty());
+    assert!(matches!(back.status(RANGE), Err(Error::NotHeld(RANGE))));
+    assert_eq!(back.status(OTHER).unwrap().applied, 20);
+}
