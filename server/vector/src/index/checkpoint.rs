@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use nabedra_rt::fs::{Fs, FsFile, OpenMode};
+use nabedra_rt::fs::{Fs, FsFile, FsLock, OpenMode};
 
 use super::codec::{Codec, direction, length};
 use super::mutant::mutant;
@@ -22,6 +22,7 @@ use crate::types::{CommitTs, Error, Key, PartId, Pos, RangeId, Result, Row, Valu
 
 const MANIFEST: &str = "MANIFEST";
 const MANIFEST_TMP: &str = "MANIFEST.tmp";
+const LOCK: &str = "LOCK";
 const SEGMENT_MAGIC: &[u8; 8] = b"NVXSEG01";
 const MANIFEST_MAGIC: &[u8; 8] = b"NVXMAN01";
 /// A segment is closed beyond this.
@@ -93,6 +94,8 @@ pub(super) struct Running {
     next: u64,
     segment: Option<Segment>,
     files: Vec<FileInfo>,
+    /// Excludes another writer until publication and cleanup finish.
+    _lease: Arc<FsLock>,
 }
 
 fn io_error(e: io::Error) -> Error {
@@ -137,6 +140,14 @@ impl Store {
 
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
+    }
+
+    fn lease(&self) -> Result<FsLock> {
+        self.prepare().map_err(io_error)?;
+        self.fs.lock(&self.path(LOCK)).map_err(|e| match e.kind() {
+            io::ErrorKind::WouldBlock => Error::Busy,
+            _ => io_error(e),
+        })
     }
 
     fn segments(&self) -> io::Result<Vec<u64>> {
@@ -277,11 +288,12 @@ impl Store {
 
 /// Copies the installed checkpoint of another search replica. The manifest goes last.
 pub fn copy_checkpoint(from: &Store, to: &Store) -> Result<()> {
-    let copy = || -> io::Result<()> {
-        let mut manifest = from
-            .load_manifest()?
-            .ok_or_else(|| damaged("the peer has no checkpoint"))?;
-        to.prepare()?;
+    let manifest = from
+        .load_manifest()
+        .and_then(|m| m.ok_or_else(|| damaged("the peer has no checkpoint")))
+        .map_err(io_error)?;
+    let _lease = to.lease()?;
+    let copy = |mut manifest: Manifest| -> io::Result<()> {
         let mut next = to.next_segment()?;
         for info in &mut manifest.files {
             let source_name = segment_name(info.number);
@@ -307,7 +319,7 @@ pub fn copy_checkpoint(from: &Store, to: &Store) -> Result<()> {
         to.clean(&manifest);
         Ok(())
     };
-    copy().map_err(io_error)
+    copy(manifest).map_err(io_error)
 }
 
 impl<C: Codec> Index<C> {
@@ -321,7 +333,7 @@ impl<C: Codec> Index<C> {
         if self.checkpoint.is_some() {
             return Err(Error::Busy);
         }
-        store.prepare().map_err(io_error)?;
+        let lease = store.lease()?;
         let next = store.next_segment().map_err(io_error)?;
         let held = |r: &Range| matches!(r.service, Service::CatchingUp | Service::Serving);
         let heads: Vec<Head> = (self.shared.ranges.iter().filter(|(_, r)| held(r)))
@@ -360,6 +372,7 @@ impl<C: Codec> Index<C> {
             next,
             segment: None,
             files: Vec::new(),
+            _lease: Arc::new(lease),
         });
         Ok(())
     }
@@ -910,6 +923,8 @@ pub(super) fn crc32c(data: &[u8]) -> u32 {
 #[cfg(test)]
 impl Store {
     pub(super) fn files(&self) -> Vec<PathBuf> {
-        self.fs.list(&self.dir).unwrap_or_default()
+        let mut files = self.fs.list(&self.dir).unwrap_or_default();
+        files.retain(|path| !path.ends_with(LOCK));
+        files
     }
 }

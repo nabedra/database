@@ -392,11 +392,13 @@ fn rv_idx3_dense_peer_copy_cannot_delete_pending_local_segments() {
 
     let peer = disk();
     prepared(&peer);
-    let copied = copy_checkpoint(&store(&peer), &store(&local));
-    let installed = writer.install_manifest();
-    eprintln!("copy: {copied:?}, local install: {installed:?}");
-    if installed.is_ok() {
-        let (_, damage) = Index::recover(cfg(), ExactCodec, store(&local.crash())).unwrap();
-        assert_eq!(damage, [], "the local manifest names a segment the copy removed");
-    }
+    assert_eq!(
+        copy_checkpoint(&store(&peer), &store(&local)),
+        Err(Error::Busy)
+    );
+    writer.install_manifest().unwrap();
+    assert_eq!(recovers(&local.crash(), &[30], "local checkpoint"), [30, 30]);
+
+    copy_checkpoint(&store(&peer), &store(&local)).unwrap();
+    assert_eq!(recovers(&local.crash(), &[20], "peer copy retry"), [20, 20]);
 }
