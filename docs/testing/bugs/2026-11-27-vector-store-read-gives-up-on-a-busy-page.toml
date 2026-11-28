@@ -1,0 +1,18 @@
+# Duplicate of VECTOR-nvme-busy-page-read-fails. The W4 draft runs the writer on another thread.
+# On 541d29e2 it passes. Reversing 2666694b gives "a page kept changing" again.
+# Evidence: w4/idx2/nt27-green.log and w4/idx2/nt27-red.log under the vector round logs.
+# Found by the 50x repetition gate of task gates (W3) on N's store tests: nt27_readers_of_stable_records_are_exact_while_neighbours_are_rewritten passed 49/50 (run 41: "a stable record 16 read as an error: vector store: raw-0: a page kept changing", /home/dev/logs/oltp-vector/w3/gates/rep-n.tsv). RecordFile::get_many (server/vector/src/store/file.rs:264) reads a record's pages and checks them against the checksums it planned under the lock; when a neighbour record on the same page is rewritten in between, it reads again, at most RETRIES = 4 rounds (file.rs:32), and then answers Error::Store("a page kept changing") for a record that never changed. A loaded machine or a writer that keeps rewriting the page makes the reader lose every round, so the product, not the test, breaks the rule of nt27 (readers of stable records get exact vectors, so exact queries answer; VEC-G05). Deterministic evidence: `cargo-slot test --locked -j 4 -p nabedra-vector --test w3_gates -- --include-ignored` (/home/dev/logs/oltp-vector/w3/gates/n-red.log) rewrites the neighbour, in place, before every read and gets the error on the first call.
+id = "VEC-BUG-store-read-gives-up-on-a-busy-page"
+title = "A read of a stable vector fails with 'a page kept changing' while a neighbour on its page is rewritten"
+class = "other"
+module = "vector"
+guarantees = ["VEC-G05"]
+scenarios = ["VS06"]
+found_by = "ci-flake"
+found_date = "2026-11-27"
+lowest_regression = "server/vector/tests/w3_gates.rs::nt27_a_stable_record_is_read_exactly_while_its_page_is_rewritten_before_every_read"
+seed = "unknown"
+why_not_caught = "nt27 races real threads, and the reader loses four rounds in a row only under load; it passed every single run before the 50x gate."
+invariant_added = "A stable vector reads back bit for bit under repeated rewrites of its page. The final read holds the record-file lock."
+fix_commits = ["2666694b21a206ee6a8b83861c5e2c9e293cee44"]
+revert_patch_ok = true
